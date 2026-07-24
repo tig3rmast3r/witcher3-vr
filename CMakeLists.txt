@@ -1,0 +1,65 @@
+cmake_minimum_required(VERSION 3.24)
+project(witcher3vr VERSION 0.602.0 LANGUAGES C CXX)
+
+include(CTest)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+set(W3VR_DEPENDENCIES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external" CACHE PATH
+    "Directory populated by scripts/setup-dependencies.ps1")
+
+set(W3VR_MINHOOK_DIR "${W3VR_DEPENDENCIES_DIR}/minhook")
+set(W3VR_OPENXR_DIR "${W3VR_DEPENDENCIES_DIR}/openxr-sdk")
+set(W3VR_DIRECTX_HEADERS_DIR "${W3VR_DEPENDENCIES_DIR}/directx-headers")
+set(W3VR_STREAMLINE_DIR "${W3VR_DEPENDENCIES_DIR}/streamline")
+
+foreach(required_path IN ITEMS
+    "${W3VR_MINHOOK_DIR}/include/MinHook.h"
+    "${W3VR_OPENXR_DIR}/include/openxr/openxr.h"
+    "${W3VR_DIRECTX_HEADERS_DIR}/include/directx/d3d12.h"
+    "${W3VR_STREAMLINE_DIR}/external/ngx-sdk/include/nvsdk_ngx.h")
+    if(NOT EXISTS "${required_path}")
+        message(FATAL_ERROR
+            "Missing dependency file: ${required_path}\n"
+            "Run scripts/setup-dependencies.ps1 before configuring.")
+    endif()
+endforeach()
+
+add_library(minhook STATIC
+    "${W3VR_MINHOOK_DIR}/src/buffer.c"
+    "${W3VR_MINHOOK_DIR}/src/hook.c"
+    "${W3VR_MINHOOK_DIR}/src/trampoline.c"
+    "${W3VR_MINHOOK_DIR}/src/hde/hde64.c"
+)
+target_include_directories(minhook PUBLIC
+    "${W3VR_MINHOOK_DIR}/include"
+    "${W3VR_MINHOOK_DIR}/src/hde"
+)
+
+add_library(witcher3vr_dxgi SHARED
+    src/dxgi_proxy.cpp
+    src/dxgi_proxy.def
+)
+target_compile_definitions(witcher3vr_dxgi PRIVATE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+target_include_directories(witcher3vr_dxgi PRIVATE
+    "${W3VR_OPENXR_DIR}/include"
+    "${W3VR_DIRECTX_HEADERS_DIR}/include"
+    "${W3VR_STREAMLINE_DIR}/external/ngx-sdk/include"
+)
+target_link_libraries(witcher3vr_dxgi PRIVATE
+    minhook
+    d3d12
+    dxguid
+)
+set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
+target_link_options(witcher3vr_dxgi PRIVATE /MAP)
+
+option(W3VR_BUILD_LAUNCHER "Build the Witcher 3 VR launcher" ON)
+if(W3VR_BUILD_LAUNCHER)
+    add_subdirectory(launcher)
+endif()

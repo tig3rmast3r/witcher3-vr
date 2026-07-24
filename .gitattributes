@@ -1,0 +1,13 @@
+* text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
+CMakeLists.txt text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.ini text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.ps1 text eol=crlf
+*.rc text eol=crlf
+*.def text eol=lf
+*.settings text eol=lf

@@ -1,0 +1,19358 @@
+﻿#include <Windows.h>
+#include <d3d12.h>
+#include <d3d12shader.h>
+#include <dxgi1_6.h>
+#include <dxcapi.h>
+#include <nvsdk_ngx.h>
+#include <MinHook.h>
+#include <intrin.h>
+
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_D3D12
+#define XR_NO_PROTOTYPES
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include <atomic>
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdarg>
+#include <cfloat>
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <iterator>
+#include <deque>
+#include <unordered_map>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+#include <array>
+
+namespace {
+
+// Source annotation convention:
+// [CORE]        Required proxy, renderer, or OpenXR infrastructure.
+// [FIX:name]    Production correction; n/m identifies every cooperating site.
+// [WORKAROUND]  Optional behavior with a known visual or compatibility trade-off.
+// [DEBUG]       Logging, probes, captures, or profiling; launcher-controlled.
+//
+// High-level flow:
+// DXGI/D3D12 interception -> REDengine stereo routing -> temporal backend
+// (No AA, TAAU, DLSS, or Packed DLSS) -> strict left/right pair cache -> OpenXR.
+
+// [CORE] Real DXGI forwarding, shared D3D12 device state, and process lifetime.
+HMODULE g_real_dxgi{};
+HMODULE g_openxr_loader{};
+HMODULE g_dxcompiler{};
+IDxcUtils* g_dxc_utils{};
+IDxcCompiler3* g_dxc_compiler{};
+std::mutex g_log_mutex{};
+std::once_flag g_init_once{};
+std::once_flag g_openxr_once{};
+std::once_flag g_performance_cpu_sets_once{};
+std::atomic<uint64_t> g_present_count{};
+std::atomic<uint64_t> g_dual_render_activation_present{};
+std::atomic<bool> g_dual_render_auto_start_consumed{};
+std::atomic<bool> g_auto_eye_shift_logged{};
+std::atomic<int> g_projection_class_probe_remaining{};
+std::atomic<bool> g_custom_resolution_active{};
+std::atomic<uint32_t> g_streamline_extent_fix_log_count{};
+HWND g_game_hwnd{};
+ID3D12CommandQueue* g_command_queue{};
+ID3D12Device* g_d3d12_device{};
+
+using GetSystemCpuSetInformationFn = BOOL(WINAPI*)(
+    PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+using SetThreadSelectedCpuSetsFn = BOOL(WINAPI*)(
+    HANDLE, const ULONG*, ULONG);
+GetSystemCpuSetInformationFn g_get_system_cpu_set_information{};
+SetThreadSelectedCpuSetsFn g_set_thread_selected_cpu_sets{};
+std::vector<ULONG> g_performance_cpu_set_ids{};
+thread_local bool g_producer_performance_cpu_sets_applied{};
+thread_local bool g_render_worker_performance_cpu_sets_applied{};
+
+enum class TemporalBackend : uint8_t {
+    None,
+    Taau,
+    Dlss,
+    DlssPacked,
+};
+
+struct Config {
+    bool openxr_enabled{true};
+    int openxr_mode{2};
+    float resolution_scale{1.0f};
+    float presentation_scale{0.9f};
+    int openxr_mono_eye_shift_px{160};
+    bool openxr_mono_eye_shift_auto{true};
+    int render_width{0};
+    int render_height{0};
+    float hud_horizontal_scale{0.7f};
+    float hud_vertical_scale{0.7f};
+    int hud_stereo_shift_px{-16};
+    float hud_size{1.0f};
+    float menu_scale{0.7f};
+    float cinema_scale{0.7f};
+    bool cinema_5x4{false};
+    float menu_distance{1.5f};
+    bool hmd_freelook{false};
+    bool hmd_compositor_only{false};
+    bool disable_desktop_vsync{true};
+    bool pipeline_frame_wait{true};
+    float hmd_yaw_scale{1.0f};
+    float hmd_pitch_scale{1.0f};
+    float hmd_roll_scale{-1.0f};
+    float hmd_fov_scale{1.0f};
+    bool hmd_lock_game_pitch{true};
+    float hmd_position_scale{1.0f};
+    float mono_neck_pivot_compensation_m{0.10f};
+    float world_marker_game_pitch_gain{0.15f};
+    float world_marker_hmd_vertical_gain{1.9f};
+    bool world_marker_game_pitch_depth_enabled{true};
+    float world_marker_game_pitch_depth_scale{-0.033333f};
+    float world_marker_vertical_offset_ndc{0.24f};
+    bool reverse_enabled{false};
+    bool reverse_scan_periodic{false};
+    bool reverse_scan_unmap{false};
+    bool reverse_cbv_probe{false};
+    int reverse_scan_interval_frames{600};
+    int reverse_max_scan_bytes{65536};
+    int reverse_max_matrix_logs{32};
+    int reverse_execute_log_interval{0};
+    int reverse_log_buffer_max_bytes{262144};
+    int reverse_draw_sample_interval{1000};
+    int reverse_max_roots{16};
+    bool reverse_active_nudge{false};
+    float reverse_nudge_amount{0.25f};
+    int reverse_nudge_start_frame{1800};
+    int reverse_nudge_cycle_frames{240};
+    int reverse_nudge_pulse_frames{120};
+    bool reverse_orbit_probe{false};
+    int reverse_orbit_frame_interval{2};
+    int reverse_orbit_max_logs{2400};
+    bool reverse_copy_probe{false};
+    int reverse_copy_max_logs{400};
+    bool reverse_stereo_probe{false};
+    bool reverse_geometry_shift{false};
+    bool engine_view_probe{false};
+    bool engine_frame_builder_probe{false};
+    bool engine_gameplay_entry_probe{false};
+    bool engine_scene_enqueue_probe{false};
+    bool engine_view_factory_probe{false};
+    bool engine_frame_factory_probe{false};
+    bool engine_dual_render_probe{false};
+    bool engine_dual_render_start{false};
+    bool engine_sync_swap_eyes{false};
+    bool engine_menu_state_probe{false};
+    bool engine_animation_hmd_frustum{false};
+    bool engine_animated_component_visible{true};
+    bool engine_taau_reverse_eye_order{false};
+    bool engine_taau_first_eye_pure_camera_motion{true};
+    bool engine_taau_pure_camera_motion_all{true};
+    int engine_taau_activation_delay_frames{30};
+    TemporalBackend temporal_backend{TemporalBackend::None};
+    bool engine_native_projection_shift{false};
+    int engine_native_projection_shift_px{8};
+    float engine_native_stereo_offset{0.0f};
+    float engine_factory_stereo_offset{0.0f};
+    float engine_close_camera_offset{0.75f};
+    int engine_camera_mode{0};
+    float engine_first_person_camera_offset{2.5f};
+    float engine_first_person_camera_up_offset{0.65f};
+    float engine_first_person_camera_eye_nudge{0.10f};
+    bool streamline_force_reset{false};
+    bool streamline_split_viewports{false};
+    float streamline_right_temporal_offset{0.0f};
+    int streamline_temporal_eye{1};
+    float streamline_temporal_clip_correction{0.0f};
+    bool streamline_trace{false};
+    int streamline_trace_start_frame{500};
+    bool streamline_mvec_probe{false};
+    bool streamline_output_probe{false};
+    bool streamline_mvec_correction{false};
+    bool streamline_reconstruct_camera_motion{false};
+    bool streamline_force_camera_mvec{false};
+    bool streamline_taau_bridge{false};
+    bool ngx_trace{false};
+    bool dlss_dlaa{false};
+    bool world_marker_diagnostics{false};
+    // [DEBUG] Both switches are launcher-controlled. When disabled, the same
+    // optimized DLL follows the normal low-overhead gaming path.
+    bool logging_enabled{false};
+    bool runtime_diagnostics{false};
+};
+
+Config g_config{};
+
+bool temporal_backend_is_taau() {
+    return g_config.temporal_backend == TemporalBackend::Taau;
+}
+
+bool temporal_backend_is_dlss() {
+    return g_config.temporal_backend == TemporalBackend::Dlss ||
+        g_config.temporal_backend == TemporalBackend::DlssPacked;
+}
+
+bool temporal_backend_is_dlss_packed() {
+    return g_config.temporal_backend == TemporalBackend::DlssPacked;
+}
+
+bool reverse_diagnostic_hooks_requested() {
+    return g_config.runtime_diagnostics ||
+        g_config.reverse_scan_periodic ||
+        g_config.reverse_scan_unmap ||
+        g_config.reverse_cbv_probe ||
+        g_config.reverse_active_nudge ||
+        g_config.reverse_orbit_probe ||
+        g_config.reverse_copy_probe ||
+        g_config.reverse_stereo_probe ||
+        g_config.reverse_geometry_shift;
+}
+
+bool taau_metadata_hooks_needed() {
+    return temporal_backend_is_taau() || temporal_backend_is_dlss() ||
+        reverse_diagnostic_hooks_requested();
+}
+
+bool graphics_binding_hooks_needed() {
+    return temporal_backend_is_dlss() || taau_metadata_hooks_needed();
+}
+
+bool temporal_compute_hooks_needed() {
+    // DLSS keeps V308's startup compute serialization. Only TAAU-exclusive
+    // resource/descriptor metadata is removed from the DLSS backend.
+    return temporal_backend_is_dlss() || taau_metadata_hooks_needed();
+}
+
+const char* temporal_backend_name() {
+    switch (g_config.temporal_backend) {
+    case TemporalBackend::Taau:
+        return "taau";
+    case TemporalBackend::Dlss:
+        return "dlss";
+    case TemporalBackend::DlssPacked:
+        return "dlss_packed";
+    default:
+        return "none";
+    }
+}
+
+std::atomic<float> g_hmd_fov_scale{1.0f};
+std::once_flag g_config_once{};
+
+PFN_xrCreateInstance pfn_xrCreateInstance{};
+PFN_xrDestroyInstance pfn_xrDestroyInstance{};
+PFN_xrGetInstanceProcAddr pfn_xrGetInstanceProcAddr{};
+PFN_xrGetSystem pfn_xrGetSystem{};
+PFN_xrGetSystemProperties pfn_xrGetSystemProperties{};
+PFN_xrCreateSession pfn_xrCreateSession{};
+PFN_xrDestroySession pfn_xrDestroySession{};
+PFN_xrGetD3D12GraphicsRequirementsKHR pfn_xrGetD3D12GraphicsRequirementsKHR{};
+PFN_xrEnumerateViewConfigurationViews pfn_xrEnumerateViewConfigurationViews{};
+PFN_xrEnumerateSwapchainFormats pfn_xrEnumerateSwapchainFormats{};
+PFN_xrCreateReferenceSpace pfn_xrCreateReferenceSpace{};
+PFN_xrDestroySpace pfn_xrDestroySpace{};
+PFN_xrCreateSwapchain pfn_xrCreateSwapchain{};
+PFN_xrDestroySwapchain pfn_xrDestroySwapchain{};
+PFN_xrEnumerateSwapchainImages pfn_xrEnumerateSwapchainImages{};
+PFN_xrAcquireSwapchainImage pfn_xrAcquireSwapchainImage{};
+PFN_xrWaitSwapchainImage pfn_xrWaitSwapchainImage{};
+PFN_xrReleaseSwapchainImage pfn_xrReleaseSwapchainImage{};
+PFN_xrPollEvent pfn_xrPollEvent{};
+PFN_xrBeginSession pfn_xrBeginSession{};
+PFN_xrEndSession pfn_xrEndSession{};
+PFN_xrWaitFrame pfn_xrWaitFrame{};
+PFN_xrBeginFrame pfn_xrBeginFrame{};
+PFN_xrEndFrame pfn_xrEndFrame{};
+PFN_xrLocateViews pfn_xrLocateViews{};
+XrInstance g_xr_instance{XR_NULL_HANDLE};
+XrSession g_xr_session{XR_NULL_HANDLE};
+XrSpace g_xr_space{XR_NULL_HANDLE};
+XrSpace g_xr_view_space{XR_NULL_HANDLE};
+XrSystemId g_xr_system{};
+XrSessionState g_xr_session_state{XR_SESSION_STATE_UNKNOWN};
+bool g_xr_session_running{};
+bool g_xr_first_frame_logged{};
+std::atomic<bool> g_xr_display_period_logged{};
+std::atomic<bool> g_xr_render_frame_prepared{};
+XrFrameState g_xr_render_frame_state{XR_TYPE_FRAME_STATE};
+bool g_xr_render_views_valid{};
+XrQuaternionf g_hmd_center_orientation{0.0f, 0.0f, 0.0f, 1.0f};
+XrQuaternionf g_hmd_center_yaw_orientation{0.0f, 0.0f, 0.0f, 1.0f};
+XrVector3f g_hmd_center_position{};
+XrView g_hmd_center_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+std::atomic<bool> g_hmd_center_valid{};
+std::atomic<bool> g_hmd_pose_valid{};
+std::atomic<bool> g_hmd_game_pitch_lock_pending{true};
+bool g_hmd_game_pitch_lock_valid{};
+float g_hmd_game_pitch_lock{};
+float g_hmd_yaw_degrees{};
+float g_hmd_pitch_degrees{};
+float g_hmd_roll_degrees{};
+float g_hmd_position_x{};
+float g_hmd_position_y{};
+float g_hmd_position_z{};
+XrVector3f g_mono_neck_pose_correction{};
+
+XrQuaternionf multiply_quaternions(const XrQuaternionf& a, const XrQuaternionf& b);
+XrVector3f rotate_vector(const XrQuaternionf& rotation, const XrVector3f& vector);
+std::atomic<float> g_hmd_render_fov_left{};
+std::atomic<float> g_hmd_render_fov_right{};
+std::atomic<float> g_hmd_render_fov_up{};
+std::atomic<float> g_hmd_render_fov_down{};
+std::atomic<bool> g_hmd_render_fov_valid{};
+std::atomic<bool> g_hmd_fov_pair_logged{};
+
+struct XrEyeSwapchain {
+    XrSwapchain handle{XR_NULL_HANDLE};
+    uint32_t width{};
+    uint32_t height{};
+    DXGI_FORMAT format{DXGI_FORMAT_R8G8B8A8_UNORM};
+    std::vector<XrSwapchainImageD3D12KHR> images{};
+    std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs{};
+    bool stereo_array{};
+};
+
+std::vector<XrViewConfigurationView> g_xr_view_configs{};
+std::vector<XrView> g_xr_views{};
+XrEyeSwapchain g_xr_eye_swapchains[2]{};
+ID3D12DescriptorHeap* g_xr_rtv_heap{};
+UINT g_xr_rtv_increment{};
+std::vector<ID3D12CommandAllocator*> g_xr_command_allocators{};
+std::vector<uint64_t> g_xr_allocator_fence_values{};
+ID3D12GraphicsCommandList* g_xr_command_list{};
+ID3D12Fence* g_xr_fence{};
+HANDLE g_xr_fence_event{};
+uint64_t g_xr_fence_value{};
+bool g_xr_resources_ready{};
+IDXGISwapChain* g_game_swapchain{};
+UINT g_game_render_width{};
+UINT g_game_render_height{};
+ID3D12Resource* g_stereo_eye_cache[2]{};
+bool g_stereo_eye_cache_initialized[2]{};
+XrView g_stereo_eye_cache_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+bool g_stereo_eye_cache_view_valid[2]{};
+ID3D12Resource* g_packed_present_cache[2]{};
+bool g_packed_present_cache_valid{};
+XrView g_packed_present_cache_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+bool g_packed_present_cache_view_valid[2]{};
+uint64_t g_packed_pending_pair_id[2]{};
+uint64_t g_packed_accepted_pair_id{};
+std::atomic<uint64_t> g_packed_accepted_pair_signal{};
+uint64_t g_packed_last_accepted_present{UINT64_MAX};
+std::atomic<bool> g_packed_runtime_ready{};
+DXGI_FORMAT g_stereo_eye_cache_format{DXGI_FORMAT_UNKNOWN};
+UINT g_stereo_eye_cache_width{};
+UINT g_stereo_eye_cache_height{};
+uint64_t g_packed_eye_version[2]{};
+uint64_t g_packed_submitted_version[2]{};
+std::atomic<uint64_t> g_packed_left_updates{};
+std::atomic<uint64_t> g_packed_right_updates{};
+std::atomic<uint64_t> g_packed_pairs_submitted{};
+
+constexpr size_t kStreamlineCaptureRingSize = 3;
+struct StreamlineCaptureSlot {
+    ID3D12Resource* resource{};
+    bool initialized{};
+    uint32_t generation{};
+    uint64_t pair_id{};
+    XrView render_view{XR_TYPE_VIEW};
+    bool render_view_valid{};
+};
+std::array<std::array<StreamlineCaptureSlot, kStreamlineCaptureRingSize>, 2> g_streamline_capture_ring{};
+std::atomic<uint64_t> g_streamline_capture_write_count[2]{};
+std::atomic<uint32_t> g_streamline_capture_latest_slot[2]{UINT32_MAX, UINT32_MAX};
+std::atomic<uint32_t> g_streamline_capture_generation{1};
+std::atomic<uint32_t> g_streamline_capture_log_count[2]{};
+std::atomic<uint32_t> g_streamline_dual_capture_sequence{};
+std::atomic<uint32_t> g_streamline_dual_evaluate_log_count{};
+std::mutex g_streamline_capture_mutex{};
+DXGI_FORMAT g_streamline_capture_format{DXGI_FORMAT_UNKNOWN};
+UINT g_streamline_capture_width{};
+UINT g_streamline_capture_height{};
+
+bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc);
+bool update_packed_eye_cache();
+bool capture_streamline_output(ID3D12GraphicsCommandList* command_list, D3D12_RESOURCE_STATES source_state);
+void bridge_streamline_private_output(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* output,
+    D3D12_RESOURCE_STATES canonical_state);
+bool capture_tagged_backbuffer_output(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* source,
+    D3D12_RESOURCE_STATES source_state,
+    uint32_t eye,
+    uint32_t generation,
+    uint64_t pair_id,
+    const XrView& render_view,
+    bool render_view_valid);
+bool native_stereo_capture_ready();
+void prepare_openxr_render_frame();
+
+using CreateDXGIFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+using CreateDXGIFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);
+using CreateDXGIFactory2Fn = HRESULT(WINAPI*)(UINT, REFIID, void**);
+using DXGIDeclareAdapterRemovalSupportFn = HRESULT(WINAPI*)();
+using DXGIGetDebugInterface1Fn = HRESULT(WINAPI*)(UINT, REFIID, void**);
+using DXGIDisableVBlankVirtualizationFn = HRESULT(WINAPI*)();
+using SlSetConstantsFn = int(__fastcall*)(void*, uint32_t, uint32_t);
+using SlSetTagFn = int(__fastcall*)(const void*, uint32_t, uint32_t, const void*);
+using SlSetFeatureConstantsFn = int(__fastcall*)(uint32_t, const void*, uint32_t, uint32_t);
+using SlEvaluateFeatureFn = int(__fastcall*)(void*, uint32_t, uint32_t, uint32_t);
+using NgxEvaluateFeatureFn = NVSDK_NGX_Result(NVSDK_CONV*)(
+    ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
+using NgxCreateFeatureFn = NVSDK_NGX_Result(NVSDK_CONV*)(
+    ID3D12GraphicsCommandList*, NVSDK_NGX_Feature, const NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
+using NgxGetParametersFn = NVSDK_NGX_Result(NVSDK_CONV*)(
+    NVSDK_NGX_Parameter**);
+using LoadLibraryAFn = HMODULE(WINAPI*)(LPCSTR);
+using LoadLibraryWFn = HMODULE(WINAPI*)(LPCWSTR);
+using LoadLibraryExAFn = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+using LoadLibraryExWFn = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+
+using CreateSwapChainForHwndFn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using CreateSwapChainFn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using GetDisplayModeListFn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGIOutput*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC*);
+using GetDisplayModeList1Fn = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGIOutput1*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC1*);
+using EngineViewportResolutionFn = void(__fastcall*)(bool, void*, uint32_t*, uint32_t*);
+using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+using CreateCommittedResourceFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    const D3D12_HEAP_PROPERTIES*,
+    D3D12_HEAP_FLAGS,
+    const D3D12_RESOURCE_DESC*,
+    D3D12_RESOURCE_STATES,
+    const D3D12_CLEAR_VALUE*,
+    REFIID,
+    void**);
+using CreateDescriptorHeapFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    const D3D12_DESCRIPTOR_HEAP_DESC*,
+    REFIID,
+    void**);
+using CreateConstantBufferViewFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC*,
+    D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateRootSignatureFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+using CreateShaderResourceViewFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*,
+    D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateUnorderedAccessViewFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*, ID3D12Resource*, ID3D12Resource*,
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateRenderTargetViewFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*,
+    D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateDepthStencilViewFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*,
+    D3D12_CPU_DESCRIPTOR_HANDLE);
+using D3D12CreateDeviceFn = HRESULT(WINAPI*)(
+    IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+using CreateGraphicsPipelineStateFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC*,
+    REFIID,
+    void**);
+using CreateComputePipelineStateFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC*,
+    REFIID,
+    void**);
+using CopyDescriptorsFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    UINT,
+    const D3D12_CPU_DESCRIPTOR_HANDLE*,
+    const UINT*,
+    UINT,
+    const D3D12_CPU_DESCRIPTOR_HANDLE*,
+    const UINT*,
+    D3D12_DESCRIPTOR_HEAP_TYPE);
+using CopyDescriptorsSimpleFn = void(STDMETHODCALLTYPE*)(
+    ID3D12Device*,
+    UINT,
+    D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_CPU_DESCRIPTOR_HANDLE,
+    D3D12_DESCRIPTOR_HEAP_TYPE);
+using ResourceMapFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
+using ResourceUnmapFn = void(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*);
+using SetDescriptorHeapsFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    ID3D12DescriptorHeap* const*);
+using SetGraphicsRootDescriptorTableFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    D3D12_GPU_DESCRIPTOR_HANDLE);
+using SetComputeRootDescriptorTableFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    D3D12_GPU_DESCRIPTOR_HANDLE);
+using SetGraphicsRootConstantBufferViewFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    D3D12_GPU_VIRTUAL_ADDRESS);
+using SetComputeRootConstantBufferViewFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    D3D12_GPU_VIRTUAL_ADDRESS);
+using SetComputeRoot32BitConstantFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+using SetComputeRoot32BitConstantsFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*, UINT, UINT, const void*, UINT);
+using SetPipelineStateFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    ID3D12PipelineState*);
+using SetGraphicsRootSignatureFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    ID3D12RootSignature*);
+using DrawIndexedInstancedFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    UINT,
+    UINT,
+    INT,
+    UINT);
+using DrawInstancedFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    UINT,
+    UINT,
+    UINT);
+using DispatchFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+using CopyBufferRegionFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    ID3D12Resource*,
+    UINT64,
+    ID3D12Resource*,
+    UINT64,
+    UINT64);
+using ResourceBarrierFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    UINT,
+    const D3D12_RESOURCE_BARRIER*);
+using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
+    const D3D12_CPU_DESCRIPTOR_HANDLE*);
+
+CreateSwapChainForHwndFn g_create_swapchain_for_hwnd{};
+CreateSwapChainFn g_create_swapchain{};
+PresentFn g_present{};
+Present1Fn g_present1{};
+ResizeBuffersFn g_resize_buffers{};
+GetDisplayModeListFn g_get_display_mode_list{};
+GetDisplayModeList1Fn g_get_display_mode_list1{};
+EngineViewportResolutionFn g_engine_viewport_resolution{};
+ExecuteCommandListsFn g_execute_command_lists{};
+CreateCommittedResourceFn g_create_committed_resource{};
+CreateDescriptorHeapFn g_create_descriptor_heap{};
+CreateConstantBufferViewFn g_create_cbv{};
+CreateRootSignatureFn g_create_root_signature{};
+CreateShaderResourceViewFn g_create_srv{};
+CreateUnorderedAccessViewFn g_create_uav{};
+CreateRenderTargetViewFn g_create_rtv{};
+CreateDepthStencilViewFn g_create_dsv{};
+D3D12CreateDeviceFn g_d3d12_create_device{};
+CreateGraphicsPipelineStateFn g_create_graphics_pipeline_state{};
+CreateComputePipelineStateFn g_create_compute_pipeline_state{};
+CopyDescriptorsFn g_copy_descriptors{};
+CopyDescriptorsSimpleFn g_copy_descriptors_simple{};
+ResourceMapFn g_resource_map{};
+ResourceUnmapFn g_resource_unmap{};
+SetDescriptorHeapsFn g_set_descriptor_heaps{};
+SetGraphicsRootDescriptorTableFn g_set_graphics_root_descriptor_table{};
+SetComputeRootDescriptorTableFn g_set_compute_root_descriptor_table{};
+SetGraphicsRootConstantBufferViewFn g_set_graphics_root_cbv{};
+SetComputeRootConstantBufferViewFn g_set_compute_root_cbv{};
+SetComputeRoot32BitConstantFn g_set_compute_root_32bit_constant{};
+SetComputeRoot32BitConstantsFn g_set_compute_root_32bit_constants{};
+SetPipelineStateFn g_set_pipeline_state{};
+SetGraphicsRootSignatureFn g_set_graphics_root_signature{};
+SetGraphicsRootSignatureFn g_set_compute_root_signature{};
+DrawIndexedInstancedFn g_draw_indexed_instanced{};
+DrawInstancedFn g_draw_instanced{};
+DispatchFn g_dispatch{};
+CopyBufferRegionFn g_copy_buffer_region{};
+ResourceBarrierFn g_resource_barrier{};
+OMSetRenderTargetsFn g_om_set_render_targets{};
+void* g_dispatch_hook_target{};
+void* g_compute_table_hook_target{};
+void* g_compute_cbv_hook_target{};
+void* g_compute_constant_hook_target{};
+void* g_compute_constants_hook_target{};
+void* g_compute_signature_hook_target{};
+void* g_om_render_targets_hook_target{};
+bool g_taau_core_hooks_enabled{};
+bool g_taau_probe_hooks_enabled{};
+std::atomic<bool> g_taau_packed_core_prearmed{};
+std::atomic<uint32_t> g_streamline_output_barrier_log_count{};
+using EngineViewConstantsFn = void(__fastcall*)(void*, void*, char);
+EngineViewConstantsFn g_engine_view_constants{};
+std::atomic<uint64_t> g_engine_view_call_count{};
+std::atomic<uint64_t> g_engine_view_last_logged_present{UINT64_MAX};
+using EngineFrameBuilderFn = void(__fastcall*)(void*, void*, void*);
+EngineFrameBuilderFn g_engine_frame_builder{};
+using EngineTemporalWriterFn = void(__fastcall*)(
+    void*, float, float, uint32_t, uint32_t);
+EngineTemporalWriterFn g_engine_temporal_writer{};
+struct PackedSourceJitterSlot {
+    std::atomic<uint32_t> x_bits{};
+    std::atomic<uint32_t> y_bits{};
+    std::atomic<uint64_t> pair_id{UINT64_MAX};
+};
+constexpr size_t kPackedSourceJitterSlotCount = 4096;
+std::array<PackedSourceJitterSlot, kPackedSourceJitterSlotCount>
+    g_packed_source_jitter_slots{};
+std::atomic<uint64_t> g_packed_source_jitter_captures{};
+std::atomic<uint64_t> g_packed_source_jitter_overrides{};
+std::atomic<uint64_t> g_packed_source_jitter_misses{};
+std::mutex g_packed_temporal_preparation_mutex{};
+std::condition_variable g_packed_temporal_preparation_cv{};
+std::unordered_map<uint64_t, uint8_t> g_packed_temporal_preparation_masks{};
+std::atomic<uint64_t> g_packed_temporal_preparation_publishes{};
+std::atomic<uint64_t> g_packed_temporal_preparation_waits{};
+std::atomic<uint64_t> g_packed_temporal_preparation_hits{};
+std::atomic<uint64_t> g_packed_temporal_preparation_timeouts{};
+std::atomic<uint64_t> g_engine_frame_builder_last_logged_present{UINT64_MAX};
+using EngineGameplayFrameEntryFn = void(__fastcall*)(void*);
+EngineGameplayFrameEntryFn g_engine_gameplay_frame_entry{};
+std::atomic<uint64_t> g_engine_gameplay_entry_last_logged_present{UINT64_MAX};
+using EngineSceneEnqueueFn = void(__fastcall*)(void*, void*);
+EngineSceneEnqueueFn g_engine_scene_enqueue{};
+std::atomic<uint64_t> g_engine_scene_enqueue_last_logged_present{UINT64_MAX};
+using EngineViewRebuildFn = void(__fastcall*)(float*);
+EngineViewRebuildFn g_engine_view_rebuild{};
+using EngineCameraDirectionFn = void(__fastcall*)(void*, void*, float*);
+EngineCameraDirectionFn g_engine_camera_direction{};
+using EngineWorldVectorToViewRatioFn = void(__fastcall*)(void*, void*, uint8_t*);
+EngineWorldVectorToViewRatioFn g_engine_world_vector_to_view_ratio{};
+std::atomic<float> g_engine_hmd_forward_x{};
+std::atomic<float> g_engine_hmd_forward_y{};
+std::atomic<float> g_engine_hmd_forward_z{};
+std::atomic<bool> g_engine_hmd_forward_valid{};
+std::atomic<uint64_t> g_engine_hmd_camera_last_present{UINT64_MAX};
+std::atomic<bool> g_cinema_mode_active{};
+std::atomic<bool> g_force_mono_cinema{};
+std::atomic<bool> g_auto_recenter_on_packed_lock_armed{};
+std::atomic<uint64_t> g_gameplay_world_pipeline_present{UINT64_MAX};
+std::mutex g_engine_view_snapshot_mutex{};
+std::array<float, 512> g_engine_view_before_hmd{};
+std::array<float, 512> g_engine_view_after_rebuild{};
+uint64_t g_engine_view_snapshot_present{};
+uint64_t g_engine_view_after_snapshot_present{};
+constexpr size_t kWorldMarkerProjectionSlotCount = 8;
+struct WorldMarkerProjectionSlot {
+    std::array<std::atomic<uint32_t>, 16> matrix_bits{};
+    std::atomic<uint64_t> present{UINT64_MAX};
+    std::atomic<uint64_t> pair_id{};
+    std::atomic<int> eye{-1};
+    std::atomic<uint64_t> sequence{};
+};
+std::array<WorldMarkerProjectionSlot, kWorldMarkerProjectionSlotCount>
+    g_world_marker_projection_slots{};
+constexpr size_t kWorldMarkerCameraFloatCount = 512;
+struct PackedWorldMarkerCameraSlot {
+    std::array<std::atomic<uint32_t>, kWorldMarkerCameraFloatCount> view_bits{};
+    std::atomic<uint32_t> hmd_pitch_bits{};
+    std::atomic<uint32_t> hmd_yaw_bits{};
+    std::atomic<uint32_t> hmd_roll_bits{};
+    std::atomic<uint64_t> present{UINT64_MAX};
+    std::atomic<uint64_t> pair_id{};
+    std::atomic<uint64_t> sequence{};
+};
+PackedWorldMarkerCameraSlot g_packed_world_marker_camera{};
+struct WorldMarkerProjectionMetadata {
+    uint64_t present{UINT64_MAX};
+    uint64_t pair_id{};
+    uint64_t sequence{};
+    int eye{-1};
+};
+constexpr size_t kWorldMarkerDiagnosticRingSize = 4096;
+struct WorldMarkerDiagnosticEntry {
+    std::atomic<uint64_t> sequence{};
+    uint64_t ordinal{};
+    uint64_t present{};
+    uint64_t projection_present{UINT64_MAX};
+    uint64_t pair_id{};
+    uint64_t projection_sequence{};
+    uint64_t matrix_hash{};
+    uint64_t stack_hash{};
+    uintptr_t camera{};
+    uintptr_t stack{};
+    DWORD thread{};
+    int kind{}; // 0=publish, 1=corrected callback, 2=native fallback, 3=rejected publish
+    int projection_eye{-1};
+    int factory_eye{-1};
+    int render_eye{-1};
+    std::array<uint32_t, 4> result_bits{};
+};
+std::array<WorldMarkerDiagnosticEntry, kWorldMarkerDiagnosticRingSize>
+    g_world_marker_diagnostic_ring{};
+std::atomic<uint64_t> g_world_marker_diagnostic_write{};
+std::atomic<uint32_t> g_taau_view_matrix_match_logs{};
+struct EngineTemporalMatrixPair {
+    uint64_t present{};
+    uint64_t pair_id{};
+    int eye{-1};
+    std::array<float, 16> original{};
+    std::array<float, 16> corrected{};
+    XrQuaternionf hmd_orientation{0.0f, 0.0f, 0.0f, 1.0f};
+    XrVector3f hmd_position{};
+    std::array<float, 9> hmd_to_base_rotation{};
+    XrVector3f hmd_to_base_translation{};
+    std::array<float, 12> base_camera{};
+    std::array<float, 12> corrected_camera{};
+    std::array<XrView, 2> render_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    float vertical_fov_degrees{};
+    float aspect{};
+    float near_plane{};
+    float far_plane{};
+    bool original_valid{};
+    bool corrected_valid{};
+    bool hmd_pose_valid{};
+    bool render_views_valid{};
+};
+std::array<EngineTemporalMatrixPair, 32> g_engine_temporal_matrix_ring{};
+std::mutex g_engine_temporal_matrix_mutex{};
+std::atomic<uint64_t> g_aim_crosshair_last_present{UINT64_MAX};
+std::atomic<uint32_t> g_aim_direction_log_count{};
+std::atomic<uint64_t> g_engine_view_factory_last_logged_present{UINT64_MAX};
+using EngineFrameDataFactoryFn = void*(__fastcall*)(void*, void*, void*);
+EngineFrameDataFactoryFn g_engine_frame_data_factory{};
+using EngineRenderQueuePumpFn = uint64_t(__fastcall*)(void*, int64_t*);
+EngineRenderQueuePumpFn g_engine_render_queue_pump{};
+std::atomic<uint32_t> g_engine_render_queue_probe_logs{};
+using EngineRenderSceneSetupFn = void(__fastcall*)(void*, float);
+EngineRenderSceneSetupFn g_engine_render_scene_setup{};
+std::atomic<uint64_t> g_hang_diag_scene_enter{};
+std::atomic<uint64_t> g_hang_diag_scene_exit{};
+std::atomic<uint64_t> g_hang_diag_scene_present{};
+std::atomic<uint32_t> g_hang_diag_scene_thread{};
+std::atomic<uint64_t> g_hang_diag_gameplay_enter{};
+std::atomic<uint64_t> g_hang_diag_gameplay_exit{};
+std::atomic<uint64_t> g_hang_diag_gameplay_present{};
+std::atomic<uint64_t> g_hang_diag_gameplay_pair{};
+std::atomic<int> g_hang_diag_gameplay_eye{-1};
+std::atomic<uint32_t> g_hang_diag_gameplay_thread{};
+std::atomic<uint64_t> g_hang_diag_builder_enter{};
+std::atomic<uint64_t> g_hang_diag_builder_exit{};
+std::atomic<uint64_t> g_hang_diag_builder_present{};
+std::atomic<uint64_t> g_hang_diag_builder_pair{};
+std::atomic<int> g_hang_diag_builder_eye{-1};
+std::atomic<uint32_t> g_hang_diag_builder_thread{};
+std::atomic<uint64_t> g_hang_diag_taau_enter{};
+std::atomic<uint64_t> g_hang_diag_taau_exit{};
+std::atomic<uint64_t> g_hang_diag_taau_present{};
+std::atomic<uint64_t> g_hang_diag_taau_pair{};
+std::atomic<int> g_hang_diag_taau_eye{-1};
+std::atomic<uint32_t> g_hang_diag_taau_thread{};
+std::atomic<uint64_t> g_hang_diag_taau_matched_pair{};
+std::atomic<int> g_hang_diag_taau_matched_eye{-1};
+std::atomic<uint64_t> g_hang_diag_fence_completed{};
+std::atomic<uint64_t> g_hang_diag_execute_enter{};
+std::atomic<uint64_t> g_hang_diag_execute_exit{};
+std::atomic<uint64_t> g_hang_diag_execute_present{};
+std::atomic<uint32_t> g_hang_diag_execute_thread{};
+std::atomic<uint32_t> g_hang_diag_execute_list_count{};
+std::atomic<uint32_t> g_hang_diag_execute_slot_count{};
+std::atomic<uint64_t> g_hang_diag_execute_signal{};
+std::atomic<long> g_hang_diag_execute_signal_hr{S_OK};
+using EngineSceneCullingFn = void(__fastcall*)(void*, void*, void*, void*, void*);
+EngineSceneCullingFn g_engine_scene_culling{};
+std::atomic<uint32_t> g_engine_scene_culling_route_logs{};
+std::atomic<uint64_t> g_render_fingerprint_culling_present{};
+using EngineInvisiblesProcessingFn = void(__fastcall*)(void*, void*);
+EngineInvisiblesProcessingFn g_engine_invisibles_processing{};
+using EngineAnimationBudgetConfigFn = void(__fastcall*)(void*);
+EngineAnimationBudgetConfigFn g_engine_animation_budget_config{};
+using EngineFrustumFromMatrixFn = void(__fastcall*)(void*, const float*);
+EngineFrustumFromMatrixFn g_engine_frustum_from_matrix{};
+void* g_engine_animation_frustum_return{};
+std::atomic<uint32_t> g_engine_animation_frustum_apply_logs{};
+using EngineFrustumAabbTestFn = int(__fastcall*)(void*, const void*);
+EngineFrustumAabbTestFn g_engine_frustum_aabb_test{};
+void* g_engine_animated_component_visibility_return{};
+std::atomic<uint64_t> g_engine_animated_component_visibility_forces{};
+std::atomic<uint32_t> g_engine_invisibles_route_logs{};
+std::atomic<uint32_t> g_engine_factory_aux_camera_logs{};
+std::atomic<uint32_t> g_engine_factory_aux_camera_reads{};
+thread_local uint64_t g_engine_producer_pair_id{};
+using EngineIsAnyMenuFn = void(__fastcall*)(void*, void*, uint8_t*);
+EngineIsAnyMenuFn g_engine_is_any_menu{};
+std::atomic<int> g_engine_menu_state{-1};
+std::atomic<void*> g_engine_gui_manager{};
+std::atomic<uint64_t> g_engine_frame_factory_last_logged_present{UINT64_MAX};
+std::atomic<uint64_t> g_engine_dual_render_last_logged_present{UINT64_MAX};
+std::atomic<uint32_t> g_engine_dual_render_log_count{};
+std::atomic<bool> g_engine_dual_render_active{};
+std::atomic<bool> g_engine_dual_gameplay_armed{};
+std::atomic<int> g_engine_dual_render_requested{-1};
+thread_local int g_engine_factory_eye{-1};
+thread_local int g_engine_render_eye{-1};
+thread_local uint32_t g_engine_render_generation{};
+thread_local uint64_t g_engine_render_pair_id{};
+thread_local XrView g_engine_render_view{XR_TYPE_VIEW};
+thread_local bool g_engine_render_view_valid{};
+std::atomic<uint64_t> g_engine_pair_sequence{};
+std::atomic<uint64_t> g_engine_last_packed_pair_present{UINT64_MAX};
+std::atomic<uint32_t> g_engine_packed_factory_throttle_logs{};
+struct EngineFrameTag {
+    uint32_t eye{};
+    uint32_t generation{};
+    uint64_t pair_id{};
+    XrView render_view{XR_TYPE_VIEW};
+    bool render_view_valid{};
+};
+std::mutex g_engine_completed_tag_queue_mutex{};
+std::deque<EngineFrameTag> g_engine_completed_tag_queue{};
+std::mutex g_engine_pair_completion_mutex{};
+std::unordered_map<uint64_t, uint8_t> g_engine_pair_completion_masks{};
+std::atomic<uint64_t> g_engine_pair_completed_signal{};
+std::mutex g_engine_pair_capture_mutex{};
+std::unordered_map<uint64_t, uint8_t> g_engine_pair_capture_masks{};
+std::atomic<uint64_t> g_engine_pair_captured_signal{};
+std::atomic<uint64_t> g_engine_pair_wait_floor{};
+std::atomic<uint64_t> g_engine_pair_capture_floor{};
+std::atomic<uint64_t> g_engine_pair_retry_present{};
+thread_local bool g_packed_capture_internal{};
+std::array<std::vector<uint8_t>, 16> g_engine_dual_scene_descriptors{};
+std::mutex g_engine_dual_frame_mutex{};
+std::unordered_map<void*, EngineFrameTag> g_engine_dual_frame_eyes{};
+std::atomic<int> g_engine_completed_eye{-1};
+std::atomic<uint32_t> g_engine_completed_generation{};
+std::atomic<uint64_t> g_engine_completed_pair_id{};
+std::atomic<uint64_t> g_engine_completed_serial{};
+uint64_t g_engine_completed_consumed_serial{};
+std::atomic<uint64_t> g_sync_completed_task_count{};
+std::atomic<uint64_t> g_sync_cache_update_count{};
+std::atomic<uint64_t> g_sync_missing_tag_present_count{};
+int64_t g_present_qpc_frequency{};
+int64_t g_present_last_qpc{};
+double g_present_interval_sum_ms{};
+double g_present_interval_min_ms{DBL_MAX};
+double g_present_interval_max_ms{};
+uint32_t g_present_interval_count{};
+uint32_t g_present_interval_over_12ms{};
+uint32_t g_present_interval_over_15ms{};
+std::mutex g_engine_completed_view_mutex{};
+XrView g_engine_completed_view{XR_TYPE_VIEW};
+bool g_engine_completed_view_valid{};
+XrView g_mono_dlss_render_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+bool g_mono_dlss_render_views_valid{};
+SlSetConstantsFn g_sl_set_constants{};
+SlSetTagFn g_sl_set_tag{};
+SlSetFeatureConstantsFn g_sl_set_feature_constants{};
+SlEvaluateFeatureFn g_sl_evaluate_feature{};
+NgxEvaluateFeatureFn g_ngx_evaluate_feature{};
+NgxCreateFeatureFn g_ngx_create_feature{};
+NgxGetParametersFn g_ngx_allocate_parameters{};
+NgxGetParametersFn g_ngx_get_capability_parameters{};
+NgxGetParametersFn g_ngx_get_parameters{};
+PFN_NVSDK_NGX_Parameter_GetUI g_ngx_parameter_get_ui{};
+LoadLibraryAFn g_load_library_a{};
+LoadLibraryWFn g_load_library_w{};
+LoadLibraryExAFn g_load_library_ex_a{};
+LoadLibraryExWFn g_load_library_ex_w{};
+std::mutex g_ngx_dlaa_hook_mutex{};
+std::atomic<uint32_t> g_ngx_dlaa_override_log_count{};
+using EngineDlssCommandFn = void(__fastcall*)(void*, uint8_t**);
+EngineDlssCommandFn g_engine_dlss_command{};
+constexpr size_t kStreamlineResourceCopySize = 80;
+constexpr size_t kStreamlineExtentCopySize = 16;
+constexpr size_t kStreamlineFeatureConstantsCopySize = 40;
+constexpr size_t kStreamlineConstantsCopySize = 0x1A0;
+constexpr size_t kStreamlineConstantsCacheSize = 64;
+constexpr size_t kStreamlineCapturedTagCount = 16;
+struct StreamlineCapturedConstantsCall {
+    std::array<uint8_t, kStreamlineConstantsCopySize> constants{};
+    std::array<XrView, 2> render_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    uint32_t frame_token{};
+    uint32_t viewport{};
+    uint32_t eye{UINT32_MAX};
+    uint64_t pair_id{UINT64_MAX};
+    uint64_t present{};
+    bool render_views_valid{};
+    bool valid{};
+};
+struct StreamlineCapturedTagCall {
+    std::array<uint8_t, kStreamlineResourceCopySize> resource{};
+    std::array<uint8_t, kStreamlineExtentCopySize> extent{};
+    uint32_t tag{};
+    uint32_t viewport{};
+    bool has_resource{};
+    bool has_extent{};
+};
+struct StreamlineCapturedFeatureCall {
+    std::array<uint8_t, kStreamlineFeatureConstantsCopySize> constants{};
+    uint32_t feature{};
+    uint32_t frame_token{};
+    uint32_t viewport{};
+    bool valid{};
+};
+struct StreamlineCapturedEvaluateCall {
+    uint32_t feature{};
+    uint32_t frame_token{};
+    uint32_t viewport{};
+    bool valid{};
+};
+struct StreamlineCapturedDlssRecipe {
+    StreamlineCapturedConstantsCall constants{};
+    std::array<StreamlineCapturedTagCall, kStreamlineCapturedTagCount> tags{};
+    StreamlineCapturedFeatureCall feature{};
+    StreamlineCapturedEvaluateCall evaluate{};
+    uint32_t tag_count{};
+    uint32_t eye{UINT32_MAX};
+    uint64_t pair_id{UINT64_MAX};
+    bool valid{};
+};
+std::mutex g_streamline_dlss_recipe_mutex{};
+StreamlineCapturedDlssRecipe g_streamline_dlss_recipe{};
+uint32_t g_streamline_dlss_replayed_eye{UINT32_MAX};
+uint64_t g_streamline_dlss_replayed_pair{UINT64_MAX};
+thread_local StreamlineCapturedDlssRecipe g_streamline_dlss_capture{};
+std::mutex g_streamline_constants_cache_mutex{};
+std::array<StreamlineCapturedConstantsCall,
+    kStreamlineConstantsCacheSize> g_streamline_constants_cache{};
+thread_local bool g_streamline_dlss_capture_active{};
+thread_local bool g_streamline_dlss_recipe_replay{};
+thread_local int g_streamline_forced_eye{-1};
+thread_local uint64_t g_streamline_dlss_pair_id{UINT64_MAX};
+std::atomic<uint32_t> g_ngx_trace_count{};
+thread_local bool g_ngx_creating_feature{};
+std::atomic<uint64_t> g_streamline_reset_last_logged_present{UINT64_MAX};
+std::atomic<uint32_t> g_streamline_trace_counts[2]{};
+std::atomic<uint32_t> g_streamline_mvec_probe_counts[2]{};
+std::atomic<uint32_t> g_streamline_output_probe_counts[2]{};
+std::atomic<uint32_t> g_streamline_taau_bridge_match_logs{};
+std::atomic<uint64_t> g_streamline_taau_bridge_matches{};
+std::atomic<uint64_t> g_streamline_taau_bridge_misses{};
+std::atomic<uint64_t> g_streamline_dlss_evaluate_calls{};
+std::atomic<uint64_t> g_streamline_mvec_dispatch_calls{};
+std::atomic<uint64_t> g_streamline_mvec_ready_misses{};
+std::atomic<uint64_t> g_ngx_dlss_evaluate_calls{};
+struct PackedDlssInputs {
+    ID3D12Resource* color{};
+    ID3D12Resource* depth{};
+    ID3D12Resource* mvec{};
+    ID3D12Resource* output{};
+    D3D12_RESOURCE_STATES color_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    D3D12_RESOURCE_STATES depth_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    D3D12_RESOURCE_STATES mvec_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+};
+std::mutex g_packed_dlss_mutex{};
+ID3D12Resource* g_packed_dlss_color{};
+ID3D12Resource* g_packed_dlss_depth{};
+ID3D12Resource* g_packed_dlss_mvec{};
+ID3D12Resource* g_packed_dlss_output{};
+PackedDlssInputs g_packed_dlss_first_inputs{};
+uint32_t g_packed_dlss_first_eye{UINT32_MAX};
+uint64_t g_packed_dlss_pair_id{UINT64_MAX};
+bool g_packed_dlss_first_ready{};
+std::mutex g_packed_dlss_handle_mutex{};
+std::unordered_map<const NVSDK_NGX_Handle*, NVSDK_NGX_Handle*>
+    g_packed_dlss_handles{};
+NVSDK_NGX_Handle* g_packed_dlss_primary_handle{};
+std::atomic<uint64_t> g_packed_dlss_calls{};
+std::atomic<uint64_t> g_packed_dlss_single_evaluations{};
+std::atomic<uint64_t> g_packed_dlss_resets{};
+std::atomic<uint64_t> g_packed_dlss_invalid_token_drops{};
+std::atomic<uint64_t> g_packed_dlss_pending_pair{UINT64_MAX};
+struct PackedDlssPairMetadata {
+    uint64_t pair_id{UINT64_MAX};
+    uint32_t generation{};
+    XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    bool view_valid[2]{};
+    uint8_t eye_mask{};
+    bool valid{};
+};
+std::mutex g_packed_dlss_present_mutex{};
+PackedDlssPairMetadata g_packed_dlss_collect_metadata{};
+PackedDlssPairMetadata g_packed_dlss_next_metadata{};
+PackedDlssPairMetadata g_packed_dlss_active_metadata{};
+uint64_t g_packed_dlss_capture_cycle_pair{UINT64_MAX};
+uint8_t g_packed_dlss_capture_cycle_mask{};
+std::atomic<bool> g_packed_dlss_output_pending_publish{};
+std::atomic<uint64_t> g_packed_dlss_output_pending_pair{UINT64_MAX};
+std::atomic<uint64_t> g_packed_dlss_outputs_published{};
+std::atomic<uint64_t> g_packed_dlss_last_published_pair{};
+std::atomic<uint64_t> g_packed_dlss_stale_pair_drops{};
+std::atomic<uint64_t> g_packed_dlss_tags_overridden{};
+
+enum DlssCpuPhase : size_t {
+    kDlssCpuNgxHook,
+    kDlssCpuPackedMutexWait,
+    kDlssCpuPackedInputCopy,
+    kDlssCpuNgxEvaluate,
+    kDlssCpuRecipeReplay,
+    kDlssCpuReplayJitter,
+    kDlssCpuSlEvaluateHook,
+    kDlssCpuPrivateBridge,
+    kDlssCpuPublish,
+    kDlssCpuConsumerSample,
+    kDlssCpuXrGpuWait,
+    kDlssCpuPhaseCount
+};
+std::array<std::atomic<uint64_t>, kDlssCpuPhaseCount>
+    g_dlss_cpu_phase_calls{};
+std::array<std::atomic<uint64_t>, kDlssCpuPhaseCount>
+    g_dlss_cpu_phase_ticks{};
+std::array<std::atomic<uint64_t>, kDlssCpuPhaseCount>
+    g_dlss_cpu_phase_max_ticks{};
+
+int64_t dlss_cpu_profile_now() {
+    if (!g_config.logging_enabled) {
+        return 0;
+    }
+    LARGE_INTEGER value{};
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
+
+void record_dlss_cpu_phase(DlssCpuPhase phase, int64_t begin) {
+    if (!g_config.logging_enabled) {
+        return;
+    }
+    const int64_t end = dlss_cpu_profile_now();
+    const uint64_t elapsed = end >= begin
+        ? static_cast<uint64_t>(end - begin) : 0;
+    g_dlss_cpu_phase_calls[phase].fetch_add(
+        1, std::memory_order_relaxed);
+    g_dlss_cpu_phase_ticks[phase].fetch_add(
+        elapsed, std::memory_order_relaxed);
+    uint64_t previous =
+        g_dlss_cpu_phase_max_ticks[phase].load(std::memory_order_relaxed);
+    while (elapsed > previous &&
+        !g_dlss_cpu_phase_max_ticks[phase].compare_exchange_weak(
+            previous, elapsed, std::memory_order_relaxed)) {
+    }
+}
+
+struct DlssCpuScope {
+    DlssCpuPhase phase;
+    int64_t begin;
+    explicit DlssCpuScope(DlssCpuPhase value)
+        : phase(value), begin(dlss_cpu_profile_now()) {}
+    ~DlssCpuScope() {
+        record_dlss_cpu_phase(phase, begin);
+    }
+};
+
+struct DlssCpuSampleScope {
+    DlssCpuPhase phase;
+    int64_t begin{};
+    bool active{};
+    DlssCpuSampleScope(DlssCpuPhase value, bool enabled)
+        : phase(value), active(enabled) {
+        if (active) {
+            begin = dlss_cpu_profile_now();
+        }
+    }
+    ~DlssCpuSampleScope() {
+        if (active) {
+            record_dlss_cpu_phase(phase, begin);
+        }
+    }
+};
+
+constexpr UINT kDlssGpuProfileTimestampCount = 8;
+constexpr UINT kDlssGpuProfileSampleCount = 16;
+struct DlssGpuProfileSample {
+    uint64_t pair_id{UINT64_MAX};
+    uint64_t present{};
+    uint64_t fence_value{};
+    LARGE_INTEGER cpu_replay_begin{};
+    LARGE_INTEGER cpu_replay_end{};
+    LARGE_INTEGER cpu_bridge_begin{};
+    LARGE_INTEGER cpu_bridge_end{};
+    bool in_use{};
+    bool resolved{};
+};
+std::mutex g_dlss_gpu_profile_mutex{};
+std::array<DlssGpuProfileSample, kDlssGpuProfileSampleCount>
+    g_dlss_gpu_profile_samples{};
+ID3D12QueryHeap* g_dlss_gpu_profile_query_heap{};
+ID3D12Resource* g_dlss_gpu_profile_readback{};
+ID3D12Fence* g_dlss_gpu_profile_fence{};
+uint64_t* g_dlss_gpu_profile_mapped{};
+uint64_t g_dlss_gpu_profile_frequency{};
+uint64_t g_dlss_gpu_profile_next_fence{};
+std::atomic<uint32_t> g_dlss_gpu_profile_logged{};
+thread_local DlssGpuProfileSample* g_dlss_gpu_profile_active_sample{};
+struct PresentPhaseProfile {
+    uint64_t samples{};
+    int64_t previous_return_qpc{};
+    double outside_sum_ms{};
+    double hook_sum_ms{};
+    double openxr_sum_ms{};
+    double prepare_sum_ms{};
+    double present_sum_ms{};
+    double outside_max_ms{};
+    double hook_max_ms{};
+    double openxr_max_ms{};
+    double prepare_max_ms{};
+    double present_max_ms{};
+};
+thread_local PresentPhaseProfile g_present_phase_profile{};
+std::atomic<ID3D12Resource*> g_ngx_input_resources[3]{};
+std::atomic<uint32_t> g_ngx_input_states[3]{UINT32_MAX, UINT32_MAX, UINT32_MAX};
+struct StreamlineMVecFrameState {
+    uint32_t frame_token{};
+    bool ready{};
+    float original_clip_to_previous[16]{};
+    float corrected_clip_to_previous[16]{};
+    float current_to_previous_hmd[12]{};
+    float hmd_projection[4]{};
+    bool hmd_motion_valid{};
+    float mvec_scale[2]{};
+    ID3D12Resource* depth{};
+    ID3D12Resource* mvec{};
+    D3D12_RESOURCE_STATES depth_state{};
+    D3D12_RESOURCE_STATES mvec_state{};
+};
+struct StreamlineMVecTemporalState {
+    float original_clip_to_previous[16]{};
+    float current_to_previous_hmd[12]{};
+    std::array<float, 12> matched_corrected_camera{};
+    std::array<XrView, 2> matched_render_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    float hmd_projection[4]{};
+    float mvec_scale[2]{};
+    bool hmd_motion_valid{};
+    bool matched_camera_valid{};
+    bool matched_render_views_valid{};
+};
+struct StreamlineOutputFrameState {
+    ID3D12Resource* output{};
+    D3D12_RESOURCE_STATES state{};
+    uint32_t eye{};
+    uint64_t pair_id{};
+    XrView render_view{XR_TYPE_VIEW};
+    bool render_view_valid{};
+};
+std::mutex g_streamline_mvec_mutex{};
+StreamlineMVecFrameState g_streamline_mvec_frame{};
+std::unordered_map<uint32_t, StreamlineMVecTemporalState>
+    g_streamline_mvec_temporal_frames{};
+std::array<std::array<float, 12>, 2> g_streamline_dlss_previous_camera{};
+bool g_streamline_dlss_previous_camera_valid[2]{};
+constexpr uint32_t kPackedDlssCameraCommitSlotCount = 64;
+struct PackedDlssCameraCommitSlot {
+    uint64_t pair_id{UINT64_MAX};
+    std::array<std::array<float, 12>, 2> camera{};
+    bool valid[2]{};
+};
+std::array<PackedDlssCameraCommitSlot, kPackedDlssCameraCommitSlotCount>
+    g_packed_dlss_camera_commit_slots{};
+std::atomic<uint64_t> g_packed_dlss_camera_history_deferred{};
+std::atomic<uint64_t> g_packed_dlss_camera_history_committed{};
+thread_local StreamlineOutputFrameState g_streamline_output_frame{};
+std::atomic<bool> g_streamline_mvec_skip_logged{};
+ID3D12DescriptorHeap* g_streamline_mvec_heap{};
+ID3D12DescriptorHeap* g_streamline_mvec_clear_heap{};
+ID3D12RootSignature* g_streamline_mvec_root_signature{};
+ID3D12PipelineState* g_streamline_mvec_pipeline{};
+UINT g_streamline_mvec_descriptor_increment{};
+std::once_flag g_streamline_mvec_pipeline_once{};
+std::once_flag g_streamline_mvec_clear_heap_once{};
+ID3D12Resource* g_dlss_mvec_readback_buffer{};
+ID3D12Fence* g_dlss_mvec_readback_fence{};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_dlss_mvec_readback_footprint{};
+std::atomic<ID3D12GraphicsCommandList*> g_dlss_mvec_readback_command_list{};
+std::atomic<bool> g_dlss_mvec_readback_scheduled{};
+std::atomic<bool> g_dlss_mvec_readback_submitted{};
+std::atomic<bool> g_dlss_mvec_readback_logged{};
+ID3D12Resource* g_stereo_luma_readback[2]{};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_stereo_luma_footprint{};
+uint64_t g_stereo_luma_readback_bytes{};
+std::atomic<bool> g_stereo_luma_scheduled{};
+std::atomic<bool> g_stereo_luma_logged{};
+std::mutex g_dlss_output_luma_mutex{};
+const NVSDK_NGX_Handle* g_dlss_output_luma_handles[2]{};
+ID3D12Resource* g_dlss_output_luma_readback[2]{};
+ID3D12Fence* g_dlss_output_luma_fences[2]{};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_dlss_output_luma_footprints[2]{};
+uint64_t g_dlss_output_luma_bytes[2]{};
+DXGI_FORMAT g_dlss_output_luma_formats[2]{};
+std::atomic<ID3D12GraphicsCommandList*> g_dlss_output_luma_command_lists[2]{};
+std::atomic<bool> g_dlss_output_luma_scheduled[2]{};
+std::atomic<bool> g_dlss_output_luma_submitted[2]{};
+std::atomic<bool> g_dlss_output_luma_logged[2]{};
+std::mutex g_streamline_private_output_mutex{};
+ID3D12Resource* g_streamline_private_outputs[2]{};
+std::array<uint64_t, 10> g_streamline_private_output_wrappers[2]{};
+ID3D12Resource* g_streamline_canonical_output{};
+D3D12_RESOURCE_STATES g_streamline_canonical_output_state{
+    D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+std::atomic<ID3D12PipelineState*> g_streamline_prepost_pipeline{};
+std::atomic<uint32_t> g_streamline_private_output_bridge_logs{};
+std::atomic<uint32_t> g_streamline_canonical_output_barrier_logs{};
+std::mutex g_streamline_command_list_eye_mutex{};
+std::unordered_map<ID3D12GraphicsCommandList*, uint32_t>
+    g_streamline_command_list_eyes{};
+std::unordered_map<ID3D12GraphicsCommandList*, uint32_t>
+    g_streamline_command_list_last_eyes{};
+std::unordered_map<ID3D12GraphicsCommandList*, EngineFrameTag>
+    g_streamline_command_list_routes{};
+std::unordered_map<ID3D12GraphicsCommandList*, uint64_t>
+    g_streamline_command_list_bridge_presents{};
+struct FinalPresentResourceDiagnostic {
+    ID3D12Resource* resource{};
+    uint32_t stable_id{};
+    int32_t swapchain_index{-1};
+};
+std::mutex g_final_present_resource_diagnostic_mutex{};
+std::vector<FinalPresentResourceDiagnostic>
+    g_final_present_resource_diagnostics{};
+std::vector<std::pair<ID3D12Resource*, ID3D12GraphicsCommandList*>>
+    g_final_present_resource_command_lists{};
+std::atomic<uint32_t> g_final_present_resource_next_id{1};
+std::atomic<uint32_t> g_final_present_non_swapchain_route_logs{};
+std::atomic<uint32_t> g_final_present_missing_route_logs{};
+std::atomic<bool> g_packed_transition_ordered_recovery_active{};
+std::atomic<uint64_t> g_packed_transition_replayed_pair{UINT64_MAX};
+std::atomic<uint64_t> g_packed_transition_pending_eye0_pair{UINT64_MAX};
+std::atomic<uint64_t> g_packed_transition_pending_eye0_final_route_pair{
+    UINT64_MAX};
+thread_local bool g_streamline_transition_replay{};
+thread_local ID3D12GraphicsCommandList*
+    g_streamline_transition_sequence_command_list{};
+thread_local uint64_t g_streamline_transition_sequence_pair{UINT64_MAX};
+thread_local uint32_t g_streamline_transition_raw_consumer_count{};
+thread_local uint64_t g_streamline_transition_publish_candidate{UINT64_MAX};
+std::atomic<uint32_t> g_streamline_consumer_bridge_logs{};
+std::atomic<bool> g_streamline_post_compute_bindings_logged[2]{};
+std::atomic<bool> g_streamline_post_compute_constants_logged[2]{};
+
+void record_streamline_command_list_eye(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t eye) {
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    g_streamline_command_list_eyes[command_list] = eye;
+    g_streamline_command_list_last_eyes[command_list] = eye;
+}
+
+void record_streamline_command_list_route(
+    ID3D12GraphicsCommandList* command_list,
+    const EngineFrameTag& tag) {
+    if (command_list == nullptr || tag.eye > 1 || tag.pair_id == 0 ||
+        tag.pair_id == UINT64_MAX) {
+        return;
+    }
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    g_streamline_command_list_eyes[command_list] = tag.eye;
+    g_streamline_command_list_last_eyes[command_list] = tag.eye;
+    g_streamline_command_list_routes[command_list] = tag;
+}
+
+bool take_streamline_command_list_route(
+    ID3D12GraphicsCommandList* command_list,
+    EngineFrameTag& tag) {
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    const auto found = g_streamline_command_list_routes.find(command_list);
+    if (found == g_streamline_command_list_routes.end()) {
+        return false;
+    }
+    tag = found->second;
+    g_streamline_command_list_routes.erase(found);
+    return true;
+}
+
+bool lookup_streamline_command_list_route(
+    ID3D12GraphicsCommandList* command_list,
+    EngineFrameTag& tag) {
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    const auto found = g_streamline_command_list_routes.find(command_list);
+    if (found == g_streamline_command_list_routes.end()) {
+        return false;
+    }
+    tag = found->second;
+    return true;
+}
+
+uint32_t take_streamline_command_list_eye(
+    ID3D12GraphicsCommandList* command_list) {
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    const auto found = g_streamline_command_list_eyes.find(command_list);
+    if (found == g_streamline_command_list_eyes.end()) {
+        return UINT32_MAX;
+    }
+    const uint32_t eye = found->second;
+    g_streamline_command_list_eyes.erase(found);
+    return eye;
+}
+
+uint32_t lookup_streamline_command_list_last_eye(
+    ID3D12GraphicsCommandList* command_list) {
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    const auto found = g_streamline_command_list_last_eyes.find(command_list);
+    return found != g_streamline_command_list_last_eyes.end()
+        ? found->second
+        : UINT32_MAX;
+}
+
+void mark_streamline_command_list_bridged(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t present) {
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    g_streamline_command_list_bridge_presents[command_list] = present;
+}
+
+bool streamline_command_list_bridged_this_present(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t present) {
+    std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+    const auto found = g_streamline_command_list_bridge_presents.find(command_list);
+    return found != g_streamline_command_list_bridge_presents.end() &&
+        found->second == present;
+}
+std::atomic<bool> g_streamline_mvec_clear_sentinel_recorded{};
+std::atomic<bool> g_streamline_mvec_dispatch_recorded{};
+std::atomic<float> g_streamline_hmd_motion_angle{};
+std::atomic<uint32_t> g_streamline_hmd_delta_logs{};
+constexpr UINT kDlssComponentProbeColumns = 24;
+constexpr UINT kDlssComponentProbeRows = 24;
+constexpr UINT kDlssComponentProbeElements =
+    kDlssComponentProbeColumns * kDlssComponentProbeRows * 2;
+ID3D12Resource* g_dlss_component_probe_buffer{};
+ID3D12Resource* g_dlss_component_probe_readback{};
+ID3D12Fence* g_dlss_component_probe_fence{};
+std::atomic<ID3D12GraphicsCommandList*> g_dlss_component_probe_command_list{};
+std::atomic<bool> g_dlss_component_probe_scheduled{};
+std::atomic<bool> g_dlss_component_probe_submitted{};
+std::atomic<bool> g_dlss_component_probe_logged{};
+
+struct ResourceInfo {
+    D3D12_RESOURCE_DESC desc{};
+    D3D12_HEAP_TYPE heap_type{D3D12_HEAP_TYPE_CUSTOM};
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va{};
+    void* mapped{};
+    size_t mapped_size{};
+};
+
+struct CommandListInfo {
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 32> graphics_cbv{};
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 32> graphics_tables{};
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 32> compute_cbv{};
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 32> compute_tables{};
+    std::array<std::array<uint32_t, 64>, 32> compute_constants{};
+    std::array<uint64_t, 32> compute_constant_masks{};
+    ID3D12DescriptorHeap* cbv_srv_uav_heap{};
+    ID3D12DescriptorHeap* sampler_heap{};
+    ID3D12PipelineState* pipeline_state{};
+    ID3D12RootSignature* graphics_root_signature{};
+    ID3D12RootSignature* compute_root_signature{};
+    uint64_t draw_count{};
+    std::vector<ID3D12Resource*> active_uav_resources{};
+    std::vector<ID3D12Resource*> active_render_targets{};
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> active_rtv_handles{};
+    UINT active_rtv_count{};
+    BOOL active_rtvs_contiguous{};
+    D3D12_CPU_DESCRIPTOR_HANDLE active_dsv_handle{};
+    ID3D12Resource* latest_taau_depth_resource{};
+    uint64_t latest_taau_depth_present{};
+};
+
+struct DlssGraphicsStateSnapshot {
+    std::array<D3D12_GPU_VIRTUAL_ADDRESS, 32> cbv{};
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 32> tables{};
+    ID3D12DescriptorHeap* cbv_srv_uav_heap{};
+    ID3D12DescriptorHeap* sampler_heap{};
+    ID3D12PipelineState* pipeline_state{};
+    ID3D12RootSignature* root_signature{};
+    bool valid{};
+};
+
+struct PipelineInfo {
+    uint64_t vs_hash{};
+    uint64_t ps_hash{};
+    uint64_t cs_hash{};
+    uint64_t root_hash{};
+    ID3D12RootSignature* root_signature{};
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE primitive_type{D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED};
+    UINT render_target_count{};
+    DXGI_FORMAT dsv_format{DXGI_FORMAT_UNKNOWN};
+};
+
+struct DescriptorHeapInfo {
+    D3D12_DESCRIPTOR_HEAP_TYPE type{};
+    UINT num_descriptors{};
+    UINT increment{};
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_start{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_start{};
+    bool shader_visible{};
+};
+
+struct CbvDescriptorInfo {
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va{};
+    UINT size_in_bytes{};
+};
+
+constexpr size_t kCbvDescriptorShardCount = 64;
+constexpr size_t kCbvDescriptorSlotCount = 1u << 20;
+constexpr size_t kCbvDescriptorProbeCount = 64;
+constexpr SIZE_T kCbvDescriptorClaimed = ~SIZE_T{};
+
+struct CbvDescriptorSlot {
+    std::atomic<SIZE_T> key{};
+    std::atomic<uint64_t> gpu_va{};
+    std::atomic<uint32_t> size_in_bytes{};
+};
+
+struct CbvDescriptorShard {
+    std::mutex mutex{};
+    std::unordered_map<SIZE_T, CbvDescriptorInfo> descriptors{};
+};
+
+std::array<CbvDescriptorSlot, kCbvDescriptorSlotCount> g_cbv_descriptor_slots{};
+std::array<CbvDescriptorShard, kCbvDescriptorShardCount> g_cbv_descriptor_shards{};
+
+size_t cbv_descriptor_slot_index(SIZE_T cpu_handle) {
+    // D3D12 CBV/SRV/UAV descriptors are 32-byte aligned on the target device.
+    // Preserve their sequential layout so REDengine's descriptor streams stay
+    // cache-local instead of scattering every access across the 24 MB table.
+    return static_cast<size_t>(cpu_handle >> 5) & (kCbvDescriptorSlotCount - 1);
+}
+
+CbvDescriptorShard& cbv_descriptor_shard(SIZE_T cpu_handle) {
+    return g_cbv_descriptor_shards[(cpu_handle >> 5) & (kCbvDescriptorShardCount - 1)];
+}
+
+void store_cbv_descriptor_fallback(SIZE_T cpu_handle, const CbvDescriptorInfo& info) {
+    auto& shard = cbv_descriptor_shard(cpu_handle);
+    std::scoped_lock lock{shard.mutex};
+    shard.descriptors[cpu_handle] = info;
+}
+
+bool load_cbv_descriptor_fallback(SIZE_T cpu_handle, CbvDescriptorInfo& info) {
+    auto& shard = cbv_descriptor_shard(cpu_handle);
+    std::scoped_lock lock{shard.mutex};
+    const auto it = shard.descriptors.find(cpu_handle);
+    if (it == shard.descriptors.end()) {
+        return false;
+    }
+    info = it->second;
+    return true;
+}
+
+void store_cbv_descriptor(SIZE_T cpu_handle, const CbvDescriptorInfo& info) {
+    const auto base = cbv_descriptor_slot_index(cpu_handle);
+    for (size_t probe = 0; probe < kCbvDescriptorProbeCount; ++probe) {
+        auto& slot = g_cbv_descriptor_slots[(base + probe) & (kCbvDescriptorSlotCount - 1)];
+        auto key = slot.key.load(std::memory_order_acquire);
+        if (key == 0) {
+            SIZE_T expected{};
+            if (slot.key.compare_exchange_strong(
+                    expected, kCbvDescriptorClaimed, std::memory_order_acq_rel)) {
+                slot.gpu_va.store(info.gpu_va, std::memory_order_relaxed);
+                slot.size_in_bytes.store(info.size_in_bytes, std::memory_order_relaxed);
+                slot.key.store(cpu_handle, std::memory_order_release);
+                return;
+            }
+            key = expected;
+        }
+        if (key == kCbvDescriptorClaimed) {
+            YieldProcessor();
+            --probe;
+            continue;
+        }
+        if (key != cpu_handle) {
+            continue;
+        }
+
+        // REDengine rewrites the same descriptor from multiple render workers.
+        // CBV size is stable for that slot, so publish it before the address and
+        // let the newest address win without serializing all of those workers.
+        slot.size_in_bytes.store(info.size_in_bytes, std::memory_order_relaxed);
+        slot.gpu_va.store(info.gpu_va, std::memory_order_release);
+        return;
+    }
+    store_cbv_descriptor_fallback(cpu_handle, info);
+}
+
+bool load_cbv_descriptor(SIZE_T cpu_handle, CbvDescriptorInfo& info) {
+    const auto base = cbv_descriptor_slot_index(cpu_handle);
+    for (size_t probe = 0; probe < kCbvDescriptorProbeCount; ++probe) {
+        auto& slot = g_cbv_descriptor_slots[(base + probe) & (kCbvDescriptorSlotCount - 1)];
+        const auto key = slot.key.load(std::memory_order_acquire);
+        if (key == 0) {
+            return load_cbv_descriptor_fallback(cpu_handle, info);
+        }
+        if (key == kCbvDescriptorClaimed) {
+            YieldProcessor();
+            --probe;
+            continue;
+        }
+        if (key != cpu_handle) {
+            continue;
+        }
+
+        const auto gpu_va = slot.gpu_va.load(std::memory_order_acquire);
+        const auto size = slot.size_in_bytes.load(std::memory_order_relaxed);
+        info = CbvDescriptorInfo{gpu_va, size};
+        return true;
+    }
+    return load_cbv_descriptor_fallback(cpu_handle, info);
+}
+
+struct ResourceDescriptorInfo {
+    ID3D12Resource* resource{};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    D3D12_SRV_DIMENSION srv_dimension{D3D12_SRV_DIMENSION_UNKNOWN};
+    UINT most_detailed_mip{};
+    UINT mip_levels{};
+    UINT first_array_slice{};
+    UINT array_size{1};
+    bool uav{};
+};
+
+struct RootDescriptorRangeInfo {
+    D3D12_DESCRIPTOR_RANGE_TYPE type{};
+    UINT num_descriptors{};
+    UINT base_shader_register{};
+    UINT register_space{};
+    UINT offset{};
+};
+
+struct RootParameterInfo {
+    D3D12_ROOT_PARAMETER_TYPE type{};
+    D3D12_SHADER_VISIBILITY visibility{};
+    std::vector<RootDescriptorRangeInfo> ranges{};
+};
+
+struct RootSignatureInfo {
+    std::vector<RootParameterInfo> parameters{};
+};
+
+std::mutex g_reverse_mutex{};
+std::unordered_map<ID3D12Resource*, ResourceInfo> g_resource_infos{};
+std::unordered_map<ID3D12GraphicsCommandList*, CommandListInfo> g_command_list_infos{};
+std::unordered_map<ID3D12DescriptorHeap*, DescriptorHeapInfo> g_descriptor_heap_infos{};
+std::unordered_map<SIZE_T, ResourceDescriptorInfo> g_resource_descriptors{};
+std::unordered_map<SIZE_T, ID3D12Resource*> g_rtv_descriptors{};
+std::unordered_map<SIZE_T, ID3D12Resource*> g_dsv_descriptors{};
+std::unordered_map<SIZE_T, SIZE_T> g_resource_descriptor_aliases{};
+std::unordered_map<ID3D12RootSignature*, RootSignatureInfo> g_root_signature_infos{};
+std::unordered_map<ID3D12PipelineState*, PipelineInfo> g_pipeline_infos{};
+constexpr size_t kCommandListPipelineSlotCount = 1u << 16;
+constexpr size_t kCommandListPipelineProbeCount = 16;
+constexpr uintptr_t kCommandListPipelineClaimed = ~uintptr_t{};
+struct CommandListPipelineSlot {
+    std::atomic<uintptr_t> key{};
+    std::atomic<ID3D12PipelineState*> pipeline{};
+};
+std::array<CommandListPipelineSlot, kCommandListPipelineSlotCount>
+    g_command_list_pipeline_slots{};
+
+constexpr size_t kDlssGraphicsStateSlotCount = 64;
+constexpr size_t kDlssGraphicsStateProbeCount = 16;
+struct DlssGraphicsStateSlot {
+    ID3D12GraphicsCommandList* command_list{};
+    DlssGraphicsStateSnapshot state{};
+};
+thread_local std::array<DlssGraphicsStateSlot, kDlssGraphicsStateSlotCount>
+    g_dlss_graphics_state_slots{};
+
+bool dlss_graphics_state_tracking_active() {
+    return temporal_backend_is_dlss() && g_config.openxr_mode == 4 &&
+        g_config.streamline_split_viewports &&
+        g_streamline_canonical_output != nullptr;
+}
+
+size_t dlss_graphics_state_slot_index(
+    ID3D12GraphicsCommandList* command_list) {
+    auto value = reinterpret_cast<uintptr_t>(command_list) >> 4;
+    value ^= value >> 17;
+    value *= 0x9E3779B185EBCA87ull;
+    return static_cast<size_t>(value) & (kDlssGraphicsStateSlotCount - 1);
+}
+
+DlssGraphicsStateSnapshot* access_dlss_graphics_state(
+    ID3D12GraphicsCommandList* command_list,
+    bool create) {
+    if (command_list == nullptr) {
+        return nullptr;
+    }
+    const auto base = dlss_graphics_state_slot_index(command_list);
+    for (size_t probe = 0; probe < kDlssGraphicsStateProbeCount; ++probe) {
+        auto& slot = g_dlss_graphics_state_slots[
+            (base + probe) & (kDlssGraphicsStateSlotCount - 1)];
+        if (slot.command_list == command_list) {
+            return &slot.state;
+        }
+        if (slot.command_list == nullptr) {
+            if (!create) {
+                return nullptr;
+            }
+            slot.command_list = command_list;
+            slot.state = {};
+            return &slot.state;
+        }
+    }
+    if (!create) {
+        return nullptr;
+    }
+    auto& replacement = g_dlss_graphics_state_slots[base];
+    replacement.command_list = command_list;
+    replacement.state = {};
+    return &replacement.state;
+}
+
+std::atomic<ID3D12PipelineState*> g_taau_resolve_pipeline{};
+std::unordered_map<ID3D12PipelineState*, ID3D12PipelineState*> g_geometry_shift_psos{};
+std::atomic<ID3D12PipelineState*> g_hud_composite_original_pso{};
+std::atomic<ID3D12PipelineState*> g_hud_composite_eye0_pso{};
+std::atomic<ID3D12PipelineState*> g_hud_composite_eye1_pso{};
+std::mutex g_hud_composite_pso_creation_mutex{};
+ID3D12DescriptorHeap* g_mono_hud_rtv_heap{};
+ID3D12Resource* g_mono_hud_outputs[2]{};
+D3D12_CPU_DESCRIPTOR_HANDLE g_mono_hud_rtvs[2]{};
+bool g_mono_hud_output_copy_source[2]{};
+std::atomic<bool> g_mono_hud_outputs_valid{};
+struct TaauUavWriter {
+    ID3D12GraphicsCommandList* command_list{};
+    ID3D12PipelineState* pipeline{};
+    uint64_t cs_hash{};
+    uint64_t present{};
+    uint64_t dispatch_serial{};
+    UINT x{};
+    UINT y{};
+    UINT z{};
+};
+std::unordered_map<ID3D12Resource*, TaauUavWriter> g_taau_uav_writers{};
+std::atomic<uint64_t> g_taau_dispatch_serial{};
+std::atomic<uint32_t> g_taau_writer_log_count{};
+struct TaauRtvWriter {
+    ID3D12GraphicsCommandList* command_list{};
+    ID3D12PipelineState* pipeline{};
+    uint64_t vs_hash{};
+    uint64_t ps_hash{};
+    uint64_t present{};
+    uint64_t draw_serial{};
+    UINT elements{};
+    UINT instances{};
+    bool indexed{};
+};
+std::unordered_map<ID3D12Resource*, TaauRtvWriter> g_taau_rtv_writers{};
+std::atomic<uint64_t> g_taau_draw_serial{};
+ID3D12Resource* g_taau_readback_buffer{};
+ID3D12Fence* g_taau_readback_fence{};
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_taau_readback_footprint{};
+std::atomic<ID3D12GraphicsCommandList*> g_taau_readback_command_list{};
+std::atomic<bool> g_taau_readback_scheduled{};
+std::atomic<bool> g_taau_readback_submitted{};
+std::atomic<bool> g_taau_readback_logged{};
+std::atomic<uint32_t> g_taau_stable_probe_frames{};
+struct TaauResourceTransition {
+    ID3D12GraphicsCommandList* command_list{};
+    D3D12_RESOURCE_STATES before{};
+    D3D12_RESOURCE_STATES after{};
+    UINT subresource{D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES};
+    uint64_t present{};
+};
+std::unordered_map<ID3D12Resource*, TaauResourceTransition> g_taau_resource_transitions{};
+struct AimDrawKey {
+    ID3D12PipelineState* pipeline{};
+    UINT elements{};
+    UINT instances{};
+    bool indexed{};
+    bool operator==(const AimDrawKey&) const = default;
+};
+struct AimDrawKeyHash {
+    size_t operator()(const AimDrawKey& key) const {
+        size_t hash = std::hash<void*>{}(key.pipeline);
+        hash ^= static_cast<size_t>(key.elements) << 1;
+        hash ^= static_cast<size_t>(key.instances) << 17;
+        hash ^= static_cast<size_t>(key.indexed) << 31;
+        return hash;
+    }
+};
+std::mutex g_aim_pso_probe_mutex{};
+std::unordered_map<AimDrawKey, uint64_t, AimDrawKeyHash> g_aim_pso_probe_counts{};
+std::atomic<bool> g_aim_pso_probe_active{};
+std::atomic<uint64_t> g_aim_pso_probe_end_present{};
+std::atomic<uint32_t> g_aim_pso_probe_capture_id{};
+struct ComputeDispatchKey {
+    ID3D12PipelineState* pipeline{};
+    UINT x{};
+    UINT y{};
+    UINT z{};
+    bool operator==(const ComputeDispatchKey&) const = default;
+};
+struct ComputeDispatchKeyHash {
+    size_t operator()(const ComputeDispatchKey& key) const {
+        size_t hash = std::hash<void*>{}(key.pipeline);
+        hash ^= static_cast<size_t>(key.x) << 1;
+        hash ^= static_cast<size_t>(key.y) << 22;
+        hash ^= static_cast<size_t>(key.z) << 43;
+        return hash;
+    }
+};
+std::mutex g_compute_probe_mutex{};
+std::unordered_map<ComputeDispatchKey, uint64_t, ComputeDispatchKeyHash> g_compute_probe_counts{};
+std::atomic<bool> g_compute_probe_active{};
+std::atomic<uint64_t> g_compute_probe_end_present{};
+std::atomic<uint32_t> g_compute_probe_capture_id{};
+std::atomic<uint32_t> g_taau_binding_sample_count{};
+constexpr uint64_t kTaauResolveComputeHash = 0x9FBCF9A46B050321ull;
+constexpr UINT kTaauOverrideHeapSize = 64;
+constexpr UINT kTaauCbvOffset = 0;
+constexpr UINT kTaauSrvOffset = 16;
+constexpr UINT kTaauUavOffset = 32;
+constexpr UINT kTaauDummyUavOffset = 48;
+struct TaauOverrideSlot {
+    ID3D12DescriptorHeap* heap{};
+    std::atomic<uint64_t> fence_value{};
+    std::atomic<bool> reserved{};
+};
+constexpr size_t kTaauOverrideSlotCount = 64;
+std::array<TaauOverrideSlot, kTaauOverrideSlotCount> g_taau_override_slots{};
+ID3D12Resource* g_taau_invalid_mvec_texture{};
+UINT g_taau_descriptor_increment{};
+std::once_flag g_taau_override_once{};
+std::atomic<bool> g_taau_force_matrix_fallback{};
+std::atomic<bool> g_close_camera_f8_latched{};
+std::atomic<int> g_camera_mode{};
+std::atomic<uint64_t> g_taau_native_last_seen_present{UINT64_MAX};
+std::atomic<uint64_t> g_taau_auto_candidate_start_present{UINT64_MAX};
+std::atomic<bool> g_taau_auto_activated{};
+std::atomic<bool> g_taau_auto_activation_pending{};
+std::atomic<bool> g_taau_matrix_warmup_active{};
+std::atomic<uint64_t> g_taau_matrix_warmup_start_present{UINT64_MAX};
+std::atomic<uint64_t> g_taau_matrix_ready_start_present{UINT64_MAX};
+std::atomic<bool> g_taau_descriptor_bootstrap_active{};
+std::atomic<uint64_t> g_taau_descriptor_bootstrap_until_present{UINT64_MAX};
+std::atomic<uint32_t> g_taau_descriptor_candidate_mask{};
+std::atomic<uint32_t> g_taau_descriptor_propagated_mask{};
+std::atomic<uint32_t> g_taau_descriptor_resolve_failure_logs{};
+std::atomic<ID3D12Resource*> g_taau_bound_depth_resource{};
+std::atomic<uint64_t> g_taau_bound_depth_present{};
+std::atomic<uint64_t> g_taau_differential_activation_present{UINT64_MAX};
+std::atomic<uint32_t> g_taau_override_slot_index{};
+std::atomic<uint32_t> g_taau_override_log_count{};
+std::atomic<uint64_t> g_taau_health_total{};
+std::atomic<uint64_t> g_taau_health_corrected{};
+std::atomic<uint64_t> g_taau_health_descriptor_fail{};
+std::atomic<uint64_t> g_taau_health_resource_fail{};
+std::atomic<uint64_t> g_taau_health_cb10_fail{};
+std::atomic<uint64_t> g_taau_health_matrix_fail{};
+std::atomic<uint64_t> g_taau_health_compose_fail{};
+std::atomic<uint64_t> g_taau_health_history_fallback{};
+std::atomic<uint32_t> g_taau_cb_snapshots_in_progress{};
+
+bool taau_runtime_tracking_active() {
+    return (temporal_backend_is_taau() || temporal_backend_is_dlss()) &&
+        (g_taau_force_matrix_fallback.load(std::memory_order_relaxed) ||
+            g_compute_probe_active.load(std::memory_order_relaxed));
+}
+
+size_t command_list_pipeline_slot_index(ID3D12GraphicsCommandList* command_list) {
+    auto value = reinterpret_cast<uintptr_t>(command_list) >> 4;
+    value ^= value >> 17;
+    value *= 0x9E3779B185EBCA87ull;
+    return static_cast<size_t>(value) & (kCommandListPipelineSlotCount - 1);
+}
+
+bool store_command_list_pipeline(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState* pipeline) {
+    if (command_list == nullptr) {
+        return false;
+    }
+    const auto key_value = reinterpret_cast<uintptr_t>(command_list);
+    const auto base = command_list_pipeline_slot_index(command_list);
+    for (size_t probe = 0; probe < kCommandListPipelineProbeCount; ++probe) {
+        auto& slot = g_command_list_pipeline_slots[
+            (base + probe) & (kCommandListPipelineSlotCount - 1)];
+        auto key = slot.key.load(std::memory_order_acquire);
+        if (key == 0) {
+            uintptr_t expected{};
+            if (slot.key.compare_exchange_strong(
+                    expected, kCommandListPipelineClaimed,
+                    std::memory_order_acq_rel)) {
+                slot.pipeline.store(pipeline, std::memory_order_relaxed);
+                slot.key.store(key_value, std::memory_order_release);
+                return true;
+            }
+            key = expected;
+        }
+        if (key == kCommandListPipelineClaimed) {
+            YieldProcessor();
+            --probe;
+            continue;
+        }
+        if (key == key_value) {
+            slot.pipeline.store(pipeline, std::memory_order_release);
+            return true;
+        }
+    }
+    return false;
+}
+
+ID3D12PipelineState* load_command_list_pipeline(
+    ID3D12GraphicsCommandList* command_list) {
+    if (command_list == nullptr) {
+        return nullptr;
+    }
+    const auto key_value = reinterpret_cast<uintptr_t>(command_list);
+    const auto base = command_list_pipeline_slot_index(command_list);
+    for (size_t probe = 0; probe < kCommandListPipelineProbeCount; ++probe) {
+        auto& slot = g_command_list_pipeline_slots[
+            (base + probe) & (kCommandListPipelineSlotCount - 1)];
+        const auto key = slot.key.load(std::memory_order_acquire);
+        if (key == 0) {
+            return nullptr;
+        }
+        if (key == kCommandListPipelineClaimed) {
+            YieldProcessor();
+            --probe;
+            continue;
+        }
+        if (key == key_value) {
+            return slot.pipeline.load(std::memory_order_acquire);
+        }
+    }
+    return nullptr;
+}
+
+ID3D12RootSignature* g_taau_mvec_root_signature{};
+ID3D12PipelineState* g_taau_mvec_pipeline{};
+ID3D12DescriptorHeap* g_taau_mvec_heap{};
+ID3D12Resource* g_taau_corrected_mvec_texture{};
+ID3D12Resource* g_taau_original_mvec_snapshot{};
+UINT64 g_taau_original_mvec_snapshot_width{};
+UINT g_taau_original_mvec_snapshot_height{};
+bool g_taau_original_mvec_snapshot_initialized{};
+constexpr size_t kTaauComposeSlotCount = 32;
+struct TaauComposeSlot {
+    ID3D12DescriptorHeap* heap{};
+    ID3D12Resource* snapshot{};
+    UINT64 width{};
+    UINT height{};
+    bool initialized{};
+    std::atomic<uint64_t> fence_value{};
+    std::atomic<bool> reserved{};
+};
+std::array<TaauComposeSlot, kTaauComposeSlotCount> g_taau_compose_slots{};
+std::atomic<uint32_t> g_taau_compose_slot_index{};
+struct TaauPendingSlotUse {
+    bool compose{};
+    uint32_t index{};
+};
+ID3D12Fence* g_taau_slot_fence{};
+std::atomic<uint64_t> g_taau_slot_fence_value{};
+std::mutex g_taau_slot_mutex{};
+std::unordered_map<ID3D12CommandList*, std::vector<TaauPendingSlotUse>>
+    g_taau_pending_slot_uses{};
+UINT g_taau_mvec_descriptor_increment{};
+std::once_flag g_taau_mvec_pipeline_once{};
+std::mutex g_taau_mvec_resource_mutex{};
+UINT64 g_taau_mvec_width{};
+UINT g_taau_mvec_height{};
+std::atomic<uint32_t> g_taau_mvec_log_count{};
+struct TaauEyeHistory {
+    ID3D12Resource* texture{};
+    UINT64 width{};
+    UINT height{};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    bool initialized{};
+    // Diagnostics only: the temporal identity most recently committed to this
+    // private history. These fields never participate in route selection.
+    uint64_t last_pair_id{};
+    uint64_t last_present{};
+    // V506 diagnostics: identify the exact resolve instance that last advanced
+    // this eye, so delayed callbacks can be distinguished from a second stage
+    // targeting the same resources.
+    ID3D12GraphicsCommandList* last_command_list{};
+    ID3D12Resource* last_native_output{};
+    ID3D12Resource* last_native_history{};
+    D3D12_GPU_VIRTUAL_ADDRESS last_cb10_gpu_va{};
+    uint64_t last_cb10_hash{};
+};
+std::array<TaauEyeHistory, 2> g_taau_eye_histories{};
+std::mutex g_taau_eye_history_mutex{};
+// Serializes each eye's complete history transaction. The metadata mutex above
+// protects individual fields, but a resolve must keep the selected predecessor,
+// recorded dispatch and committed pair as one indivisible operation.
+std::array<std::mutex, 2> g_taau_eye_transaction_mutex{};
+std::atomic<bool> g_taau_cinema_bypass_active{};
+struct TaauRecordedResolveIdentity {
+    int eye{-1};
+    uint64_t pair_id{};
+    uint64_t recorded_present{};
+    uint64_t history_pair_at_record{};
+    uint64_t cb10_hash{};
+    ID3D12Resource* native_output{};
+    bool recovered{};
+    bool replayed_as_stale{};
+};
+std::mutex g_taau_recorded_resolve_mutex{};
+std::unordered_map<ID3D12CommandList*, TaauRecordedResolveIdentity>
+    g_taau_recorded_resolves{};
+std::array<std::atomic<uint64_t>, 2> g_taau_last_submitted_pair{};
+std::atomic<uint64_t> g_taau_submitted_resolve_count{};
+struct CameraCbvWatch {
+    ID3D12Resource* resource{};
+    size_t begin{};
+    size_t end{};
+    uint64_t frame{};
+    UINT root{};
+    uint64_t vs_hash{};
+    uint64_t ps_hash{};
+};
+
+std::vector<CameraCbvWatch> g_camera_cbv_watches{};
+std::atomic<uint64_t> g_execute_count{};
+std::atomic<uint64_t> g_global_draw_count{};
+std::atomic<uint64_t> g_fingerprint_indexed_draw_count{};
+std::atomic<uint64_t> g_fingerprint_nonindexed_draw_count{};
+std::atomic<uint32_t> g_cbv_bind_log_count{};
+std::atomic<uint32_t> g_descriptor_table_bind_log_count{};
+std::atomic<uint32_t> g_cbv_create_log_count{};
+std::atomic<uint32_t> g_pso_create_log_count{};
+std::atomic<uint32_t> g_pso_bind_log_count{};
+std::atomic<uint32_t> g_descriptor_heap_log_count{};
+std::atomic<uint32_t> g_matrix_log_count{};
+std::atomic<uint32_t> g_active_nudge_log_count{};
+std::atomic<uint32_t> g_orbit_probe_log_count{};
+std::atomic<uint32_t> g_copy_probe_log_count{};
+std::unordered_map<uint64_t, bool> g_dumped_shader_hashes{};
+std::vector<uint8_t> g_geometry_shift_7tc{};
+std::vector<uint8_t> g_geometry_shift_6tc{};
+std::once_flag g_geometry_shader_once{};
+std::once_flag g_dxc_once{};
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_generated_geometry_shaders{};
+std::unordered_map<uint64_t, uint64_t> g_active_nudge_frames{};
+std::atomic<uint64_t> g_active_nudge_signaled_cycle{UINT64_MAX};
+std::atomic<uint64_t> g_active_nudge_written_frame{UINT64_MAX};
+std::array<std::atomic<uint64_t>, 16> g_orbit_probe_slot_frames{};
+struct PendingExecuteNudge {
+    ID3D12Resource* resource{};
+    uint8_t* mapped{};
+    size_t absolute_offset{};
+    size_t mapped_size{};
+    UINT root{};
+    uint32_t component{};
+    uint32_t slot{};
+    uint64_t draw{};
+    uint64_t recorded_frame{};
+};
+std::unordered_map<ID3D12GraphicsCommandList*, PendingExecuteNudge> g_pending_execute_nudges{};
+bool g_reverse_hooks_installed{};
+bool g_command_list_hooks_installed{};
+
+HRESULT STDMETHODCALLTYPE hook_present(
+    IDXGISwapChain* swapchain,
+    UINT sync_interval,
+    UINT flags);
+HRESULT STDMETHODCALLTYPE hook_present1(
+    IDXGISwapChain1* swapchain,
+    UINT sync_interval,
+    UINT flags,
+    const DXGI_PRESENT_PARAMETERS* params);
+HRESULT STDMETHODCALLTYPE hook_get_display_mode_list(
+    IDXGIOutput* output, DXGI_FORMAT format, UINT flags,
+    UINT* mode_count, DXGI_MODE_DESC* modes) {
+    const UINT capacity = mode_count != nullptr ? *mode_count : 0;
+    const auto result = g_get_display_mode_list(output, format, flags, mode_count, modes);
+    if (SUCCEEDED(result) && mode_count != nullptr &&
+        g_config.render_width > 0 && g_config.render_height > 0) {
+        if (modes == nullptr) {
+            ++*mode_count;
+        } else if (*mode_count < capacity) {
+            auto& mode = modes[*mode_count];
+            mode.Width = static_cast<UINT>(g_config.render_width);
+            mode.Height = static_cast<UINT>(g_config.render_height);
+            mode.RefreshRate = {60, 1};
+            mode.Format = format;
+            mode.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+            mode.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+            ++*mode_count;
+        }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hook_get_display_mode_list1(
+    IDXGIOutput1* output, DXGI_FORMAT format, UINT flags,
+    UINT* mode_count, DXGI_MODE_DESC1* modes) {
+    const UINT capacity = mode_count != nullptr ? *mode_count : 0;
+    const auto result = g_get_display_mode_list1(output, format, flags, mode_count, modes);
+    if (SUCCEEDED(result) && mode_count != nullptr &&
+        g_config.render_width > 0 && g_config.render_height > 0) {
+        if (modes == nullptr) {
+            ++*mode_count;
+        } else if (*mode_count < capacity) {
+            auto& mode = modes[*mode_count];
+            mode.Width = static_cast<UINT>(g_config.render_width);
+            mode.Height = static_cast<UINT>(g_config.render_height);
+            mode.RefreshRate = {60, 1};
+            mode.Format = format;
+            mode.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+            mode.Scaling = DXGI_MODE_SCALING_UNSPECIFIED;
+            mode.Stereo = FALSE;
+            ++*mode_count;
+        }
+    }
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hook_resize_buffers(
+    IDXGISwapChain* swapchain,
+    UINT buffer_count,
+    UINT width,
+    UINT height,
+    DXGI_FORMAT format,
+    UINT flags);
+HRESULT STDMETHODCALLTYPE hook_get_display_mode_list(
+    IDXGIOutput* output, DXGI_FORMAT format, UINT flags,
+    UINT* mode_count, DXGI_MODE_DESC* modes);
+HRESULT STDMETHODCALLTYPE hook_get_display_mode_list1(
+    IDXGIOutput1* output, DXGI_FORMAT format, UINT flags,
+    UINT* mode_count, DXGI_MODE_DESC1* modes);
+void STDMETHODCALLTYPE hook_execute_command_lists(
+    ID3D12CommandQueue* queue,
+    UINT num_command_lists,
+    ID3D12CommandList* const* command_lists);
+HRESULT STDMETHODCALLTYPE hook_create_committed_resource(
+    ID3D12Device* device,
+    const D3D12_HEAP_PROPERTIES* heap_properties,
+    D3D12_HEAP_FLAGS heap_flags,
+    const D3D12_RESOURCE_DESC* desc,
+    D3D12_RESOURCE_STATES initial_state,
+    const D3D12_CLEAR_VALUE* optimized_clear_value,
+    REFIID riid_resource,
+    void** resource);
+HRESULT STDMETHODCALLTYPE hook_create_descriptor_heap(
+    ID3D12Device* device,
+    const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+    REFIID riid,
+    void** heap);
+void STDMETHODCALLTYPE hook_create_cbv(
+    ID3D12Device* device,
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor);
+HRESULT STDMETHODCALLTYPE hook_create_root_signature(
+    ID3D12Device* device,
+    UINT node_mask,
+    const void* blob_with_root_signature,
+    SIZE_T blob_length_in_bytes,
+    REFIID riid,
+    void** root_signature);
+void STDMETHODCALLTYPE hook_create_srv(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor);
+void STDMETHODCALLTYPE hook_create_uav(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    ID3D12Resource* counter_resource,
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor);
+void STDMETHODCALLTYPE hook_create_rtv(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor);
+HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
+    ID3D12Device* device,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid,
+    void** pipeline_state);
+HRESULT STDMETHODCALLTYPE hook_create_compute_pipeline_state(
+    ID3D12Device* device,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+    REFIID riid,
+    void** pipeline_state);
+void STDMETHODCALLTYPE hook_copy_descriptors(
+    ID3D12Device* device,
+    UINT num_dest_descriptor_ranges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* dest_descriptor_range_starts,
+    const UINT* dest_descriptor_range_sizes,
+    UINT num_src_descriptor_ranges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* src_descriptor_range_starts,
+    const UINT* src_descriptor_range_sizes,
+    D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heaps_type);
+void STDMETHODCALLTYPE hook_copy_descriptors_simple(
+    ID3D12Device* device,
+    UINT num_descriptors,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor_range_start,
+    D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_start,
+    D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heaps_type);
+HRESULT STDMETHODCALLTYPE hook_resource_map(
+    ID3D12Resource* resource,
+    UINT subresource,
+    const D3D12_RANGE* read_range,
+    void** data);
+void STDMETHODCALLTYPE hook_resource_unmap(
+    ID3D12Resource* resource,
+    UINT subresource,
+    const D3D12_RANGE* written_range);
+void STDMETHODCALLTYPE hook_set_descriptor_heaps(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_descriptor_heaps,
+    ID3D12DescriptorHeap* const* descriptor_heaps);
+void STDMETHODCALLTYPE hook_set_graphics_root_descriptor_table(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor);
+void STDMETHODCALLTYPE hook_set_compute_root_descriptor_table(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor);
+void STDMETHODCALLTYPE hook_set_graphics_root_cbv(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS buffer_location);
+void STDMETHODCALLTYPE hook_set_compute_root_cbv(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS buffer_location);
+void STDMETHODCALLTYPE hook_set_compute_root_32bit_constant(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT src_data,
+    UINT dest_offset_in_32bit_values);
+void STDMETHODCALLTYPE hook_set_compute_root_32bit_constants(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT num_32bit_values_to_set,
+    const void* src_data,
+    UINT dest_offset_in_32bit_values);
+void STDMETHODCALLTYPE hook_set_pipeline_state(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState* pipeline_state);
+void STDMETHODCALLTYPE hook_set_graphics_root_signature(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12RootSignature* root_signature);
+void STDMETHODCALLTYPE hook_set_compute_root_signature(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12RootSignature* root_signature);
+bool try_bridge_streamline_second_present_before_draw(
+    ID3D12GraphicsCommandList* command_list,
+    bool indexed,
+    UINT element_count,
+    UINT instance_count);
+bool publish_packed_dlss_output_after_draw(
+    ID3D12GraphicsCommandList* command_list);
+bool prepare_engine_dlss_output_for_eye(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t eye,
+    uint64_t pair_id);
+uint32_t streamline_viewport_for_eye(uint32_t viewport);
+int __fastcall hook_sl_set_tag(
+    const void* resource, uint32_t tag, uint32_t viewport, const void* extent);
+int __fastcall hook_sl_set_feature_constants(
+    uint32_t feature, const void* constants, uint32_t frame_token, uint32_t viewport);
+int __fastcall hook_sl_evaluate_feature(
+    void* command_buffer, uint32_t feature, uint32_t frame_token, uint32_t viewport);
+
+void STDMETHODCALLTYPE hook_draw_indexed_instanced(
+    ID3D12GraphicsCommandList* command_list,
+    UINT index_count_per_instance,
+    UINT instance_count,
+    UINT start_index_location,
+    INT base_vertex_location,
+    UINT start_instance_location);
+void STDMETHODCALLTYPE hook_draw_instanced(
+    ID3D12GraphicsCommandList* command_list,
+    UINT vertex_count_per_instance,
+    UINT instance_count,
+    UINT start_vertex_location,
+    UINT start_instance_location);
+void log_line(const char* fmt, ...);
+void wait_for_xr_gpu();
+void update_taau_hot_hook_state();
+bool taau_matrix_warmup_ready(uint64_t present) {
+    uint32_t recent_samples[2]{};
+    std::scoped_lock lock{g_engine_temporal_matrix_mutex};
+    for (const auto& pair : g_engine_temporal_matrix_ring) {
+        if (!pair.corrected_valid || pair.eye < 0 || pair.eye > 1 ||
+            pair.present > present || present - pair.present > 16) {
+            continue;
+        }
+        ++recent_samples[pair.eye];
+    }
+    if (g_config.openxr_mode == 2) {
+        return recent_samples[0] >= 2;
+    }
+    return recent_samples[0] >= 2 && recent_samples[1] >= 2;
+}
+
+void update_taau_auto_activation(uint64_t present) {
+    if ((!temporal_backend_is_taau() && !temporal_backend_is_dlss()) ||
+        g_taau_auto_activated.load(std::memory_order_relaxed) ||
+        g_taau_auto_activation_pending.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const auto last_seen =
+        g_taau_native_last_seen_present.load(std::memory_order_relaxed);
+    const bool taau_recent = last_seen != UINT64_MAX &&
+        present >= last_seen && present - last_seen <= 4;
+    const bool packed_ready = g_config.openxr_mode != 4 ||
+        g_packed_runtime_ready.load(std::memory_order_relaxed);
+    const bool render_route_ready = g_config.openxr_mode == 2 ||
+        g_engine_dual_render_active.load(std::memory_order_relaxed);
+    const bool renderer_ready = taau_recent && render_route_ready &&
+        g_hmd_pose_valid.load(std::memory_order_relaxed) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        packed_ready;
+    if (!renderer_ready) {
+        g_taau_auto_candidate_start_present.store(
+            UINT64_MAX, std::memory_order_relaxed);
+        g_taau_matrix_warmup_active.store(false, std::memory_order_relaxed);
+        g_taau_matrix_warmup_start_present.store(
+            UINT64_MAX, std::memory_order_relaxed);
+        g_taau_matrix_ready_start_present.store(
+            UINT64_MAX, std::memory_order_relaxed);
+        return;
+    }
+
+    auto start = g_taau_auto_candidate_start_present.load(std::memory_order_relaxed);
+    if (start == UINT64_MAX) {
+        g_taau_auto_candidate_start_present.store(present, std::memory_order_relaxed);
+        return;
+    }
+    const auto activation_delay = static_cast<uint64_t>(
+        g_config.engine_taau_activation_delay_frames);
+    if (present - start < activation_delay) {
+        return;
+    }
+
+    if (!g_taau_matrix_warmup_active.exchange(true, std::memory_order_relaxed)) {
+        g_taau_matrix_warmup_start_present.store(present, std::memory_order_relaxed);
+        log_line("TAAU matrix warmup started present=%llu",
+            static_cast<unsigned long long>(present));
+        return;
+    }
+    if (!taau_matrix_warmup_ready(present)) {
+        g_taau_matrix_ready_start_present.store(
+            UINT64_MAX, std::memory_order_relaxed);
+        return;
+    }
+    auto matrix_ready_start = g_taau_matrix_ready_start_present.load(
+        std::memory_order_relaxed);
+    if (matrix_ready_start == UINT64_MAX) {
+        g_taau_matrix_ready_start_present.store(present, std::memory_order_relaxed);
+        return;
+    }
+    constexpr uint64_t kTaauMatrixReadySettleFrames = 30;
+    if (present - matrix_ready_start < kTaauMatrixReadySettleFrames) {
+        return;
+    }
+
+    g_taau_auto_activation_pending.store(true, std::memory_order_relaxed);
+    if (g_config.openxr_mode == 4) {
+        log_line("TAAU correction activation queued at packed pair boundary present=%llu",
+            static_cast<unsigned long long>(present));
+        return;
+    }
+    wait_for_xr_gpu();
+    g_taau_force_matrix_fallback.store(true, std::memory_order_relaxed);
+    g_taau_differential_activation_present.store(UINT64_MAX, std::memory_order_relaxed);
+    g_taau_override_log_count.store(0, std::memory_order_relaxed);
+    g_taau_auto_activated.store(true, std::memory_order_relaxed);
+    g_taau_auto_activation_pending.store(false, std::memory_order_relaxed);
+    log_line("TAAU correction auto-activated present=%llu first_seen=%llu stable=%llu",
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(last_seen),
+        static_cast<unsigned long long>(present - start));
+}
+
+void commit_packed_taau_auto_activation(uint64_t present) {
+    if ((!temporal_backend_is_taau() && !temporal_backend_is_dlss()) ||
+        g_config.openxr_mode != 4 ||
+        !g_taau_auto_activation_pending.exchange(false, std::memory_order_relaxed) ||
+        g_taau_auto_activated.load(std::memory_order_relaxed)) {
+        return;
+    }
+    wait_for_xr_gpu();
+    g_taau_force_matrix_fallback.store(true, std::memory_order_relaxed);
+    g_taau_differential_activation_present.store(UINT64_MAX, std::memory_order_relaxed);
+    g_taau_override_log_count.store(0, std::memory_order_relaxed);
+    g_taau_auto_activated.store(true, std::memory_order_relaxed);
+    update_taau_hot_hook_state();
+    log_line("TAAU correction auto-activated at packed pair boundary present=%llu",
+        static_cast<unsigned long long>(present));
+}
+
+void log_taau_health(uint64_t present) {
+    if (!g_config.runtime_diagnostics ||
+        !g_taau_force_matrix_fallback.load(std::memory_order_relaxed) ||
+        present == 0 || present % 1800 != 0) {
+        return;
+    }
+    log_line("TAAU health present=%llu total=%llu corrected=%llu descriptor_fail=%llu resource_fail=%llu cb10_fail=%llu matrix_fail=%llu compose_fail=%llu history_fallback=%llu",
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(g_taau_health_total.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_corrected.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_descriptor_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_resource_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_cb10_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_matrix_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_compose_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_history_fallback.load(std::memory_order_relaxed)));
+}
+
+void log_packed_hang_diagnostics(uint64_t present) {
+    if (!g_config.logging_enabled ||
+        present == 0 || present % 120 != 0 || g_config.openxr_mode != 4) {
+        return;
+    }
+    log_line(
+        "Packed hang diag present=%llu accepted=%llu sequence=%llu floors=%llu/%llu "
+        "scene=%llu/%llu@%llu:t%u gameplay=%llu/%llu@%llu:p%llu:e%d:t%u "
+        "builder=%llu/%llu@%llu:p%llu:e%d:t%u taau=%llu/%llu@%llu:p%llu:e%d:t%u "
+        "matched=p%llu:e%d fence=%llu/%llu execute=%llu/%llu@%llu:t%u:n%u:s%u:hr%08X "
+        "taau_health=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu fence=%llu",
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(g_packed_accepted_pair_id),
+        static_cast<unsigned long long>(g_engine_pair_sequence.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_engine_pair_wait_floor.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_engine_pair_capture_floor.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_scene_enter.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_scene_exit.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_scene_present.load(std::memory_order_relaxed)),
+        g_hang_diag_scene_thread.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(g_hang_diag_gameplay_enter.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_gameplay_exit.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_gameplay_present.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_gameplay_pair.load(std::memory_order_relaxed)),
+        g_hang_diag_gameplay_eye.load(std::memory_order_relaxed),
+        g_hang_diag_gameplay_thread.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(g_hang_diag_builder_enter.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_builder_exit.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_builder_present.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_builder_pair.load(std::memory_order_relaxed)),
+        g_hang_diag_builder_eye.load(std::memory_order_relaxed),
+        g_hang_diag_builder_thread.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(g_hang_diag_taau_enter.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_taau_exit.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_taau_present.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_taau_pair.load(std::memory_order_relaxed)),
+        g_hang_diag_taau_eye.load(std::memory_order_relaxed),
+        g_hang_diag_taau_thread.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(g_hang_diag_taau_matched_pair.load(std::memory_order_relaxed)),
+        g_hang_diag_taau_matched_eye.load(std::memory_order_relaxed),
+        static_cast<unsigned long long>(g_hang_diag_fence_completed.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_execute_signal.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_execute_enter.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_execute_exit.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_hang_diag_execute_present.load(std::memory_order_relaxed)),
+        g_hang_diag_execute_thread.load(std::memory_order_relaxed),
+        g_hang_diag_execute_list_count.load(std::memory_order_relaxed),
+        g_hang_diag_execute_slot_count.load(std::memory_order_relaxed),
+        static_cast<unsigned>(g_hang_diag_execute_signal_hr.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_total.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_corrected.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_descriptor_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_resource_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_cb10_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_matrix_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_compose_fail.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_health_history_fallback.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_taau_slot_fence_value.load(std::memory_order_relaxed)));
+}
+
+void log_taau_early_failure(const char* category, uint64_t count) {
+    if (count <= 4) {
+        log_line("TAAU health early failure category=%s count=%llu total=%llu present=%llu",
+            category,
+            static_cast<unsigned long long>(count),
+            static_cast<unsigned long long>(g_taau_health_total.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+    }
+}
+
+bool streamline_post_dlss_descriptor_probe_active() {
+    return temporal_backend_is_dlss() &&
+        g_config.streamline_split_viewports && g_config.openxr_mode == 4 &&
+        (!g_streamline_post_compute_bindings_logged[0].load() ||
+            !g_streamline_post_compute_bindings_logged[1].load() ||
+            !g_streamline_post_compute_constants_logged[0].load() ||
+            !g_streamline_post_compute_constants_logged[1].load());
+}
+
+void update_taau_hot_hook_state() {
+    const bool core_needed = taau_runtime_tracking_active() ||
+        g_taau_packed_core_prearmed.load(std::memory_order_relaxed) ||
+        streamline_post_dlss_descriptor_probe_active();
+    const bool probe_needed = g_compute_probe_active.load(std::memory_order_relaxed) ||
+        streamline_post_dlss_descriptor_probe_active();
+    auto set_hook = [](void* target, bool enabled) {
+        if (target == nullptr) {
+            return;
+        }
+        if (enabled) {
+            MH_EnableHook(target);
+        } else {
+            MH_DisableHook(target);
+        }
+    };
+
+    if (core_needed != g_taau_core_hooks_enabled) {
+        if (core_needed) {
+            set_hook(g_compute_table_hook_target, true);
+            set_hook(g_compute_signature_hook_target, true);
+            set_hook(g_dispatch_hook_target, true);
+        } else {
+            set_hook(g_dispatch_hook_target, false);
+            set_hook(g_compute_signature_hook_target, false);
+            set_hook(g_compute_table_hook_target, false);
+        }
+        g_taau_core_hooks_enabled = core_needed;
+        log_line("TAAU core hooks enabled=%u", core_needed ? 1u : 0u);
+    }
+    if (probe_needed != g_taau_probe_hooks_enabled) {
+        set_hook(g_compute_cbv_hook_target, probe_needed);
+        set_hook(g_compute_constant_hook_target, probe_needed);
+        set_hook(g_compute_constants_hook_target, probe_needed);
+        set_hook(g_om_render_targets_hook_target, core_needed || probe_needed);
+        g_taau_probe_hooks_enabled = probe_needed;
+        log_line("TAAU probe-only hooks enabled=%u", probe_needed ? 1u : 0u);
+    }
+}
+
+void STDMETHODCALLTYPE hook_dispatch(
+    ID3D12GraphicsCommandList* command_list,
+    UINT thread_group_count_x,
+    UINT thread_group_count_y,
+    UINT thread_group_count_z);
+void STDMETHODCALLTYPE hook_copy_buffer_region(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* dst_buffer,
+    UINT64 dst_offset,
+    ID3D12Resource* src_buffer,
+    UINT64 src_offset,
+    UINT64 num_bytes);
+void STDMETHODCALLTYPE hook_resource_barrier(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_barriers,
+    const D3D12_RESOURCE_BARRIER* barriers);
+void STDMETHODCALLTYPE hook_om_set_render_targets(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_render_target_descriptors,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
+    BOOL rts_single_handle_to_descriptor_range,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor);
+void install_resource_hooks(ID3D12Resource* resource);
+void install_command_list_hooks();
+void install_streamline_resource_barrier_probe();
+bool reverse_enabled();
+
+void log_line(const char* fmt, ...) {
+    if (!g_config.logging_enabled) {
+        return;
+    }
+
+    std::scoped_lock lock{g_log_mutex};
+
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+
+    char* slash = strrchr(module_path, '\\');
+    if (slash != nullptr) {
+        slash[1] = '\0';
+    }
+
+    strcat_s(module_path, "witcher3vr.log");
+
+    FILE* file{};
+    if (fopen_s(&file, module_path, "a") != 0 || file == nullptr) {
+        return;
+    }
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fprintf(file, "[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    va_list args{};
+    va_start(args, fmt);
+    vfprintf(file, fmt, args);
+    va_end(args);
+
+    fprintf(file, "\n");
+    fclose(file);
+}
+
+void diagnose_final_present_resource_identity(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* resource,
+    const PipelineInfo& pipeline) {
+    if (command_list == nullptr || resource == nullptr ||
+        g_game_swapchain == nullptr) {
+        return;
+    }
+
+    EngineFrameTag route{};
+    const bool route_valid =
+        lookup_streamline_command_list_route(command_list, route) &&
+        route.generation ==
+            g_streamline_capture_generation.load(std::memory_order_acquire);
+
+    uint32_t stable_id{};
+    int32_t swapchain_index{-1};
+    uint32_t current_backbuffer_index{UINT32_MAX};
+    bool new_resource{};
+    bool new_resource_command_list{};
+    {
+        std::scoped_lock lock{g_final_present_resource_diagnostic_mutex};
+        const auto existing = std::find_if(
+            g_final_present_resource_diagnostics.begin(),
+            g_final_present_resource_diagnostics.end(),
+            [resource](const auto& entry) {
+                return entry.resource == resource;
+            });
+        if (existing != g_final_present_resource_diagnostics.end()) {
+            stable_id = existing->stable_id;
+            swapchain_index = existing->swapchain_index;
+        } else {
+            new_resource = true;
+            stable_id = g_final_present_resource_next_id.fetch_add(
+                1, std::memory_order_relaxed);
+            DXGI_SWAP_CHAIN_DESC swapchain_desc{};
+            if (SUCCEEDED(g_game_swapchain->GetDesc(&swapchain_desc))) {
+                for (UINT index = 0; index < swapchain_desc.BufferCount;
+                    ++index) {
+                    ID3D12Resource* swapchain_buffer{};
+                    if (SUCCEEDED(g_game_swapchain->GetBuffer(
+                            index, IID_PPV_ARGS(&swapchain_buffer))) &&
+                        swapchain_buffer != nullptr) {
+                        const bool same_resource =
+                            swapchain_buffer == resource;
+                        swapchain_buffer->Release();
+                        if (same_resource) {
+                            swapchain_index = static_cast<int32_t>(index);
+                            break;
+                        }
+                    }
+                }
+            }
+            g_final_present_resource_diagnostics.push_back(
+                {resource, stable_id, swapchain_index});
+        }
+
+        const auto resource_command_list = std::find(
+            g_final_present_resource_command_lists.begin(),
+            g_final_present_resource_command_lists.end(),
+            std::make_pair(resource, command_list));
+        if (resource_command_list ==
+            g_final_present_resource_command_lists.end()) {
+            new_resource_command_list = true;
+            g_final_present_resource_command_lists.emplace_back(
+                resource, command_list);
+        }
+    }
+
+    IDXGISwapChain3* swapchain3{};
+    if (SUCCEEDED(g_game_swapchain->QueryInterface(
+            IID_PPV_ARGS(&swapchain3))) &&
+        swapchain3 != nullptr) {
+        current_backbuffer_index =
+            swapchain3->GetCurrentBackBufferIndex();
+        swapchain3->Release();
+    }
+
+    if (new_resource || new_resource_command_list) {
+        log_line(
+            "V574 final PRESENT identity resource_id=%u resource=%p "
+            "swapchain_index=%d current_index=%u new_resource=%u "
+            "new_command_list=%u command_list=%p route_valid=%u "
+            "route_eye=%u route_pair=%llu generation=%u present=%llu",
+            stable_id, resource, swapchain_index,
+            current_backbuffer_index, new_resource ? 1u : 0u,
+            new_resource_command_list ? 1u : 0u, command_list,
+            route_valid ? 1u : 0u, route.eye,
+            static_cast<unsigned long long>(route.pair_id),
+            route.generation,
+            static_cast<unsigned long long>(g_present_count.load(
+                std::memory_order_relaxed)));
+    }
+    if (swapchain_index < 0 && route_valid &&
+        g_final_present_non_swapchain_route_logs.fetch_add(
+            1, std::memory_order_relaxed) < 128) {
+        log_line(
+            "V574 non-swapchain resource would consume final route "
+            "resource_id=%u resource=%p command_list=%p eye=%u pair=%llu "
+            "present=%llu",
+            stable_id, resource, command_list, route.eye,
+            static_cast<unsigned long long>(route.pair_id),
+            static_cast<unsigned long long>(g_present_count.load(
+                std::memory_order_relaxed)));
+    }
+    if (swapchain_index >= 0 && !route_valid &&
+        g_engine_dual_gameplay_armed.load(std::memory_order_relaxed) &&
+        g_final_present_missing_route_logs.fetch_add(
+            1, std::memory_order_relaxed) < 256) {
+        EngineFrameTag queue_front{};
+        EngineFrameTag queue_back{};
+        size_t queue_depth{};
+        {
+            std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+            queue_depth = g_engine_completed_tag_queue.size();
+            if (!g_engine_completed_tag_queue.empty()) {
+                queue_front = g_engine_completed_tag_queue.front();
+                queue_back = g_engine_completed_tag_queue.back();
+            }
+        }
+        log_line(
+            "V575 fire-route miss resource_id=%u swapchain_index=%d "
+            "current_index=%u command_list=%p last_eye=%u "
+            "pipeline_vs=0x%llX pipeline_ps=0x%llX pipeline_cs=0x%llX "
+            "pipeline_root=0x%llX rt_count=%u dsv=%u "
+            "queue_depth=%zu queue_front=%u/%llu queue_back=%u/%llu "
+            "pending_pair=%llu present=%llu",
+            stable_id, swapchain_index, current_backbuffer_index,
+            command_list,
+            lookup_streamline_command_list_last_eye(command_list),
+            static_cast<unsigned long long>(pipeline.vs_hash),
+            static_cast<unsigned long long>(pipeline.ps_hash),
+            static_cast<unsigned long long>(pipeline.cs_hash),
+            static_cast<unsigned long long>(pipeline.root_hash),
+            pipeline.render_target_count,
+            static_cast<unsigned>(pipeline.dsv_format),
+            queue_depth, queue_front.eye,
+            static_cast<unsigned long long>(queue_front.pair_id),
+            queue_back.eye,
+            static_cast<unsigned long long>(queue_back.pair_id),
+            static_cast<unsigned long long>(
+                g_packed_dlss_pending_pair.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_present_count.load(
+                std::memory_order_relaxed)));
+    }
+}
+
+void initialize_performance_cpu_sets() {
+    std::call_once(g_performance_cpu_sets_once, []() {
+        auto* kernel32 = GetModuleHandleW(L"kernel32.dll");
+        g_get_system_cpu_set_information = kernel32 != nullptr
+            ? reinterpret_cast<GetSystemCpuSetInformationFn>(
+                  GetProcAddress(kernel32, "GetSystemCpuSetInformation"))
+            : nullptr;
+        g_set_thread_selected_cpu_sets = kernel32 != nullptr
+            ? reinterpret_cast<SetThreadSelectedCpuSetsFn>(
+                  GetProcAddress(kernel32, "SetThreadSelectedCpuSets"))
+            : nullptr;
+        if (g_get_system_cpu_set_information == nullptr ||
+            g_set_thread_selected_cpu_sets == nullptr) {
+            log_line("REDengine P-core routing unavailable: CPU-set APIs missing");
+            return;
+        }
+
+        ULONG required_bytes{};
+        g_get_system_cpu_set_information(
+            nullptr, 0, &required_bytes, GetCurrentProcess(), 0);
+        if (required_bytes < sizeof(SYSTEM_CPU_SET_INFORMATION)) {
+            log_line("REDengine P-core routing unavailable: CPU-set query size=%lu",
+                static_cast<unsigned long>(required_bytes));
+            return;
+        }
+
+        std::vector<uint8_t> buffer(required_bytes);
+        if (!g_get_system_cpu_set_information(
+                reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                required_bytes, &required_bytes, GetCurrentProcess(), 0)) {
+            log_line("REDengine P-core routing unavailable: CPU-set query failed error=%lu",
+                static_cast<unsigned long>(GetLastError()));
+            return;
+        }
+
+        uint8_t maximum_efficiency_class{};
+        uint32_t cpu_set_count{};
+        size_t offset{};
+        while (offset + sizeof(ULONG) <= required_bytes) {
+            const auto* entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(
+                buffer.data() + offset);
+            if (entry->Size < sizeof(ULONG) || offset + entry->Size > required_bytes) {
+                break;
+            }
+            if (entry->Type == CpuSetInformation) {
+                maximum_efficiency_class = std::max(
+                    maximum_efficiency_class, entry->CpuSet.EfficiencyClass);
+                ++cpu_set_count;
+            }
+            offset += entry->Size;
+        }
+
+        std::string logical_processors{};
+        offset = 0;
+        while (offset + sizeof(ULONG) <= required_bytes) {
+            const auto* entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(
+                buffer.data() + offset);
+            if (entry->Size < sizeof(ULONG) || offset + entry->Size > required_bytes) {
+                break;
+            }
+            if (entry->Type == CpuSetInformation &&
+                entry->CpuSet.EfficiencyClass == maximum_efficiency_class) {
+                g_performance_cpu_set_ids.push_back(entry->CpuSet.Id);
+                char logical_processor[16]{};
+                sprintf_s(logical_processor, "%u",
+                    static_cast<unsigned>(entry->CpuSet.LogicalProcessorIndex));
+                if (!logical_processors.empty()) {
+                    logical_processors += ',';
+                }
+                logical_processors += logical_processor;
+            }
+            offset += entry->Size;
+        }
+
+        if (g_performance_cpu_set_ids.empty() ||
+            g_performance_cpu_set_ids.size() == cpu_set_count) {
+            g_performance_cpu_set_ids.clear();
+            log_line(
+                "REDengine P-core routing inactive: homogeneous CPU sets=%u class=%u",
+                cpu_set_count, static_cast<unsigned>(maximum_efficiency_class));
+            return;
+        }
+
+        log_line(
+            "REDengine P-core routing ready total=%u selected=%zu class=%u logical=%s",
+            cpu_set_count, g_performance_cpu_set_ids.size(),
+            static_cast<unsigned>(maximum_efficiency_class),
+            logical_processors.c_str());
+    });
+}
+
+void apply_performance_cpu_sets_to_current_thread(
+    const char* role, bool& already_applied) {
+    if (already_applied) {
+        return;
+    }
+    already_applied = true;
+    initialize_performance_cpu_sets();
+    if (g_set_thread_selected_cpu_sets == nullptr ||
+        g_performance_cpu_set_ids.empty()) {
+        return;
+    }
+
+    const DWORD thread_id = GetCurrentThreadId();
+    const DWORD initial_processor = GetCurrentProcessorNumber();
+    const BOOL applied = g_set_thread_selected_cpu_sets(
+        GetCurrentThread(), g_performance_cpu_set_ids.data(),
+        static_cast<ULONG>(g_performance_cpu_set_ids.size()));
+    log_line(
+        "REDengine P-core routing role=%s tid=%lu initial_cpu=%lu selected=%zu result=%d error=%lu",
+        role, static_cast<unsigned long>(thread_id),
+        static_cast<unsigned long>(initial_processor),
+        g_performance_cpu_set_ids.size(), applied ? 1 : 0,
+        applied ? 0ul : static_cast<unsigned long>(GetLastError()));
+}
+
+bool read_ini_bool(const char* section, const char* key, bool default_value) {
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+
+    char* slash = strrchr(module_path, '\\');
+    if (slash != nullptr) {
+        slash[1] = '\0';
+    }
+
+    strcat_s(module_path, "witcher3vr.ini");
+    return GetPrivateProfileIntA(section, key, default_value ? 1 : 0, module_path) != 0;
+}
+
+int read_ini_int(const char* section, const char* key, int default_value) {
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+
+    char* slash = strrchr(module_path, '\\');
+    if (slash != nullptr) {
+        slash[1] = '\0';
+    }
+
+    strcat_s(module_path, "witcher3vr.ini");
+    return GetPrivateProfileIntA(section, key, default_value, module_path);
+}
+
+float read_ini_float(const char* section, const char* key, float default_value) {
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+
+    char* slash = strrchr(module_path, '\\');
+    if (slash != nullptr) {
+        slash[1] = '\0';
+    }
+
+    strcat_s(module_path, "witcher3vr.ini");
+
+    char value[64]{};
+    sprintf_s(value, "%.3f", default_value);
+    GetPrivateProfileStringA(section, key, value, value, sizeof(value), module_path);
+    return static_cast<float>(atof(value));
+}
+
+std::string read_ini_string(
+    const char* section, const char* key, const char* default_value) {
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+
+    char* slash = strrchr(module_path, '\\');
+    if (slash != nullptr) {
+        slash[1] = '\0';
+    }
+
+    strcat_s(module_path, "witcher3vr.ini");
+
+    char value[64]{};
+    GetPrivateProfileStringA(
+        section, key, default_value, value, sizeof(value), module_path);
+    std::string result{value};
+    result.erase(result.begin(), std::find_if(
+        result.begin(), result.end(), [](unsigned char ch) { return ch > ' '; }));
+    result.erase(std::find_if(
+        result.rbegin(), result.rend(), [](unsigned char ch) { return ch > ' '; }).base(),
+        result.end());
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char ch) {
+        return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') :
+            static_cast<char>(ch);
+    });
+    return result;
+}
+
+TemporalBackend parse_temporal_backend(
+    const std::string& value, bool legacy_dlss, bool legacy_taau) {
+    if (value == "none" || value == "off" || value == "disabled") {
+        return TemporalBackend::None;
+    }
+    if (value == "taau" || value == "taa") {
+        return TemporalBackend::Taau;
+    }
+    if (value == "dlss") {
+        return TemporalBackend::Dlss;
+    }
+    if (value == "dlss_packed" || value == "packed_dlss" ||
+        value == "dlss_sbs") {
+        return TemporalBackend::DlssPacked;
+    }
+    return legacy_dlss ? TemporalBackend::Dlss :
+        (legacy_taau ? TemporalBackend::Taau : TemporalBackend::None);
+}
+
+void STDMETHODCALLTYPE hook_om_set_render_targets(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_render_target_descriptors,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* render_target_descriptors,
+    BOOL rts_single_handle_to_descriptor_range,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* depth_stencil_descriptor) {
+    if (reverse_enabled()) {
+        std::vector<ID3D12Resource*> targets{};
+        targets.reserve(num_render_target_descriptors);
+        const UINT increment = g_d3d12_device != nullptr
+            ? g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+            : 0;
+        std::scoped_lock lock{g_reverse_mutex};
+        for (UINT index = 0; index < num_render_target_descriptors; ++index) {
+            if (render_target_descriptors == nullptr) {
+                break;
+            }
+            const SIZE_T handle = rts_single_handle_to_descriptor_range
+                ? render_target_descriptors[0].ptr + static_cast<SIZE_T>(index) * increment
+                : render_target_descriptors[index].ptr;
+            const auto it = g_rtv_descriptors.find(handle);
+            if (it != g_rtv_descriptors.end() && it->second != nullptr) {
+                targets.push_back(it->second);
+            }
+        }
+        auto& command_info = g_command_list_infos[command_list];
+        command_info.active_render_targets = std::move(targets);
+        command_info.active_rtv_handles.fill({});
+        command_info.active_rtv_count = render_target_descriptors != nullptr
+            ? std::min<UINT>(num_render_target_descriptors,
+                static_cast<UINT>(command_info.active_rtv_handles.size()))
+            : 0;
+        command_info.active_rtvs_contiguous =
+            rts_single_handle_to_descriptor_range;
+        for (UINT index = 0; index < command_info.active_rtv_count; ++index) {
+            command_info.active_rtv_handles[index] =
+                rts_single_handle_to_descriptor_range
+                ? D3D12_CPU_DESCRIPTOR_HANDLE{
+                    render_target_descriptors[0].ptr +
+                    static_cast<SIZE_T>(index) * increment}
+                : render_target_descriptors[index];
+        }
+        command_info.active_dsv_handle = depth_stencil_descriptor != nullptr
+            ? *depth_stencil_descriptor
+            : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        if (depth_stencil_descriptor != nullptr && depth_stencil_descriptor->ptr != 0) {
+            const auto depth_it = g_dsv_descriptors.find(depth_stencil_descriptor->ptr);
+            if (depth_it != g_dsv_descriptors.end() && depth_it->second != nullptr) {
+                auto* depth_resource = depth_it->second;
+                command_info.latest_taau_depth_resource = depth_resource;
+                command_info.latest_taau_depth_present = g_present_count.load();
+                g_taau_bound_depth_resource.store(depth_resource);
+                g_taau_bound_depth_present.store(g_present_count.load());
+            }
+        }
+    }
+    g_om_set_render_targets(command_list, num_render_target_descriptors,
+        render_target_descriptors, rts_single_handle_to_descriptor_range,
+        depth_stencil_descriptor);
+}
+
+void apply_hud_frame_scale() {
+    char settings_path[MAX_PATH]{};
+    if (ExpandEnvironmentStringsA(
+            "%USERPROFILE%\\Documents\\The Witcher 3\\dx12user.settings",
+            settings_path, static_cast<DWORD>(std::size(settings_path))) == 0) {
+        return;
+    }
+
+    char horizontal[32]{};
+    char vertical[32]{};
+    sprintf_s(horizontal, "%.3f", g_config.hud_horizontal_scale);
+    sprintf_s(vertical, "%.3f", g_config.hud_vertical_scale);
+    const BOOL horizontal_written = WritePrivateProfileStringA(
+        "Hidden", "uiHorizontalFrameScale", horizontal, settings_path);
+    const BOOL vertical_written = WritePrivateProfileStringA(
+        "Hidden", "uiVerticalFrameScale", vertical, settings_path);
+    log_line("HUD frame scale applied horizontal=%.3f vertical=%.3f written=%d,%d",
+        g_config.hud_horizontal_scale, g_config.hud_vertical_scale,
+        horizontal_written, vertical_written);
+}
+
+void load_config() {
+    std::call_once(g_config_once, []() {
+        g_config.openxr_enabled = read_ini_bool("openxr", "enabled", true);
+        g_config.openxr_mode = read_ini_int("openxr", "mode", 2);
+        g_config.resolution_scale = std::clamp(read_ini_float("openxr", "resolution_scale", 1.0f), 0.25f, 2.0f);
+        g_config.presentation_scale = std::clamp(read_ini_float("openxr", "presentation_scale", 0.9f), 0.5f, 1.0f);
+        g_config.openxr_mono_eye_shift_px = std::clamp(read_ini_int("openxr", "mono_eye_shift_px", 160), -512, 512);
+        g_config.openxr_mono_eye_shift_auto = read_ini_bool("openxr", "mono_eye_shift_auto", true);
+        g_config.render_width = std::max(0, read_ini_int("openxr", "render_width", 0));
+        g_config.render_height = std::max(0, read_ini_int("openxr", "render_height", 0));
+        g_config.hud_horizontal_scale = std::clamp(
+            read_ini_float("openxr", "hud_horizontal_scale", 0.7f), 0.25f, 1.0f);
+        g_config.hud_vertical_scale = std::clamp(
+            read_ini_float("openxr", "hud_vertical_scale", 0.7f), 0.25f, 1.0f);
+        g_config.hud_stereo_shift_px = std::clamp(
+            read_ini_int("openxr", "hud_stereo_shift_px", -16), -256, 256);
+        g_config.hud_size = std::clamp(
+            read_ini_float("openxr", "hud_size", 1.0f), 0.5f, 1.5f);
+        g_config.menu_scale = std::clamp(
+            read_ini_float("openxr", "menu_scale", 0.7f), 0.3f, 1.5f);
+        // [FIX:CINEMA-5X4 1/3] Load the optional framing workaround separately
+        // from cinema size so its visual trade-offs remain user-controlled.
+        g_config.cinema_scale = std::clamp(
+            read_ini_float("openxr", "cinema_scale", g_config.menu_scale),
+            0.3f, 1.5f);
+        g_config.cinema_5x4 = read_ini_bool(
+            "openxr", "cinema_5x4", false);
+        g_config.menu_distance = std::clamp(
+            read_ini_float("openxr", "menu_distance", 1.5f), 0.5f, 5.0f);
+        g_config.hmd_freelook = read_ini_bool("openxr", "hmd_freelook", false);
+        g_config.hmd_compositor_only = read_ini_bool(
+            "openxr", "hmd_compositor_only", false);
+        g_config.disable_desktop_vsync = read_ini_bool(
+            "openxr", "disable_desktop_vsync", true);
+        g_config.pipeline_frame_wait = read_ini_bool(
+            "openxr", "pipeline_frame_wait", true);
+        g_config.hmd_yaw_scale = std::clamp(
+            read_ini_float("openxr", "hmd_yaw_scale", 1.0f), -2.0f, 2.0f);
+        g_config.hmd_pitch_scale = std::clamp(
+            read_ini_float("openxr", "hmd_pitch_scale", 1.0f), -2.0f, 2.0f);
+        g_config.hmd_roll_scale = std::clamp(
+            read_ini_float("openxr", "hmd_roll_scale", -1.0f), -2.0f, 2.0f);
+        g_config.hmd_fov_scale = std::clamp(
+            read_ini_float("openxr", "hmd_fov_scale", 1.0f), 0.9f, 1.1f);
+        g_hmd_fov_scale.store(g_config.hmd_fov_scale);
+        g_config.hmd_lock_game_pitch = read_ini_bool(
+            "openxr", "hmd_lock_game_pitch", true);
+        // New positive-form switch. If omitted, preserve the legacy inverse
+        // hmd_lock_game_pitch setting for backward compatibility.
+        g_config.hmd_lock_game_pitch = !read_ini_bool(
+            "openxr", "vertical_pitch_enabled", !g_config.hmd_lock_game_pitch);
+        g_config.hmd_position_scale = std::clamp(
+            read_ini_float("openxr", "hmd_position_scale", 1.0f), 0.0f, 2.0f);
+        g_config.mono_neck_pivot_compensation_m = std::clamp(
+            read_ini_float(
+                "openxr", "mono_neck_pivot_compensation_m", 0.10f),
+            0.0f, 0.30f);
+        g_config.world_marker_game_pitch_gain = std::clamp(
+            read_ini_float("openxr", "world_marker_game_pitch_gain", 0.15f),
+            -4.0f, 4.0f);
+        g_config.world_marker_hmd_vertical_gain = std::clamp(
+            read_ini_float("openxr", "world_marker_hmd_vertical_gain", 1.9f),
+            -4.0f, 4.0f);
+        g_config.world_marker_game_pitch_depth_enabled = read_ini_bool(
+            "openxr", "world_marker_game_pitch_depth_enabled", true);
+        g_config.world_marker_game_pitch_depth_scale = std::clamp(
+            read_ini_float(
+                "openxr", "world_marker_game_pitch_depth_scale", -0.033333f),
+            -1.0f, 1.0f);
+        g_config.world_marker_vertical_offset_ndc = std::clamp(
+            read_ini_float("openxr", "world_marker_vertical_offset_ndc", 0.24f),
+            -0.5f, 0.5f);
+        apply_hud_frame_scale();
+
+        g_config.reverse_enabled = read_ini_bool("reverse", "enabled", false);
+        g_config.reverse_scan_periodic = read_ini_bool("reverse", "scan_periodic", false);
+        g_config.reverse_scan_unmap = read_ini_bool("reverse", "scan_unmap", false);
+        g_config.reverse_cbv_probe = read_ini_bool("reverse", "cbv_probe", false);
+        g_config.reverse_scan_interval_frames = std::max(1, read_ini_int("reverse", "scan_interval_frames", 600));
+        g_config.reverse_max_scan_bytes = std::max(4096, read_ini_int("reverse", "max_scan_bytes", 65536));
+        g_config.reverse_max_matrix_logs = std::max(0, read_ini_int("reverse", "max_matrix_logs", 32));
+        g_config.reverse_execute_log_interval = std::max(0, read_ini_int("reverse", "execute_log_interval", 0));
+        g_config.reverse_log_buffer_max_bytes = std::max(0, read_ini_int("reverse", "log_buffer_max_bytes", 262144));
+        g_config.reverse_draw_sample_interval = std::max(1, read_ini_int("reverse", "draw_sample_interval", 1000));
+        g_config.reverse_max_roots = std::clamp(read_ini_int("reverse", "max_roots", 16), 1, 32);
+        g_config.reverse_active_nudge = read_ini_bool("reverse", "active_nudge", false);
+        g_config.reverse_nudge_amount = std::clamp(read_ini_float("reverse", "nudge_amount", 0.25f), -500.0f, 500.0f);
+        g_config.reverse_nudge_start_frame = std::max(0, read_ini_int("reverse", "nudge_start_frame", 1800));
+        g_config.reverse_nudge_cycle_frames = std::max(60, read_ini_int("reverse", "nudge_cycle_frames", 240));
+        g_config.reverse_nudge_pulse_frames = std::clamp(
+            read_ini_int("reverse", "nudge_pulse_frames", 120),
+            1,
+            g_config.reverse_nudge_cycle_frames);
+        g_config.reverse_orbit_probe = read_ini_bool("reverse", "orbit_probe", false);
+        g_config.reverse_orbit_frame_interval = std::max(1, read_ini_int("reverse", "orbit_frame_interval", 2));
+        g_config.reverse_orbit_max_logs = std::max(0, read_ini_int("reverse", "orbit_max_logs", 2400));
+        g_config.reverse_copy_probe = read_ini_bool("reverse", "copy_probe", false);
+        g_config.reverse_copy_max_logs = std::max(0, read_ini_int("reverse", "copy_max_logs", 400));
+        g_config.reverse_stereo_probe = read_ini_bool("reverse", "stereo_probe", false);
+        g_config.reverse_geometry_shift = read_ini_bool("reverse", "geometry_shift", false);
+        g_config.engine_view_probe = read_ini_bool("engine", "view_probe", false);
+        g_config.engine_frame_builder_probe = read_ini_bool("engine", "frame_builder_probe", false);
+        g_config.engine_gameplay_entry_probe = read_ini_bool("engine", "gameplay_entry_probe", false);
+        g_config.engine_scene_enqueue_probe = read_ini_bool("engine", "scene_enqueue_probe", false);
+        g_config.engine_view_factory_probe = read_ini_bool("engine", "view_factory_probe", false);
+        g_config.engine_frame_factory_probe = read_ini_bool("engine", "frame_factory_probe", false);
+        g_config.engine_dual_render_probe = read_ini_bool("engine", "dual_render_probe", false);
+        g_config.engine_dual_render_start = read_ini_bool("engine", "dual_render_start", false);
+        g_config.engine_sync_swap_eyes = read_ini_bool("engine", "sync_swap_eyes", false);
+        g_config.engine_menu_state_probe = read_ini_bool("engine", "menu_state_probe", false);
+        g_config.engine_animation_hmd_frustum = read_ini_bool(
+            "engine", "animation_hmd_frustum", false);
+        g_config.engine_animated_component_visible = read_ini_bool(
+            "engine", "animated_component_visible", true);
+        g_config.engine_taau_reverse_eye_order = read_ini_bool(
+            "engine", "taau_reverse_eye_order", false);
+        g_config.engine_taau_first_eye_pure_camera_motion = read_ini_bool(
+            "engine", "taau_first_eye_pure_camera_motion", true);
+        g_config.engine_taau_pure_camera_motion_all = read_ini_bool(
+            "engine", "taau_pure_camera_motion_all", true);
+        g_config.engine_taau_activation_delay_frames = std::clamp(
+            read_ini_int("engine", "taau_activation_delay_frames", 30),
+            30, 3600);
+        g_config.engine_native_projection_shift = read_ini_bool(
+            "engine", "native_projection_shift", false);
+        g_config.engine_native_projection_shift_px = std::clamp(
+            read_ini_int("engine", "native_projection_shift_px", 8), 0, 512);
+        g_config.engine_native_stereo_offset = std::clamp(
+            read_ini_float("engine", "native_stereo_offset", 0.0f), -100.0f, 100.0f);
+        g_config.engine_factory_stereo_offset = std::clamp(
+            read_ini_float("engine", "factory_stereo_offset", 0.0f), -1.0f, 1.0f);
+        g_config.engine_close_camera_offset = std::clamp(
+            read_ini_float("engine", "close_camera_offset", 0.75f), -5.0f, 5.0f);
+        g_config.engine_camera_mode = std::clamp(
+            read_ini_int("engine", "camera_mode", 0), 0, 2);
+        g_config.engine_first_person_camera_offset = std::clamp(
+            read_ini_float("engine", "first_person_camera_offset", 2.5f), -5.0f, 5.0f);
+        g_config.engine_first_person_camera_up_offset = std::clamp(
+            read_ini_float("engine", "first_person_camera_up_offset", 0.65f), -2.0f, 2.0f);
+        g_config.engine_first_person_camera_eye_nudge = std::clamp(
+            read_ini_float("engine", "first_person_camera_eye_nudge", 0.10f),
+            -0.25f, 0.25f);
+        g_camera_mode.store(g_config.engine_camera_mode, std::memory_order_relaxed);
+        g_config.streamline_force_reset = read_ini_bool("engine", "streamline_force_reset", false);
+        g_config.streamline_split_viewports = read_ini_bool("engine", "streamline_split_viewports", false);
+        g_config.streamline_right_temporal_offset = std::clamp(
+            read_ini_float("engine", "streamline_right_temporal_offset", 0.0f), -1.0f, 1.0f);
+        g_config.streamline_temporal_eye = std::clamp(
+            read_ini_int("engine", "streamline_temporal_eye", 1), 0, 1);
+        g_config.streamline_temporal_clip_correction = std::clamp(
+            read_ini_float("engine", "streamline_temporal_clip_correction", 0.0f), -2.0f, 2.0f);
+        g_config.streamline_trace = read_ini_bool("engine", "streamline_trace", false);
+        g_config.streamline_trace_start_frame = std::max(
+            0, read_ini_int("engine", "streamline_trace_start_frame", 500));
+        g_config.streamline_mvec_probe = read_ini_bool("engine", "streamline_mvec_probe", false);
+        g_config.streamline_output_probe = read_ini_bool("engine", "streamline_output_probe", false);
+        g_config.streamline_mvec_correction = read_ini_bool("engine", "streamline_mvec_correction", false);
+        g_config.streamline_reconstruct_camera_motion = read_ini_bool(
+            "engine", "streamline_reconstruct_camera_motion", false);
+        g_config.streamline_force_camera_mvec = read_ini_bool(
+            "engine", "streamline_force_camera_mvec", false);
+        g_config.streamline_taau_bridge = read_ini_bool(
+            "engine", "streamline_taau_bridge", false);
+        g_config.ngx_trace = read_ini_bool("engine", "ngx_trace", false);
+        g_config.dlss_dlaa = read_ini_bool("engine", "dlss_dlaa", false);
+        g_config.world_marker_diagnostics = read_ini_bool(
+            "debug", "world_marker_diagnostics", false);
+        // [DEBUG 2/2] One binary supports normal and diagnostic runs; the
+        // launcher enables both file output and the detailed probes together.
+        g_config.logging_enabled = read_ini_bool(
+            "debug", "logging_enabled", false);
+        g_config.runtime_diagnostics = read_ini_bool("debug", "runtime_diagnostics", false);
+
+        const auto temporal_backend = read_ini_string(
+            "engine", "temporal_backend", "auto");
+        g_config.temporal_backend = parse_temporal_backend(
+            temporal_backend,
+            g_config.ngx_trace,
+            g_config.streamline_taau_bridge);
+
+        if (temporal_backend_is_dlss()) {
+            g_config.ngx_trace = true;
+            g_config.streamline_split_viewports = true;
+            g_config.streamline_taau_bridge = true;
+        } else {
+            g_config.ngx_trace = false;
+            g_config.streamline_split_viewports = false;
+            g_config.streamline_taau_bridge = false;
+            g_config.streamline_mvec_correction = false;
+            g_config.streamline_reconstruct_camera_motion = false;
+            g_config.streamline_force_camera_mvec = false;
+        }
+
+        log_line("Config openxr enabled=%d mode=%d resolution_scale=%.3f mono_shift=%d reverse enabled=%d periodic=%d unmap=%d cbv=%d active_nudge=%d nudge=%.3f start=%d cycle=%d pulse=%d orbit_probe=%d orbit_interval=%d orbit_max=%d copy_probe=%d copy_max=%d stereo_probe=%d geometry_shift=%d",
+            g_config.openxr_enabled,
+            g_config.openxr_mode,
+            g_config.resolution_scale,
+            g_config.openxr_mono_eye_shift_px,
+            g_config.reverse_enabled,
+            g_config.reverse_scan_periodic,
+            g_config.reverse_scan_unmap,
+            g_config.reverse_cbv_probe,
+            g_config.reverse_active_nudge,
+            g_config.reverse_nudge_amount,
+            g_config.reverse_nudge_start_frame,
+            g_config.reverse_nudge_cycle_frames,
+            g_config.reverse_nudge_pulse_frames,
+            g_config.reverse_orbit_probe,
+            g_config.reverse_orbit_frame_interval,
+            g_config.reverse_orbit_max_logs,
+            g_config.reverse_copy_probe,
+            g_config.reverse_copy_max_logs,
+            g_config.reverse_stereo_probe,
+            g_config.reverse_geometry_shift);
+        log_line("Config engine temporal_backend=%s dlss_dlaa=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_split_viewports=%d streamline_right_temporal_offset=%.4f streamline_temporal_eye=%d streamline_temporal_clip_correction=%.5f streamline_trace=%d streamline_trace_start_frame=%d streamline_mvec_probe=%d streamline_output_probe=%d streamline_mvec_correction=%d streamline_reconstruct_camera_motion=%d streamline_force_camera_mvec=%d",
+            temporal_backend_name(),
+            g_config.dlss_dlaa,
+            g_config.engine_view_probe, g_config.engine_frame_builder_probe,
+            g_config.engine_gameplay_entry_probe,
+            g_config.engine_scene_enqueue_probe,
+            g_config.engine_view_factory_probe,
+            g_config.engine_frame_factory_probe,
+            g_config.engine_dual_render_probe,
+            g_config.engine_native_stereo_offset,
+            g_config.engine_factory_stereo_offset,
+            g_config.streamline_force_reset,
+            g_config.streamline_split_viewports,
+            g_config.streamline_right_temporal_offset,
+            g_config.streamline_temporal_eye,
+            g_config.streamline_temporal_clip_correction,
+            g_config.streamline_trace,
+            g_config.streamline_trace_start_frame,
+            g_config.streamline_mvec_probe,
+            g_config.streamline_output_probe,
+            g_config.streamline_mvec_correction,
+            g_config.streamline_reconstruct_camera_motion,
+            g_config.streamline_force_camera_mvec);
+    });
+}
+
+bool reverse_enabled() {
+    return g_config.reverse_enabled;
+}
+
+const char* classify_matrix(const float* m) {
+    for (uint32_t i = 0; i < 16; ++i) {
+        if (!std::isfinite(m[i]) || fabsf(m[i]) > 100000.0f) {
+            return nullptr;
+        }
+    }
+
+    const bool identity_like =
+        fabsf(m[0] - 1.0f) < 0.001f && fabsf(m[5] - 1.0f) < 0.001f &&
+        fabsf(m[10] - 1.0f) < 0.001f && fabsf(m[15] - 1.0f) < 0.001f &&
+        fabsf(m[1]) < 0.001f && fabsf(m[2]) < 0.001f && fabsf(m[3]) < 0.001f &&
+        fabsf(m[4]) < 0.001f && fabsf(m[6]) < 0.001f && fabsf(m[7]) < 0.001f &&
+        fabsf(m[8]) < 0.001f && fabsf(m[9]) < 0.001f && fabsf(m[11]) < 0.001f &&
+        fabsf(m[12]) < 0.001f && fabsf(m[13]) < 0.001f && fabsf(m[14]) < 0.001f;
+    if (identity_like) {
+        return nullptr;
+    }
+
+    const auto abs_m0 = fabsf(m[0]);
+    const auto abs_m5 = fabsf(m[5]);
+    const auto abs_m10 = fabsf(m[10]);
+    const auto abs_m11 = fabsf(m[11]);
+    const auto abs_m15 = fabsf(m[15]);
+
+    const float row0_len = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+    const float row1_len = sqrtf(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+    const float row2_len = sqrtf(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
+    const bool viewport_translation =
+        fabsf(m[14]) < 0.02f &&
+        fabsf(m[12]) >= 64.0f && fabsf(m[12]) <= 8192.0f &&
+        fabsf(m[13]) >= 64.0f && fabsf(m[13]) <= 8192.0f;
+    const bool affine_view_like =
+        !viewport_translation &&
+        fabsf(m[15] - 1.0f) < 0.02f &&
+        fabsf(m[3]) < 0.02f && fabsf(m[7]) < 0.02f && fabsf(m[11]) < 0.02f &&
+        row0_len > 0.5f && row0_len < 1.5f &&
+        row1_len > 0.5f && row1_len < 1.5f &&
+        row2_len > 0.5f && row2_len < 1.5f &&
+        (fabsf(m[12]) > 0.1f || fabsf(m[13]) > 0.1f || fabsf(m[14]) > 0.1f);
+    if (affine_view_like) {
+        return "affine-view";
+    }
+
+    const bool projection_like =
+        abs_m0 > 0.1f && abs_m0 < 10.0f &&
+        abs_m5 > 0.1f && abs_m5 < 10.0f &&
+        abs_m10 > 0.001f && abs_m10 < 10.0f &&
+        fabsf(m[1]) < 0.02f && fabsf(m[4]) < 0.02f &&
+        fabsf(m[3]) < 0.02f && fabsf(m[7]) < 0.02f &&
+        fabsf(abs_m11 - 1.0f) < 0.02f &&
+        abs_m15 < 0.02f;
+    if (projection_like) {
+        return "projection";
+    }
+
+    const bool packed_basis_like =
+        fabsf(m[3]) < 0.02f &&
+        fabsf(m[7] - 1.0f) < 0.02f &&
+        row0_len > 0.5f && row0_len < 100.0f &&
+        row1_len > 0.5f && row1_len < 100.0f;
+    if (packed_basis_like) {
+        return "packed-basis";
+    }
+
+    return nullptr;
+}
+
+void log_matrix_candidate(
+    ID3D12Resource* resource,
+    size_t absolute_offset,
+    size_t cbv_offset,
+    size_t local_offset,
+    UINT root_index,
+    uint64_t draw_count,
+    UINT element_count,
+    UINT instance_count,
+    ID3D12PipelineState* pipeline_state,
+    const PipelineInfo& pipeline_info,
+    ID3D12RootSignature* active_root_signature,
+    const float* m,
+    const char* source,
+    const char* kind) {
+    if (g_matrix_log_count.fetch_add(1) >= static_cast<uint32_t>(g_config.reverse_max_matrix_logs)) {
+        return;
+    }
+
+    log_line("Reverse matrix candidate kind=%s source=%s draw=%llu elements=%u instances=%u root=%u pso=%p vs=0x%llX ps=0x%llX rs=%p pso_rs=%p prim=%u rt=%u resource=%p abs=0x%zX cbv=0x%zX local=0x%zX rows=[%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f]",
+        kind,
+        source,
+        static_cast<unsigned long long>(draw_count),
+        element_count,
+        instance_count,
+        root_index,
+        pipeline_state,
+        static_cast<unsigned long long>(pipeline_info.vs_hash),
+        static_cast<unsigned long long>(pipeline_info.ps_hash),
+        active_root_signature,
+        pipeline_info.root_signature,
+        static_cast<unsigned>(pipeline_info.primitive_type),
+        pipeline_info.render_target_count,
+        resource,
+        absolute_offset,
+        cbv_offset,
+        local_offset,
+        m[0], m[1], m[2], m[3],
+        m[4], m[5], m[6], m[7],
+        m[8], m[9], m[10], m[11],
+        m[12], m[13], m[14], m[15]);
+}
+
+template <typename T>
+T method(void* object, size_t index) {
+    auto vtable = *reinterpret_cast<void***>(object);
+    return reinterpret_cast<T>(vtable[index]);
+}
+
+uint64_t fnv1a64(const void* data, size_t size) {
+    constexpr uint64_t offset_basis = 14695981039346656037ull;
+    constexpr uint64_t prime = 1099511628211ull;
+    auto hash = offset_basis;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= prime;
+    }
+    return hash;
+}
+
+uint64_t hash_shader_bytecode(const D3D12_SHADER_BYTECODE& bytecode) {
+    if (bytecode.pShaderBytecode == nullptr || bytecode.BytecodeLength == 0) {
+        return 0;
+    }
+    return fnv1a64(bytecode.pShaderBytecode, bytecode.BytecodeLength);
+}
+
+void dump_shader_bytecode(const char* stage, uint64_t hash, const D3D12_SHADER_BYTECODE& bytecode) {
+    const bool taau_motion_writer =
+        hash == 0x9503CB0CCE8D37AFull || hash == 0x835BD7C8E1E8FD93ull;
+    if ((!g_config.reverse_stereo_probe && hash != kTaauResolveComputeHash &&
+            !taau_motion_writer) ||
+        stage == nullptr || hash == 0 ||
+        bytecode.pShaderBytecode == nullptr || bytecode.BytecodeLength == 0) {
+        return;
+    }
+
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        if (g_dumped_shader_hashes[hash]) {
+            return;
+        }
+        g_dumped_shader_hashes[hash] = true;
+    }
+
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+    auto* slash = strrchr(module_path, '\\');
+    if (slash == nullptr) {
+        return;
+    }
+    slash[1] = '\0';
+
+    char dump_dir[MAX_PATH]{};
+    sprintf_s(dump_dir, "%switcher3vr_shaders", module_path);
+    CreateDirectoryA(dump_dir, nullptr);
+
+    char dump_path[MAX_PATH]{};
+    sprintf_s(dump_path, "%s\\%s_%016llX.dxil", dump_dir, stage, static_cast<unsigned long long>(hash));
+    FILE* file{};
+    if (fopen_s(&file, dump_path, "wb") != 0 || file == nullptr) {
+        return;
+    }
+    const auto written = fwrite(bytecode.pShaderBytecode, 1, bytecode.BytecodeLength, file);
+    fclose(file);
+    log_line("Stereo dumped shader stage=%s hash=0x%llX bytes=%zu written=%zu path=%s",
+        stage,
+        static_cast<unsigned long long>(hash),
+        bytecode.BytecodeLength,
+        written,
+        dump_path);
+}
+
+void load_geometry_shift_shaders() {
+    std::call_once(g_geometry_shader_once, []() {
+        char module_path[MAX_PATH]{};
+        GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+        auto* slash = strrchr(module_path, '\\');
+        if (slash == nullptr) {
+            return;
+        }
+        slash[1] = '\0';
+
+        const auto load_one = [&](const char* name, std::vector<uint8_t>& output) {
+            char path[MAX_PATH]{};
+            sprintf_s(path, "%s%s", module_path, name);
+            FILE* file{};
+            if (fopen_s(&file, path, "rb") != 0 || file == nullptr) {
+                log_line("Stereo geometry shader missing path=%s", path);
+                return;
+            }
+            fseek(file, 0, SEEK_END);
+            const auto size = ftell(file);
+            fseek(file, 0, SEEK_SET);
+            if (size > 0) {
+                output.resize(static_cast<size_t>(size));
+                fread(output.data(), 1, output.size(), file);
+            }
+            fclose(file);
+            log_line("Stereo geometry shader loaded path=%s bytes=%zu", path, output.size());
+        };
+
+        load_one("stereo_shift_7tc.dxil", g_geometry_shift_7tc);
+        load_one("stereo_shift_6tc.dxil", g_geometry_shift_6tc);
+    });
+}
+
+bool initialize_dxc() {
+    std::call_once(g_dxc_once, []() {
+        g_dxcompiler = LoadLibraryA("dxcompiler.dll");
+        if (g_dxcompiler == nullptr) {
+            return;
+        }
+        const auto create_instance = reinterpret_cast<DxcCreateInstanceProc>(
+            GetProcAddress(g_dxcompiler, "DxcCreateInstance"));
+        if (create_instance == nullptr) {
+            return;
+        }
+        create_instance(CLSID_DxcUtils, IID_PPV_ARGS(&g_dxc_utils));
+        create_instance(CLSID_DxcCompiler, IID_PPV_ARGS(&g_dxc_compiler));
+        log_line("Stereo DXC initialized utils=%p compiler=%p", g_dxc_utils, g_dxc_compiler);
+    });
+    return g_dxc_utils != nullptr && g_dxc_compiler != nullptr;
+}
+
+IDxcBlob* compile_hud_composite_pixel_shader(
+    int source_shift_px, float hud_size) {
+    if (!initialize_dxc()) {
+        return nullptr;
+    }
+
+    char shader_source[4096]{};
+    if (fabsf(hud_size - 1.0f) <= 0.0001f) {
+        // Byte-for-byte source path used by the validated V400 behavior.
+        sprintf_s(shader_source, R"(
+Texture2D<float4> scene_texture : register(t0);
+Texture2D<float4> hud_texture : register(t1);
+SamplerState linear_sampler : register(s1);
+cbuffer CustomPixelConsts : register(b3) {
+    float4 custom_constants[25];
+};
+struct PixelInput {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+float4 ps_main(PixelInput input) : SV_Target0 {
+    int2 hud_coordinate = int2(input.position.xy - custom_constants[1].xy);
+    hud_coordinate.x += %d;
+    float4 hud = hud_texture.Load(int3(hud_coordinate, 0));
+    float4 scene = scene_texture.SampleLevel(linear_sampler, input.uv, 0.0);
+    float transfer_in = custom_constants[2].x * custom_constants[2].y;
+    float3 hud_linear = exp(log(hud.rgb) * transfer_in);
+    float3 scene_linear = exp(log(scene.rgb) * transfer_in);
+    float4 combined;
+    combined.rgb = scene_linear + (hud_linear - scene_linear) * hud.a;
+    combined.a = scene.a + (hud.a - scene.a) * hud.a;
+    return exp(log(combined) * custom_constants[2].z);
+}
+)", source_shift_px);
+    } else {
+        sprintf_s(shader_source, R"(
+Texture2D<float4> scene_texture : register(t0);
+Texture2D<float4> hud_texture : register(t1);
+SamplerState linear_sampler : register(s1);
+cbuffer CustomPixelConsts : register(b3) {
+    float4 custom_constants[25];
+};
+struct PixelInput {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+float4 ps_main(PixelInput input) : SV_Target0 {
+    uint hud_width, hud_height;
+    hud_texture.GetDimensions(hud_width, hud_height);
+    float2 hud_center = float2(hud_width, hud_height) * 0.5;
+    float2 hud_local = input.position.xy - custom_constants[1].xy;
+    int2 hud_coordinate = int2(
+        (hud_local - hud_center) / %.6f + hud_center);
+    hud_coordinate.x += %d;
+    float4 hud = hud_texture.Load(int3(hud_coordinate, 0));
+    float4 scene = scene_texture.SampleLevel(linear_sampler, input.uv, 0.0);
+    float transfer_in = custom_constants[2].x * custom_constants[2].y;
+    float3 hud_linear = exp(log(hud.rgb) * transfer_in);
+    float3 scene_linear = exp(log(scene.rgb) * transfer_in);
+    float4 combined;
+    combined.rgb = scene_linear + (hud_linear - scene_linear) * hud.a;
+    combined.a = scene.a + (hud.a - scene.a) * hud.a;
+    return exp(log(combined) * custom_constants[2].z);
+}
+)", std::max(hud_size, 0.01f), source_shift_px);
+    }
+
+    DxcBuffer source{shader_source, strlen(shader_source), DXC_CP_UTF8};
+    LPCWSTR arguments[] = {L"-E", L"ps_main", L"-T", L"ps_6_0", L"-O3"};
+    IDxcResult* result{};
+    if (FAILED(g_dxc_compiler->Compile(
+            &source, arguments, static_cast<UINT32>(std::size(arguments)),
+            nullptr, IID_PPV_ARGS(&result))) || result == nullptr) {
+        return nullptr;
+    }
+    HRESULT status{};
+    result->GetStatus(&status);
+    if (FAILED(status)) {
+        IDxcBlobUtf8* errors{};
+        result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        log_line("HUD composite shader compile failed shift=%d size=%.3f: %s",
+            source_shift_px, hud_size,
+            errors != nullptr ? errors->GetStringPointer() : "unknown");
+        if (errors != nullptr) errors->Release();
+        result->Release();
+        return nullptr;
+    }
+    IDxcBlob* shader{};
+    if (FAILED(result->GetOutput(
+            DXC_OUT_OBJECT, IID_PPV_ARGS(&shader), nullptr))) {
+        shader = nullptr;
+    }
+    result->Release();
+    return shader;
+}
+
+const char* signature_component_type(D3D_REGISTER_COMPONENT_TYPE type) {
+    switch (type) {
+    case D3D_REGISTER_COMPONENT_UINT32: return "uint";
+    case D3D_REGISTER_COMPONENT_SINT32: return "int";
+    default: return "float";
+    }
+}
+
+void STDMETHODCALLTYPE hook_create_srv(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor) {
+    g_create_srv(device, resource, desc, dest_descriptor);
+    if (!reverse_enabled() || resource == nullptr || dest_descriptor.ptr == 0) {
+        return;
+    }
+    const auto resource_desc = resource->GetDesc();
+    const bool taau_motion_candidate = desc != nullptr &&
+        desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+        desc->Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        resource_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        (resource_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+    const bool taau_depth_candidate = desc != nullptr &&
+        desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+        resource_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        ((desc->Format == DXGI_FORMAT_R32_FLOAT &&
+             resource_desc.Format == DXGI_FORMAT_R32_TYPELESS) ||
+            (desc->Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS &&
+             resource_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)) &&
+        (resource_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+    const bool taau_bootstrap_candidate = taau_motion_candidate || taau_depth_candidate;
+    if (!taau_bootstrap_candidate && !g_config.runtime_diagnostics &&
+        !streamline_post_dlss_descriptor_probe_active() &&
+        !g_compute_probe_active.load(std::memory_order_relaxed)) {
+        return;
+    }
+    ResourceDescriptorInfo info{};
+    info.resource = resource;
+    info.format = desc != nullptr ? desc->Format : resource_desc.Format;
+    info.srv_dimension = desc != nullptr ? desc->ViewDimension : D3D12_SRV_DIMENSION_UNKNOWN;
+    if (desc != nullptr && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+        info.most_detailed_mip = desc->Texture2D.MostDetailedMip;
+        info.mip_levels = desc->Texture2D.MipLevels;
+    } else if (desc != nullptr && desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY) {
+        info.most_detailed_mip = desc->Texture2DArray.MostDetailedMip;
+        info.mip_levels = desc->Texture2DArray.MipLevels;
+        info.first_array_slice = desc->Texture2DArray.FirstArraySlice;
+        info.array_size = desc->Texture2DArray.ArraySize;
+    }
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_resource_descriptors[dest_descriptor.ptr] = info;
+    }
+    if (taau_bootstrap_candidate) {
+        const uint32_t candidate_bit = taau_motion_candidate ? 1u : 2u;
+        const uint32_t previous_mask =
+            g_taau_descriptor_candidate_mask.fetch_or(candidate_bit);
+        if ((previous_mask & candidate_bit) == 0) {
+            log_line("TAAU bootstrap candidate type=%s cpu=0x%zX resource=%p size=%llux%u view_format=%u resource_format=%u",
+                taau_motion_candidate ? "motion" : "depth", dest_descriptor.ptr,
+                resource, static_cast<unsigned long long>(resource_desc.Width),
+                resource_desc.Height, static_cast<unsigned>(desc->Format),
+                static_cast<unsigned>(resource_desc.Format));
+        }
+        g_taau_descriptor_bootstrap_active.store(true, std::memory_order_relaxed);
+        g_taau_descriptor_bootstrap_until_present.store(
+            g_present_count.load(std::memory_order_relaxed) + 600,
+            std::memory_order_relaxed);
+    }
+}
+
+void STDMETHODCALLTYPE hook_create_rtv(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor) {
+    g_create_rtv(device, resource, desc, dest_descriptor);
+    if (!reverse_enabled() ||
+        (!taau_runtime_tracking_active() &&
+            !streamline_post_dlss_descriptor_probe_active()) ||
+        resource == nullptr || dest_descriptor.ptr == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_reverse_mutex};
+    g_rtv_descriptors[dest_descriptor.ptr] = resource;
+}
+
+void STDMETHODCALLTYPE hook_create_dsv(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor) {
+    g_create_dsv(device, resource, desc, dest_descriptor);
+    if (!reverse_enabled() || resource == nullptr || dest_descriptor.ptr == 0) {
+        return;
+    }
+    const auto resource_desc = resource->GetDesc();
+    if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        resource_desc.Format != DXGI_FORMAT_R32_TYPELESS ||
+        (resource_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_reverse_mutex};
+    g_dsv_descriptors[dest_descriptor.ptr] = resource;
+}
+
+void STDMETHODCALLTYPE hook_create_uav(
+    ID3D12Device* device,
+    ID3D12Resource* resource,
+    ID3D12Resource* counter_resource,
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor) {
+    g_create_uav(device, resource, counter_resource, desc, dest_descriptor);
+    if (!reverse_enabled() ||
+        (!taau_runtime_tracking_active() &&
+            !streamline_post_dlss_descriptor_probe_active()) ||
+        resource == nullptr || dest_descriptor.ptr == 0) {
+        return;
+    }
+    const auto resource_desc = resource->GetDesc();
+    ResourceDescriptorInfo info{};
+    info.resource = resource;
+    info.format = desc != nullptr ? desc->Format : resource_desc.Format;
+    info.uav = true;
+    std::scoped_lock lock{g_reverse_mutex};
+    g_resource_descriptors[dest_descriptor.ptr] = info;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_root_signature(
+    ID3D12Device* device,
+    UINT node_mask,
+    const void* blob_with_root_signature,
+    SIZE_T blob_length_in_bytes,
+    REFIID riid,
+    void** root_signature) {
+    const auto hr = g_create_root_signature(device, node_mask, blob_with_root_signature,
+        blob_length_in_bytes, riid, root_signature);
+    if (!reverse_enabled() || FAILED(hr) || root_signature == nullptr || *root_signature == nullptr ||
+        blob_with_root_signature == nullptr || blob_length_in_bytes == 0) {
+        return hr;
+    }
+
+    ID3D12VersionedRootSignatureDeserializer* deserializer{};
+    if (FAILED(D3D12CreateVersionedRootSignatureDeserializer(
+            blob_with_root_signature, blob_length_in_bytes,
+            IID_PPV_ARGS(&deserializer))) || deserializer == nullptr) {
+        return hr;
+    }
+
+    RootSignatureInfo info{};
+    const auto* desc = deserializer->GetUnconvertedRootSignatureDesc();
+    if (desc != nullptr && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+        info.parameters.reserve(desc->Desc_1_0.NumParameters);
+        for (UINT index = 0; index < desc->Desc_1_0.NumParameters; ++index) {
+            const auto& source = desc->Desc_1_0.pParameters[index];
+            RootParameterInfo parameter{};
+            parameter.type = source.ParameterType;
+            parameter.visibility = source.ShaderVisibility;
+            if (source.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                parameter.ranges.reserve(source.DescriptorTable.NumDescriptorRanges);
+                for (UINT range_index = 0; range_index < source.DescriptorTable.NumDescriptorRanges; ++range_index) {
+                    const auto& range = source.DescriptorTable.pDescriptorRanges[range_index];
+                    parameter.ranges.push_back(RootDescriptorRangeInfo{
+                        range.RangeType, range.NumDescriptors, range.BaseShaderRegister,
+                        range.RegisterSpace, range.OffsetInDescriptorsFromTableStart});
+                }
+            }
+            info.parameters.push_back(std::move(parameter));
+        }
+    } else if (desc != nullptr && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+        info.parameters.reserve(desc->Desc_1_1.NumParameters);
+        for (UINT index = 0; index < desc->Desc_1_1.NumParameters; ++index) {
+            const auto& source = desc->Desc_1_1.pParameters[index];
+            RootParameterInfo parameter{};
+            parameter.type = source.ParameterType;
+            parameter.visibility = source.ShaderVisibility;
+            if (source.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                parameter.ranges.reserve(source.DescriptorTable.NumDescriptorRanges);
+                for (UINT range_index = 0; range_index < source.DescriptorTable.NumDescriptorRanges; ++range_index) {
+                    const auto& range = source.DescriptorTable.pDescriptorRanges[range_index];
+                    parameter.ranges.push_back(RootDescriptorRangeInfo{
+                        range.RangeType, range.NumDescriptors, range.BaseShaderRegister,
+                        range.RegisterSpace, range.OffsetInDescriptorsFromTableStart});
+                }
+            }
+            info.parameters.push_back(std::move(parameter));
+        }
+    }
+    deserializer->Release();
+
+    if (!info.parameters.empty()) {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_root_signature_infos[static_cast<ID3D12RootSignature*>(*root_signature)] = std::move(info);
+    }
+    return hr;
+}
+
+UINT signature_component_count(BYTE mask) {
+    if ((mask & 0x8) != 0) return 4;
+    if ((mask & 0x4) != 0) return 3;
+    if ((mask & 0x2) != 0) return 2;
+    return 1;
+}
+
+bool generate_geometry_shift_shader(
+    const D3D12_SHADER_BYTECODE& vertex_shader,
+    std::vector<uint8_t>& shader_out,
+    uint64_t& signature_hash_out,
+    UINT& output_count_out) {
+    if (!initialize_dxc() || vertex_shader.pShaderBytecode == nullptr || vertex_shader.BytecodeLength == 0) {
+        return false;
+    }
+
+    DxcBuffer reflection_buffer{};
+    reflection_buffer.Ptr = vertex_shader.pShaderBytecode;
+    reflection_buffer.Size = vertex_shader.BytecodeLength;
+    reflection_buffer.Encoding = 0;
+    ID3D12ShaderReflection* reflection{};
+    if (FAILED(g_dxc_utils->CreateReflection(
+            &reflection_buffer,
+            IID_PPV_ARGS(&reflection))) || reflection == nullptr) {
+        return false;
+    }
+
+    D3D12_SHADER_DESC shader_desc{};
+    if (FAILED(reflection->GetDesc(&shader_desc)) ||
+        shader_desc.InputParameters < 1 || shader_desc.OutputParameters < 2) {
+        reflection->Release();
+        return false;
+    }
+    output_count_out = shader_desc.OutputParameters;
+
+    std::string source = "struct VertexData {\n";
+    std::string signature_key{};
+    int position_field = -1;
+    for (UINT index = 0; index < shader_desc.OutputParameters; ++index) {
+        D3D12_SIGNATURE_PARAMETER_DESC parameter{};
+        if (FAILED(reflection->GetOutputParameterDesc(index, &parameter)) ||
+            parameter.SemanticName == nullptr || parameter.Stream != 0) {
+            reflection->Release();
+            return false;
+        }
+
+        const auto components = signature_component_count(parameter.Mask);
+        source += "    ";
+        source += signature_component_type(parameter.ComponentType);
+        if (components > 1) {
+            source += std::to_string(components);
+        }
+        source += " value" + std::to_string(index) + " : ";
+        source += parameter.SemanticName;
+        source += std::to_string(parameter.SemanticIndex);
+        source += ";\n";
+
+        signature_key += parameter.SemanticName;
+        signature_key += std::to_string(parameter.SemanticIndex);
+        signature_key += ":" + std::to_string(parameter.Mask);
+        signature_key += ":" + std::to_string(parameter.ComponentType) + ";";
+        if (parameter.SystemValueType == D3D_NAME_POSITION) {
+            position_field = static_cast<int>(index);
+        }
+    }
+    reflection->Release();
+
+    if (position_field < 0) {
+        return false;
+    }
+
+    signature_hash_out = fnv1a64(signature_key.data(), signature_key.size());
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto cached = g_generated_geometry_shaders.find(signature_hash_out);
+        if (cached != g_generated_geometry_shaders.end()) {
+            shader_out = cached->second;
+            return true;
+        }
+    }
+
+    source += "};\n[maxvertexcount(3)]\n";
+    source += "void main(triangle VertexData input[3], inout TriangleStream<VertexData> output) {\n";
+    source += "    [unroll] for (uint index = 0; index < 3; ++index) {\n";
+    source += "        VertexData vertex = input[index];\n";
+    source += "        vertex.value" + std::to_string(position_field) + ".x += 0.035;\n";
+    source += "        output.Append(vertex);\n    }\n}\n";
+
+    DxcBuffer source_buffer{};
+    source_buffer.Ptr = source.data();
+    source_buffer.Size = source.size();
+    source_buffer.Encoding = DXC_CP_UTF8;
+    LPCWSTR arguments[] = {L"-E", L"main", L"-T", L"gs_6_0", L"-O3"};
+    IDxcResult* result{};
+    if (FAILED(g_dxc_compiler->Compile(
+            &source_buffer,
+            arguments,
+            static_cast<UINT32>(std::size(arguments)),
+            nullptr,
+            IID_PPV_ARGS(&result))) || result == nullptr) {
+        return false;
+    }
+
+    HRESULT compile_status{};
+    result->GetStatus(&compile_status);
+    if (FAILED(compile_status)) {
+        IDxcBlobUtf8* errors{};
+        result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        log_line("Stereo generated GS compile failed signature=0x%llX error=%s",
+            static_cast<unsigned long long>(signature_hash_out),
+            errors != nullptr && errors->GetStringPointer() != nullptr ? errors->GetStringPointer() : "unknown");
+        if (errors != nullptr) errors->Release();
+        result->Release();
+        return false;
+    }
+
+    IDxcBlob* object{};
+    if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr)) || object == nullptr) {
+        result->Release();
+        return false;
+    }
+    shader_out.resize(object->GetBufferSize());
+    memcpy(shader_out.data(), object->GetBufferPointer(), shader_out.size());
+    object->Release();
+    result->Release();
+
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_generated_geometry_shaders[signature_hash_out] = shader_out;
+    }
+    log_line("Stereo generated GS signature=0x%llX outputs=%u bytes=%zu",
+        static_cast<unsigned long long>(signature_hash_out),
+        shader_desc.OutputParameters,
+        shader_out.size());
+    return true;
+}
+
+PipelineInfo lookup_pipeline_info(ID3D12PipelineState* pipeline_state) {
+    std::scoped_lock lock{g_reverse_mutex};
+    auto it = g_pipeline_infos.find(pipeline_state);
+    if (it == g_pipeline_infos.end()) {
+        return {};
+    }
+    return it->second;
+}
+
+void scan_buffer_for_matrices(
+    ID3D12Resource* resource,
+    const void* data,
+    size_t size,
+    const char* source,
+    size_t cbv_offset,
+    UINT root_index,
+    uint64_t draw_count,
+    UINT element_count,
+    UINT instance_count,
+    ID3D12PipelineState* pipeline_state,
+    const PipelineInfo& pipeline_info,
+    ID3D12RootSignature* active_root_signature) {
+    if (data == nullptr || size < sizeof(float) * 16 || !reverse_enabled()) {
+        return;
+    }
+
+    const auto max_scan = static_cast<size_t>(std::min<uint64_t>(size, static_cast<uint64_t>(g_config.reverse_max_scan_bytes)));
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t offset = 0; offset + sizeof(float) * 16 <= max_scan; offset += 16) {
+        const auto* m = reinterpret_cast<const float*>(bytes + offset);
+        const auto* kind = classify_matrix(m);
+        if (kind != nullptr) {
+            if (strstr(source, "draw") != nullptr && strcmp(kind, "affine-view") != 0) {
+                continue;
+            }
+            log_matrix_candidate(
+                resource,
+                cbv_offset + offset,
+                cbv_offset,
+                offset,
+                root_index,
+                draw_count,
+                element_count,
+                instance_count,
+                pipeline_state,
+                pipeline_info,
+                active_root_signature,
+                m,
+                source,
+                kind);
+        }
+    }
+}
+
+bool resolve_gpu_va(D3D12_GPU_VIRTUAL_ADDRESS gpu_va, ResourceInfo& out, size_t& offset, ID3D12Resource*& resource_out) {
+    std::scoped_lock lock{g_reverse_mutex};
+    for (const auto& [resource, info] : g_resource_infos) {
+        if (info.gpu_va == 0 || info.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || info.mapped == nullptr) {
+            continue;
+        }
+
+        const auto begin = info.gpu_va;
+        const auto end = begin + info.desc.Width;
+        if (gpu_va >= begin && gpu_va < end) {
+            out = info;
+            offset = static_cast<size_t>(gpu_va - begin);
+            resource_out = resource;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool guarded_memcpy(void* destination, const void* source, size_t size) {
+    SIZE_T bytes_read{};
+    return ReadProcessMemory(
+               GetCurrentProcess(), source, destination, size, &bytes_read) != FALSE &&
+        bytes_read == size;
+}
+
+bool copy_gpu_va_bytes(D3D12_GPU_VIRTUAL_ADDRESS gpu_va, void* destination, size_t size) {
+    if (gpu_va == 0 || destination == nullptr || size == 0) {
+        return false;
+    }
+
+    g_taau_cb_snapshots_in_progress.fetch_add(1, std::memory_order_acq_rel);
+    bool copied{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        for (const auto& [resource, info] : g_resource_infos) {
+            if (info.gpu_va == 0 || info.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+                info.mapped == nullptr || gpu_va < info.gpu_va) {
+                continue;
+            }
+
+            const auto offset = static_cast<uint64_t>(gpu_va - info.gpu_va);
+            if (offset > info.desc.Width || size > info.desc.Width - offset ||
+                offset > info.mapped_size || size > info.mapped_size - static_cast<size_t>(offset)) {
+                continue;
+            }
+
+            const auto* source = static_cast<const uint8_t*>(info.mapped) + offset;
+            if (guarded_memcpy(destination, source, size)) {
+                copied = true;
+                break;
+            }
+
+            // A released resource can leave a stale mapping record. Keep searching:
+            // a newer allocation may legitimately reuse the same GPU virtual address.
+        }
+    }
+    g_taau_cb_snapshots_in_progress.fetch_sub(1, std::memory_order_acq_rel);
+    return copied;
+}
+
+void scan_cbv_gpu_va(
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+    const char* source,
+    UINT root_index,
+    uint64_t draw_count,
+    UINT element_count,
+    UINT instance_count,
+    ID3D12PipelineState* pipeline_state,
+    const PipelineInfo& pipeline_info,
+    ID3D12RootSignature* active_root_signature) {
+    if (!reverse_enabled() || !g_config.reverse_cbv_probe || gpu_va == 0) {
+        return;
+    }
+
+    ResourceInfo info{};
+    ID3D12Resource* resource{};
+    size_t offset{};
+    if (!resolve_gpu_va(gpu_va, info, offset, resource)) {
+        return;
+    }
+
+    const auto remaining = info.mapped_size > offset ? info.mapped_size - offset : 0;
+    const auto scan_size = std::min<size_t>(remaining, static_cast<size_t>(g_config.reverse_max_scan_bytes));
+    if (scan_size < sizeof(float) * 16) {
+        return;
+    }
+
+    static std::atomic<uint32_t> cbv_hit_logs{};
+    if (cbv_hit_logs.fetch_add(1) < 40) {
+        log_line("Reverse CBV sample source=%s draw=%llu root=%u pso=%p vs=0x%llX ps=0x%llX rs=%p gpuva=0x%llX resource=%p offset=0x%zX scan=%zu",
+            source,
+            static_cast<unsigned long long>(draw_count),
+            root_index,
+            pipeline_state,
+            static_cast<unsigned long long>(pipeline_info.vs_hash),
+            static_cast<unsigned long long>(pipeline_info.ps_hash),
+            active_root_signature,
+            static_cast<unsigned long long>(gpu_va),
+            resource,
+            offset,
+            scan_size);
+    }
+
+    scan_buffer_for_matrices(
+        resource,
+        static_cast<uint8_t*>(info.mapped) + offset,
+        scan_size,
+        source,
+        offset,
+        root_index,
+        draw_count,
+        element_count,
+        instance_count,
+        pipeline_state,
+        pipeline_info,
+        active_root_signature);
+}
+
+DWORD WINAPI nudge_beep_thread(LPVOID param) {
+    const auto slot = reinterpret_cast<uintptr_t>(param);
+    const DWORD frequency = 450 + static_cast<DWORD>(slot) * 250;
+    Beep(frequency, 140);
+    return 0;
+}
+
+void signal_nudge_slot(uint64_t cycle, uint32_t slot) {
+    auto expected = UINT64_MAX;
+    if (!g_active_nudge_signaled_cycle.compare_exchange_strong(expected, cycle)) {
+        expected = g_active_nudge_signaled_cycle.load();
+        if (expected == cycle || !g_active_nudge_signaled_cycle.compare_exchange_strong(expected, cycle)) {
+            return;
+        }
+    }
+
+    log_line("Reverse active nudge slot=%u cycle=%llu freq=%u",
+        slot,
+        static_cast<unsigned long long>(cycle),
+        450u + slot * 250u);
+
+    HANDLE thread = CreateThread(
+        nullptr,
+        0,
+        nudge_beep_thread,
+        reinterpret_cast<LPVOID>(static_cast<uintptr_t>(slot)),
+        0,
+        nullptr);
+    if (thread != nullptr) {
+        CloseHandle(thread);
+    }
+}
+
+struct ActiveNudgeTarget {
+    UINT root{};
+    size_t local_offset{};
+    uint32_t component{};
+    uint32_t slot{};
+    uint64_t vs_hash{};
+    uint64_t ps_hash{};
+};
+
+bool active_nudge_target(ActiveNudgeTarget& target, const PipelineInfo& pipeline_info) {
+    const auto frame = g_present_count.load();
+    const auto start_frame = static_cast<uint64_t>(g_config.reverse_nudge_start_frame);
+    if (frame < start_frame) {
+        return false;
+    }
+
+    const auto cycle_frames = static_cast<uint64_t>(g_config.reverse_nudge_cycle_frames);
+    const auto pulse_frames = static_cast<uint64_t>(g_config.reverse_nudge_pulse_frames);
+    const auto relative_frame = frame - start_frame;
+    const auto cycle = relative_frame / cycle_frames;
+    const auto phase = relative_frame % cycle_frames;
+    if (phase >= pulse_frames) {
+        return false;
+    }
+
+    static constexpr ActiveNudgeTarget targets[] = {
+        {10, 0x10, 12, 0, 0xEDFD76797EB58077ull, 0xBB5967B70E8594BFull},
+        {10, 0x90, 12, 1, 0xEDFD76797EB58077ull, 0xBB5967B70E8594BFull},
+        {13, 0x10, 12, 2, 0xA6D5EB4C9688AB1Bull, 0xA04F949CEF867EA0ull},
+        {13, 0x90, 12, 3, 0xA6D5EB4C9688AB1Bull, 0xA04F949CEF867EA0ull},
+    };
+
+    target = targets[cycle % std::size(targets)];
+    if (pipeline_info.vs_hash != target.vs_hash || pipeline_info.ps_hash != target.ps_hash) {
+        return false;
+    }
+
+    signal_nudge_slot(cycle, target.slot);
+    return true;
+}
+
+bool active_nudge_pipeline_candidate(const PipelineInfo& pipeline_info) {
+    return
+        (pipeline_info.vs_hash == 0xEDFD76797EB58077ull && pipeline_info.ps_hash == 0xBB5967B70E8594BFull) ||
+        (pipeline_info.vs_hash == 0xA6D5EB4C9688AB1Bull && pipeline_info.ps_hash == 0xA04F949CEF867EA0ull);
+}
+
+struct OrbitProbeTarget {
+    UINT root{};
+    size_t local_offset{};
+    uint32_t slot{};
+    uint64_t vs_hash{};
+    uint64_t ps_hash{};
+};
+
+static constexpr OrbitProbeTarget k_orbit_probe_targets[] = {
+    {10, 0x10, 0, 0xEDFD76797EB58077ull, 0xBB5967B70E8594BFull},
+    {10, 0x90, 1, 0xEDFD76797EB58077ull, 0xBB5967B70E8594BFull},
+    {13, 0x10, 2, 0xA6D5EB4C9688AB1Bull, 0xA04F949CEF867EA0ull},
+    {13, 0x90, 3, 0xA6D5EB4C9688AB1Bull, 0xA04F949CEF867EA0ull},
+    {10, 0x240, 4, 0x5E2E73E55B072A74ull, 0x7FC495F2BB36CAC0ull},
+    {10, 0x280, 5, 0x5E2E73E55B072A74ull, 0x7FC495F2BB36CAC0ull},
+    {10, 0x2C0, 6, 0x5E2E73E55B072A74ull, 0x7FC495F2BB36CAC0ull},
+    {13, 0x10, 7, 0x5E2E73E55B072A74ull, 0x7FC495F2BB36CAC0ull},
+    {13, 0x90, 8, 0x5E2E73E55B072A74ull, 0x7FC495F2BB36CAC0ull},
+};
+
+bool orbit_probe_pipeline_candidate(const PipelineInfo& pipeline_info) {
+    for (const auto& target : k_orbit_probe_targets) {
+        if (pipeline_info.vs_hash == target.vs_hash && pipeline_info.ps_hash == target.ps_hash) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void maybe_log_orbit_matrix(
+    ID3D12Resource* resource,
+    uint8_t* mapped,
+    size_t cbv_offset,
+    size_t mapped_size,
+    UINT root_index,
+    uint64_t draw_count,
+    UINT element_count,
+    UINT instance_count,
+    const PipelineInfo& pipeline_info) {
+    if (!g_config.reverse_orbit_probe || mapped == nullptr) {
+        return;
+    }
+
+    const auto frame = g_present_count.load();
+    if (frame == 0 || frame % static_cast<uint64_t>(g_config.reverse_orbit_frame_interval) != 0) {
+        return;
+    }
+
+    for (const auto& target : k_orbit_probe_targets) {
+        if (target.root != root_index ||
+            target.vs_hash != pipeline_info.vs_hash ||
+            target.ps_hash != pipeline_info.ps_hash) {
+            continue;
+        }
+
+        if (target.slot >= g_orbit_probe_slot_frames.size()) {
+            continue;
+        }
+
+        auto last_frame = g_orbit_probe_slot_frames[target.slot].load();
+        if (last_frame == frame ||
+            !g_orbit_probe_slot_frames[target.slot].compare_exchange_strong(last_frame, frame)) {
+            continue;
+        }
+
+        const auto absolute_offset = cbv_offset + target.local_offset;
+        if (absolute_offset + sizeof(float) * 16 > mapped_size) {
+            continue;
+        }
+
+        const auto* m = reinterpret_cast<const float*>(mapped + absolute_offset);
+        const auto* kind = classify_matrix(m);
+        if (kind == nullptr || strcmp(kind, "affine-view") != 0) {
+            continue;
+        }
+
+        if (g_orbit_probe_log_count.fetch_add(1) >= static_cast<uint32_t>(g_config.reverse_orbit_max_logs)) {
+            return;
+        }
+
+        log_line("Reverse orbit sample frame=%llu draw=%llu slot=%u root=%u local=0x%zX elements=%u instances=%u vs=0x%llX ps=0x%llX rt=%u resource=%p cbv=0x%zX abs=0x%zX rows=[%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f]",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(draw_count),
+            target.slot,
+            root_index,
+            target.local_offset,
+            element_count,
+            instance_count,
+            static_cast<unsigned long long>(pipeline_info.vs_hash),
+            static_cast<unsigned long long>(pipeline_info.ps_hash),
+            pipeline_info.render_target_count,
+            resource,
+            cbv_offset,
+            absolute_offset,
+            m[0], m[1], m[2], m[3],
+            m[4], m[5], m[6], m[7],
+            m[8], m[9], m[10], m[11],
+            m[12], m[13], m[14], m[15]);
+    }
+}
+
+void orbit_probe_cbv_gpu_va(
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+    UINT root_index,
+    uint64_t draw_count,
+    UINT element_count,
+    UINT instance_count,
+    const PipelineInfo& pipeline_info) {
+    if (!reverse_enabled() || !g_config.reverse_orbit_probe || gpu_va == 0) {
+        return;
+    }
+
+    ResourceInfo info{};
+    ID3D12Resource* resource{};
+    size_t cbv_offset{};
+    if (!resolve_gpu_va(gpu_va, info, cbv_offset, resource) || info.mapped == nullptr) {
+        return;
+    }
+
+    maybe_log_orbit_matrix(
+        resource,
+        static_cast<uint8_t*>(info.mapped),
+        cbv_offset,
+        info.mapped_size,
+        root_index,
+        draw_count,
+        element_count,
+        instance_count,
+        pipeline_info);
+}
+
+void watch_camera_cbv_gpu_va(
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+    size_t size,
+    UINT root,
+    const PipelineInfo& pipeline_info) {
+    if (!g_config.reverse_copy_probe || gpu_va == 0) {
+        return;
+    }
+
+    ResourceInfo info{};
+    ID3D12Resource* resource{};
+    size_t offset{};
+    if (!resolve_gpu_va(gpu_va, info, offset, resource) || resource == nullptr) {
+        return;
+    }
+
+    const auto end = std::min(info.mapped_size, offset + std::max<size_t>(size, sizeof(float) * 16));
+    const auto frame = g_present_count.load();
+    std::scoped_lock lock{g_reverse_mutex};
+    for (auto& watch : g_camera_cbv_watches) {
+        if (watch.resource == resource && watch.begin == offset && watch.root == root &&
+            watch.vs_hash == pipeline_info.vs_hash && watch.ps_hash == pipeline_info.ps_hash) {
+            watch.end = end;
+            watch.frame = frame;
+            return;
+        }
+    }
+    g_camera_cbv_watches.push_back(CameraCbvWatch{
+        resource, offset, end, frame, root, pipeline_info.vs_hash, pipeline_info.ps_hash});
+}
+
+void maybe_nudge_affine_matrix(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* resource,
+    uint8_t* mapped,
+    size_t cbv_offset,
+    size_t mapped_size,
+    size_t local_offset,
+    UINT root_index,
+    uint64_t draw_count,
+    const PipelineInfo& pipeline_info) {
+    if (!g_config.reverse_active_nudge || mapped == nullptr) {
+        return;
+    }
+
+    ActiveNudgeTarget target{};
+    if (!active_nudge_target(target, pipeline_info) || root_index != target.root || local_offset != target.local_offset) {
+        return;
+    }
+
+    const auto absolute_offset = cbv_offset + local_offset;
+    if (absolute_offset + sizeof(float) * 16 > mapped_size) {
+        return;
+    }
+
+    auto* m = reinterpret_cast<float*>(mapped + absolute_offset);
+    const auto* kind = classify_matrix(m);
+    if (kind == nullptr || strcmp(kind, "affine-view") != 0) {
+        return;
+    }
+
+    if (fabsf(m[12]) < 1.0f || fabsf(m[12]) > 1000.0f ||
+        fabsf(m[13]) < 1.0f || fabsf(m[13]) > 1000.0f ||
+        fabsf(m[14]) < 1.0f || fabsf(m[14]) > 1000.0f) {
+        return;
+    }
+
+    std::scoped_lock lock{g_reverse_mutex};
+    g_pending_execute_nudges[command_list] = PendingExecuteNudge{
+        resource,
+        mapped,
+        absolute_offset,
+        mapped_size,
+        root_index,
+        target.component,
+        target.slot,
+        draw_count,
+        g_present_count.load()};
+}
+
+void nudge_cbv_gpu_va(
+    ID3D12GraphicsCommandList* command_list,
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+    UINT root_index,
+    uint64_t draw_count,
+    const PipelineInfo& pipeline_info) {
+    if (!reverse_enabled() || !g_config.reverse_active_nudge || gpu_va == 0) {
+        return;
+    }
+
+    ResourceInfo info{};
+    ID3D12Resource* resource{};
+    size_t cbv_offset{};
+    if (!resolve_gpu_va(gpu_va, info, cbv_offset, resource) || info.mapped == nullptr) {
+        return;
+    }
+
+    static constexpr size_t candidate_offsets[] = {
+        0x10,
+        0x90,
+    };
+
+    for (const auto local_offset : candidate_offsets) {
+        maybe_nudge_affine_matrix(
+            command_list,
+            resource,
+            static_cast<uint8_t*>(info.mapped),
+            cbv_offset,
+            info.mapped_size,
+            local_offset,
+            root_index,
+            draw_count,
+            pipeline_info);
+    }
+}
+
+bool resolve_descriptor_table_cbv(
+    const CommandListInfo& command_list_info,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    CbvDescriptorInfo& cbv_out,
+    SIZE_T& cpu_handle_out,
+    UINT descriptor_offset = 0) {
+    if (table.ptr == 0 || command_list_info.cbv_srv_uav_heap == nullptr) {
+        return false;
+    }
+
+    auto heap_it = g_descriptor_heap_infos.find(command_list_info.cbv_srv_uav_heap);
+    if (heap_it == g_descriptor_heap_infos.end()) {
+        return false;
+    }
+
+    const auto& heap = heap_it->second;
+    if (heap.type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || !heap.shader_visible || heap.increment == 0 || heap.gpu_start.ptr == 0) {
+        return false;
+    }
+
+    const auto heap_begin = heap.gpu_start.ptr;
+    const auto heap_size = static_cast<SIZE_T>(heap.num_descriptors) * static_cast<SIZE_T>(heap.increment);
+    const auto heap_end = heap_begin + heap_size;
+    if (table.ptr < heap_begin || table.ptr >= heap_end) {
+        return false;
+    }
+
+    const auto byte_offset = table.ptr - heap_begin;
+    const auto index = byte_offset / heap.increment + descriptor_offset;
+    const auto cpu_handle = heap.cpu_start.ptr + index * static_cast<SIZE_T>(heap.increment);
+    if (!load_cbv_descriptor(cpu_handle, cbv_out)) {
+        return false;
+    }
+
+    cpu_handle_out = cpu_handle;
+    return true;
+}
+
+bool resolve_descriptor_table_resource(
+    const CommandListInfo& command_list_info,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_offset,
+    ResourceDescriptorInfo& descriptor_out,
+    SIZE_T& cpu_handle_out) {
+    if (table.ptr == 0 || command_list_info.cbv_srv_uav_heap == nullptr) {
+        return false;
+    }
+    const auto heap_it = g_descriptor_heap_infos.find(command_list_info.cbv_srv_uav_heap);
+    if (heap_it == g_descriptor_heap_infos.end()) {
+        return false;
+    }
+    const auto& heap = heap_it->second;
+    if (!heap.shader_visible || heap.increment == 0 || table.ptr < heap.gpu_start.ptr) {
+        return false;
+    }
+    const SIZE_T base_index = (table.ptr - heap.gpu_start.ptr) / heap.increment;
+    const SIZE_T descriptor_index = base_index + descriptor_offset;
+    if (descriptor_index >= heap.num_descriptors) {
+        return false;
+    }
+    const SIZE_T cpu_handle = heap.cpu_start.ptr + descriptor_index * heap.increment;
+    const auto descriptor_it = g_resource_descriptors.find(cpu_handle);
+    if (descriptor_it == g_resource_descriptors.end()) {
+        return false;
+    }
+    descriptor_out = descriptor_it->second;
+    cpu_handle_out = cpu_handle;
+    return true;
+}
+
+void copy_cbv_descriptor_metadata(SIZE_T dest_cpu, SIZE_T src_cpu, UINT increment) {
+    CbvDescriptorInfo source_cbv{};
+    const bool cbv_copied = load_cbv_descriptor(src_cpu, source_cbv);
+    if (cbv_copied) {
+        store_cbv_descriptor(dest_cpu, source_cbv);
+    }
+    bool copied = cbv_copied;
+    auto resource_it = g_resource_descriptors.find(src_cpu);
+    if (resource_it != g_resource_descriptors.end()) {
+        g_resource_descriptors[dest_cpu] = resource_it->second;
+        const uint32_t propagated_bit =
+            resource_it->second.format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1u : 2u;
+        const uint32_t previous_mask =
+            g_taau_descriptor_propagated_mask.fetch_or(propagated_bit);
+        if ((previous_mask & propagated_bit) == 0) {
+            log_line("TAAU bootstrap propagated type=%s src=0x%zX dest=0x%zX",
+                propagated_bit == 1 ? "motion" : "depth", src_cpu, dest_cpu);
+        }
+        copied = true;
+    }
+    if (!copied) {
+        return;
+    }
+
+    static std::atomic<uint32_t> copy_log_count{};
+    if (cbv_copied && copy_log_count.fetch_add(1) < 40) {
+        log_line("Reverse CBV descriptor copy src=0x%zX dest=0x%zX gpuva=0x%llX size=%u inc=%u",
+            src_cpu,
+            dest_cpu,
+            static_cast<unsigned long long>(source_cbv.gpu_va),
+            source_cbv.size_in_bytes,
+            increment);
+    }
+}
+
+void scan_mapped_resources_periodically(uint64_t frame) {
+    if (!reverse_enabled() || !g_config.reverse_scan_periodic) {
+        return;
+    }
+
+    const auto interval = static_cast<uint64_t>(g_config.reverse_scan_interval_frames);
+    if (frame % interval != 0) {
+        return;
+    }
+
+    std::vector<std::pair<ID3D12Resource*, ResourceInfo>> snapshot{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        snapshot.reserve(g_resource_infos.size());
+        for (const auto& [resource, info] : g_resource_infos) {
+            if (info.mapped != nullptr && info.mapped_size > 0 && info.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                snapshot.emplace_back(resource, info);
+            }
+        }
+    }
+
+    log_line("Reverse scanning mapped upload buffers frame=%llu count=%zu",
+        static_cast<unsigned long long>(frame),
+        snapshot.size());
+
+    for (const auto& [resource, info] : snapshot) {
+        scan_buffer_for_matrices(resource, info.mapped, info.mapped_size, "periodic-map", 0, 0, frame, 0, 0, nullptr, PipelineInfo{}, nullptr);
+    }
+}
+
+void install_reverse_hooks() {
+    if (!reverse_enabled() || g_reverse_hooks_installed || g_d3d12_device == nullptr) {
+        return;
+    }
+
+    const bool metadata_hooks = taau_metadata_hooks_needed();
+    const bool command_state_hooks = graphics_binding_hooks_needed();
+
+    if (metadata_hooks && g_command_queue != nullptr && g_execute_command_lists == nullptr) {
+        auto target = method<void*>(g_command_queue, 10);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_execute_command_lists), reinterpret_cast<void**>(&g_execute_command_lists)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12CommandQueue::ExecuteCommandLists at %p", target);
+        }
+    }
+
+    if (metadata_hooks && g_create_committed_resource == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 27);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_committed_resource), reinterpret_cast<void**>(&g_create_committed_resource)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateCommittedResource at %p", target);
+        }
+    }
+
+    if (metadata_hooks && g_create_descriptor_heap == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 14);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_descriptor_heap), reinterpret_cast<void**>(&g_create_descriptor_heap)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateDescriptorHeap at %p", target);
+        }
+    }
+
+    if (metadata_hooks &&
+        (!temporal_backend_is_dlss_packed() ||
+            reverse_diagnostic_hooks_requested()) &&
+        g_create_cbv == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 17);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_cbv), reinterpret_cast<void**>(&g_create_cbv)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateConstantBufferView at %p", target);
+        }
+    }
+
+    if (metadata_hooks && g_create_root_signature == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 16);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_root_signature), reinterpret_cast<void**>(&g_create_root_signature)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateRootSignature at %p", target);
+        }
+    }
+
+    if (metadata_hooks && g_create_srv == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 18);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_srv), reinterpret_cast<void**>(&g_create_srv)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateShaderResourceView at %p", target);
+        }
+    }
+
+    if (metadata_hooks && g_create_uav == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 19);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_uav), reinterpret_cast<void**>(&g_create_uav)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateUnorderedAccessView at %p", target);
+        }
+    }
+
+    if (metadata_hooks && g_create_rtv == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 20);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_rtv),
+                reinterpret_cast<void**>(&g_create_rtv)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateRenderTargetView at %p", target);
+        }
+    }
+
+    if (metadata_hooks && g_create_dsv == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 21);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_dsv),
+                reinterpret_cast<void**>(&g_create_dsv)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateDepthStencilView at %p", target);
+        }
+    }
+
+    if (g_create_graphics_pipeline_state == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 10);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_graphics_pipeline_state), reinterpret_cast<void**>(&g_create_graphics_pipeline_state)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateGraphicsPipelineState at %p", target);
+        }
+    }
+
+    // DLSS keeps compute-PSO identification so V308's startup serialization
+    // retires at the same post-DLSS signatures instead of remaining armed.
+    if (temporal_compute_hooks_needed() &&
+        g_create_compute_pipeline_state == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 11);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_create_compute_pipeline_state), reinterpret_cast<void**>(&g_create_compute_pipeline_state)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CreateComputePipelineState at %p", target);
+        }
+    }
+
+    if (metadata_hooks &&
+        (!temporal_backend_is_dlss_packed() ||
+            reverse_diagnostic_hooks_requested()) &&
+        g_copy_descriptors == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 23);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_copy_descriptors), reinterpret_cast<void**>(&g_copy_descriptors)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CopyDescriptors at %p", target);
+        }
+    }
+
+    if (metadata_hooks &&
+        (!temporal_backend_is_dlss_packed() ||
+            reverse_diagnostic_hooks_requested()) &&
+        g_copy_descriptors_simple == nullptr) {
+        auto target = method<void*>(g_d3d12_device, 24);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_copy_descriptors_simple), reinterpret_cast<void**>(&g_copy_descriptors_simple)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Device::CopyDescriptorsSimple at %p", target);
+        }
+    }
+
+    if (metadata_hooks && (g_resource_map == nullptr || g_resource_unmap == nullptr)) {
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Alignment = 0;
+        desc.Width = 4096;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_UNKNOWN;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        ID3D12Resource* dummy{};
+        if (SUCCEEDED(g_d3d12_device->CreateCommittedResource(
+                &heap_props,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(&dummy))) &&
+            dummy != nullptr) {
+            install_resource_hooks(dummy);
+            dummy->Release();
+        }
+    }
+
+    if (command_state_hooks || g_create_graphics_pipeline_state != nullptr) {
+        install_command_list_hooks();
+    }
+    if (g_command_queue != nullptr) {
+        g_reverse_hooks_installed = true;
+    }
+}
+
+void install_resource_hooks(ID3D12Resource* resource) {
+    if (resource == nullptr || !taau_metadata_hooks_needed()) {
+        return;
+    }
+
+    if ((!temporal_backend_is_dlss_packed() ||
+            reverse_diagnostic_hooks_requested()) &&
+        g_resource_map == nullptr) {
+        auto target = method<void*>(resource, 8);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_resource_map), reinterpret_cast<void**>(&g_resource_map)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Resource::Map at %p", target);
+        }
+    }
+
+    if ((!temporal_backend_is_dlss_packed() || g_config.runtime_diagnostics ||
+            g_config.reverse_scan_unmap) &&
+        g_resource_unmap == nullptr) {
+        auto target = method<void*>(resource, 9);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_resource_unmap), reinterpret_cast<void**>(&g_resource_unmap)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12Resource::Unmap at %p", target);
+        }
+    }
+}
+
+void install_command_list_hooks() {
+    if (!reverse_enabled() || g_command_list_hooks_installed ||
+        g_d3d12_device == nullptr) {
+        return;
+    }
+
+    ID3D12CommandAllocator* allocator{};
+    ID3D12GraphicsCommandList* command_list{};
+    if (FAILED(g_d3d12_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)))) {
+        return;
+    }
+
+    if (FAILED(g_d3d12_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&command_list)))) {
+        allocator->Release();
+        return;
+    }
+
+    command_list->Close();
+
+    const bool command_state_hooks = graphics_binding_hooks_needed();
+    const bool compute_hooks = temporal_compute_hooks_needed();
+
+    if (g_draw_instanced == nullptr) {
+        auto target = method<void*>(command_list, 12);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_draw_instanced), reinterpret_cast<void**>(&g_draw_instanced)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::DrawInstanced at %p", target);
+        }
+    }
+
+    if (g_draw_indexed_instanced == nullptr) {
+        auto target = method<void*>(command_list, 13);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_draw_indexed_instanced), reinterpret_cast<void**>(&g_draw_indexed_instanced)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::DrawIndexedInstanced at %p", target);
+        }
+    }
+
+    if (compute_hooks && g_dispatch == nullptr) {
+        auto target = method<void*>(command_list, 14);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_dispatch),
+                reinterpret_cast<void**>(&g_dispatch)) == MH_OK) {
+            g_dispatch_hook_target = target;
+            log_line("Reverse created disabled ID3D12GraphicsCommandList::Dispatch hook at %p", target);
+        }
+    }
+
+    if ((compute_hooks || g_config.openxr_mode == 2) &&
+        g_om_set_render_targets == nullptr) {
+        auto target = method<void*>(command_list, 46);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_om_set_render_targets),
+                reinterpret_cast<void**>(&g_om_set_render_targets)) == MH_OK) {
+            g_om_render_targets_hook_target = target;
+            if (g_config.openxr_mode == 2) {
+                MH_EnableHook(target);
+                log_line("Reverse hooked ID3D12GraphicsCommandList::OMSetRenderTargets for mono HUD at %p", target);
+            } else {
+                log_line("Reverse created disabled ID3D12GraphicsCommandList::OMSetRenderTargets hook at %p", target);
+            }
+        }
+    }
+
+    if (g_config.reverse_copy_probe && g_copy_buffer_region == nullptr) {
+        auto target = method<void*>(command_list, 15);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_copy_buffer_region), reinterpret_cast<void**>(&g_copy_buffer_region)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::CopyBufferRegion at %p", target);
+        }
+    }
+
+    if (command_state_hooks && g_set_descriptor_heaps == nullptr) {
+        auto target = method<void*>(command_list, 28);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_descriptor_heaps), reinterpret_cast<void**>(&g_set_descriptor_heaps)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::SetDescriptorHeaps at %p", target);
+        }
+    }
+
+    if (command_state_hooks && g_set_graphics_root_descriptor_table == nullptr) {
+        auto target = method<void*>(command_list, 32);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_graphics_root_descriptor_table), reinterpret_cast<void**>(&g_set_graphics_root_descriptor_table)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable at %p", target);
+        }
+    }
+
+    if (compute_hooks && g_set_compute_root_descriptor_table == nullptr) {
+        auto target = method<void*>(command_list, 31);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_compute_root_descriptor_table),
+                reinterpret_cast<void**>(&g_set_compute_root_descriptor_table)) == MH_OK) {
+            g_compute_table_hook_target = target;
+            log_line("Reverse created disabled ID3D12GraphicsCommandList::SetComputeRootDescriptorTable hook at %p", target);
+        }
+    }
+
+    if (command_state_hooks && g_set_graphics_root_cbv == nullptr) {
+        auto target = method<void*>(command_list, 38);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_graphics_root_cbv), reinterpret_cast<void**>(&g_set_graphics_root_cbv)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView at %p", target);
+        }
+    }
+
+    if (compute_hooks && g_set_compute_root_cbv == nullptr) {
+        auto target = method<void*>(command_list, 37);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_compute_root_cbv),
+                reinterpret_cast<void**>(&g_set_compute_root_cbv)) == MH_OK) {
+            g_compute_cbv_hook_target = target;
+            log_line("Reverse created disabled ID3D12GraphicsCommandList::SetComputeRootConstantBufferView hook at %p", target);
+        }
+    }
+
+    if (compute_hooks && g_set_compute_root_32bit_constant == nullptr) {
+        auto target = method<void*>(command_list, 33);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_compute_root_32bit_constant),
+                reinterpret_cast<void**>(&g_set_compute_root_32bit_constant)) == MH_OK) {
+            g_compute_constant_hook_target = target;
+            log_line("Reverse created disabled ID3D12GraphicsCommandList::SetComputeRoot32BitConstant hook at %p", target);
+        }
+    }
+
+    if (compute_hooks && g_set_compute_root_32bit_constants == nullptr) {
+        auto target = method<void*>(command_list, 35);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_compute_root_32bit_constants),
+                reinterpret_cast<void**>(&g_set_compute_root_32bit_constants)) == MH_OK) {
+            g_compute_constants_hook_target = target;
+            log_line("Reverse created disabled ID3D12GraphicsCommandList::SetComputeRoot32BitConstants hook at %p", target);
+        }
+    }
+
+    if (g_set_pipeline_state == nullptr) {
+        auto target = method<void*>(command_list, 25);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_pipeline_state), reinterpret_cast<void**>(&g_set_pipeline_state)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::SetPipelineState at %p", target);
+        }
+    }
+
+    if (command_state_hooks && g_set_graphics_root_signature == nullptr) {
+        auto target = method<void*>(command_list, 30);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_graphics_root_signature), reinterpret_cast<void**>(&g_set_graphics_root_signature)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Reverse hooked ID3D12GraphicsCommandList::SetGraphicsRootSignature at %p", target);
+        }
+    }
+
+    if (compute_hooks && g_set_compute_root_signature == nullptr) {
+        auto target = method<void*>(command_list, 29);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_set_compute_root_signature),
+                reinterpret_cast<void**>(&g_set_compute_root_signature)) == MH_OK) {
+            g_compute_signature_hook_target = target;
+            log_line("Reverse created disabled ID3D12GraphicsCommandList::SetComputeRootSignature hook at %p", target);
+        }
+    }
+
+    g_command_list_hooks_installed = true;
+    command_list->Release();
+    allocator->Release();
+}
+
+void STDMETHODCALLTYPE hook_execute_command_lists(
+    ID3D12CommandQueue* queue,
+    UINT num_command_lists,
+    ID3D12CommandList* const* command_lists) {
+    const auto count = ++g_execute_count;
+    if (reverse_enabled()) {
+        const auto interval = static_cast<uint64_t>(g_config.reverse_execute_log_interval);
+        if (interval > 0 && (count == 1 || count % interval == 0)) {
+            log_line("Reverse ExecuteCommandLists count=%llu lists=%u",
+                static_cast<unsigned long long>(count),
+                num_command_lists);
+        }
+    }
+
+    PendingExecuteNudge pending{};
+    bool has_pending{};
+    if (reverse_enabled() && g_config.reverse_active_nudge && command_lists != nullptr) {
+        std::scoped_lock lock{g_reverse_mutex};
+        for (UINT index = 0; index < num_command_lists; ++index) {
+            auto* graphics_list = reinterpret_cast<ID3D12GraphicsCommandList*>(command_lists[index]);
+            const auto it = g_pending_execute_nudges.find(graphics_list);
+            if (it == g_pending_execute_nudges.end()) {
+                continue;
+            }
+            pending = it->second;
+            has_pending = true;
+            g_pending_execute_nudges.erase(it);
+            break;
+        }
+    }
+
+    if (has_pending && pending.mapped != nullptr &&
+        pending.absolute_offset + sizeof(float) * 16 <= pending.mapped_size) {
+        auto* matrix = reinterpret_cast<float*>(pending.mapped + pending.absolute_offset);
+        const auto* kind = classify_matrix(matrix);
+        const auto frame = g_present_count.load();
+        auto written_frame = g_active_nudge_written_frame.load();
+        if (kind != nullptr && strcmp(kind, "affine-view") == 0 &&
+            written_frame != frame &&
+            g_active_nudge_written_frame.compare_exchange_strong(written_frame, frame)) {
+            const auto old_value = matrix[pending.component];
+            matrix[pending.component] += g_config.reverse_nudge_amount;
+            if (g_active_nudge_log_count.fetch_add(1) < 120) {
+                log_line("Reverse execute nudge slot=%u execute=%llu draw=%llu frame=%llu recorded_frame=%llu root=%u resource=%p abs=0x%zX component=%u old=%.4f new=%.4f amount=%.4f",
+                    pending.slot,
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(pending.draw),
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(pending.recorded_frame),
+                    pending.root,
+                    pending.resource,
+                    pending.absolute_offset,
+                    pending.component,
+                    old_value,
+                    matrix[pending.component],
+                    g_config.reverse_nudge_amount);
+            }
+        }
+    }
+
+    bool submits_taau_readback{};
+    auto* readback_list = g_taau_readback_command_list.load();
+    if (readback_list != nullptr && command_lists != nullptr &&
+        !g_taau_readback_submitted.load()) {
+        for (UINT index = 0; index < num_command_lists; ++index) {
+            if (command_lists[index] == static_cast<ID3D12CommandList*>(readback_list)) {
+                submits_taau_readback = true;
+                break;
+            }
+        }
+    }
+
+    bool submits_dlss_mvec_readback{};
+    auto* dlss_readback_list = g_dlss_mvec_readback_command_list.load();
+    if (dlss_readback_list != nullptr && command_lists != nullptr &&
+        !g_dlss_mvec_readback_submitted.load()) {
+        for (UINT index = 0; index < num_command_lists; ++index) {
+            if (command_lists[index] == static_cast<ID3D12CommandList*>(dlss_readback_list)) {
+                submits_dlss_mvec_readback = true;
+                break;
+            }
+        }
+    }
+
+    bool submits_dlss_component_probe{};
+    auto* component_probe_list = g_dlss_component_probe_command_list.load();
+    if (component_probe_list != nullptr && command_lists != nullptr &&
+        !g_dlss_component_probe_submitted.load()) {
+        for (UINT index = 0; index < num_command_lists; ++index) {
+            if (command_lists[index] == static_cast<ID3D12CommandList*>(component_probe_list)) {
+                submits_dlss_component_probe = true;
+                break;
+            }
+        }
+    }
+
+    bool submits_dlss_output_luma[2]{};
+    if (command_lists != nullptr) {
+        for (uint32_t lane = 0; lane < 2; ++lane) {
+            auto* output_luma_list = g_dlss_output_luma_command_lists[lane].load();
+            if (output_luma_list == nullptr ||
+                g_dlss_output_luma_submitted[lane].load()) {
+                continue;
+            }
+            for (UINT index = 0; index < num_command_lists; ++index) {
+                if (command_lists[index] ==
+                    static_cast<ID3D12CommandList*>(output_luma_list)) {
+                    submits_dlss_output_luma[lane] = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    std::vector<TaauPendingSlotUse> taau_slot_uses{};
+    if (command_lists != nullptr) {
+        std::scoped_lock lock{g_taau_slot_mutex};
+        for (UINT index = 0; index < num_command_lists; ++index) {
+            const auto it = g_taau_pending_slot_uses.find(command_lists[index]);
+            if (it == g_taau_pending_slot_uses.end()) {
+                continue;
+            }
+            taau_slot_uses.insert(
+                taau_slot_uses.end(), it->second.begin(), it->second.end());
+            g_taau_pending_slot_uses.erase(it);
+        }
+    }
+
+    // V507 observes the authority REDengine actually gives the GPU. Recording
+    // order is speculative; only command lists present in ExecuteCommandLists
+    // form the real temporal sequence.
+    if (command_lists != nullptr) {
+        for (UINT index = 0; index < num_command_lists; ++index) {
+            TaauRecordedResolveIdentity submitted{};
+            bool found{};
+            {
+                std::scoped_lock lock{g_taau_recorded_resolve_mutex};
+                const auto it = g_taau_recorded_resolves.find(command_lists[index]);
+                if (it != g_taau_recorded_resolves.end()) {
+                    submitted = it->second;
+                    g_taau_recorded_resolves.erase(it);
+                    found = true;
+                }
+            }
+            if (!found || submitted.eye < 0 || submitted.eye > 1) {
+                continue;
+            }
+            auto& last = g_taau_last_submitted_pair[
+                static_cast<size_t>(submitted.eye)];
+            const uint64_t previous = last.exchange(
+                submitted.pair_id, std::memory_order_relaxed);
+            const uint64_t submitted_count = g_taau_submitted_resolve_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            const bool non_forward = previous != 0 &&
+                submitted.pair_id <= previous;
+            if (submitted_count <= 128 || non_forward ||
+                submitted.replayed_as_stale || submitted_count % 240 == 0) {
+                log_line(
+                    "TAAU submitted resolve count=%llu execute=%llu eye=%d pair=%llu previous_submitted=%llu non_forward=%u recorded_present=%llu history_at_record=%llu recovered=%u stale_replay=%u cmd=%p output=%p cbhash=0x%llX",
+                    static_cast<unsigned long long>(submitted_count),
+                    static_cast<unsigned long long>(count), submitted.eye,
+                    static_cast<unsigned long long>(submitted.pair_id),
+                    static_cast<unsigned long long>(previous),
+                    non_forward ? 1u : 0u,
+                    static_cast<unsigned long long>(submitted.recorded_present),
+                    static_cast<unsigned long long>(submitted.history_pair_at_record),
+                    submitted.recovered ? 1u : 0u,
+                    submitted.replayed_as_stale ? 1u : 0u,
+                    command_lists[index], submitted.native_output,
+                    static_cast<unsigned long long>(submitted.cb10_hash));
+            }
+        }
+    }
+
+    g_hang_diag_execute_present.store(
+        g_present_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    g_hang_diag_execute_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_hang_diag_execute_list_count.store(num_command_lists, std::memory_order_relaxed);
+    g_hang_diag_execute_slot_count.store(
+        static_cast<uint32_t>(taau_slot_uses.size()), std::memory_order_relaxed);
+    g_hang_diag_execute_enter.fetch_add(1, std::memory_order_relaxed);
+    g_execute_command_lists(queue, num_command_lists, command_lists);
+    g_hang_diag_execute_exit.fetch_add(1, std::memory_order_relaxed);
+    if (!taau_slot_uses.empty() && g_taau_slot_fence != nullptr) {
+        const auto fence_value = g_taau_slot_fence_value.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        const auto signal_hr = queue->Signal(g_taau_slot_fence, fence_value);
+        g_hang_diag_execute_signal.store(fence_value, std::memory_order_relaxed);
+        g_hang_diag_execute_signal_hr.store(signal_hr, std::memory_order_relaxed);
+        const auto retired_value = SUCCEEDED(signal_hr) ? fence_value : UINT64_MAX;
+        for (const auto& use : taau_slot_uses) {
+            if (use.compose && use.index < g_taau_compose_slots.size()) {
+                auto& slot = g_taau_compose_slots[use.index];
+                slot.fence_value.store(retired_value, std::memory_order_release);
+                slot.reserved.store(false, std::memory_order_release);
+            } else if (!use.compose && use.index < g_taau_override_slots.size()) {
+                auto& slot = g_taau_override_slots[use.index];
+                slot.fence_value.store(retired_value, std::memory_order_release);
+                slot.reserved.store(false, std::memory_order_release);
+            }
+        }
+        if (FAILED(signal_hr)) {
+            log_line("TAAU slot retirement signal failed hr=0x%08X slots=%zu",
+                static_cast<unsigned>(signal_hr), taau_slot_uses.size());
+        }
+    }
+    if (submits_taau_readback && g_taau_readback_fence != nullptr &&
+        !g_taau_readback_submitted.exchange(true)) {
+        const HRESULT signal_hr = queue->Signal(g_taau_readback_fence, 1);
+        log_line("TAAU readback submitted command_list=%p signal_hr=0x%08X",
+            readback_list, static_cast<unsigned>(signal_hr));
+    }
+    if (submits_dlss_mvec_readback && g_dlss_mvec_readback_fence != nullptr &&
+        !g_dlss_mvec_readback_submitted.exchange(true)) {
+        const HRESULT signal_hr = queue->Signal(g_dlss_mvec_readback_fence, 1);
+        log_line("DLSS MVec readback submitted command_list=%p signal_hr=0x%08X",
+            dlss_readback_list, static_cast<unsigned>(signal_hr));
+    }
+    if (submits_dlss_component_probe && g_dlss_component_probe_fence != nullptr &&
+        !g_dlss_component_probe_submitted.exchange(true)) {
+        const HRESULT signal_hr = queue->Signal(g_dlss_component_probe_fence, 1);
+        log_line("DLSS component probe submitted command_list=%p signal_hr=0x%08X",
+            component_probe_list, static_cast<unsigned>(signal_hr));
+    }
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+        if (submits_dlss_output_luma[lane] &&
+            g_dlss_output_luma_fences[lane] != nullptr &&
+            !g_dlss_output_luma_submitted[lane].exchange(true)) {
+            const HRESULT signal_hr = queue->Signal(
+                g_dlss_output_luma_fences[lane], 1);
+            log_line("DLSS output luminance submitted lane=%u command_list=%p signal_hr=0x%08X",
+                lane, g_dlss_output_luma_command_lists[lane].load(),
+                static_cast<unsigned>(signal_hr));
+        }
+    }
+}
+
+void STDMETHODCALLTYPE hook_copy_buffer_region(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* dst_buffer,
+    UINT64 dst_offset,
+    ID3D12Resource* src_buffer,
+    UINT64 src_offset,
+    UINT64 num_bytes) {
+    if (reverse_enabled() && g_config.reverse_copy_probe && src_buffer != nullptr && dst_buffer != nullptr) {
+        ResourceInfo src_info{};
+        ResourceInfo dst_info{};
+        CameraCbvWatch matched_watch{};
+        bool watched{};
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            const auto copy_begin = static_cast<size_t>(std::min<UINT64>(src_offset, SIZE_MAX));
+            const auto copy_end = static_cast<size_t>(std::min<UINT64>(src_offset + num_bytes, SIZE_MAX));
+            for (const auto& watch : g_camera_cbv_watches) {
+                if (watch.resource == src_buffer && copy_begin <= watch.begin && copy_end >= watch.end) {
+                    matched_watch = watch;
+                    watched = true;
+                    break;
+                }
+            }
+            const auto src_it = g_resource_infos.find(src_buffer);
+            if (src_it != g_resource_infos.end()) {
+                src_info = src_it->second;
+            }
+            const auto dst_it = g_resource_infos.find(dst_buffer);
+            if (dst_it != g_resource_infos.end()) {
+                dst_info = dst_it->second;
+            }
+        }
+
+        const float* matrix{};
+        if (watched && src_info.mapped != nullptr && matched_watch.end <= src_info.mapped_size) {
+            matrix = reinterpret_cast<const float*>(
+                static_cast<const uint8_t*>(src_info.mapped) + matched_watch.begin);
+            const auto* kind = classify_matrix(matrix);
+            watched = kind != nullptr && strcmp(kind, "affine-view") == 0;
+        } else {
+            watched = false;
+        }
+
+        if (watched && g_copy_probe_log_count.fetch_add(1) < static_cast<uint32_t>(g_config.reverse_copy_max_logs)) {
+            const auto dst_matrix_offset = dst_offset + (matched_watch.begin - static_cast<size_t>(src_offset));
+            log_line("Reverse camera matrix copy frame=%llu learned_frame=%llu root=%u vs=0x%llX ps=0x%llX src_matrix=0x%zX command_list=%p src=%p src_heap=%u src_off=0x%llX dst=%p dst_heap=%u dst_off=0x%llX bytes=0x%llX dst_matrix=0x%llX dst_matrix_gpuva=0x%llX rows=[%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f]",
+                static_cast<unsigned long long>(g_present_count.load()),
+                static_cast<unsigned long long>(matched_watch.frame),
+                matched_watch.root,
+                static_cast<unsigned long long>(matched_watch.vs_hash),
+                static_cast<unsigned long long>(matched_watch.ps_hash),
+                matched_watch.begin,
+                command_list,
+                src_buffer,
+                static_cast<unsigned>(src_info.heap_type),
+                static_cast<unsigned long long>(src_offset),
+                dst_buffer,
+                static_cast<unsigned>(dst_info.heap_type),
+                static_cast<unsigned long long>(dst_offset),
+                static_cast<unsigned long long>(num_bytes),
+                static_cast<unsigned long long>(dst_matrix_offset),
+                static_cast<unsigned long long>(dst_info.gpu_va + dst_matrix_offset),
+                matrix[0], matrix[1], matrix[2], matrix[3],
+                matrix[4], matrix[5], matrix[6], matrix[7],
+                matrix[8], matrix[9], matrix[10], matrix[11],
+                matrix[12], matrix[13], matrix[14], matrix[15]);
+        }
+    }
+
+    g_copy_buffer_region(command_list, dst_buffer, dst_offset, src_buffer, src_offset, num_bytes);
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_committed_resource(
+    ID3D12Device* device,
+    const D3D12_HEAP_PROPERTIES* heap_properties,
+    D3D12_HEAP_FLAGS heap_flags,
+    const D3D12_RESOURCE_DESC* desc,
+    D3D12_RESOURCE_STATES initial_state,
+    const D3D12_CLEAR_VALUE* optimized_clear_value,
+    REFIID riid_resource,
+    void** resource) {
+    const auto hr = g_create_committed_resource(
+        device,
+        heap_properties,
+        heap_flags,
+        desc,
+        initial_state,
+        optimized_clear_value,
+        riid_resource,
+        resource);
+
+    if (SUCCEEDED(hr) && resource != nullptr && *resource != nullptr && desc != nullptr) {
+        auto* d3d_resource = static_cast<ID3D12Resource*>(*resource);
+        const auto heap_type = heap_properties != nullptr ? heap_properties->Type : D3D12_HEAP_TYPE_CUSTOM;
+
+        if (g_ngx_creating_feature && g_config.ngx_trace) {
+            log_line("NGX create resource=%p dimension=%u size=%llux%u format=%u flags=0x%X heap=%u state=0x%X",
+                d3d_resource, static_cast<unsigned>(desc->Dimension),
+                static_cast<unsigned long long>(desc->Width), desc->Height,
+                static_cast<unsigned>(desc->Format), static_cast<unsigned>(desc->Flags),
+                static_cast<unsigned>(heap_type), static_cast<unsigned>(initial_state));
+        }
+
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            {
+                std::scoped_lock lock{g_reverse_mutex};
+                g_resource_infos[d3d_resource] = ResourceInfo{
+                    *desc,
+                    heap_type,
+                    d3d_resource->GetGPUVirtualAddress(),
+                    nullptr,
+                    static_cast<size_t>(std::min<uint64_t>(desc->Width, SIZE_MAX))};
+            }
+
+            install_resource_hooks(d3d_resource);
+
+            if (g_config.runtime_diagnostics && reverse_enabled() &&
+                heap_type == D3D12_HEAP_TYPE_UPLOAD &&
+                desc->Width <= static_cast<UINT64>(g_config.reverse_log_buffer_max_bytes)) {
+                log_line("Reverse CreateCommittedResource upload buffer resource=%p width=%llu initial_state=0x%X",
+                    d3d_resource,
+                    static_cast<unsigned long long>(desc->Width),
+                    static_cast<unsigned>(initial_state));
+            }
+        }
+    }
+
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_descriptor_heap(
+    ID3D12Device* device,
+    const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+    REFIID riid,
+    void** heap) {
+    const auto hr = g_create_descriptor_heap(device, desc, riid, heap);
+    if (SUCCEEDED(hr) && desc != nullptr && heap != nullptr && *heap != nullptr &&
+        desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        auto* d3d_heap = static_cast<ID3D12DescriptorHeap*>(*heap);
+        DescriptorHeapInfo info{};
+        info.type = desc->Type;
+        info.num_descriptors = desc->NumDescriptors;
+        info.increment = device->GetDescriptorHandleIncrementSize(desc->Type);
+        info.shader_visible = (desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+        info.cpu_start = d3d_heap->GetCPUDescriptorHandleForHeapStart();
+        if (info.shader_visible) {
+            info.gpu_start = d3d_heap->GetGPUDescriptorHandleForHeapStart();
+        }
+
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            g_descriptor_heap_infos[d3d_heap] = info;
+        }
+
+        if (g_config.runtime_diagnostics && reverse_enabled() &&
+            g_descriptor_heap_log_count.fetch_add(1) < 40) {
+            log_line("Reverse descriptor heap heap=%p num=%u inc=%u shader=%u cpu=0x%zX gpu=0x%zX",
+                d3d_heap,
+                info.num_descriptors,
+                info.increment,
+                info.shader_visible ? 1u : 0u,
+                info.cpu_start.ptr,
+                info.gpu_start.ptr);
+        }
+    }
+
+    return hr;
+}
+
+void STDMETHODCALLTYPE hook_create_cbv(
+    ID3D12Device* device,
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor) {
+    g_create_cbv(device, desc, dest_descriptor);
+
+    if (!reverse_enabled() || desc == nullptr || dest_descriptor.ptr == 0) {
+        return;
+    }
+
+    store_cbv_descriptor(
+        dest_descriptor.ptr,
+        CbvDescriptorInfo{desc->BufferLocation, desc->SizeInBytes});
+
+    if (g_config.runtime_diagnostics && g_cbv_create_log_count.fetch_add(1) < 80) {
+        log_line("Reverse CreateCBV cpu=0x%zX gpuva=0x%llX size=%u",
+            dest_descriptor.ptr,
+            static_cast<unsigned long long>(desc->BufferLocation),
+            desc->SizeInBytes);
+    }
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
+    ID3D12Device* device,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+    REFIID riid,
+    void** pipeline_state) {
+    const auto hr = g_create_graphics_pipeline_state(device, desc, riid, pipeline_state);
+    if (!reverse_enabled() || FAILED(hr) || desc == nullptr || pipeline_state == nullptr || *pipeline_state == nullptr) {
+        return hr;
+    }
+
+    auto* pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
+    PipelineInfo info{};
+    info.vs_hash = hash_shader_bytecode(desc->VS);
+    info.ps_hash = hash_shader_bytecode(desc->PS);
+    info.root_signature = desc->pRootSignature;
+    info.root_hash = fnv1a64(&desc->pRootSignature, sizeof(desc->pRootSignature));
+    info.primitive_type = desc->PrimitiveTopologyType;
+    info.render_target_count = desc->NumRenderTargets;
+    info.dsv_format = desc->DSVFormat;
+
+    const auto stereo_dump_candidate =
+        (info.vs_hash == 0xEDFD76797EB58077ull && info.ps_hash == 0xBB5967B70E8594BFull) ||
+        (info.vs_hash == 0xA6D5EB4C9688AB1Bull && info.ps_hash == 0xA04F949CEF867EA0ull) ||
+        (info.vs_hash == 0x9503CB0CCE8D37AFull && info.ps_hash == 0x835BD7C8E1E8FD93ull);
+    if (info.vs_hash == 0x9503CB0CCE8D37AFull &&
+        info.ps_hash == 0x835BD7C8E1E8FD93ull) {
+        uint64_t expected = UINT64_MAX;
+        const auto present = g_present_count.load(std::memory_order_relaxed);
+        if (g_gameplay_world_pipeline_present.compare_exchange_strong(
+                expected, present, std::memory_order_relaxed)) {
+            log_line("Gameplay world pipeline ready present=%llu",
+                static_cast<unsigned long long>(present));
+        }
+    }
+    if (stereo_dump_candidate) {
+        dump_shader_bytecode("vs", info.vs_hash, desc->VS);
+        dump_shader_bytecode("ps", info.ps_hash, desc->PS);
+    }
+
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_pipeline_infos[pso] = info;
+    }
+
+    if (info.vs_hash == 0x84F8A283C01E56D2ull &&
+        info.ps_hash == 0x051248978BCC3943ull &&
+        g_hud_composite_original_pso.load(std::memory_order_acquire) == nullptr) {
+        std::scoped_lock creation_lock{g_hud_composite_pso_creation_mutex};
+        if (g_hud_composite_original_pso.load(std::memory_order_acquire) == nullptr) {
+            IDxcBlob* eye0_shader = compile_hud_composite_pixel_shader(
+                g_config.hud_stereo_shift_px, g_config.hud_size);
+            IDxcBlob* eye1_shader = compile_hud_composite_pixel_shader(
+                -g_config.hud_stereo_shift_px, g_config.hud_size);
+            ID3D12PipelineState* eye0_pso{};
+            ID3D12PipelineState* eye1_pso{};
+            if (eye0_shader != nullptr && eye1_shader != nullptr) {
+                auto shifted_desc = *desc;
+                shifted_desc.PS = {
+                    eye0_shader->GetBufferPointer(), eye0_shader->GetBufferSize()};
+                const auto eye0_hr = g_create_graphics_pipeline_state(
+                    device, &shifted_desc, IID_PPV_ARGS(&eye0_pso));
+                shifted_desc.PS = {
+                    eye1_shader->GetBufferPointer(), eye1_shader->GetBufferSize()};
+                const auto eye1_hr = g_create_graphics_pipeline_state(
+                    device, &shifted_desc, IID_PPV_ARGS(&eye1_pso));
+                if (FAILED(eye0_hr) || FAILED(eye1_hr)) {
+                    if (eye0_pso != nullptr) eye0_pso->Release();
+                    if (eye1_pso != nullptr) eye1_pso->Release();
+                    eye0_pso = nullptr;
+                    eye1_pso = nullptr;
+                    log_line(
+                        "HUD PSO creation failed shift=%d size=%.3f hr=0x%08X,0x%08X",
+                        g_config.hud_stereo_shift_px, g_config.hud_size,
+                        static_cast<unsigned>(eye0_hr),
+                        static_cast<unsigned>(eye1_hr));
+                }
+            }
+            if (eye0_shader != nullptr) eye0_shader->Release();
+            if (eye1_shader != nullptr) eye1_shader->Release();
+            if (eye0_pso != nullptr && eye1_pso != nullptr) {
+                {
+                    std::scoped_lock lock{g_reverse_mutex};
+                    g_pipeline_infos[eye0_pso] = info;
+                    g_pipeline_infos[eye1_pso] = info;
+                }
+                g_hud_composite_eye0_pso.store(eye0_pso, std::memory_order_relaxed);
+                g_hud_composite_eye1_pso.store(eye1_pso, std::memory_order_relaxed);
+                g_hud_composite_original_pso.store(pso, std::memory_order_release);
+                log_line(
+                    "HUD PSOs ready original=%p eye0=%p eye1=%p shift=%d size=%.3f",
+                    pso, eye0_pso, eye1_pso,
+                    g_config.hud_stereo_shift_px, g_config.hud_size);
+            }
+        }
+    }
+
+    if (g_config.reverse_geometry_shift &&
+        desc->GS.pShaderBytecode == nullptr &&
+        desc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+        desc->NumRenderTargets > 0) {
+        std::vector<uint8_t> geometry_shader{};
+        uint64_t signature_hash{};
+        UINT geometry_output_count{};
+        const auto& geometry_source = desc->DS.pShaderBytecode != nullptr && desc->DS.BytecodeLength > 0
+            ? desc->DS
+            : desc->VS;
+        const bool generated = generate_geometry_shift_shader(
+            geometry_source,
+            geometry_shader,
+            signature_hash,
+            geometry_output_count);
+        const bool geometry_pass = desc->DSVFormat != DXGI_FORMAT_UNKNOWN ||
+            desc->NumRenderTargets >= 2 || geometry_output_count >= 3;
+        if (generated && geometry_pass && !geometry_shader.empty()) {
+            auto shifted_desc = *desc;
+            shifted_desc.GS = D3D12_SHADER_BYTECODE{geometry_shader.data(), geometry_shader.size()};
+            ID3D12PipelineState* shifted_pso{};
+            const auto shifted_hr = g_create_graphics_pipeline_state(
+                device,
+                &shifted_desc,
+                IID_PPV_ARGS(&shifted_pso));
+            if (SUCCEEDED(shifted_hr) && shifted_pso != nullptr) {
+                std::scoped_lock lock{g_reverse_mutex};
+                g_geometry_shift_psos[pso] = shifted_pso;
+                g_pipeline_infos[shifted_pso] = info;
+                log_line("Stereo geometry PSO created original=%p shifted=%p signature=0x%llX vs=0x%llX ps=0x%llX",
+                    pso,
+                    shifted_pso,
+                    static_cast<unsigned long long>(signature_hash),
+                    static_cast<unsigned long long>(info.vs_hash),
+                    static_cast<unsigned long long>(info.ps_hash));
+            } else {
+                log_line("Stereo geometry PSO failed original=%p vs=0x%llX ps=0x%llX hr=0x%08X",
+                    pso,
+                    static_cast<unsigned long long>(info.vs_hash),
+                    static_cast<unsigned long long>(info.ps_hash),
+                    static_cast<unsigned>(shifted_hr));
+            }
+        }
+    }
+
+    if (g_config.runtime_diagnostics && g_pso_create_log_count.fetch_add(1) < 120) {
+        log_line("Reverse CreateGPSO pso=%p vs=0x%llX ps=0x%llX rs=%p prim=%u rt=%u dsv=%u",
+            pso,
+            static_cast<unsigned long long>(info.vs_hash),
+            static_cast<unsigned long long>(info.ps_hash),
+            info.root_signature,
+            static_cast<unsigned>(info.primitive_type),
+            info.render_target_count,
+            static_cast<unsigned>(info.dsv_format));
+    }
+
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_compute_pipeline_state(
+    ID3D12Device* device,
+    const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
+    REFIID riid,
+    void** pipeline_state) {
+    const auto hr = g_create_compute_pipeline_state(device, desc, riid, pipeline_state);
+    if (!reverse_enabled() || FAILED(hr) || desc == nullptr ||
+        pipeline_state == nullptr || *pipeline_state == nullptr) {
+        return hr;
+    }
+
+    auto* pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
+    PipelineInfo info{};
+    info.cs_hash = hash_shader_bytecode(desc->CS);
+    info.root_signature = desc->pRootSignature;
+    info.root_hash = fnv1a64(&desc->pRootSignature, sizeof(desc->pRootSignature));
+    if (info.cs_hash == kTaauResolveComputeHash) {
+        g_taau_resolve_pipeline.store(pso, std::memory_order_release);
+    }
+    if (g_config.runtime_diagnostics && info.cs_hash == kTaauResolveComputeHash) {
+        dump_shader_bytecode("cs", info.cs_hash, desc->CS);
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto root_it = g_root_signature_infos.find(desc->pRootSignature);
+        if (root_it != g_root_signature_infos.end()) {
+            for (UINT root = 0; root < root_it->second.parameters.size(); ++root) {
+                const auto& parameter = root_it->second.parameters[root];
+                log_line("TAAU root signature root=%u type=%u visibility=%u ranges=%zu",
+                    root, static_cast<unsigned>(parameter.type),
+                    static_cast<unsigned>(parameter.visibility), parameter.ranges.size());
+                for (UINT range_index = 0; range_index < parameter.ranges.size(); ++range_index) {
+                    const auto& range = parameter.ranges[range_index];
+                    log_line("TAAU root range root=%u range=%u type=%u base=%u count=%u space=%u offset=%u",
+                        root, range_index, static_cast<unsigned>(range.type),
+                        range.base_shader_register, range.num_descriptors,
+                        range.register_space, range.offset);
+                }
+            }
+        } else {
+            log_line("TAAU root signature metadata missing rs=%p", desc->pRootSignature);
+        }
+    }
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_pipeline_infos[pso] = info;
+    }
+    return hr;
+}
+
+void STDMETHODCALLTYPE hook_copy_descriptors(
+    ID3D12Device* device,
+    UINT num_dest_descriptor_ranges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* dest_descriptor_range_starts,
+    const UINT* dest_descriptor_range_sizes,
+    UINT num_src_descriptor_ranges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* src_descriptor_range_starts,
+    const UINT* src_descriptor_range_sizes,
+    D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heaps_type) {
+    g_copy_descriptors(
+        device,
+        num_dest_descriptor_ranges,
+        dest_descriptor_range_starts,
+        dest_descriptor_range_sizes,
+        num_src_descriptor_ranges,
+        src_descriptor_range_starts,
+        src_descriptor_range_sizes,
+        descriptor_heaps_type);
+
+    if (temporal_backend_is_dlss_packed() &&
+        !reverse_diagnostic_hooks_requested()) {
+        std::scoped_lock lock{g_reverse_mutex};
+        return;
+    }
+
+    if (!reverse_enabled() || descriptor_heaps_type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+        dest_descriptor_range_starts == nullptr || src_descriptor_range_starts == nullptr) {
+        return;
+    }
+
+    const auto increment = device->GetDescriptorHandleIncrementSize(descriptor_heaps_type);
+    UINT dest_range = 0;
+    UINT src_range = 0;
+    UINT dest_index = 0;
+    UINT src_index = 0;
+    std::scoped_lock lock{g_reverse_mutex};
+
+    while (dest_range < num_dest_descriptor_ranges && src_range < num_src_descriptor_ranges) {
+        const auto dest_size = dest_descriptor_range_sizes != nullptr ? dest_descriptor_range_sizes[dest_range] : 1u;
+        const auto src_size = src_descriptor_range_sizes != nullptr ? src_descriptor_range_sizes[src_range] : 1u;
+        if (dest_size == 0 || src_size == 0) {
+            break;
+        }
+
+        const auto dest_cpu = dest_descriptor_range_starts[dest_range].ptr + static_cast<SIZE_T>(dest_index) * increment;
+        const auto src_cpu = src_descriptor_range_starts[src_range].ptr + static_cast<SIZE_T>(src_index) * increment;
+        copy_cbv_descriptor_metadata(dest_cpu, src_cpu, increment);
+
+        ++dest_index;
+        ++src_index;
+        if (dest_index >= dest_size) {
+            ++dest_range;
+            dest_index = 0;
+        }
+        if (src_index >= src_size) {
+            ++src_range;
+            src_index = 0;
+        }
+    }
+}
+
+void STDMETHODCALLTYPE hook_copy_descriptors_simple(
+    ID3D12Device* device,
+    UINT num_descriptors,
+    D3D12_CPU_DESCRIPTOR_HANDLE dest_descriptor_range_start,
+    D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_start,
+    D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heaps_type) {
+    g_copy_descriptors_simple(
+        device,
+        num_descriptors,
+        dest_descriptor_range_start,
+        src_descriptor_range_start,
+        descriptor_heaps_type);
+
+    if (!reverse_enabled() || descriptor_heaps_type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+        dest_descriptor_range_start.ptr == 0 || src_descriptor_range_start.ptr == 0) {
+        return;
+    }
+
+    const auto increment = device->GetDescriptorHandleIncrementSize(descriptor_heaps_type);
+    std::scoped_lock lock{g_reverse_mutex};
+    for (UINT index = 0; index < num_descriptors; ++index) {
+        const auto dest_cpu = dest_descriptor_range_start.ptr + static_cast<SIZE_T>(index) * increment;
+        const auto src_cpu = src_descriptor_range_start.ptr + static_cast<SIZE_T>(index) * increment;
+        copy_cbv_descriptor_metadata(dest_cpu, src_cpu, increment);
+    }
+}
+
+HRESULT STDMETHODCALLTYPE hook_resource_map(
+    ID3D12Resource* resource,
+    UINT subresource,
+    const D3D12_RANGE* read_range,
+    void** data) {
+    const auto hr = g_resource_map(resource, subresource, read_range, data);
+    if (SUCCEEDED(hr) && data != nullptr && *data != nullptr) {
+        ResourceInfo info{};
+        bool tracked{};
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            auto it = g_resource_infos.find(resource);
+            if (it != g_resource_infos.end()) {
+                it->second.mapped = *data;
+                if (it->second.mapped_size == 0 && it->second.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                    it->second.mapped_size = static_cast<size_t>(std::min<uint64_t>(it->second.desc.Width, SIZE_MAX));
+                }
+                info = it->second;
+                tracked = true;
+            }
+        }
+
+        if (!tracked) {
+            D3D12_HEAP_PROPERTIES heap_props{};
+            D3D12_HEAP_FLAGS heap_flags{};
+            info.desc = resource->GetDesc();
+            if (SUCCEEDED(resource->GetHeapProperties(&heap_props, &heap_flags))) {
+                info.heap_type = heap_props.Type;
+            }
+            info.gpu_va = resource->GetGPUVirtualAddress();
+            info.mapped = *data;
+            info.mapped_size = info.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                ? static_cast<size_t>(std::min<uint64_t>(info.desc.Width, SIZE_MAX))
+                : 0;
+
+            if (info.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                std::scoped_lock lock{g_reverse_mutex};
+                g_resource_infos[resource] = info;
+                tracked = true;
+            }
+        }
+
+        if (tracked && reverse_enabled() && info.heap_type == D3D12_HEAP_TYPE_UPLOAD) {
+            static std::atomic<uint32_t> map_log_count{};
+            if (map_log_count.fetch_add(1) < 50) {
+                log_line("Reverse Map upload resource=%p data=%p size=%zu", resource, *data, info.mapped_size);
+            }
+        }
+    }
+
+    return hr;
+}
+
+void STDMETHODCALLTYPE hook_resource_unmap(
+    ID3D12Resource* resource,
+    UINT subresource,
+    const D3D12_RANGE* written_range) {
+    ResourceInfo info{};
+    bool tracked{};
+    if (reverse_enabled() && g_config.reverse_scan_unmap) {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto it = g_resource_infos.find(resource);
+        if (it != g_resource_infos.end()) {
+            info = it->second;
+            tracked = true;
+        }
+    }
+
+    if (tracked && info.mapped != nullptr && info.mapped_size > 0 && reverse_enabled() && g_config.reverse_scan_unmap) {
+        size_t scan_size = info.mapped_size;
+        if (written_range != nullptr && written_range->End > written_range->Begin) {
+            const auto begin = std::min<SIZE_T>(written_range->Begin, info.mapped_size);
+            const auto end = std::min<SIZE_T>(written_range->End, info.mapped_size);
+            if (end > begin) {
+                scan_buffer_for_matrices(resource, static_cast<uint8_t*>(info.mapped) + begin, end - begin, "unmap-written", begin, 0, 0, 0, 0, nullptr, PipelineInfo{}, nullptr);
+                scan_size = 0;
+            }
+        }
+
+        if (scan_size > 0) {
+            scan_buffer_for_matrices(resource, info.mapped, scan_size, "unmap", 0, 0, 0, 0, 0, nullptr, PipelineInfo{}, nullptr);
+        }
+    }
+
+    if (taau_runtime_tracking_active() &&
+        g_taau_cb_snapshots_in_progress.load(std::memory_order_acquire) != 0) {
+        // Only the short guarded CB snapshot needs exclusion from Unmap. Serializing
+        // every engine Unmap for the full TAAU lifetime perturbs render scheduling.
+        std::scoped_lock lock{g_reverse_mutex};
+        g_resource_unmap(resource, subresource, written_range);
+    } else {
+        g_resource_unmap(resource, subresource, written_range);
+    }
+}
+
+void STDMETHODCALLTYPE hook_set_descriptor_heaps(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_descriptor_heaps,
+    ID3D12DescriptorHeap* const* descriptor_heaps) {
+    if (dlss_graphics_state_tracking_active() && descriptor_heaps != nullptr) {
+        auto* state = access_dlss_graphics_state(command_list, true);
+        if (state != nullptr) {
+            for (UINT index = 0; index < num_descriptor_heaps; ++index) {
+                auto* heap = descriptor_heaps[index];
+                if (heap == nullptr) {
+                    continue;
+                }
+                const auto desc = heap->GetDesc();
+                if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                    state->cbv_srv_uav_heap = heap;
+                } else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+                    state->sampler_heap = heap;
+                }
+            }
+        }
+    }
+    if (reverse_enabled() &&
+        (g_config.reverse_cbv_probe || taau_runtime_tracking_active() ||
+            streamline_post_dlss_descriptor_probe_active()) &&
+        descriptor_heaps != nullptr) {
+        ID3D12DescriptorHeap* cbv_heap{};
+        ID3D12DescriptorHeap* sampler_heap{};
+        for (UINT index = 0; index < num_descriptor_heaps; ++index) {
+            auto* heap = descriptor_heaps[index];
+            if (heap == nullptr) {
+                continue;
+            }
+
+            const auto bound_desc = heap->GetDesc();
+            if (bound_desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
+                sampler_heap = heap;
+                continue;
+            }
+
+            std::scoped_lock lock{g_reverse_mutex};
+            auto it = g_descriptor_heap_infos.find(heap);
+            if (it == g_descriptor_heap_infos.end() && g_d3d12_device != nullptr) {
+                const auto desc = heap->GetDesc();
+                if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                    DescriptorHeapInfo info{};
+                    info.type = desc.Type;
+                    info.num_descriptors = desc.NumDescriptors;
+                    info.increment = g_d3d12_device->GetDescriptorHandleIncrementSize(desc.Type);
+                    info.shader_visible = (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+                    info.cpu_start = heap->GetCPUDescriptorHandleForHeapStart();
+                    if (info.shader_visible) {
+                        info.gpu_start = heap->GetGPUDescriptorHandleForHeapStart();
+                    }
+                    it = g_descriptor_heap_infos.emplace(heap, info).first;
+                    if (g_descriptor_heap_log_count.fetch_add(1) < 40) {
+                        log_line("Reverse descriptor heap lazy heap=%p num=%u inc=%u shader=%u cpu=0x%zX gpu=0x%zX",
+                            heap,
+                            info.num_descriptors,
+                            info.increment,
+                            info.shader_visible ? 1u : 0u,
+                            info.cpu_start.ptr,
+                            info.gpu_start.ptr);
+                    }
+                }
+            }
+            if (it != g_descriptor_heap_infos.end() && it->second.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+                cbv_heap = heap;
+            }
+        }
+
+        if (cbv_heap != nullptr || sampler_heap != nullptr) {
+            std::scoped_lock lock{g_reverse_mutex};
+            auto& info = g_command_list_infos[command_list];
+            if (cbv_heap != nullptr) {
+                info.cbv_srv_uav_heap = cbv_heap;
+            }
+            if (sampler_heap != nullptr) {
+                info.sampler_heap = sampler_heap;
+            }
+        }
+    }
+
+    g_set_descriptor_heaps(command_list, num_descriptor_heaps, descriptor_heaps);
+}
+
+void STDMETHODCALLTYPE hook_set_graphics_root_descriptor_table(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
+    if (dlss_graphics_state_tracking_active() && root_parameter_index < 32) {
+        if (auto* state = access_dlss_graphics_state(command_list, true)) {
+            state->tables[root_parameter_index] = base_descriptor;
+        }
+    }
+    if (reverse_enabled() &&
+        g_config.reverse_cbv_probe &&
+        root_parameter_index < 32) {
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            g_command_list_infos[command_list].graphics_tables[root_parameter_index] = base_descriptor;
+        }
+
+        if (base_descriptor.ptr != 0 && g_descriptor_table_bind_log_count.fetch_add(1) < 80) {
+            log_line("Reverse descriptor table bind command_list=%p root=%u gpu=0x%zX",
+                command_list,
+                root_parameter_index,
+                base_descriptor.ptr);
+        }
+    }
+
+    g_set_graphics_root_descriptor_table(command_list, root_parameter_index, base_descriptor);
+}
+
+void STDMETHODCALLTYPE hook_set_compute_root_descriptor_table(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
+    if (reverse_enabled() &&
+        (taau_runtime_tracking_active() ||
+            streamline_post_dlss_descriptor_probe_active()) &&
+        root_parameter_index < 32) {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_command_list_infos[command_list].compute_tables[root_parameter_index] = base_descriptor;
+    }
+    g_set_compute_root_descriptor_table(command_list, root_parameter_index, base_descriptor);
+}
+
+void STDMETHODCALLTYPE hook_set_graphics_root_cbv(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
+    if (dlss_graphics_state_tracking_active() && root_parameter_index < 32) {
+        if (auto* state = access_dlss_graphics_state(command_list, true)) {
+            state->cbv[root_parameter_index] = buffer_location;
+        }
+    }
+    if (reverse_enabled() &&
+        g_config.reverse_cbv_probe &&
+        root_parameter_index < 32) {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_command_list_infos[command_list].graphics_cbv[root_parameter_index] = buffer_location;
+
+        if (buffer_location != 0 && g_cbv_bind_log_count.fetch_add(1) < 40) {
+            log_line("Reverse CBV bind command_list=%p root=%u gpuva=0x%llX",
+                command_list,
+                root_parameter_index,
+                static_cast<unsigned long long>(buffer_location));
+        }
+    }
+
+    g_set_graphics_root_cbv(command_list, root_parameter_index, buffer_location);
+}
+
+void STDMETHODCALLTYPE hook_set_compute_root_cbv(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
+    if (reverse_enabled() &&
+        (taau_runtime_tracking_active() ||
+            streamline_post_dlss_descriptor_probe_active()) &&
+        root_parameter_index < 32) {
+        std::scoped_lock lock{g_reverse_mutex};
+        g_command_list_infos[command_list].compute_cbv[root_parameter_index] = buffer_location;
+    }
+    g_set_compute_root_cbv(command_list, root_parameter_index, buffer_location);
+}
+
+void STDMETHODCALLTYPE hook_set_compute_root_32bit_constant(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT src_data,
+    UINT dest_offset_in_32bit_values) {
+    if (reverse_enabled() &&
+        (taau_runtime_tracking_active() ||
+            streamline_post_dlss_descriptor_probe_active()) &&
+        root_parameter_index < 32 && dest_offset_in_32bit_values < 64) {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& info = g_command_list_infos[command_list];
+        info.compute_constants[root_parameter_index][dest_offset_in_32bit_values] = src_data;
+        info.compute_constant_masks[root_parameter_index] |= 1ull << dest_offset_in_32bit_values;
+    }
+    g_set_compute_root_32bit_constant(
+        command_list, root_parameter_index, src_data, dest_offset_in_32bit_values);
+}
+
+void STDMETHODCALLTYPE hook_set_compute_root_32bit_constants(
+    ID3D12GraphicsCommandList* command_list,
+    UINT root_parameter_index,
+    UINT num_32bit_values_to_set,
+    const void* src_data,
+    UINT dest_offset_in_32bit_values) {
+    if (reverse_enabled() &&
+        (taau_runtime_tracking_active() ||
+            streamline_post_dlss_descriptor_probe_active()) &&
+        root_parameter_index < 32 && src_data != nullptr &&
+        dest_offset_in_32bit_values < 64) {
+        const UINT count = std::min(num_32bit_values_to_set, 64u - dest_offset_in_32bit_values);
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& info = g_command_list_infos[command_list];
+        memcpy(info.compute_constants[root_parameter_index].data() + dest_offset_in_32bit_values,
+            src_data, static_cast<size_t>(count) * sizeof(uint32_t));
+        for (UINT index = 0; index < count; ++index) {
+            info.compute_constant_masks[root_parameter_index] |=
+                1ull << (dest_offset_in_32bit_values + index);
+        }
+    }
+    g_set_compute_root_32bit_constants(command_list, root_parameter_index,
+        num_32bit_values_to_set, src_data, dest_offset_in_32bit_values);
+}
+
+void STDMETHODCALLTYPE hook_set_pipeline_state(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState* pipeline_state) {
+    ID3D12PipelineState* bound_pipeline_state = pipeline_state;
+    if (pipeline_state != nullptr &&
+        g_hud_composite_original_pso.load(std::memory_order_acquire) == pipeline_state) {
+        // Fullscreen menus are submitted as one head-locked quad visible to
+        // both eyes. Applying the gameplay -16/+16 variants while REDengine
+        // still records its two serial views can bake two displaced UI copies
+        // into that single texture. Keep the original zero-shift composite for
+        // this mono/head-locked route; gameplay retains the exact V400 routing.
+        if (g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+            !g_cinema_mode_active.load(std::memory_order_relaxed)) {
+            int hud_eye = g_engine_render_eye;
+            if (hud_eye < 0 || hud_eye > 1) {
+                hud_eye = g_engine_factory_eye;
+            }
+            const uint32_t routed_eye =
+                lookup_streamline_command_list_last_eye(command_list);
+            if (routed_eye <= 1) {
+                hud_eye = static_cast<int>(routed_eye);
+            }
+            // No-AA and TAAU do not pass through Streamline, so their final HUD
+            // command list has no route tag even though the frame itself already
+            // has an authoritative REDengine eye/pair tag. Peek (do not consume)
+            // the same queue entry that the later PRESENT barrier will use to
+            // capture this backbuffer. This keeps HUD convergence attached to
+            // the exact output identity instead of guessing from Present parity.
+            uint64_t hud_pair_id{};
+            if ((hud_eye < 0 || hud_eye > 1) &&
+                g_config.openxr_mode == 4 &&
+                !temporal_backend_is_dlss_packed()) {
+                std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+                if (!g_engine_completed_tag_queue.empty()) {
+                    const auto& completed_tag =
+                        g_engine_completed_tag_queue.front();
+                    if (completed_tag.eye <= 1 &&
+                        completed_tag.pair_id != 0 &&
+                        completed_tag.generation ==
+                            g_streamline_capture_generation.load(
+                                std::memory_order_acquire)) {
+                        hud_eye = static_cast<int>(completed_tag.eye);
+                        hud_pair_id = completed_tag.pair_id;
+                    }
+                }
+            }
+            if (hud_eye == 0) {
+                bound_pipeline_state =
+                    g_hud_composite_eye0_pso.load(std::memory_order_acquire);
+            } else if (hud_eye == 1) {
+                bound_pipeline_state =
+                    g_hud_composite_eye1_pso.load(std::memory_order_acquire);
+            }
+            if (bound_pipeline_state == nullptr) {
+                bound_pipeline_state = pipeline_state;
+            }
+            if (hud_pair_id != 0) {
+                static std::atomic<uint32_t> completed_tag_hud_logs{};
+                if (completed_tag_hud_logs.fetch_add(
+                        1, std::memory_order_relaxed) < 24) {
+                    log_line(
+                        "HUD completed-tag authority eye=%d pair=%llu command_list=%p present=%llu",
+                        hud_eye,
+                        static_cast<unsigned long long>(hud_pair_id),
+                        command_list,
+                        static_cast<unsigned long long>(
+                            g_present_count.load(std::memory_order_relaxed)));
+                }
+            }
+        }
+    }
+    const bool use_shifted_geometry = g_config.reverse_geometry_shift &&
+        ((g_config.openxr_mode != 3 && g_config.openxr_mode != 4) ||
+            (g_present_count.load() & 1ull) != 0);
+    if (use_shifted_geometry && pipeline_state != nullptr) {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto shifted = g_geometry_shift_psos.find(pipeline_state);
+        if (shifted != g_geometry_shift_psos.end()) {
+            bound_pipeline_state = shifted->second;
+        }
+    }
+
+    if (reverse_enabled()) {
+        const bool stored = store_command_list_pipeline(command_list, bound_pipeline_state);
+        const bool legacy_pipeline_tracking =
+            g_config.reverse_cbv_probe || g_config.reverse_stereo_probe ||
+            g_config.reverse_orbit_probe || g_config.reverse_copy_probe ||
+            g_config.reverse_geometry_shift || g_aim_pso_probe_active.load() ||
+            g_compute_probe_active.load();
+        if (!stored || legacy_pipeline_tracking) {
+            std::scoped_lock lock{g_reverse_mutex};
+            g_command_list_infos[command_list].pipeline_state = bound_pipeline_state;
+        }
+
+        if (pipeline_state != nullptr &&
+            pipeline_state == g_taau_resolve_pipeline.load(std::memory_order_acquire)) {
+            g_taau_native_last_seen_present.store(
+                g_present_count.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+
+        if (g_config.reverse_cbv_probe && pipeline_state != nullptr &&
+            g_pso_bind_log_count.fetch_add(1) < 80) {
+            const auto info = lookup_pipeline_info(pipeline_state);
+            log_line("Reverse SetPipelineState command_list=%p pso=%p vs=0x%llX ps=0x%llX rs=%p prim=%u rt=%u",
+                command_list,
+                pipeline_state,
+                static_cast<unsigned long long>(info.vs_hash),
+                static_cast<unsigned long long>(info.ps_hash),
+                info.root_signature,
+                static_cast<unsigned>(info.primitive_type),
+                info.render_target_count);
+        }
+    }
+
+    g_set_pipeline_state(command_list, bound_pipeline_state);
+}
+
+void STDMETHODCALLTYPE hook_set_graphics_root_signature(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12RootSignature* root_signature) {
+    if (dlss_graphics_state_tracking_active()) {
+        if (auto* state = access_dlss_graphics_state(command_list, true)) {
+            state->root_signature = root_signature;
+            state->cbv.fill(0);
+            state->tables.fill(D3D12_GPU_DESCRIPTOR_HANDLE{});
+        }
+    }
+    if (reverse_enabled() &&
+        g_config.reverse_cbv_probe) {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& info = g_command_list_infos[command_list];
+        info.graphics_root_signature = root_signature;
+        info.graphics_cbv.fill(0);
+        info.graphics_tables.fill(D3D12_GPU_DESCRIPTOR_HANDLE{});
+    }
+
+    g_set_graphics_root_signature(command_list, root_signature);
+}
+
+void STDMETHODCALLTYPE hook_set_compute_root_signature(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12RootSignature* root_signature) {
+    if (reverse_enabled() &&
+        (taau_runtime_tracking_active() ||
+            streamline_post_dlss_descriptor_probe_active())) {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& info = g_command_list_infos[command_list];
+        info.compute_root_signature = root_signature;
+        info.compute_cbv.fill(0);
+        info.compute_tables.fill(D3D12_GPU_DESCRIPTOR_HANDLE{});
+        info.compute_constant_masks.fill(0);
+    }
+    g_set_compute_root_signature(command_list, root_signature);
+}
+
+void sample_aim_pso_probe(
+    ID3D12GraphicsCommandList* command_list,
+    const char* source,
+    UINT element_count,
+    UINT instance_count) {
+    const uint64_t present = g_present_count.load();
+    auto* pipeline = load_command_list_pipeline(command_list);
+    if (pipeline != nullptr) {
+        const auto pipeline_info = lookup_pipeline_info(pipeline);
+        if (source != nullptr && strstr(source, "Indexed") == nullptr &&
+            element_count == 6 && instance_count == 1 &&
+            pipeline_info.vs_hash == 0xA1EFA1FD7AF9F39Full &&
+            pipeline_info.ps_hash == 0x383D662D669D2C2Cull) {
+            g_aim_crosshair_last_present.store(present);
+        }
+    }
+    if (!g_aim_pso_probe_active.load()) {
+        return;
+    }
+
+    if (pipeline != nullptr) {
+        const AimDrawKey key{
+            pipeline, element_count, instance_count,
+            source != nullptr && strstr(source, "Indexed") != nullptr};
+        std::scoped_lock lock{g_aim_pso_probe_mutex};
+        ++g_aim_pso_probe_counts[key];
+    }
+
+    if (present < g_aim_pso_probe_end_present.load() ||
+        !g_aim_pso_probe_active.exchange(false)) {
+        return;
+    }
+
+    std::vector<std::pair<AimDrawKey, uint64_t>> samples{};
+    {
+        std::scoped_lock lock{g_aim_pso_probe_mutex};
+        samples.assign(g_aim_pso_probe_counts.begin(), g_aim_pso_probe_counts.end());
+    }
+    std::sort(samples.begin(), samples.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+    const uint32_t capture = g_aim_pso_probe_capture_id.load();
+    log_line("Aim PSO capture %u complete signatures=%zu", capture, samples.size());
+    for (size_t index = 0; index < std::min<size_t>(samples.size(), 120); ++index) {
+        const auto& [key, count] = samples[index];
+        const auto info = lookup_pipeline_info(key.pipeline);
+        log_line("Aim PSO capture=%u count=%llu indexed=%d elements=%u instances=%u pso=%p vs=0x%llX ps=0x%llX rt=%u",
+            capture, static_cast<unsigned long long>(count), key.indexed,
+            key.elements, key.instances, key.pipeline,
+            static_cast<unsigned long long>(info.vs_hash),
+            static_cast<unsigned long long>(info.ps_hash), info.render_target_count);
+    }
+}
+
+void sample_draw_cbvs(
+    ID3D12GraphicsCommandList* command_list,
+    const char* source,
+    UINT element_count,
+    UINT instance_count) {
+    sample_aim_pso_probe(command_list, source, element_count, instance_count);
+    if (!reverse_enabled() || !g_config.reverse_cbv_probe) {
+        return;
+    }
+
+    const auto global_draw = ++g_global_draw_count;
+    if (g_config.reverse_orbit_probe || g_config.reverse_copy_probe) {
+        CommandListInfo orbit_snapshot{};
+        PipelineInfo orbit_pipeline_info{};
+        struct OrbitTable {
+            UINT root{};
+            size_t local_offset{};
+            CbvDescriptorInfo cbv{};
+        };
+        std::vector<OrbitTable> orbit_tables{};
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            auto it = g_command_list_infos.find(command_list);
+            if (it != g_command_list_infos.end()) {
+                orbit_snapshot = it->second;
+            }
+        }
+        orbit_snapshot.pipeline_state = load_command_list_pipeline(command_list);
+
+        orbit_pipeline_info = lookup_pipeline_info(orbit_snapshot.pipeline_state);
+        if (orbit_probe_pipeline_candidate(orbit_pipeline_info)) {
+            {
+                std::scoped_lock lock{g_reverse_mutex};
+                for (const auto& target : k_orbit_probe_targets) {
+                    if (target.vs_hash != orbit_pipeline_info.vs_hash ||
+                        target.ps_hash != orbit_pipeline_info.ps_hash ||
+                        target.root >= static_cast<UINT>(g_config.reverse_max_roots)) {
+                        continue;
+                    }
+
+                    CbvDescriptorInfo cbv{};
+                    SIZE_T cpu_handle{};
+                    if (resolve_descriptor_table_cbv(orbit_snapshot, orbit_snapshot.graphics_tables[target.root], cbv, cpu_handle)) {
+                        orbit_tables.push_back(OrbitTable{target.root, target.local_offset, cbv});
+                    }
+                }
+            }
+
+            for (const auto& target : k_orbit_probe_targets) {
+                if (target.vs_hash == orbit_pipeline_info.vs_hash &&
+                    target.ps_hash == orbit_pipeline_info.ps_hash &&
+                    target.root < static_cast<UINT>(g_config.reverse_max_roots)) {
+                    watch_camera_cbv_gpu_va(
+                        orbit_snapshot.graphics_cbv[target.root] + target.local_offset,
+                        sizeof(float) * 16,
+                        target.root,
+                        orbit_pipeline_info);
+                    orbit_probe_cbv_gpu_va(
+                        orbit_snapshot.graphics_cbv[target.root],
+                        target.root,
+                        global_draw,
+                        element_count,
+                        instance_count,
+                        orbit_pipeline_info);
+                }
+            }
+
+            for (const auto& table : orbit_tables) {
+                watch_camera_cbv_gpu_va(
+                    table.cbv.gpu_va + table.local_offset,
+                    sizeof(float) * 16,
+                    table.root,
+                    orbit_pipeline_info);
+                orbit_probe_cbv_gpu_va(
+                    table.cbv.gpu_va,
+                    table.root,
+                    global_draw,
+                    element_count,
+                    instance_count,
+                    orbit_pipeline_info);
+            }
+        }
+    }
+
+    if (g_config.reverse_active_nudge) {
+        CommandListInfo active_snapshot{};
+        PipelineInfo active_pipeline_info{};
+        struct ActiveTable {
+            UINT root{};
+            CbvDescriptorInfo cbv{};
+        };
+        std::vector<ActiveTable> active_tables{};
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            auto it = g_command_list_infos.find(command_list);
+            if (it != g_command_list_infos.end()) {
+                active_snapshot = it->second;
+            }
+        }
+        active_snapshot.pipeline_state = load_command_list_pipeline(command_list);
+
+        active_pipeline_info = lookup_pipeline_info(active_snapshot.pipeline_state);
+        if (active_nudge_pipeline_candidate(active_pipeline_info)) {
+            {
+                std::scoped_lock lock{g_reverse_mutex};
+                for (UINT root = 0; root < static_cast<UINT>(g_config.reverse_max_roots); ++root) {
+                    CbvDescriptorInfo cbv{};
+                    SIZE_T cpu_handle{};
+                    if (resolve_descriptor_table_cbv(active_snapshot, active_snapshot.graphics_tables[root], cbv, cpu_handle)) {
+                        active_tables.push_back(ActiveTable{root, cbv});
+                    }
+                }
+            }
+
+            for (UINT root = 0; root < static_cast<UINT>(g_config.reverse_max_roots); ++root) {
+                nudge_cbv_gpu_va(command_list, active_snapshot.graphics_cbv[root], root, global_draw, active_pipeline_info);
+            }
+            for (const auto& table : active_tables) {
+                nudge_cbv_gpu_va(command_list, table.cbv.gpu_va, table.root, global_draw, active_pipeline_info);
+            }
+        }
+    }
+
+    if (global_draw % static_cast<uint64_t>(g_config.reverse_draw_sample_interval) != 0) {
+        return;
+    }
+
+    CommandListInfo snapshot{};
+    uint64_t local_draw_count{};
+    struct DescriptorTableSample {
+        UINT root{};
+        D3D12_GPU_DESCRIPTOR_HANDLE table{};
+        SIZE_T cpu_handle{};
+        CbvDescriptorInfo cbv{};
+    };
+    std::vector<DescriptorTableSample> table_samples{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& info = g_command_list_infos[command_list];
+        local_draw_count = ++info.draw_count;
+        snapshot = info;
+
+        for (UINT root = 0; root < static_cast<UINT>(g_config.reverse_max_roots); ++root) {
+            CbvDescriptorInfo cbv{};
+            SIZE_T cpu_handle{};
+            if (resolve_descriptor_table_cbv(snapshot, snapshot.graphics_tables[root], cbv, cpu_handle)) {
+                table_samples.push_back(DescriptorTableSample{root, snapshot.graphics_tables[root], cpu_handle, cbv});
+            }
+        }
+    }
+
+    const auto pipeline_info = lookup_pipeline_info(snapshot.pipeline_state);
+
+    log_line("Reverse draw sample source=%s global_draw=%llu local_draw=%llu command_list=%p elements=%u instances=%u pso=%p vs=0x%llX ps=0x%llX rs=%p pso_rs=%p prim=%u rt=%u",
+        source,
+        static_cast<unsigned long long>(global_draw),
+        static_cast<unsigned long long>(local_draw_count),
+        command_list,
+        element_count,
+        instance_count,
+        snapshot.pipeline_state,
+        static_cast<unsigned long long>(pipeline_info.vs_hash),
+        static_cast<unsigned long long>(pipeline_info.ps_hash),
+        snapshot.graphics_root_signature,
+        pipeline_info.root_signature,
+        static_cast<unsigned>(pipeline_info.primitive_type),
+        pipeline_info.render_target_count);
+
+    for (UINT root = 0; root < static_cast<UINT>(g_config.reverse_max_roots); ++root) {
+        scan_cbv_gpu_va(snapshot.graphics_cbv[root], source, root, global_draw, element_count, instance_count, snapshot.pipeline_state, pipeline_info, snapshot.graphics_root_signature);
+    }
+
+    for (const auto& table_sample : table_samples) {
+        static std::atomic<uint32_t> table_sample_log_count{};
+        if (table_sample_log_count.fetch_add(1) < 80) {
+            log_line("Reverse descriptor table sample source=%s draw=%llu root=%u pso=%p vs=0x%llX ps=0x%llX rs=%p table=0x%zX cpu=0x%zX gpuva=0x%llX size=%u",
+                source,
+                static_cast<unsigned long long>(global_draw),
+                table_sample.root,
+                snapshot.pipeline_state,
+                static_cast<unsigned long long>(pipeline_info.vs_hash),
+                static_cast<unsigned long long>(pipeline_info.ps_hash),
+                snapshot.graphics_root_signature,
+                table_sample.table.ptr,
+                table_sample.cpu_handle,
+                static_cast<unsigned long long>(table_sample.cbv.gpu_va),
+                table_sample.cbv.size_in_bytes);
+        }
+
+        scan_cbv_gpu_va(table_sample.cbv.gpu_va, "draw-descriptor-table-cbv", table_sample.root, global_draw, element_count, instance_count, snapshot.pipeline_state, pipeline_info, snapshot.graphics_root_signature);
+    }
+}
+
+bool ensure_dlss_gpu_profiler() {
+    if (!g_config.logging_enabled || !g_config.ngx_trace ||
+        g_d3d12_device == nullptr || g_command_queue == nullptr) {
+        return false;
+    }
+    std::scoped_lock lock{g_dlss_gpu_profile_mutex};
+    if (g_dlss_gpu_profile_query_heap != nullptr &&
+        g_dlss_gpu_profile_readback != nullptr &&
+        g_dlss_gpu_profile_fence != nullptr &&
+        g_dlss_gpu_profile_mapped != nullptr &&
+        g_dlss_gpu_profile_frequency != 0) {
+        return true;
+    }
+
+    D3D12_QUERY_HEAP_DESC query_desc{};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_desc.Count = kDlssGpuProfileTimestampCount *
+        kDlssGpuProfileSampleCount;
+    if (FAILED(g_d3d12_device->CreateQueryHeap(
+            &query_desc, IID_PPV_ARGS(&g_dlss_gpu_profile_query_heap)))) {
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = static_cast<UINT64>(query_desc.Count) * sizeof(uint64_t);
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_d3d12_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&g_dlss_gpu_profile_readback)))) {
+        return false;
+    }
+    const D3D12_RANGE empty_range{0, 0};
+    if (FAILED(g_dlss_gpu_profile_readback->Map(
+            0, &empty_range,
+            reinterpret_cast<void**>(&g_dlss_gpu_profile_mapped)))) {
+        return false;
+    }
+    if (FAILED(g_d3d12_device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE,
+            IID_PPV_ARGS(&g_dlss_gpu_profile_fence))) ||
+        FAILED(g_command_queue->GetTimestampFrequency(
+            &g_dlss_gpu_profile_frequency)) ||
+        g_dlss_gpu_profile_frequency == 0) {
+        return false;
+    }
+    log_line("DLSS GPU profiler ready frequency=%llu samples=%u timestamps=%u",
+        static_cast<unsigned long long>(g_dlss_gpu_profile_frequency),
+        kDlssGpuProfileSampleCount, kDlssGpuProfileTimestampCount);
+    return true;
+}
+
+UINT dlss_gpu_profile_query_base(const DlssGpuProfileSample* sample) {
+    return static_cast<UINT>(sample - g_dlss_gpu_profile_samples.data()) *
+        kDlssGpuProfileTimestampCount;
+}
+
+void dlss_gpu_profile_mark(
+    ID3D12GraphicsCommandList* command_list,
+    UINT timestamp) {
+    auto* sample = g_dlss_gpu_profile_active_sample;
+    if (sample == nullptr || command_list == nullptr ||
+        g_dlss_gpu_profile_query_heap == nullptr ||
+        timestamp >= kDlssGpuProfileTimestampCount) {
+        return;
+    }
+    command_list->EndQuery(
+        g_dlss_gpu_profile_query_heap,
+        D3D12_QUERY_TYPE_TIMESTAMP,
+        dlss_gpu_profile_query_base(sample) + timestamp);
+}
+
+void begin_dlss_gpu_profile(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t pair_id) {
+    const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+    if (command_list == nullptr || pair_id == UINT64_MAX ||
+        present < 300 || pair_id % 30 != 0 ||
+        g_dlss_gpu_profile_logged.load(std::memory_order_relaxed) >= 12 ||
+        g_dlss_gpu_profile_active_sample != nullptr ||
+        !ensure_dlss_gpu_profiler()) {
+        return;
+    }
+    std::scoped_lock lock{g_dlss_gpu_profile_mutex};
+    for (auto& sample : g_dlss_gpu_profile_samples) {
+        if (sample.in_use) {
+            continue;
+        }
+        sample = {};
+        sample.in_use = true;
+        sample.pair_id = pair_id;
+        sample.present = present;
+        QueryPerformanceCounter(&sample.cpu_replay_begin);
+        g_dlss_gpu_profile_active_sample = &sample;
+        dlss_gpu_profile_mark(command_list, 0);
+        return;
+    }
+}
+
+void finish_dlss_gpu_profile_replay(
+    ID3D12GraphicsCommandList* command_list) {
+    auto* sample = g_dlss_gpu_profile_active_sample;
+    if (sample == nullptr) {
+        return;
+    }
+    dlss_gpu_profile_mark(command_list, 5);
+    QueryPerformanceCounter(&sample->cpu_replay_end);
+}
+
+void begin_dlss_gpu_profile_bridge(
+    ID3D12GraphicsCommandList* command_list) {
+    auto* sample = g_dlss_gpu_profile_active_sample;
+    if (sample == nullptr) {
+        return;
+    }
+    QueryPerformanceCounter(&sample->cpu_bridge_begin);
+    dlss_gpu_profile_mark(command_list, 6);
+}
+
+void finish_dlss_gpu_profile(
+    ID3D12GraphicsCommandList* command_list) {
+    auto* sample = g_dlss_gpu_profile_active_sample;
+    if (sample == nullptr || command_list == nullptr) {
+        return;
+    }
+    dlss_gpu_profile_mark(command_list, 7);
+    QueryPerformanceCounter(&sample->cpu_bridge_end);
+    const UINT query_base = dlss_gpu_profile_query_base(sample);
+    command_list->ResolveQueryData(
+        g_dlss_gpu_profile_query_heap,
+        D3D12_QUERY_TYPE_TIMESTAMP,
+        query_base,
+        kDlssGpuProfileTimestampCount,
+        g_dlss_gpu_profile_readback,
+        static_cast<UINT64>(query_base) * sizeof(uint64_t));
+    {
+        std::scoped_lock lock{g_dlss_gpu_profile_mutex};
+        sample->resolved = true;
+    }
+    g_dlss_gpu_profile_active_sample = nullptr;
+}
+
+double dlss_gpu_profile_qpc_ms(
+    LARGE_INTEGER begin,
+    LARGE_INTEGER end) {
+    static LARGE_INTEGER frequency = [] {
+        LARGE_INTEGER value{};
+        QueryPerformanceFrequency(&value);
+        return value;
+    }();
+    if (frequency.QuadPart == 0 || end.QuadPart < begin.QuadPart) {
+        return 0.0;
+    }
+    return static_cast<double>(end.QuadPart - begin.QuadPart) * 1000.0 /
+        static_cast<double>(frequency.QuadPart);
+}
+
+int64_t present_phase_qpc_now() {
+    LARGE_INTEGER value{};
+    QueryPerformanceCounter(&value);
+    return value.QuadPart;
+}
+
+double present_phase_qpc_ms(int64_t begin, int64_t end) {
+    static const int64_t frequency = [] {
+        LARGE_INTEGER value{};
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart;
+    }();
+    if (frequency <= 0 || begin <= 0 || end < begin) {
+        return 0.0;
+    }
+    return static_cast<double>(end - begin) * 1000.0 /
+        static_cast<double>(frequency);
+}
+
+void process_dlss_gpu_profile() {
+    if (g_dlss_gpu_profile_fence == nullptr || g_command_queue == nullptr ||
+        g_dlss_gpu_profile_mapped == nullptr ||
+        g_dlss_gpu_profile_frequency == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_dlss_gpu_profile_mutex};
+    bool needs_signal{};
+    for (const auto& sample : g_dlss_gpu_profile_samples) {
+        needs_signal |= sample.in_use && sample.resolved &&
+            sample.fence_value == 0;
+    }
+    if (needs_signal) {
+        const uint64_t value = ++g_dlss_gpu_profile_next_fence;
+        if (SUCCEEDED(g_command_queue->Signal(
+                g_dlss_gpu_profile_fence, value))) {
+            for (auto& sample : g_dlss_gpu_profile_samples) {
+                if (sample.in_use && sample.resolved &&
+                    sample.fence_value == 0) {
+                    sample.fence_value = value;
+                }
+            }
+        }
+    }
+
+    const uint64_t completed = g_dlss_gpu_profile_fence->GetCompletedValue();
+    static double replay_sum{};
+    static double mvec_sum{};
+    static double ngx_sum{};
+    static double bridge_sum{};
+    static double cpu_replay_sum{};
+    static double cpu_bridge_sum{};
+    for (auto& sample : g_dlss_gpu_profile_samples) {
+        if (!sample.in_use || !sample.resolved || sample.fence_value == 0 ||
+            sample.fence_value > completed) {
+            continue;
+        }
+        const UINT query_base = dlss_gpu_profile_query_base(&sample);
+        const auto* timestamp = g_dlss_gpu_profile_mapped + query_base;
+        bool valid = timestamp[0] != 0;
+        for (UINT index = 1; index < kDlssGpuProfileTimestampCount; ++index) {
+            valid &= timestamp[index] >= timestamp[index - 1];
+        }
+        if (valid) {
+            const double scale = 1000.0 /
+                static_cast<double>(g_dlss_gpu_profile_frequency);
+            const double replay_ms =
+                static_cast<double>(timestamp[5] - timestamp[0]) * scale;
+            const double mvec_ms =
+                static_cast<double>(timestamp[2] - timestamp[1]) * scale;
+            const double ngx_ms =
+                static_cast<double>(timestamp[4] - timestamp[3]) * scale;
+            const double bridge_ms =
+                static_cast<double>(timestamp[7] - timestamp[6]) * scale;
+            const double other_ms = std::max(
+                0.0, replay_ms - mvec_ms - ngx_ms);
+            const double cpu_replay_ms = dlss_gpu_profile_qpc_ms(
+                sample.cpu_replay_begin, sample.cpu_replay_end);
+            const double cpu_bridge_ms = dlss_gpu_profile_qpc_ms(
+                sample.cpu_bridge_begin, sample.cpu_bridge_end);
+            const uint32_t logged =
+                g_dlss_gpu_profile_logged.fetch_add(1) + 1;
+            replay_sum += replay_ms;
+            mvec_sum += mvec_ms;
+            ngx_sum += ngx_ms;
+            bridge_sum += bridge_ms;
+            cpu_replay_sum += cpu_replay_ms;
+            cpu_bridge_sum += cpu_bridge_ms;
+            log_line(
+                "DLSS GPU profile sample=%u pair=%llu present=%llu replay=%.4fms mvec=%.4fms ngx=%.4fms other=%.4fms bridge=%.4fms cpu_replay=%.4fms cpu_bridge=%.4fms",
+                logged,
+                static_cast<unsigned long long>(sample.pair_id),
+                static_cast<unsigned long long>(sample.present),
+                replay_ms, mvec_ms, ngx_ms, other_ms, bridge_ms,
+                cpu_replay_ms, cpu_bridge_ms);
+            if (logged == 12) {
+                log_line(
+                    "DLSS GPU profile average samples=12 replay=%.4fms mvec=%.4fms ngx=%.4fms other=%.4fms bridge=%.4fms cpu_replay=%.4fms cpu_bridge=%.4fms",
+                    replay_sum / 12.0, mvec_sum / 12.0,
+                    ngx_sum / 12.0,
+                    std::max(0.0, replay_sum - mvec_sum - ngx_sum) / 12.0,
+                    bridge_sum / 12.0, cpu_replay_sum / 12.0,
+                    cpu_bridge_sum / 12.0);
+            }
+        }
+        sample = {};
+    }
+}
+
+DlssGraphicsStateSnapshot capture_dlss_graphics_state(
+    ID3D12GraphicsCommandList* command_list) {
+    DlssGraphicsStateSnapshot snapshot{};
+    if (command_list == nullptr) {
+        return snapshot;
+    }
+
+    if (const auto* local = access_dlss_graphics_state(command_list, false)) {
+        snapshot = *local;
+        snapshot.pipeline_state = load_command_list_pipeline(command_list);
+        snapshot.valid = snapshot.pipeline_state != nullptr &&
+            snapshot.root_signature != nullptr;
+        if (snapshot.valid) {
+            return snapshot;
+        }
+    }
+
+    // A command list normally stays on one recording thread. Keep the legacy
+    // tracker as a correctness fallback if REDengine migrates one mid-pass.
+    std::scoped_lock lock{g_reverse_mutex};
+    const auto found = g_command_list_infos.find(command_list);
+    if (found == g_command_list_infos.end()) {
+        return snapshot;
+    }
+    const auto& tracked = found->second;
+    snapshot.cbv = tracked.graphics_cbv;
+    snapshot.tables = tracked.graphics_tables;
+    snapshot.cbv_srv_uav_heap = tracked.cbv_srv_uav_heap;
+    snapshot.sampler_heap = tracked.sampler_heap;
+    snapshot.pipeline_state = load_command_list_pipeline(command_list);
+    if (snapshot.pipeline_state == nullptr) {
+        snapshot.pipeline_state = tracked.pipeline_state;
+    }
+    snapshot.root_signature = tracked.graphics_root_signature;
+    snapshot.valid = snapshot.pipeline_state != nullptr &&
+        snapshot.root_signature != nullptr;
+    return snapshot;
+}
+
+void restore_dlss_graphics_state(
+    ID3D12GraphicsCommandList* command_list,
+    const DlssGraphicsStateSnapshot& snapshot) {
+    if (command_list == nullptr || !snapshot.valid ||
+        g_set_descriptor_heaps == nullptr ||
+        g_set_graphics_root_signature == nullptr ||
+        g_set_pipeline_state == nullptr ||
+        g_set_graphics_root_descriptor_table == nullptr ||
+        g_set_graphics_root_cbv == nullptr) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[2]{};
+    UINT heap_count{};
+    if (snapshot.cbv_srv_uav_heap != nullptr) {
+        heaps[heap_count++] = snapshot.cbv_srv_uav_heap;
+    }
+    if (snapshot.sampler_heap != nullptr) {
+        heaps[heap_count++] = snapshot.sampler_heap;
+    }
+    if (heap_count != 0) {
+        g_set_descriptor_heaps(command_list, heap_count, heaps);
+    }
+    g_set_graphics_root_signature(command_list, snapshot.root_signature);
+    g_set_pipeline_state(command_list, snapshot.pipeline_state);
+
+    UINT table_count{};
+    UINT cbv_count{};
+    for (UINT root = 0; root < snapshot.tables.size(); ++root) {
+        if (snapshot.tables[root].ptr != 0) {
+            g_set_graphics_root_descriptor_table(
+                command_list, root, snapshot.tables[root]);
+            ++table_count;
+        }
+        if (snapshot.cbv[root] != 0) {
+            g_set_graphics_root_cbv(command_list, root, snapshot.cbv[root]);
+            ++cbv_count;
+        }
+    }
+
+    store_command_list_pipeline(command_list, snapshot.pipeline_state);
+    if (auto* local = access_dlss_graphics_state(command_list, true)) {
+        *local = snapshot;
+    }
+    if (reverse_enabled() &&
+        (g_config.reverse_cbv_probe || taau_runtime_tracking_active() ||
+            streamline_post_dlss_descriptor_probe_active())) {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& tracked = g_command_list_infos[command_list];
+        tracked.graphics_cbv = snapshot.cbv;
+        tracked.graphics_tables = snapshot.tables;
+        tracked.cbv_srv_uav_heap = snapshot.cbv_srv_uav_heap;
+        tracked.sampler_heap = snapshot.sampler_heap;
+        tracked.pipeline_state = snapshot.pipeline_state;
+        tracked.graphics_root_signature = snapshot.root_signature;
+    }
+    static std::atomic<uint32_t> restore_logs{};
+    if (restore_logs.fetch_add(1) < 32) {
+        log_line(
+            "Streamline replay graphics state restored command_list=%p pso=%p root_signature=%p heaps=%u tables=%u cbv=%u",
+            command_list, snapshot.pipeline_state, snapshot.root_signature,
+            heap_count, table_count, cbv_count);
+    }
+}
+
+// [FIX:DLSS-PACKED 8/10] Preserve the geometry-pair identity until the
+// corresponding processed image pair becomes active for presentation.
+void record_packed_dlss_pair_metadata(const EngineFrameTag& tag) {
+    if (!temporal_backend_is_dlss_packed() || tag.eye > 1 ||
+        tag.pair_id == UINT64_MAX) {
+        return;
+    }
+    std::scoped_lock lock{g_packed_dlss_present_mutex};
+    if (g_packed_dlss_collect_metadata.pair_id != tag.pair_id) {
+        g_packed_dlss_collect_metadata = {};
+        g_packed_dlss_collect_metadata.pair_id = tag.pair_id;
+        g_packed_dlss_collect_metadata.generation = tag.generation;
+    }
+    g_packed_dlss_collect_metadata.views[tag.eye] = tag.render_view;
+    g_packed_dlss_collect_metadata.view_valid[tag.eye] = tag.render_view_valid;
+    g_packed_dlss_collect_metadata.eye_mask = static_cast<uint8_t>(
+        g_packed_dlss_collect_metadata.eye_mask | (1u << tag.eye));
+    g_packed_dlss_collect_metadata.valid =
+        g_packed_dlss_collect_metadata.eye_mask == 0x3;
+}
+
+bool route_packed_dlss_present_tag(
+    const EngineFrameTag& engine_tag,
+    EngineFrameTag& presented_tag) {
+    if (!temporal_backend_is_dlss_packed() || engine_tag.eye > 1) {
+        return false;
+    }
+    std::scoped_lock lock{g_packed_dlss_present_mutex};
+    if (!g_packed_dlss_active_metadata.valid ||
+        g_packed_dlss_active_metadata.pair_id == UINT64_MAX) {
+        return false;
+    }
+    presented_tag = engine_tag;
+    presented_tag.pair_id = g_packed_dlss_active_metadata.pair_id;
+    presented_tag.generation = g_packed_dlss_active_metadata.generation;
+    presented_tag.render_view =
+        g_packed_dlss_active_metadata.views[engine_tag.eye];
+    presented_tag.render_view_valid =
+        g_packed_dlss_active_metadata.view_valid[engine_tag.eye];
+    g_packed_dlss_tags_overridden.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void finish_packed_dlss_present_capture(const EngineFrameTag& engine_tag) {
+    if (!temporal_backend_is_dlss_packed() || engine_tag.eye > 1 ||
+        engine_tag.pair_id == UINT64_MAX) {
+        return;
+    }
+    std::scoped_lock lock{g_packed_dlss_present_mutex};
+    if (g_packed_dlss_capture_cycle_pair != engine_tag.pair_id) {
+        g_packed_dlss_capture_cycle_pair = engine_tag.pair_id;
+        g_packed_dlss_capture_cycle_mask = 0;
+    }
+    g_packed_dlss_capture_cycle_mask = static_cast<uint8_t>(
+        g_packed_dlss_capture_cycle_mask | (1u << engine_tag.eye));
+    if (g_packed_dlss_capture_cycle_mask != 0x3 ||
+        !g_packed_dlss_next_metadata.valid) {
+        return;
+    }
+    g_packed_dlss_active_metadata = g_packed_dlss_next_metadata;
+    g_packed_dlss_next_metadata = {};
+    g_packed_dlss_capture_cycle_mask = 0;
+    static std::atomic<uint32_t> promotion_logs{};
+    if (promotion_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+        log_line(
+            "Packed DLSS presentation pair promoted engine_pair=%llu image_pair=%llu",
+            static_cast<unsigned long long>(engine_tag.pair_id),
+            static_cast<unsigned long long>(
+                g_packed_dlss_active_metadata.pair_id));
+    }
+}
+
+bool try_bridge_streamline_second_present_before_draw(
+    ID3D12GraphicsCommandList* command_list,
+    bool indexed,
+    UINT element_count,
+    UINT instance_count) {
+    thread_local uint32_t consumer_profile_counter{};
+    DlssCpuSampleScope cpu_scope{
+        kDlssCpuConsumerSample,
+        (++consumer_profile_counter & 0xFFu) == 0};
+    if (!temporal_backend_is_dlss() || command_list == nullptr ||
+        g_config.openxr_mode != 4 ||
+        g_streamline_canonical_output == nullptr) {
+        return false;
+    }
+    // Before the first real stereo activation the frontend/tutorial owns the
+    // native single-view route.  Once dual gameplay has been established,
+    // locked-camera cinematics remain valid geometry-stereo packed producers.
+    if (g_cinema_mode_active.load(std::memory_order_relaxed) ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire) ||
+        !g_engine_dual_gameplay_armed.load(std::memory_order_acquire)) {
+        return false;
+    }
+    constexpr uint64_t kStreamlinePrePostPixelHash =
+        0x93F11229A3A21CC6ull;
+    constexpr uint64_t kStreamlineRawConsumerPixelHash =
+        0xCBAB7210DBBD5199ull;
+    constexpr uint64_t kTransitionPrimaryPixelHash =
+        0x76B4B2DAB58944FCull;
+    constexpr uint64_t kFinalCompositePixelHash =
+        0x051248978BCC3943ull;
+    auto* current_pipeline = load_command_list_pipeline(command_list);
+    const auto current_pipeline_info = lookup_pipeline_info(current_pipeline);
+    auto* target_pipeline = g_streamline_prepost_pipeline.load(
+        std::memory_order_acquire);
+
+    // The transition-only recovery has no PS93 boundary, but the real eye-0
+    // command list still begins at PS76B.  The natural eye-1 DLSS command has
+    // copied only the right input into the packed atlas by this point.  Wait
+    // for this real eye-0 boundary before replaying Streamline: the shared
+    // REDengine color/depth/motion resources now contain the left render, just
+    // as they do at the normal packed replay boundary.  Preserve the validated
+    // one-pair latency by bridging the previous private left output first;
+    // publishing the newly completed pair afterward cannot overwrite the
+    // canonical image already copied for this native post chain.
+    if (g_packed_transition_ordered_recovery_active.load(
+            std::memory_order_acquire) &&
+        current_pipeline_info.ps_hash == kTransitionPrimaryPixelHash) {
+        const uint64_t pending_pair =
+            g_packed_dlss_pending_pair.load(std::memory_order_acquire);
+        if (pending_pair != UINT64_MAX) {
+            EngineFrameTag existing_route{};
+            const bool already_routed = lookup_streamline_command_list_route(
+                command_list, existing_route);
+            EngineFrameTag queue_back{};
+            bool queue_back_valid{};
+            {
+                std::scoped_lock queue_lock{
+                    g_engine_completed_tag_queue_mutex};
+                if (!g_engine_completed_tag_queue.empty()) {
+                    queue_back = g_engine_completed_tag_queue.back();
+                    queue_back_valid = true;
+                }
+            }
+            const uint32_t generation =
+                g_streamline_capture_generation.load(
+                    std::memory_order_acquire);
+            StreamlineCapturedDlssRecipe recipe{};
+            {
+                std::scoped_lock recipe_lock{g_streamline_dlss_recipe_mutex};
+                recipe = g_streamline_dlss_recipe;
+            }
+            if (!already_routed && queue_back_valid && queue_back.eye == 0 &&
+                queue_back.pair_id == pending_pair &&
+                queue_back.generation == generation && recipe.valid &&
+                recipe.eye == 1 && recipe.pair_id == pending_pair) {
+                uint64_t previous_pair =
+                    g_packed_transition_replayed_pair.load(
+                        std::memory_order_acquire);
+                bool claimed{};
+                while (previous_pair != pending_pair) {
+                    if (g_packed_transition_replayed_pair
+                            .compare_exchange_weak(
+                                previous_pair, pending_pair,
+                                std::memory_order_acq_rel,
+                                std::memory_order_acquire)) {
+                        claimed = true;
+                        break;
+                    }
+                }
+                if (claimed) {
+                    record_streamline_command_list_route(
+                        command_list, queue_back);
+
+                    begin_dlss_gpu_profile_bridge(command_list);
+                    bridge_streamline_private_output(
+                        command_list, g_streamline_private_outputs[0],
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    finish_dlss_gpu_profile(command_list);
+                    mark_streamline_command_list_bridged(
+                        command_list, g_present_count.load(
+                            std::memory_order_acquire));
+
+                    EngineFrameTag replay_tag = queue_back;
+                    if (recipe.constants.render_views_valid) {
+                        replay_tag.render_view =
+                            recipe.constants.render_views[0];
+                        replay_tag.render_view_valid = true;
+                    }
+                    record_packed_dlss_pair_metadata(replay_tag);
+
+                    begin_dlss_gpu_profile(command_list, pending_pair);
+                    const auto graphics_state = capture_dlss_graphics_state(
+                        command_list);
+                    g_streamline_transition_replay = true;
+                    const bool replayed = prepare_engine_dlss_output_for_eye(
+                        command_list, 0, pending_pair);
+                    g_streamline_transition_replay = false;
+                    restore_dlss_graphics_state(command_list, graphics_state);
+                    finish_dlss_gpu_profile_replay(command_list);
+
+                    const bool published = replayed &&
+                        publish_packed_dlss_output_after_draw(command_list);
+                    if (!replayed) {
+                        g_packed_transition_replayed_pair.store(
+                            previous_pair, std::memory_order_release);
+                    }
+                    static std::atomic<uint32_t> transition_76b_logs{};
+                    if (transition_76b_logs.fetch_add(
+                            1, std::memory_order_relaxed) < 64) {
+                        log_line(
+                            "Packed transition real eye0 completed before native 76B pair=%llu replayed=%u published=%u command_list=%p present=%llu",
+                            static_cast<unsigned long long>(pending_pair),
+                            replayed ? 1u : 0u, published ? 1u : 0u,
+                            command_list,
+                            static_cast<unsigned long long>(
+                                g_present_count.load(
+                                    std::memory_order_acquire)));
+                    }
+                }
+            }
+        }
+    }
+
+    // V550 proved that this draw hook runs immediately before REDengine's
+    // native PS5EA 0x80 -> 0x4 barrier.  Do not consume the ordered eye-0 pair
+    // here: the resource-barrier hook now performs the same private-output
+    // bridge at the exact native boundary.  If that barrier is absent, the
+    // existing final-composite fallback below still supplies continuous output.
+
+    // V536 proved that the packed atlas and both private outputs are correct,
+    // while eye 0 has already gone dark by the final composite.  V236 had
+    // already established the required boundary: publish the private output
+    // before REDengine's PS93 color/pre-post draw so the complete native post
+    // chain consumes the correct eye.  The pending pair identifies the
+    // anonymous natural eye-0 command list without relying on arrival parity.
+    if (g_packed_transition_ordered_recovery_active.load(
+            std::memory_order_acquire) &&
+        current_pipeline_info.ps_hash == kStreamlinePrePostPixelHash) {
+        const uint64_t pending_pair =
+            g_packed_transition_pending_eye0_pair.load(
+                std::memory_order_acquire);
+        if (pending_pair != UINT64_MAX) {
+            EngineFrameTag existing_route{};
+            const bool already_routed = lookup_streamline_command_list_route(
+                command_list, existing_route);
+            EngineFrameTag queue_back{};
+            bool queue_back_valid{};
+            {
+                std::scoped_lock queue_lock{g_engine_completed_tag_queue_mutex};
+                if (!g_engine_completed_tag_queue.empty()) {
+                    queue_back = g_engine_completed_tag_queue.back();
+                    queue_back_valid = true;
+                }
+            }
+            const uint32_t generation =
+                g_streamline_capture_generation.load(std::memory_order_acquire);
+            if (!already_routed && queue_back_valid && queue_back.eye == 0 &&
+                queue_back.pair_id == pending_pair &&
+                queue_back.generation == generation) {
+                uint64_t expected = pending_pair;
+                if (g_packed_transition_pending_eye0_pair.compare_exchange_strong(
+                        expected, UINT64_MAX, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    // This is the first ordinary PS93 route after the gap.
+                    // Seed its exact identity, then fall through to the
+                    // already validated normal PS93 bridge below.  That path
+                    // performs the image copy and atomically disarms ordered
+                    // recovery, so subsequent pairs are completely untouched.
+                    record_streamline_command_list_route(command_list, queue_back);
+                    static std::atomic<uint32_t> normal_handoff_logs{};
+                    if (normal_handoff_logs.fetch_add(
+                            1, std::memory_order_relaxed) < 8) {
+                        log_line(
+                            "Packed transition handed off to normal PS93 route pair=%llu command_list=%p present=%llu",
+                            static_cast<unsigned long long>(pending_pair),
+                            command_list,
+                            static_cast<unsigned long long>(g_present_count.load(
+                                std::memory_order_acquire)));
+                    }
+                }
+            }
+        }
+    }
+
+    // During the measured cinema-exit gap REDengine emits no PS93 draw for
+    // several seconds.  Preserve V534's continuous-output behavior only for a
+    // pair that still has not been consumed by the PS93 block above.  Once
+    // PS93 appears it claims the initial pending pair first, so this late
+    // bridge automatically stops and the correctly color-processed route wins.
+    if (g_packed_transition_ordered_recovery_active.load(
+            std::memory_order_acquire) &&
+        current_pipeline_info.ps_hash == kFinalCompositePixelHash) {
+        const uint64_t pending_pair =
+            g_packed_transition_pending_eye0_pair.load(
+                std::memory_order_acquire);
+        if (pending_pair != UINT64_MAX) {
+            EngineFrameTag existing_route{};
+            const bool already_routed = lookup_streamline_command_list_route(
+                command_list, existing_route);
+            EngineFrameTag queue_back{};
+            bool queue_back_valid{};
+            {
+                std::scoped_lock queue_lock{g_engine_completed_tag_queue_mutex};
+                if (!g_engine_completed_tag_queue.empty()) {
+                    queue_back = g_engine_completed_tag_queue.back();
+                    queue_back_valid = true;
+                }
+            }
+            const uint32_t generation =
+                g_streamline_capture_generation.load(std::memory_order_acquire);
+            if (!already_routed && queue_back_valid && queue_back.eye == 0 &&
+                queue_back.pair_id == pending_pair &&
+                queue_back.generation == generation) {
+                uint64_t expected = pending_pair;
+                if (g_packed_transition_pending_eye0_pair.compare_exchange_strong(
+                        expected, UINT64_MAX, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    record_streamline_command_list_route(command_list, queue_back);
+                    begin_dlss_gpu_profile_bridge(command_list);
+                    bridge_streamline_private_output(
+                        command_list, g_streamline_private_outputs[0],
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    finish_dlss_gpu_profile(command_list);
+                    mark_streamline_command_list_bridged(
+                        command_list, g_present_count.load(
+                            std::memory_order_acquire));
+                    static std::atomic<uint32_t> late_fallback_logs{};
+                    if (late_fallback_logs.fetch_add(
+                            1, std::memory_order_relaxed) < 64) {
+                        log_line(
+                            "Packed transition eye0 late bridge used while PS93 absent pair=%llu command_list=%p present=%llu",
+                            static_cast<unsigned long long>(pending_pair),
+                            command_list,
+                            static_cast<unsigned long long>(g_present_count.load(
+                                std::memory_order_acquire)));
+                    }
+                }
+            }
+        }
+    }
+
+    // V540 observed PS93 and its final composite retaining the same route in
+    // the measured variant.  Keep the one-shot route handoff for any variant
+    // that records them on separate command lists, but never copy the pre-post
+    // image here.
+    if (g_packed_transition_ordered_recovery_active.load(
+            std::memory_order_acquire) &&
+        current_pipeline_info.ps_hash == kFinalCompositePixelHash) {
+        const uint64_t pending_pair =
+            g_packed_transition_pending_eye0_final_route_pair.load(
+                std::memory_order_acquire);
+        if (pending_pair != UINT64_MAX) {
+            EngineFrameTag existing_route{};
+            const bool already_routed = lookup_streamline_command_list_route(
+                command_list, existing_route);
+            EngineFrameTag queue_back{};
+            bool queue_back_valid{};
+            {
+                std::scoped_lock queue_lock{g_engine_completed_tag_queue_mutex};
+                if (!g_engine_completed_tag_queue.empty()) {
+                    queue_back = g_engine_completed_tag_queue.back();
+                    queue_back_valid = true;
+                }
+            }
+            const uint32_t generation =
+                g_streamline_capture_generation.load(std::memory_order_acquire);
+            if (!already_routed && queue_back_valid && queue_back.eye == 0 &&
+                queue_back.pair_id == pending_pair &&
+                queue_back.generation == generation) {
+                uint64_t expected = pending_pair;
+                if (g_packed_transition_pending_eye0_final_route_pair
+                        .compare_exchange_strong(
+                            expected, UINT64_MAX, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                    record_streamline_command_list_route(command_list, queue_back);
+                    static std::atomic<uint32_t> ordered_final_route_logs{};
+                    if (ordered_final_route_logs.fetch_add(
+                            1, std::memory_order_relaxed) < 64) {
+                        log_line(
+                            "Packed transition eye0 final route restored without image bridge pair=%llu command_list=%p present=%llu",
+                            static_cast<unsigned long long>(pending_pair),
+                            command_list,
+                            static_cast<unsigned long long>(g_present_count.load(
+                                std::memory_order_acquire)));
+                    }
+                }
+            }
+        }
+    }
+
+    // During the cinema-exit variant the normal 93F primary is absent, but the
+    // draw order is stable: two CBAB raw consumers followed by the natural
+    // three-vertex primary. Complete the packed evaluation there without
+    // changing its PSO or canonical output; the following eye-0 final composite
+    // consumes the second private output in the block above.
+    EngineFrameTag sequence_tag{};
+    const uint32_t sequence_generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    const bool sequence_route_valid =
+        g_packed_transition_ordered_recovery_active.load(
+            std::memory_order_acquire) &&
+        lookup_streamline_command_list_route(command_list, sequence_tag) &&
+        sequence_tag.generation == sequence_generation &&
+        sequence_tag.eye == 1;
+    bool transition_primary{};
+    if (sequence_route_valid) {
+        if (g_streamline_transition_sequence_command_list != command_list ||
+            g_streamline_transition_sequence_pair != sequence_tag.pair_id) {
+            g_streamline_transition_sequence_command_list = command_list;
+            g_streamline_transition_sequence_pair = sequence_tag.pair_id;
+            g_streamline_transition_raw_consumer_count = 0;
+        }
+        const bool raw_consumer = !indexed && element_count == 3 &&
+            instance_count == 1 &&
+            current_pipeline_info.ps_hash == kStreamlineRawConsumerPixelHash;
+        if (raw_consumer && g_streamline_transition_raw_consumer_count < 2) {
+            ++g_streamline_transition_raw_consumer_count;
+        } else {
+            transition_primary =
+                g_streamline_transition_raw_consumer_count == 2 &&
+                !indexed && element_count == 3 && instance_count == 1;
+            g_streamline_transition_raw_consumer_count = 0;
+        }
+    } else {
+        g_streamline_transition_sequence_command_list = nullptr;
+        g_streamline_transition_sequence_pair = UINT64_MAX;
+        g_streamline_transition_raw_consumer_count = 0;
+    }
+    if (transition_primary) {
+        StreamlineCapturedDlssRecipe recipe{};
+        {
+            std::scoped_lock lock{g_streamline_dlss_recipe_mutex};
+            recipe = g_streamline_dlss_recipe;
+        }
+        if (recipe.valid && recipe.eye == 1 && recipe.pair_id != 0 &&
+            recipe.pair_id != UINT64_MAX &&
+            sequence_tag.pair_id == recipe.pair_id) {
+            // Do not synthesize eye 0 on the natural eye-1 command list.  The
+            // recipe wrappers refer to shared render resources which still
+            // contain right-eye pixels here.  Leave the first atlas half
+            // pending; the following real eye-0 PS76B boundary completes it.
+            static std::atomic<uint32_t> deferred_replay_logs{};
+            if (deferred_replay_logs.fetch_add(
+                    1, std::memory_order_relaxed) < 64) {
+                log_line(
+                    "Packed transition eye0 replay deferred to real pre-76B boundary pair=%llu command_list=%p present=%llu",
+                    static_cast<unsigned long long>(recipe.pair_id),
+                    command_list,
+                    static_cast<unsigned long long>(g_present_count.load(
+                        std::memory_order_acquire)));
+            }
+        }
+    }
+
+    if (target_pipeline != nullptr) {
+        if (current_pipeline != target_pipeline) {
+            return false;
+        }
+    } else {
+        const auto pipeline = lookup_pipeline_info(current_pipeline);
+        if (pipeline.ps_hash != kStreamlinePrePostPixelHash) {
+            return false;
+        }
+        ID3D12PipelineState* expected{};
+        if (!g_streamline_prepost_pipeline.compare_exchange_strong(
+                expected, current_pipeline,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire) &&
+            expected != current_pipeline) {
+            return false;
+        }
+    }
+
+    const uint64_t present = g_present_count.load();
+    if (streamline_command_list_bridged_this_present(command_list, present)) {
+        return false;
+    }
+
+    uint32_t route_eye = UINT32_MAX;
+    uint64_t route_pair = UINT64_MAX;
+    EngineFrameTag route_tag{};
+    bool route_tag_valid{};
+    bool packed_replay_required{};
+    const uint32_t capture_generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    if (temporal_backend_is_dlss_packed()) {
+        route_tag_valid = lookup_streamline_command_list_route(
+            command_list, route_tag) &&
+            route_tag.generation == capture_generation;
+        if (!route_tag_valid) {
+            StreamlineCapturedDlssRecipe recipe{};
+            {
+                std::scoped_lock lock{g_streamline_dlss_recipe_mutex};
+                recipe = g_streamline_dlss_recipe;
+            }
+            if (recipe.valid && recipe.eye <= 1 &&
+                recipe.pair_id != 0 && recipe.pair_id != UINT64_MAX) {
+                route_tag.eye = 1u - recipe.eye;
+                route_tag.pair_id = recipe.pair_id;
+                route_tag.generation = capture_generation;
+                if (recipe.constants.render_views_valid) {
+                    route_tag.render_view =
+                        recipe.constants.render_views[route_tag.eye];
+                    route_tag.render_view_valid = true;
+                }
+                route_tag_valid = true;
+                packed_replay_required = true;
+                record_streamline_command_list_route(command_list, route_tag);
+            }
+        }
+    } else {
+        std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+        if (!g_engine_completed_tag_queue.empty()) {
+            const auto& tag = g_engine_completed_tag_queue.front();
+            if (tag.generation == capture_generation) {
+                route_eye = tag.eye;
+                route_pair = tag.pair_id;
+                route_tag = tag;
+                route_tag_valid = true;
+            }
+        }
+    }
+    if (route_tag_valid) {
+        route_eye = route_tag.eye;
+        route_pair = route_tag.pair_id;
+    }
+    if (route_tag_valid) {
+        record_packed_dlss_pair_metadata(route_tag);
+    }
+    if (route_eye > 1) {
+        return false;
+    }
+
+    begin_dlss_gpu_profile(command_list, route_pair);
+    const auto graphics_state = capture_dlss_graphics_state(command_list);
+    uint32_t private_eye = 1u - route_eye;
+    bool replayed{};
+    if (temporal_backend_is_dlss_packed()) {
+        private_eye = route_eye;
+        replayed = !packed_replay_required ||
+            prepare_engine_dlss_output_for_eye(
+                command_list, route_eye, route_pair);
+    } else {
+        replayed = prepare_engine_dlss_output_for_eye(
+            command_list, route_eye, route_pair);
+    }
+    restore_dlss_graphics_state(command_list, graphics_state);
+    finish_dlss_gpu_profile_replay(command_list);
+    if (replayed) {
+        private_eye = route_eye;
+    }
+    auto* private_output = g_streamline_private_outputs[private_eye];
+    if (g_config.ngx_trace) {
+        static std::atomic<uint32_t> second_eye_input_state_logs{};
+        if (second_eye_input_state_logs.fetch_add(1) < 32) {
+            log_line(
+                "NGX second-eye input states route_eye=%u private_eye=%u "
+                "color=%p:0x%X depth=%p:0x%X mvec=%p:0x%X present=%llu",
+                route_eye, private_eye,
+                g_ngx_input_resources[0].load(std::memory_order_acquire),
+                g_ngx_input_states[0].load(std::memory_order_relaxed),
+                g_ngx_input_resources[1].load(std::memory_order_acquire),
+                g_ngx_input_states[1].load(std::memory_order_relaxed),
+                g_ngx_input_resources[2].load(std::memory_order_acquire),
+                g_ngx_input_states[2].load(std::memory_order_relaxed),
+                static_cast<unsigned long long>(present));
+        }
+    }
+    begin_dlss_gpu_profile_bridge(command_list);
+    bridge_streamline_private_output(
+        command_list, private_output,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    finish_dlss_gpu_profile(command_list);
+    mark_streamline_command_list_bridged(command_list, present);
+    if (temporal_backend_is_dlss_packed() && replayed &&
+        g_packed_transition_ordered_recovery_active.exchange(
+            false, std::memory_order_acq_rel)) {
+        g_packed_transition_pending_eye0_pair.store(
+            UINT64_MAX, std::memory_order_release);
+        g_packed_transition_pending_eye0_final_route_pair.store(
+            UINT64_MAX, std::memory_order_release);
+        log_line(
+            "Packed ordered transition recovery disarmed by normal primary pair=%llu present=%llu",
+            static_cast<unsigned long long>(route_pair),
+            static_cast<unsigned long long>(present));
+    }
+    if (g_streamline_consumer_bridge_logs.fetch_add(1) < 32) {
+        log_line(
+            "Streamline pre-draw fallback bridge private_eye=%u route_eye=%u "
+            "command_list=%p canonical=%p present=%llu",
+            private_eye, route_eye, command_list,
+            g_streamline_canonical_output,
+            static_cast<unsigned long long>(present));
+    }
+    return temporal_backend_is_dlss_packed() && replayed;
+}
+
+void STDMETHODCALLTYPE hook_draw_indexed_instanced(
+    ID3D12GraphicsCommandList* command_list,
+    UINT index_count_per_instance,
+    UINT instance_count,
+    UINT start_index_location,
+    INT base_vertex_location,
+    UINT start_instance_location) {
+    if (g_config.logging_enabled) {
+        g_fingerprint_indexed_draw_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (g_compute_probe_active.load()) {
+        CommandListInfo snapshot{};
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            const auto it = g_command_list_infos.find(command_list);
+            if (it != g_command_list_infos.end()) {
+                snapshot = it->second;
+            }
+        }
+        snapshot.pipeline_state = load_command_list_pipeline(command_list);
+        if (snapshot.pipeline_state != nullptr && !snapshot.active_render_targets.empty()) {
+            const auto pipeline = lookup_pipeline_info(snapshot.pipeline_state);
+            const uint64_t serial = g_taau_draw_serial.fetch_add(1) + 1;
+            std::scoped_lock lock{g_reverse_mutex};
+            for (auto* resource : snapshot.active_render_targets) {
+                if (resource != nullptr) {
+                    g_taau_rtv_writers[resource] = TaauRtvWriter{
+                        command_list, snapshot.pipeline_state, pipeline.vs_hash, pipeline.ps_hash,
+                        g_present_count.load(), serial, index_count_per_instance,
+                        instance_count, true};
+                }
+            }
+        }
+    }
+    sample_draw_cbvs(command_list, "draw-indexed-cbv", index_count_per_instance, instance_count);
+    const bool publish_packed_after_draw =
+        try_bridge_streamline_second_present_before_draw(command_list, true,
+            index_count_per_instance, instance_count);
+    g_draw_indexed_instanced(
+        command_list,
+        index_count_per_instance,
+        instance_count,
+        start_index_location,
+        base_vertex_location,
+        start_instance_location);
+    if (publish_packed_after_draw) {
+        const bool published = publish_packed_dlss_output_after_draw(command_list);
+        const uint64_t candidate = g_streamline_transition_publish_candidate;
+        g_streamline_transition_publish_candidate = UINT64_MAX;
+        if (published && candidate != UINT64_MAX) {
+            g_packed_transition_pending_eye0_final_route_pair.store(
+                UINT64_MAX, std::memory_order_release);
+            g_packed_transition_pending_eye0_pair.store(
+                candidate, std::memory_order_release);
+        }
+    }
+}
+
+bool ensure_mono_hud_outputs() {
+    if (g_mono_hud_outputs[0] != nullptr &&
+        g_mono_hud_outputs[1] != nullptr &&
+        g_mono_hud_rtv_heap != nullptr) {
+        return true;
+    }
+    if (g_d3d12_device == nullptr || g_game_swapchain == nullptr) {
+        return false;
+    }
+    ID3D12Resource* backbuffer{};
+    if (FAILED(g_game_swapchain->GetBuffer(0, IID_PPV_ARGS(&backbuffer))) ||
+        backbuffer == nullptr) {
+        return false;
+    }
+    const auto desc = backbuffer->GetDesc();
+    backbuffer->Release();
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap_desc.NumDescriptors = 2;
+    if (FAILED(g_d3d12_device->CreateDescriptorHeap(
+            &heap_desc, IID_PPV_ARGS(&g_mono_hud_rtv_heap))) ||
+        g_mono_hud_rtv_heap == nullptr) {
+        return false;
+    }
+    const UINT increment = g_d3d12_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto first = g_mono_hud_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_HEAP_PROPERTIES heap_properties{};
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_properties.CreationNodeMask = 1;
+    heap_properties.VisibleNodeMask = 1;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap_properties, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                IID_PPV_ARGS(&g_mono_hud_outputs[eye]))) ||
+            g_mono_hud_outputs[eye] == nullptr) {
+            return false;
+        }
+        g_mono_hud_rtvs[eye] = {
+            first.ptr + static_cast<SIZE_T>(eye) * increment};
+        g_d3d12_device->CreateRenderTargetView(
+            g_mono_hud_outputs[eye], nullptr, g_mono_hud_rtvs[eye]);
+    }
+    log_line("Mono dual HUD outputs created size=%llux%u format=%u",
+        static_cast<unsigned long long>(desc.Width), desc.Height,
+        static_cast<unsigned>(desc.Format));
+    return true;
+}
+
+bool replay_mono_hud_composites(
+    ID3D12GraphicsCommandList* command_list,
+    UINT vertex_count_per_instance,
+    UINT instance_count,
+    UINT start_vertex_location,
+    UINT start_instance_location) {
+    if (g_config.openxr_mode != 2 ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        g_cinema_mode_active.load(std::memory_order_relaxed) ||
+        load_command_list_pipeline(command_list) !=
+            g_hud_composite_original_pso.load(std::memory_order_acquire) ||
+        !ensure_mono_hud_outputs()) {
+        return false;
+    }
+    ID3D12PipelineState* eye_psos[2] = {
+        g_hud_composite_eye0_pso.load(std::memory_order_acquire),
+        g_hud_composite_eye1_pso.load(std::memory_order_acquire)};
+    if (eye_psos[0] == nullptr || eye_psos[1] == nullptr) {
+        return false;
+    }
+    CommandListInfo snapshot{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto found = g_command_list_infos.find(command_list);
+        if (found == g_command_list_infos.end()) {
+            return false;
+        }
+        snapshot = found->second;
+    }
+    if (snapshot.active_rtv_count == 0) {
+        return false;
+    }
+
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        if (g_mono_hud_output_copy_source[eye]) {
+            D3D12_RESOURCE_BARRIER to_render_target{};
+            to_render_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_render_target.Transition.pResource = g_mono_hud_outputs[eye];
+            to_render_target.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            to_render_target.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            to_render_target.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_resource_barrier(command_list, 1, &to_render_target);
+        }
+        g_om_set_render_targets(command_list, 1, &g_mono_hud_rtvs[eye], FALSE, nullptr);
+        g_set_pipeline_state(command_list, eye_psos[eye]);
+        g_draw_instanced(command_list, vertex_count_per_instance, instance_count,
+            start_vertex_location, start_instance_location);
+        D3D12_RESOURCE_BARRIER to_copy_source{};
+        to_copy_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy_source.Transition.pResource = g_mono_hud_outputs[eye];
+        to_copy_source.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        to_copy_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_copy_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        g_resource_barrier(command_list, 1, &to_copy_source);
+        g_mono_hud_output_copy_source[eye] = true;
+    }
+    const auto* dsv = snapshot.active_dsv_handle.ptr != 0
+        ? &snapshot.active_dsv_handle
+        : nullptr;
+    g_om_set_render_targets(command_list, snapshot.active_rtv_count,
+        snapshot.active_rtv_handles.data(), FALSE, dsv);
+    g_set_pipeline_state(command_list,
+        g_hud_composite_original_pso.load(std::memory_order_acquire));
+    g_mono_hud_outputs_valid.store(true, std::memory_order_release);
+    static std::atomic<uint32_t> replay_logs{};
+    if (replay_logs.fetch_add(1) < 4) {
+        log_line("Mono dual HUD composite replayed outputs=%p,%p present=%llu",
+            g_mono_hud_outputs[0], g_mono_hud_outputs[1],
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+    return true;
+}
+
+void STDMETHODCALLTYPE hook_draw_instanced(
+    ID3D12GraphicsCommandList* command_list,
+    UINT vertex_count_per_instance,
+    UINT instance_count,
+    UINT start_vertex_location,
+    UINT start_instance_location) {
+    if (g_config.logging_enabled) {
+        g_fingerprint_nonindexed_draw_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (g_compute_probe_active.load()) {
+        CommandListInfo snapshot{};
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            const auto it = g_command_list_infos.find(command_list);
+            if (it != g_command_list_infos.end()) {
+                snapshot = it->second;
+            }
+        }
+        snapshot.pipeline_state = load_command_list_pipeline(command_list);
+        if (snapshot.pipeline_state != nullptr && !snapshot.active_render_targets.empty()) {
+            const auto pipeline = lookup_pipeline_info(snapshot.pipeline_state);
+            const uint64_t serial = g_taau_draw_serial.fetch_add(1) + 1;
+            std::scoped_lock lock{g_reverse_mutex};
+            for (auto* resource : snapshot.active_render_targets) {
+                if (resource != nullptr) {
+                    g_taau_rtv_writers[resource] = TaauRtvWriter{
+                        command_list, snapshot.pipeline_state, pipeline.vs_hash, pipeline.ps_hash,
+                        g_present_count.load(), serial, vertex_count_per_instance,
+                        instance_count, false};
+                }
+            }
+        }
+    }
+    sample_draw_cbvs(command_list, "draw-cbv", vertex_count_per_instance, instance_count);
+
+    const bool publish_packed_after_draw =
+        try_bridge_streamline_second_present_before_draw(command_list, false,
+            vertex_count_per_instance, instance_count);
+    g_draw_instanced(
+        command_list,
+        vertex_count_per_instance,
+        instance_count,
+        start_vertex_location,
+        start_instance_location);
+    replay_mono_hud_composites(command_list,
+        vertex_count_per_instance, instance_count,
+        start_vertex_location, start_instance_location);
+    if (publish_packed_after_draw) {
+        const bool published = publish_packed_dlss_output_after_draw(command_list);
+        const uint64_t candidate = g_streamline_transition_publish_candidate;
+        g_streamline_transition_publish_candidate = UINT64_MAX;
+        if (published && candidate != UINT64_MAX) {
+            g_packed_transition_pending_eye0_final_route_pair.store(
+                UINT64_MAX, std::memory_order_release);
+            g_packed_transition_pending_eye0_pair.store(
+                candidate, std::memory_order_release);
+        }
+    }
+}
+
+bool ensure_taau_matrix_fallback_resources() {
+    std::call_once(g_taau_override_once, []() {
+        if (g_d3d12_device == nullptr) {
+            return;
+        }
+
+        D3D12_HEAP_PROPERTIES heap_properties{};
+        heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap_properties.CreationNodeMask = 1;
+        heap_properties.VisibleNodeMask = 1;
+
+        D3D12_RESOURCE_DESC texture_desc{};
+        texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture_desc.Width = 320;
+        texture_desc.Height = 180;
+        texture_desc.DepthOrArraySize = 1;
+        texture_desc.MipLevels = 1;
+        texture_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        texture_desc.SampleDesc.Count = 1;
+        texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap_properties, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&g_taau_invalid_mvec_texture)))) {
+            log_line("TAAU matrix fallback failed to create sentinel texture");
+            return;
+        }
+
+        g_taau_descriptor_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = kTaauOverrideHeapSize;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        for (auto& slot : g_taau_override_slots) {
+            if (FAILED(g_d3d12_device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot.heap)))) {
+                log_line("TAAU matrix fallback failed to create override heap");
+                return;
+            }
+            auto cpu = slot.heap->GetCPUDescriptorHandleForHeapStart();
+            cpu.ptr += static_cast<SIZE_T>(kTaauDummyUavOffset) * g_taau_descriptor_increment;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+            uav_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            g_d3d12_device->CreateUnorderedAccessView(
+                g_taau_invalid_mvec_texture, nullptr, &uav_desc, cpu);
+        }
+        log_line("TAAU matrix fallback resources ready slots=%zu size=%llux%u format=RGBA32F",
+            g_taau_override_slots.size(),
+            static_cast<unsigned long long>(texture_desc.Width), texture_desc.Height);
+    });
+
+    if (g_taau_invalid_mvec_texture == nullptr || g_taau_descriptor_increment == 0) {
+        return false;
+    }
+    return std::all_of(g_taau_override_slots.begin(), g_taau_override_slots.end(),
+        [](const TaauOverrideSlot& slot) { return slot.heap != nullptr; });
+}
+
+bool taau_table_cpu_handle(
+    const CommandListInfo& snapshot,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_count,
+    D3D12_CPU_DESCRIPTOR_HANDLE& cpu_out) {
+    if (snapshot.cbv_srv_uav_heap == nullptr || table.ptr == 0) {
+        return false;
+    }
+    std::scoped_lock lock{g_reverse_mutex};
+    const auto heap_it = g_descriptor_heap_infos.find(snapshot.cbv_srv_uav_heap);
+    if (heap_it == g_descriptor_heap_infos.end()) {
+        return false;
+    }
+    const auto& heap = heap_it->second;
+    if (!heap.shader_visible || heap.increment == 0 || table.ptr < heap.gpu_start.ptr) {
+        return false;
+    }
+    const SIZE_T byte_offset = table.ptr - heap.gpu_start.ptr;
+    const SIZE_T descriptor_index = byte_offset / heap.increment;
+    if (descriptor_index + descriptor_count > heap.num_descriptors) {
+        return false;
+    }
+    cpu_out.ptr = heap.cpu_start.ptr + descriptor_index * heap.increment;
+    return true;
+}
+
+bool initialize_taau_mvec_pipeline() {
+    std::call_once(g_taau_mvec_pipeline_once, []() {
+        if (g_d3d12_device == nullptr || !initialize_dxc()) {
+            return;
+        }
+        static constexpr char kShaderSource[] = R"(
+Texture2D<float4> original_mvec : register(t0);
+Texture2D<float> depth_texture : register(t1);
+RWTexture2D<float4> corrected_mvec : register(u0);
+cbuffer Parameters : register(b0) {
+    row_major float4x4 corrected_clip_to_previous;
+    float4 taau_r0;
+    float4 taau_r1;
+    float4 taau_r2;
+    float4 taau_r3;
+    float4 current_to_previous_base_row0;
+    float4 current_to_previous_base_row1;
+    float4 current_to_previous_base_row2;
+    float4 current_to_previous_corrected_row0;
+    float4 current_to_previous_corrected_row1;
+    float4 current_to_previous_corrected_row2;
+    float4 hmd_projection;
+};
+[numthreads(8, 8, 1)]
+void main(uint3 dispatch_id : SV_DispatchThreadID) {
+    uint2 source_size = uint2(taau_r1.xy);
+    if (any(dispatch_id.xy >= source_size)) return;
+
+    // This texture is indexed in source-image space. REDengine's resolve performs
+    // its own jitter and closest-depth selection before sampling t7.
+    float2 source_uv = (float2(dispatch_id.xy) + 0.5) * taau_r1.zw;
+    float depth = depth_texture.Load(int3(dispatch_id.xy, 0));
+    float4 native_motion = original_mvec.Load(int3(dispatch_id.xy, 0));
+
+    float4 clip = float4(source_uv.x * 2.0 - 1.0, 1.0 - source_uv.y * 2.0, depth, 1.0);
+    float4 previous = mul(clip, corrected_clip_to_previous);
+    if (abs(previous.w) < 1e-6) {
+        corrected_mvec[dispatch_id.xy] = float4(2.0, 2.0, 2.0, 2.0);
+        return;
+    }
+    float3 previous_ndc = previous.xyz / previous.w;
+    float2 previous_uv = float2(
+        previous_ndc.x * 0.5 + 0.5,
+        previous_ndc.y * -0.5 + 0.5);
+    float2 ndc = float2(source_uv.x * 2.0 - 1.0, 1.0 - source_uv.y * 2.0);
+    float tan_half_y = hmd_projection.x;
+    float tan_half_x = tan_half_y * hmd_projection.y;
+    float near_plane = hmd_projection.z;
+    float far_plane = hmd_projection.w;
+    float linear_depth = near_plane * far_plane /
+        max(near_plane + depth * (far_plane - near_plane), 1e-6);
+    float3 current_position = float3(
+        ndc.x * tan_half_x, ndc.y * tan_half_y, 1.0) * linear_depth;
+    float3 previous_base_position = float3(
+        dot(current_to_previous_base_row0.xyz, current_position) +
+            current_to_previous_base_row0.w,
+        dot(current_to_previous_base_row1.xyz, current_position) +
+            current_to_previous_base_row1.w,
+        dot(current_to_previous_base_row2.xyz, current_position) +
+            current_to_previous_base_row2.w);
+    float3 previous_corrected_position = float3(
+        dot(current_to_previous_corrected_row0.xyz, current_position) +
+            current_to_previous_corrected_row0.w,
+        dot(current_to_previous_corrected_row1.xyz, current_position) +
+            current_to_previous_corrected_row1.w,
+        dot(current_to_previous_corrected_row2.xyz, current_position) +
+            current_to_previous_corrected_row2.w);
+    if (previous_base_position.z <= 1e-5 || previous_corrected_position.z <= 1e-5) {
+        corrected_mvec[dispatch_id.xy] = native_motion;
+        return;
+    }
+
+    float2 previous_base_ndc = float2(
+        previous_base_position.x / (previous_base_position.z * tan_half_x),
+        previous_base_position.y / (previous_base_position.z * tan_half_y));
+    float2 previous_corrected_ndc = float2(
+        previous_corrected_position.x / (previous_corrected_position.z * tan_half_x),
+        previous_corrected_position.y / (previous_corrected_position.z * tan_half_y));
+    float2 previous_base_uv = float2(
+        previous_base_ndc.x * 0.5 + 0.5, 0.5 - previous_base_ndc.y * 0.5);
+    float2 previous_corrected_uv = float2(
+        previous_corrected_ndc.x * 0.5 + 0.5, 0.5 - previous_corrected_ndc.y * 0.5);
+    // REDengine's native field reprojects the HMD-corrected current image into
+    // the uncorrected previous camera. Replace that camera component with the
+    // measured N-1 HMD reprojection while preserving per-object residuals.
+    float2 engine_camera_motion = source_uv - previous_uv;
+    float2 hmd_camera_motion = source_uv - previous_base_uv;
+    bool native_is_valid = native_motion.x < 2.0 && native_motion.y < 2.0;
+    bool pure_camera_motion = current_to_previous_corrected_row0.w > 0.5;
+    float2 corrected_xy = pure_camera_motion || !native_is_valid
+        ? hmd_camera_motion
+        : native_motion.xy - engine_camera_motion + hmd_camera_motion;
+    corrected_mvec[dispatch_id.xy] = float4(
+        corrected_xy, native_is_valid ? native_motion.z : 0.0, native_motion.w);
+}
+)";
+        DxcBuffer source{kShaderSource, sizeof(kShaderSource) - 1, DXC_CP_UTF8};
+        LPCWSTR arguments[] = {L"-E", L"main", L"-T", L"cs_6_0", L"-O3"};
+        IDxcResult* result{};
+        if (FAILED(g_dxc_compiler->Compile(&source, arguments,
+                static_cast<UINT32>(std::size(arguments)), nullptr,
+                IID_PPV_ARGS(&result))) || result == nullptr) {
+            return;
+        }
+        HRESULT status{};
+        result->GetStatus(&status);
+        if (FAILED(status)) {
+            IDxcBlobUtf8* errors{};
+            result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+            log_line("TAAU MVec shader compile failed: %s",
+                errors != nullptr ? errors->GetStringPointer() : "unknown");
+            if (errors != nullptr) errors->Release();
+            result->Release();
+            return;
+        }
+        IDxcBlob* shader{};
+        if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shader), nullptr)) || shader == nullptr) {
+            result->Release();
+            return;
+        }
+
+        D3D12_DESCRIPTOR_RANGE ranges[2]{};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 2;
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].BaseShaderRegister = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        D3D12_ROOT_PARAMETER parameters[3]{};
+        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[0].DescriptorTable = {1, &ranges[0]};
+        parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[1].DescriptorTable = {1, &ranges[1]};
+        parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[2].Constants.ShaderRegister = 0;
+        parameters[2].Constants.Num32BitValues = 60;
+        parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC root_desc{};
+        root_desc.NumParameters = static_cast<UINT>(std::size(parameters));
+        root_desc.pParameters = parameters;
+        ID3DBlob* serialized{};
+        ID3DBlob* errors{};
+        if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+                &serialized, &errors))) {
+            if (errors != nullptr) errors->Release();
+            shader->Release();
+            result->Release();
+            return;
+        }
+        if (FAILED(g_d3d12_device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                serialized->GetBufferSize(), IID_PPV_ARGS(&g_taau_mvec_root_signature)))) {
+            serialized->Release();
+            shader->Release();
+            result->Release();
+            return;
+        }
+        serialized->Release();
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{};
+        pipeline_desc.pRootSignature = g_taau_mvec_root_signature;
+        pipeline_desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+        const auto pipeline_result = g_d3d12_device->CreateComputePipelineState(
+            &pipeline_desc, IID_PPV_ARGS(&g_taau_mvec_pipeline));
+        shader->Release();
+        result->Release();
+        if (FAILED(pipeline_result)) {
+            return;
+        }
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = 3;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_d3d12_device->CreateDescriptorHeap(
+                &heap_desc, IID_PPV_ARGS(&g_taau_mvec_heap)))) {
+            return;
+        }
+        g_taau_mvec_descriptor_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        log_line("TAAU differential MVec pipeline initialized");
+    });
+    return g_taau_mvec_pipeline != nullptr && g_taau_mvec_root_signature != nullptr &&
+        g_taau_mvec_heap != nullptr;
+}
+
+bool ensure_taau_corrected_mvec_texture(ID3D12Resource* original_mvec) {
+    if (original_mvec == nullptr || !initialize_taau_mvec_pipeline()) {
+        return false;
+    }
+    const auto source_desc = original_mvec->GetDesc();
+    std::scoped_lock lock{g_taau_mvec_resource_mutex};
+    if (g_taau_corrected_mvec_texture != nullptr &&
+        g_taau_mvec_width == source_desc.Width && g_taau_mvec_height == source_desc.Height) {
+        return true;
+    }
+    if (g_taau_corrected_mvec_texture != nullptr) {
+        g_taau_corrected_mvec_texture->Release();
+        g_taau_corrected_mvec_texture = nullptr;
+    }
+    D3D12_HEAP_PROPERTIES heap_properties{};
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_properties.CreationNodeMask = 1;
+    heap_properties.VisibleNodeMask = 1;
+    auto corrected_desc = source_desc;
+    corrected_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    corrected_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    corrected_desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    if (FAILED(g_d3d12_device->CreateCommittedResource(
+            &heap_properties, D3D12_HEAP_FLAG_NONE, &corrected_desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+            IID_PPV_ARGS(&g_taau_corrected_mvec_texture)))) {
+        return false;
+    }
+    g_taau_mvec_width = source_desc.Width;
+    g_taau_mvec_height = source_desc.Height;
+    log_line("TAAU corrected MVec texture created size=%llux%u",
+        static_cast<unsigned long long>(source_desc.Width), source_desc.Height);
+    return true;
+}
+
+bool find_engine_original_temporal_matrix(
+    const float* corrected_matrix,
+    std::array<float, 16>& original_out,
+    uint64_t& matched_present_out,
+    float& error_out) {
+    if (corrected_matrix == nullptr) {
+        return false;
+    }
+    float best_error = FLT_MAX;
+    EngineTemporalMatrixPair best{};
+    {
+        std::scoped_lock lock{g_engine_temporal_matrix_mutex};
+        for (const auto& pair : g_engine_temporal_matrix_ring) {
+            if (!pair.original_valid || !pair.corrected_valid) {
+                continue;
+            }
+            float error{};
+            for (size_t index = 0; index < 16; ++index) {
+                error += fabsf(pair.corrected[index] - corrected_matrix[index]);
+            }
+            if (error < best_error) {
+                best_error = error;
+                best = pair;
+            }
+        }
+    }
+    if (best_error > 0.1f || !best.original_valid) {
+        return false;
+    }
+    original_out = best.original;
+    matched_present_out = best.present;
+    error_out = best_error;
+    return true;
+}
+
+struct TaauHmdMotionParameters {
+    std::array<float, 12> current_to_previous_base{};
+    std::array<float, 12> current_to_previous_hmd_only{};
+    std::array<float, 12> current_to_previous_corrected{};
+    std::array<float, 12> matched_corrected_camera{};
+    std::array<XrView, 2> matched_render_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    float vertical_fov_degrees{};
+    float aspect{};
+    float near_plane{};
+    float far_plane{};
+    uint64_t matched_present{};
+    uint64_t matched_pair_id{};
+    uint64_t previous_matched_present{};
+    uint64_t previous_matched_pair_id{};
+    int matched_eye{-1};
+    float matrix_error{};
+    bool exact_pair_match{};
+    bool matched_render_views_valid{};
+};
+
+XrQuaternionf quaternion_from_hmd_euler(float pitch, float yaw, float roll) {
+    constexpr float kDegreesToHalfRadians =
+        3.14159265358979323846f / 360.0f;
+    const float hp = pitch * kDegreesToHalfRadians;
+    const float hy = yaw * kDegreesToHalfRadians;
+    const float hr = roll * kDegreesToHalfRadians;
+    const XrQuaternionf qx{sinf(hp), 0.0f, 0.0f, cosf(hp)};
+    const XrQuaternionf qy{0.0f, sinf(hy), 0.0f, cosf(hy)};
+    const XrQuaternionf qz{0.0f, 0.0f, sinf(hr), cosf(hr)};
+    return multiply_quaternions(multiply_quaternions(qy, qx), qz);
+}
+
+bool find_taau_hmd_motion_parameters(
+    const float* taau_matrix,
+    int expected_eye,
+    uint64_t expected_pair_id,
+    TaauHmdMotionParameters& out,
+    uint64_t expected_previous_pair_id = 0) {
+    if (taau_matrix == nullptr) {
+        return false;
+    }
+
+    float best_error = FLT_MAX;
+    EngineTemporalMatrixPair current{};
+    EngineTemporalMatrixPair previous{};
+    bool exact_pair_match{};
+    {
+        std::scoped_lock lock{g_engine_temporal_matrix_mutex};
+        const auto find_current = [&](bool require_pair_id) {
+            for (const auto& pair : g_engine_temporal_matrix_ring) {
+                if (!pair.corrected_valid || !pair.hmd_pose_valid) {
+                    continue;
+                }
+                if (expected_eye >= 0 && pair.eye != expected_eye) {
+                    continue;
+                }
+                if (require_pair_id && expected_pair_id != 0 &&
+                    pair.pair_id != expected_pair_id) {
+                    continue;
+                }
+                float error{};
+                for (size_t index = 0; index < 16; ++index) {
+                    error += fabsf(pair.corrected[index] - taau_matrix[index]);
+                }
+                if (error < best_error ||
+                    (error == best_error && pair.present > current.present)) {
+                    best_error = error;
+                    current = pair;
+                }
+            }
+        };
+        find_current(true);
+        exact_pair_match = expected_pair_id != 0 && current.present != 0 &&
+            current.pair_id == expected_pair_id &&
+            (expected_eye < 0 || current.eye == expected_eye);
+        if (!exact_pair_match && expected_pair_id != 0) {
+            best_error = FLT_MAX;
+            current = {};
+            find_current(false);
+        }
+        for (const auto& pair : g_engine_temporal_matrix_ring) {
+            if (!pair.hmd_pose_valid || pair.eye != current.eye) {
+                continue;
+            }
+            if (expected_previous_pair_id != 0) {
+                if (pair.pair_id == expected_previous_pair_id) {
+                    previous = pair;
+                    break;
+                }
+                continue;
+            }
+            if (current.pair_id != 0) {
+                if (pair.pair_id == 0 || pair.pair_id >= current.pair_id ||
+                    pair.pair_id <= previous.pair_id) {
+                    continue;
+                }
+            } else if (pair.present >= current.present ||
+                pair.present <= previous.present) {
+                continue;
+            }
+            previous = pair;
+        }
+    }
+    if (current.present == 0 || previous.present == 0) {
+        if (expected_previous_pair_id != 0 && current.present != 0) {
+            static std::atomic<uint64_t> missing_history_matrix_count{};
+            const uint64_t count = missing_history_matrix_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (count <= 16 || count % 120 == 0) {
+                log_line(
+                    "TAAU exact history matrix missing count=%llu expected_current=%llu matched_current=%llu expected_previous=%llu eye=%d present=%llu",
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(expected_pair_id),
+                    static_cast<unsigned long long>(current.pair_id),
+                    static_cast<unsigned long long>(expected_previous_pair_id),
+                    current.eye,
+                    static_cast<unsigned long long>(
+                        g_present_count.load(std::memory_order_relaxed)));
+            }
+        }
+        return false;
+    }
+
+    // Transform current corrected-camera coordinates directly into the previous
+    // corrected camera. This includes REDengine locomotion/orbit/collision motion,
+    // HMD pose, camera mode, and the per-eye stereo offset.
+    const float* current_position = current.corrected_camera.data();
+    const float* previous_position = previous.corrected_camera.data();
+    const float* current_basis[3] = {
+        current.corrected_camera.data() + 3,
+        current.corrected_camera.data() + 6,
+        current.corrected_camera.data() + 9};
+    const float* previous_basis[3] = {
+        previous.corrected_camera.data() + 3,
+        previous.corrected_camera.data() + 6,
+        previous.corrected_camera.data() + 9};
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            float value{};
+            for (size_t k = 0; k < 3; ++k) {
+                value += previous_basis[row][k] * current_basis[column][k];
+            }
+            out.current_to_previous_base[row * 4 + column] = value;
+        }
+        float translation{};
+        for (size_t k = 0; k < 3; ++k) {
+            translation += previous_basis[row][k] *
+                (current_position[k] - previous_position[k]);
+        }
+        out.current_to_previous_base[row * 4 + 3] = translation;
+    }
+
+    // Isolate the headset transform from REDengine camera motion. Each stored
+    // H matrix maps corrected/HMD-local camera coordinates into that frame's
+    // unmodified base-camera coordinates. Therefore Hprev^-1 * Hcurrent maps
+    // the current HMD camera into the previous HMD camera without including
+    // orbit, collision zoom, locomotion, or camera-mode motion already present
+    // in REDengine's native velocity field.
+    const auto& current_hmd = current.hmd_to_base_rotation;
+    const auto& previous_hmd = previous.hmd_to_base_rotation;
+    // Camera-derived translations can be overwritten by another REDengine
+    // camera/stereo pass within the same present. Use the raw OpenXR positions,
+    // in the exact local right/up/forward convention used by the camera hook.
+    const float position_scale = g_config.hmd_position_scale;
+    const float current_translation[3] = {
+        current.hmd_position.x * position_scale,
+        current.hmd_position.y * position_scale,
+        -current.hmd_position.z * position_scale};
+    const float previous_translation[3] = {
+        previous.hmd_position.x * position_scale,
+        previous.hmd_position.y * position_scale,
+        -previous.hmd_position.z * position_scale};
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            float value{};
+            for (size_t base_axis = 0; base_axis < 3; ++base_axis) {
+                value += previous_hmd[base_axis * 3 + row] *
+                    current_hmd[base_axis * 3 + column];
+            }
+            out.current_to_previous_hmd_only[row * 4 + column] = value;
+        }
+        float translation{};
+        for (size_t base_axis = 0; base_axis < 3; ++base_axis) {
+            translation += previous_hmd[base_axis * 3 + row] *
+                (current_translation[base_axis] - previous_translation[base_axis]);
+        }
+        out.current_to_previous_hmd_only[row * 4 + 3] = translation;
+    }
+    out.current_to_previous_corrected = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f};
+    out.matched_corrected_camera = current.corrected_camera;
+    out.matched_render_views = current.render_views;
+    out.matched_render_views_valid = current.render_views_valid;
+    out.vertical_fov_degrees = current.vertical_fov_degrees;
+    out.aspect = current.aspect;
+    out.near_plane = current.near_plane;
+    out.far_plane = current.far_plane;
+    out.matched_present = current.present;
+    out.matched_pair_id = current.pair_id;
+    out.previous_matched_present = previous.present;
+    out.previous_matched_pair_id = previous.pair_id;
+    out.matched_eye = current.eye;
+    out.matrix_error = best_error;
+    out.exact_pair_match = exact_pair_match;
+    return true;
+}
+
+bool dispatch_taau_additive_mvec(
+    ID3D12GraphicsCommandList* command_list,
+    const CommandListInfo& snapshot) {
+    ResourceDescriptorInfo original_mvec{};
+    ResourceDescriptorInfo depth{};
+    SIZE_T ignored_cpu{};
+    CbvDescriptorInfo cb10{};
+    SIZE_T cb10_cpu{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        if (!resolve_descriptor_table_resource(snapshot, snapshot.compute_tables[1], 7,
+                original_mvec, ignored_cpu) ||
+            !resolve_descriptor_table_resource(snapshot, snapshot.compute_tables[1], 3,
+                depth, ignored_cpu) ||
+            !resolve_descriptor_table_cbv(snapshot, snapshot.compute_tables[0], cb10, cb10_cpu, 10)) {
+            return false;
+        }
+    }
+    if (original_mvec.resource == nullptr || depth.resource == nullptr ||
+        !ensure_taau_corrected_mvec_texture(original_mvec.resource)) {
+        return false;
+    }
+
+    ResourceInfo cb_info{};
+    size_t cb_offset{};
+    ID3D12Resource* cb_resource{};
+    if (!resolve_gpu_va(cb10.gpu_va, cb_info, cb_offset, cb_resource) ||
+        cb_info.mapped == nullptr || cb_offset + 10 * 16 > cb_info.mapped_size) {
+        return false;
+    }
+    const auto* corrected_matrix = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(cb_info.mapped) + cb_offset + 6 * 16);
+    std::array<uint32_t, 32> constants{};
+    memcpy(constants.data(), corrected_matrix, 64);
+    memcpy(constants.data() + 16,
+        static_cast<const uint8_t*>(cb_info.mapped) + cb_offset, 64);
+    if (g_config.runtime_diagnostics && g_taau_mvec_log_count.fetch_add(1) < 12) {
+        log_line("TAAU pure camera MVec present=%llu jitter=%.6f,%.6f input=%.0fx%.0f output=%.0fx%.0f",
+            static_cast<unsigned long long>(g_present_count.load()),
+            reinterpret_cast<const float*>(constants.data() + 16)[0],
+            reinterpret_cast<const float*>(constants.data() + 16)[1],
+            reinterpret_cast<const float*>(constants.data() + 20)[0],
+            reinterpret_cast<const float*>(constants.data() + 20)[1],
+            reinterpret_cast<const float*>(constants.data() + 24)[0],
+            reinterpret_cast<const float*>(constants.data() + 24)[1]);
+    }
+
+    auto cpu = g_taau_mvec_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC mvec_srv{};
+    mvec_srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    mvec_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    mvec_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    mvec_srv.Texture2D.MipLevels = 1;
+    g_d3d12_device->CreateShaderResourceView(original_mvec.resource, &mvec_srv, cpu);
+    cpu.ptr += g_taau_mvec_descriptor_increment;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
+    depth_srv.Format = depth.format;
+    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth_srv.Texture2D.MipLevels = 1;
+    g_d3d12_device->CreateShaderResourceView(depth.resource, &depth_srv, cpu);
+    cpu.ptr += g_taau_mvec_descriptor_increment;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav{};
+    output_uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_d3d12_device->CreateUnorderedAccessView(
+        g_taau_corrected_mvec_texture, nullptr, &output_uav, cpu);
+
+    // Routing marker: clear the replacement resource directly so this test does
+    // not depend on the custom compute shader, constants, or depth bindings.
+    auto marker_cpu = g_taau_mvec_heap->GetCPUDescriptorHandleForHeapStart();
+    marker_cpu.ptr += static_cast<SIZE_T>(2) * g_taau_mvec_descriptor_increment;
+    marker_cpu.ptr += static_cast<SIZE_T>(2) * g_taau_mvec_descriptor_increment;
+    auto marker_gpu = g_taau_mvec_heap->GetGPUDescriptorHandleForHeapStart();
+    marker_gpu.ptr += static_cast<UINT64>(2) * g_taau_mvec_descriptor_increment;
+    marker_gpu.ptr += static_cast<UINT64>(2) * g_taau_mvec_descriptor_increment;
+    ID3D12DescriptorHeap* heaps[] = {g_taau_mvec_heap};
+    command_list->SetDescriptorHeaps(1, heaps);
+    const float marker[4] = {3.0f, 3.0f, 3.0f, 3.0f};
+    command_list->ClearUnorderedAccessViewFloat(
+        marker_gpu, marker_cpu, g_taau_corrected_mvec_texture, marker, 0, nullptr);
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[0].UAV.pResource = g_taau_corrected_mvec_texture;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = g_taau_corrected_mvec_texture;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    command_list->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+    return true;
+}
+
+bool ensure_taau_readback(ID3D12Resource* source) {
+    if (g_taau_readback_buffer != nullptr && g_taau_readback_fence != nullptr) {
+        return true;
+    }
+    if (source == nullptr || g_d3d12_device == nullptr) {
+        return false;
+    }
+    const auto source_desc = source->GetDesc();
+    UINT64 total_bytes{};
+    g_d3d12_device->GetCopyableFootprints(&source_desc, 0, 1, 0,
+        &g_taau_readback_footprint, nullptr, nullptr, &total_bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total_bytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_d3d12_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&g_taau_readback_buffer))) ||
+        FAILED(g_d3d12_device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_taau_readback_fence)))) {
+        log_line("TAAU readback initialization failed");
+        return false;
+    }
+    log_line("TAAU readback ready bytes=%llu row_pitch=%u size=%ux%u",
+        static_cast<unsigned long long>(total_bytes),
+        g_taau_readback_footprint.Footprint.RowPitch,
+        g_taau_readback_footprint.Footprint.Width,
+        g_taau_readback_footprint.Footprint.Height);
+    return true;
+}
+
+bool ensure_taau_original_mvec_snapshot(ID3D12Resource* source) {
+    if (source == nullptr || g_d3d12_device == nullptr) {
+        return false;
+    }
+    const auto source_desc = source->GetDesc();
+    if (g_taau_original_mvec_snapshot != nullptr &&
+        g_taau_original_mvec_snapshot_width == source_desc.Width &&
+        g_taau_original_mvec_snapshot_height == source_desc.Height) {
+        return true;
+    }
+    if (g_taau_original_mvec_snapshot != nullptr) {
+        g_taau_original_mvec_snapshot->Release();
+        g_taau_original_mvec_snapshot = nullptr;
+    }
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    auto snapshot_desc = source_desc;
+    snapshot_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (FAILED(g_d3d12_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &snapshot_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&g_taau_original_mvec_snapshot)))) {
+        log_line("TAAU original MVec snapshot creation failed");
+        return false;
+    }
+    g_taau_original_mvec_snapshot_width = source_desc.Width;
+    g_taau_original_mvec_snapshot_height = source_desc.Height;
+    g_taau_original_mvec_snapshot_initialized = false;
+    log_line("TAAU original MVec snapshot ready size=%llux%u format=%u",
+        static_cast<unsigned long long>(source_desc.Width), source_desc.Height,
+        static_cast<unsigned>(source_desc.Format));
+    return true;
+}
+
+bool ensure_taau_slot_fence() {
+    if (g_taau_slot_fence != nullptr) {
+        return true;
+    }
+    if (g_d3d12_device == nullptr) {
+        return false;
+    }
+    std::scoped_lock lock{g_taau_slot_mutex};
+    if (g_taau_slot_fence == nullptr && FAILED(g_d3d12_device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_taau_slot_fence)))) {
+        log_line("TAAU slot retirement fence creation failed");
+        return false;
+    }
+    return g_taau_slot_fence != nullptr;
+}
+
+void track_taau_slot_use(
+    ID3D12GraphicsCommandList* command_list,
+    bool compose,
+    uint32_t index) {
+    std::scoped_lock lock{g_taau_slot_mutex};
+    g_taau_pending_slot_uses[command_list].push_back({compose, index});
+}
+
+bool acquire_taau_override_slot(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t& slot_index_out) {
+    if (command_list == nullptr || !ensure_taau_slot_fence()) {
+        return false;
+    }
+    const auto completed = g_taau_slot_fence->GetCompletedValue();
+    g_hang_diag_fence_completed.store(completed, std::memory_order_relaxed);
+    const auto start = g_taau_override_slot_index.fetch_add(1);
+    for (uint32_t offset = 0; offset < g_taau_override_slots.size(); ++offset) {
+        const auto index = (start + offset) %
+            static_cast<uint32_t>(g_taau_override_slots.size());
+        auto& slot = g_taau_override_slots[index];
+        bool expected{};
+        if (!slot.reserved.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+            continue;
+        }
+        const auto fence_value = slot.fence_value.load(std::memory_order_acquire);
+        if (fence_value == 0 || completed >= fence_value) {
+            slot_index_out = index;
+            track_taau_slot_use(command_list, false, index);
+            return true;
+        }
+        slot.reserved.store(false, std::memory_order_release);
+    }
+    return false;
+}
+
+bool acquire_taau_compose_slot(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* source,
+    TaauComposeSlot*& slot_out,
+    bool& was_initialized) {
+    if (command_list == nullptr || source == nullptr || g_d3d12_device == nullptr ||
+        !ensure_taau_slot_fence() ||
+        g_taau_mvec_descriptor_increment == 0) {
+        return false;
+    }
+
+    const auto completed = g_taau_slot_fence->GetCompletedValue();
+    g_hang_diag_fence_completed.store(completed, std::memory_order_relaxed);
+    const auto start = g_taau_compose_slot_index.fetch_add(1);
+    uint32_t slot_index = UINT32_MAX;
+    for (uint32_t offset = 0; offset < g_taau_compose_slots.size(); ++offset) {
+        const auto index = (start + offset) %
+            static_cast<uint32_t>(g_taau_compose_slots.size());
+        auto& candidate = g_taau_compose_slots[index];
+        bool expected{};
+        if (!candidate.reserved.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+            continue;
+        }
+        const auto fence_value = candidate.fence_value.load(std::memory_order_acquire);
+        if (fence_value == 0 || completed >= fence_value) {
+            slot_index = index;
+            break;
+        }
+        candidate.reserved.store(false, std::memory_order_release);
+    }
+    if (slot_index == UINT32_MAX) {
+        return false;
+    }
+    auto& slot = g_taau_compose_slots[slot_index];
+    const auto source_desc = source->GetDesc();
+    std::scoped_lock lock{g_taau_mvec_resource_mutex};
+
+    if (slot.heap == nullptr) {
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = 3;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_d3d12_device->CreateDescriptorHeap(
+                &heap_desc, IID_PPV_ARGS(&slot.heap)))) {
+            slot.reserved.store(false, std::memory_order_release);
+            return false;
+        }
+    }
+
+    if (slot.snapshot == nullptr || slot.width != source_desc.Width ||
+        slot.height != source_desc.Height) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        auto snapshot_desc = source_desc;
+        snapshot_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        ID3D12Resource* snapshot{};
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &snapshot_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&snapshot)))) {
+            slot.reserved.store(false, std::memory_order_release);
+            return false;
+        }
+
+        // Resolution changes are rare. Keep an old in-flight resource alive
+        // rather than releasing it while previously recorded work may use it.
+        slot.snapshot = snapshot;
+        slot.width = source_desc.Width;
+        slot.height = source_desc.Height;
+        slot.initialized = false;
+        if (g_config.runtime_diagnostics) {
+            log_line("TAAU compose slot=%u ready size=%llux%u format=%u",
+                slot_index, static_cast<unsigned long long>(source_desc.Width),
+                source_desc.Height, static_cast<unsigned>(source_desc.Format));
+        }
+    }
+
+    was_initialized = slot.initialized;
+    slot.initialized = true;
+    slot_out = &slot;
+    track_taau_slot_use(command_list, true, slot_index);
+    return true;
+}
+
+bool validate_taau_resolve_resources(
+    const ResourceDescriptorInfo& motion,
+    const ResourceDescriptorInfo& depth) {
+    const bool descriptors_valid = motion.resource != nullptr && depth.resource != nullptr;
+    if (!descriptors_valid) {
+        return false;
+    }
+
+    const auto motion_desc = motion.resource->GetDesc();
+    const auto depth_desc = depth.resource->GetDesc();
+    const bool depth_format_valid =
+        (depth.format == DXGI_FORMAT_R32_FLOAT &&
+            depth_desc.Format == DXGI_FORMAT_R32_TYPELESS) ||
+        (depth.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS &&
+            depth_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS);
+    const bool valid = motion.format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        depth_format_valid &&
+        motion_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        depth_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        motion_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        motion_desc.Width == depth_desc.Width &&
+        motion_desc.Height == depth_desc.Height &&
+        motion_desc.Width >= 256 && motion_desc.Width <= 8192 &&
+        motion_desc.Height >= 256 && motion_desc.Height <= 8192 &&
+        (motion_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
+        (depth_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+    if (!valid) {
+        static std::atomic<bool> validation_failure_logged{};
+        if (!validation_failure_logged.exchange(true)) {
+            log_line(
+                "TAAU validation rejected motion=%p viewfmt=%u resfmt=%u dim=%u size=%llux%u flags=0x%X depth=%p viewfmt=%u resfmt=%u dim=%u size=%llux%u flags=0x%X",
+                motion.resource,
+                static_cast<unsigned>(motion.format),
+                static_cast<unsigned>(motion_desc.Format),
+                static_cast<unsigned>(motion_desc.Dimension),
+                static_cast<unsigned long long>(motion_desc.Width),
+                motion_desc.Height,
+                static_cast<unsigned>(motion_desc.Flags),
+                depth.resource,
+                static_cast<unsigned>(depth.format),
+                static_cast<unsigned>(depth_desc.Format),
+                static_cast<unsigned>(depth_desc.Dimension),
+                static_cast<unsigned long long>(depth_desc.Width),
+                depth_desc.Height,
+                static_cast<unsigned>(depth_desc.Flags));
+        }
+    }
+    return valid;
+}
+
+bool dispatch_taau_inplace_marker(
+    ID3D12GraphicsCommandList* command_list,
+    UINT x,
+    UINT y,
+    UINT z) {
+    if (g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        (g_config.openxr_mode == 4 &&
+            !g_packed_runtime_ready.load(std::memory_order_relaxed))) {
+        return false;
+    }
+    if (g_cinema_mode_active.load(std::memory_order_relaxed)) {
+        if (!g_taau_cinema_bypass_active.exchange(true, std::memory_order_relaxed)) {
+            std::unique_lock<std::mutex> left_history_transaction_lock{};
+            std::unique_lock<std::mutex> right_history_transaction_lock{};
+            if (g_config.openxr_mode == 2) {
+                left_history_transaction_lock = std::unique_lock<std::mutex>{
+                    g_taau_eye_transaction_mutex[0]};
+            } else if (g_config.openxr_mode == 4) {
+                left_history_transaction_lock = std::unique_lock<std::mutex>{
+                    g_taau_eye_transaction_mutex[0], std::defer_lock};
+                right_history_transaction_lock = std::unique_lock<std::mutex>{
+                    g_taau_eye_transaction_mutex[1], std::defer_lock};
+                std::lock(left_history_transaction_lock,
+                    right_history_transaction_lock);
+            }
+            std::scoped_lock lock{g_taau_eye_history_mutex};
+            for (auto& history : g_taau_eye_histories) {
+                history.initialized = false;
+                history.last_pair_id = 0;
+                history.last_present = 0;
+            }
+            log_line("TAAU native cinema bypass entered; private histories invalidated present=%llu",
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)));
+        }
+        return false;
+    }
+    if (g_taau_cinema_bypass_active.exchange(false, std::memory_order_relaxed)) {
+        log_line("TAAU native cinema bypass exited present=%llu",
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
+    if (g_config.runtime_diagnostics) {
+        g_taau_health_total.fetch_add(1, std::memory_order_relaxed);
+    }
+    CommandListInfo snapshot{};
+    ResourceDescriptorInfo original_mvec{};
+    ResourceDescriptorInfo depth{};
+    ResourceDescriptorInfo native_history{};
+    ResourceDescriptorInfo native_output{};
+    CbvDescriptorInfo cb10{};
+    SIZE_T ignored_cpu{};
+    SIZE_T cb10_cpu{};
+    bool motion_found{};
+    bool depth_found{};
+    bool cb10_found{};
+    bool history_found{};
+    bool output_found{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto it = g_command_list_infos.find(command_list);
+        if (it == g_command_list_infos.end()) {
+            return false;
+        }
+        snapshot = it->second;
+        motion_found = resolve_descriptor_table_resource(
+            snapshot, snapshot.compute_tables[1], 7, original_mvec, ignored_cpu);
+        depth_found = resolve_descriptor_table_resource(
+            snapshot, snapshot.compute_tables[1], 3, depth, ignored_cpu);
+        history_found = resolve_descriptor_table_resource(
+            snapshot, snapshot.compute_tables[1], 2, native_history, ignored_cpu);
+        output_found = resolve_descriptor_table_resource(
+            snapshot, snapshot.compute_tables[3], 0, native_output, ignored_cpu);
+        cb10_found = resolve_descriptor_table_cbv(
+            snapshot, snapshot.compute_tables[0], cb10, cb10_cpu, 10);
+    }
+    snapshot.pipeline_state = load_command_list_pipeline(command_list);
+    if (!motion_found || !depth_found || !cb10_found) {
+        const auto failure = g_taau_health_descriptor_fail.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        log_taau_early_failure("descriptor", failure);
+        if (g_config.runtime_diagnostics &&
+            g_taau_descriptor_resolve_failure_logs.fetch_add(1) < 4) {
+            log_line("TAAU resolve missing motion=%u depth=%u cb10=%u candidates=0x%X propagated=0x%X table0=0x%zX table1=0x%zX",
+                motion_found ? 1u : 0u, depth_found ? 1u : 0u,
+                cb10_found ? 1u : 0u,
+                g_taau_descriptor_candidate_mask.load(),
+                g_taau_descriptor_propagated_mask.load(),
+                snapshot.compute_tables[0].ptr, snapshot.compute_tables[1].ptr);
+        }
+        return false;
+    }
+    if (!validate_taau_resolve_resources(original_mvec, depth) ||
+        !initialize_taau_mvec_pipeline() || g_taau_mvec_descriptor_increment == 0 ||
+        snapshot.cbv_srv_uav_heap == nullptr || snapshot.sampler_heap == nullptr) {
+        const auto failure = g_taau_health_resource_fail.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        log_taau_early_failure("resource", failure);
+        return false;
+    }
+
+    std::array<uint8_t, 10 * 16> cb_data{};
+    if (!copy_gpu_va_bytes(cb10.gpu_va, cb_data.data(), cb_data.size())) {
+        const auto health_failure = g_taau_health_cb10_fail.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        log_taau_early_failure("cb10", health_failure);
+        static std::atomic<uint32_t> cb10_copy_failures{};
+        const auto failure = cb10_copy_failures.fetch_add(1) + 1;
+        if (g_config.runtime_diagnostics &&
+            (failure <= 16 || failure % 120 == 0)) {
+            log_line("TAAU b10 snapshot skipped failure=%u present=%llu gpuva=0x%llX",
+                failure, static_cast<unsigned long long>(g_present_count.load()),
+                static_cast<unsigned long long>(cb10.gpu_va));
+        }
+        return false;
+    }
+    std::array<uint32_t, 60> constants{};
+    memcpy(constants.data(), cb_data.data() + 6 * 16, 64);
+    memcpy(constants.data() + 16, cb_data.data(), 64);
+
+    int expected_eye = g_engine_render_eye;
+    uint64_t expected_pair_id = g_engine_render_pair_id;
+    bool identity_recovered = false;
+    bool completed_tag_authority = false;
+    if (g_config.openxr_mode == 2) {
+        // A mono resolve always belongs to eye 0, including callbacks recorded
+        // immediately after the producer TLS lifetime has ended. Keep that eye
+        // identity and its private-history transaction authoritative even when
+        // the exact producer pair is temporarily unavailable.
+        expected_eye = 0;
+        expected_pair_id = g_engine_producer_pair_id;
+    }
+
+    // Stereo TAAU can be recorded immediately after the producer TLS lifetime.
+    // Matrix proximity reliably identifies the eye but not the pair: REDengine
+    // can reuse an older CB10 allocation while recording the current output.
+    // Select the pair from the completed-tag queue, skipping entries which are
+    // already older than this eye's private history. TLS-owned callbacks may
+    // advance history while an older queue entry is still waiting for PRESENT,
+    // so blindly peeking queue.front() can itself reintroduce a rollback.
+    if (g_config.openxr_mode == 4 &&
+        (expected_eye < 0 || expected_eye > 1 || expected_pair_id == 0)) {
+        TaauHmdMotionParameters matrix_identity{};
+        const bool matrix_identity_valid = find_taau_hmd_motion_parameters(
+                reinterpret_cast<const float*>(cb_data.data() + 6 * 16),
+                -1, 0, matrix_identity, 0) &&
+            matrix_identity.matched_eye >= 0 &&
+            matrix_identity.matched_eye <= 1;
+        if (matrix_identity_valid) {
+            expected_eye = matrix_identity.matched_eye;
+        }
+
+        uint64_t history_floor{};
+        if (expected_eye >= 0 && expected_eye <= 1) {
+            std::scoped_lock lock{g_taau_eye_history_mutex};
+            const auto& history = g_taau_eye_histories[
+                static_cast<size_t>(expected_eye)];
+            if (history.initialized) {
+                history_floor = history.last_pair_id;
+            }
+        }
+
+        uint64_t equal_candidate{};
+        uint64_t forward_candidate{};
+        {
+            std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+            for (const auto& tag : g_engine_completed_tag_queue) {
+                if (tag.eye <= 1 &&
+                    static_cast<int>(tag.eye) == expected_eye &&
+                    tag.pair_id != 0 &&
+                    tag.pair_id != UINT64_MAX &&
+                    tag.generation == g_streamline_capture_generation.load(
+                        std::memory_order_acquire)) {
+                    if (history_floor != 0 && tag.pair_id == history_floor &&
+                        equal_candidate == 0) {
+                        equal_candidate = tag.pair_id;
+                    } else if (tag.pair_id > history_floor &&
+                        forward_candidate == 0) {
+                        forward_candidate = tag.pair_id;
+                    }
+                }
+            }
+        }
+
+        // An equal tag denotes a second resolve of the current output and is
+        // intentionally replayed. Otherwise choose the earliest forward tag.
+        if (equal_candidate != 0) {
+            expected_pair_id = equal_candidate;
+            completed_tag_authority = true;
+        } else if (forward_candidate != 0) {
+            expected_pair_id = forward_candidate;
+            completed_tag_authority = true;
+        } else if (history_floor != 0 && expected_eye >= 0) {
+            // No newer tag is published yet. Replaying the current eye is safer
+            // than assigning an older matrix pair and rolling temporal state.
+            expected_pair_id = history_floor;
+            completed_tag_authority = true;
+        } else if (matrix_identity_valid &&
+            matrix_identity.matched_pair_id != 0) {
+            expected_pair_id = matrix_identity.matched_pair_id;
+        } else {
+            const auto health_failure = g_taau_health_matrix_fail.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            log_taau_early_failure("stereo-identity", health_failure);
+            return false;
+        }
+        identity_recovered = true;
+        if (completed_tag_authority) {
+            static std::atomic<uint64_t> completed_tag_taau_count{};
+            const uint64_t count = completed_tag_taau_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (count <= 64 || count % 240 == 0) {
+                log_line(
+                    "TAAU completed-tag authority count=%llu present=%llu eye=%d pair=%llu history_floor=%llu equal=%llu forward=%llu cmd=%p",
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(
+                        g_present_count.load(std::memory_order_relaxed)),
+                    expected_eye,
+                    static_cast<unsigned long long>(expected_pair_id),
+                    static_cast<unsigned long long>(history_floor),
+                    static_cast<unsigned long long>(equal_candidate),
+                    static_cast<unsigned long long>(forward_candidate),
+                    command_list);
+            }
+        }
+    }
+
+    std::unique_lock<std::mutex> history_transaction_lock{};
+    if (g_config.openxr_mode == 2) {
+        history_transaction_lock = std::unique_lock<std::mutex>{
+            g_taau_eye_transaction_mutex[0]};
+    } else if (g_config.openxr_mode == 4 &&
+        expected_eye >= 0 && expected_eye <= 1) {
+        history_transaction_lock = std::unique_lock<std::mutex>{
+            g_taau_eye_transaction_mutex[static_cast<size_t>(expected_eye)]};
+    }
+    uint64_t expected_history_pair_id{};
+    ID3D12Resource* latest_stereo_history{};
+    ID3D12GraphicsCommandList* committed_command_list{};
+    ID3D12Resource* committed_native_output{};
+    ID3D12Resource* committed_native_history{};
+    D3D12_GPU_VIRTUAL_ADDRESS committed_cb10_gpu_va{};
+    uint64_t committed_cb10_hash{};
+    if (g_config.openxr_mode == 2 ||
+        (g_config.openxr_mode == 4 &&
+            expected_eye >= 0 && expected_eye <= 1)) {
+        std::scoped_lock lock{g_taau_eye_history_mutex};
+        const auto& history = g_taau_eye_histories[
+            static_cast<size_t>(expected_eye)];
+        if (history.initialized) {
+            expected_history_pair_id = history.last_pair_id;
+            latest_stereo_history = history.texture;
+            committed_command_list = history.last_command_list;
+            committed_native_output = history.last_native_output;
+            committed_native_history = history.last_native_history;
+            committed_cb10_gpu_va = history.last_cb10_gpu_va;
+            committed_cb10_hash = history.last_cb10_hash;
+        }
+    }
+
+    const uint64_t cb10_hash = fnv1a64(cb_data.data(), cb_data.size());
+    if (g_config.openxr_mode == 4 && expected_eye >= 0 && expected_eye <= 1 &&
+        expected_pair_id != 0 && expected_pair_id != UINT64_MAX) {
+        const bool replayed_as_stale = expected_history_pair_id != 0 &&
+            expected_pair_id <= expected_history_pair_id;
+        std::scoped_lock lock{g_taau_recorded_resolve_mutex};
+        g_taau_recorded_resolves[command_list] = TaauRecordedResolveIdentity{
+            expected_eye, expected_pair_id,
+            g_present_count.load(std::memory_order_relaxed),
+            expected_history_pair_id, cb10_hash, native_output.resource,
+            identity_recovered, replayed_as_stale};
+    }
+
+    // Command recording can finish out of order across stereo worker threads.
+    // Once an eye has committed pair N, a delayed resolve for N or an older pair
+    // must never roll that private history backward. Replay the already valid
+    // latest eye output into this resolve's target and consume the stale command
+    // without touching motion vectors or history metadata.
+    if (g_config.openxr_mode == 4 && expected_history_pair_id != 0 &&
+        expected_pair_id <= expected_history_pair_id &&
+        latest_stereo_history != nullptr && native_output.resource != nullptr) {
+        const auto history_desc = latest_stereo_history->GetDesc();
+        const auto output_desc = native_output.resource->GetDesc();
+        const bool compatible =
+            history_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            output_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            history_desc.Width == output_desc.Width &&
+            history_desc.Height == output_desc.Height &&
+            history_desc.Format == output_desc.Format;
+        if (compatible) {
+            D3D12_RESOURCE_BARRIER replay_barriers[2]{};
+            replay_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            replay_barriers[0].Transition.pResource = latest_stereo_history;
+            replay_barriers[0].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            replay_barriers[0].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            replay_barriers[0].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_COPY_SOURCE;
+            replay_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            replay_barriers[1].Transition.pResource = native_output.resource;
+            replay_barriers[1].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            replay_barriers[1].Transition.StateBefore =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            replay_barriers[1].Transition.StateAfter =
+                D3D12_RESOURCE_STATE_COPY_DEST;
+            command_list->ResourceBarrier(2, replay_barriers);
+            command_list->CopyResource(
+                native_output.resource, latest_stereo_history);
+            std::swap(replay_barriers[0].Transition.StateBefore,
+                replay_barriers[0].Transition.StateAfter);
+            std::swap(replay_barriers[1].Transition.StateBefore,
+                replay_barriers[1].Transition.StateAfter);
+            command_list->ResourceBarrier(2, replay_barriers);
+
+            static std::atomic<uint64_t> stale_stereo_replay_count{};
+            const uint64_t count = stale_stereo_replay_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (count <= 64 || count % 120 == 0) {
+                log_line(
+                    "TAAU stale stereo resolve replayed count=%llu present=%llu eye=%d incoming_pair=%llu history_pair=%llu recovered=%u tid=%lu cmd=%p committed_cmd=%p output=%p committed_output=%p native_history=%p committed_native_history=%p cb10=0x%llX committed_cb10=0x%llX cbhash=0x%llX committed_cbhash=0x%llX",
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(
+                        g_present_count.load(std::memory_order_relaxed)),
+                    expected_eye,
+                    static_cast<unsigned long long>(expected_pair_id),
+                    static_cast<unsigned long long>(
+                        expected_history_pair_id),
+                    identity_recovered ? 1u : 0u,
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    command_list, committed_command_list,
+                    native_output.resource, committed_native_output,
+                    native_history.resource, committed_native_history,
+                    static_cast<unsigned long long>(cb10.gpu_va),
+                    static_cast<unsigned long long>(committed_cb10_gpu_va),
+                    static_cast<unsigned long long>(cb10_hash),
+                    static_cast<unsigned long long>(committed_cb10_hash));
+            }
+            return true;
+        }
+    }
+    if (expected_history_pair_id != 0 &&
+        expected_history_pair_id == expected_pair_id) {
+        static std::atomic<uint64_t> serialized_same_pair_count{};
+        const uint64_t count = serialized_same_pair_count.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count <= 16 || count % 120 == 0) {
+            log_line(
+                "TAAU same-pair replay serialized count=%llu present=%llu eye=%d pair=%llu",
+                static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)),
+                expected_eye,
+                static_cast<unsigned long long>(expected_pair_id));
+        }
+    }
+    TaauHmdMotionParameters hmd_motion{};
+    if (!find_taau_hmd_motion_parameters(
+            reinterpret_cast<const float*>(cb_data.data() + 6 * 16),
+            expected_eye, expected_pair_id, hmd_motion,
+            expected_history_pair_id)) {
+        const auto health_failure = g_taau_health_matrix_fail.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        log_taau_early_failure("matrix", health_failure);
+        static std::atomic<uint32_t> hmd_match_failures{};
+        const auto failure = hmd_match_failures.fetch_add(1) + 1;
+        if (g_config.runtime_diagnostics &&
+            (failure <= 16 || failure % 120 == 0)) {
+            log_line("TAAU HMD basis match skipped failure=%u present=%llu eye=%d pair=%llu",
+                failure, static_cast<unsigned long long>(g_present_count.load()),
+                expected_eye,
+                static_cast<unsigned long long>(expected_pair_id));
+        }
+        // Never suppress the native resolve without writing its output. Exact
+        // packed pair tags are handled above; a genuine miss must leave the
+        // original TAAU path intact rather than submit an undefined target.
+        return false;
+    }
+    if (g_config.openxr_mode == 4 &&
+        (!hmd_motion.exact_pair_match ||
+            hmd_motion.matched_eye != expected_eye ||
+            hmd_motion.matched_pair_id != expected_pair_id ||
+            (expected_history_pair_id != 0 &&
+                hmd_motion.previous_matched_pair_id !=
+                    expected_history_pair_id))) {
+        static std::atomic<uint64_t> stereo_exact_identity_rejections{};
+        const uint64_t count = stereo_exact_identity_rejections.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count <= 32 || count % 120 == 0) {
+            log_line(
+                "TAAU stereo exact identity rejected count=%llu present=%llu expected_eye=%d expected_pair=%llu matched_eye=%d matched_pair=%llu expected_previous=%llu matched_previous=%llu exact=%u",
+                static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)),
+                expected_eye,
+                static_cast<unsigned long long>(expected_pair_id),
+                hmd_motion.matched_eye,
+                static_cast<unsigned long long>(hmd_motion.matched_pair_id),
+                static_cast<unsigned long long>(expected_history_pair_id),
+                static_cast<unsigned long long>(
+                    hmd_motion.previous_matched_pair_id),
+                hmd_motion.exact_pair_match ? 1u : 0u);
+        }
+        return false;
+    }
+    g_hang_diag_taau_matched_pair.store(
+        hmd_motion.matched_pair_id, std::memory_order_relaxed);
+    g_hang_diag_taau_matched_eye.store(
+        hmd_motion.matched_eye, std::memory_order_relaxed);
+    {
+        const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+        const bool identity_fallback = expected_pair_id != 0 &&
+            (!hmd_motion.exact_pair_match ||
+                hmd_motion.matched_pair_id != expected_pair_id);
+        const bool predecessor_gap = expected_history_pair_id != 0
+            ? hmd_motion.previous_matched_pair_id != expected_history_pair_id
+            : (hmd_motion.matched_pair_id != 0 &&
+                hmd_motion.previous_matched_pair_id != 0 &&
+                hmd_motion.previous_matched_pair_id + 1 !=
+                    hmd_motion.matched_pair_id);
+        const uint64_t matched_age = present >= hmd_motion.matched_present
+            ? present - hmd_motion.matched_present
+            : UINT64_MAX;
+        const bool stale_match = matched_age > 4;
+        const bool large_matrix_error = hmd_motion.matrix_error > 0.01f;
+        if (identity_fallback || predecessor_gap || stale_match || large_matrix_error) {
+            static std::atomic<uint64_t> anomaly_count{};
+            const uint64_t count = anomaly_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 64 || count % 120 == 0) {
+                log_line(
+                    "TAAU identity anomaly count=%llu present=%llu tls_eye=%d expected_pair=%llu exact=%u matched_eye=%d matched_pair=%llu matched_present=%llu age=%llu expected_history_pair=%llu previous_pair=%llu previous_present=%llu predecessor_mismatch=%u matrix_error=%.6f",
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(present),
+                    expected_eye,
+                    static_cast<unsigned long long>(expected_pair_id),
+                    hmd_motion.exact_pair_match ? 1u : 0u,
+                    hmd_motion.matched_eye,
+                    static_cast<unsigned long long>(hmd_motion.matched_pair_id),
+                    static_cast<unsigned long long>(hmd_motion.matched_present),
+                    static_cast<unsigned long long>(matched_age),
+                    static_cast<unsigned long long>(expected_history_pair_id),
+                    static_cast<unsigned long long>(hmd_motion.previous_matched_pair_id),
+                    static_cast<unsigned long long>(hmd_motion.previous_matched_present),
+                    predecessor_gap ? 1u : 0u,
+                    hmd_motion.matrix_error);
+            }
+        }
+    }
+    static std::atomic<uint32_t> per_eye_route_logs{};
+    const auto route_log = g_config.runtime_diagnostics
+        ? per_eye_route_logs.fetch_add(1) : UINT32_MAX;
+    if (route_log < 24) {
+        log_line("TAAU per-eye route present=%llu tls_eye=%d tls_pair=%llu matched_eye=%d matched_pair=%llu matrix_error=%.6f",
+            static_cast<unsigned long long>(g_present_count.load()),
+            expected_eye,
+            static_cast<unsigned long long>(expected_pair_id),
+            hmd_motion.matched_eye,
+            static_cast<unsigned long long>(hmd_motion.matched_pair_id),
+            hmd_motion.matrix_error);
+    }
+    float hmd_constants[28]{};
+    memcpy(hmd_constants, hmd_motion.current_to_previous_base.data(), 12 * sizeof(float));
+    memcpy(hmd_constants + 12, hmd_motion.current_to_previous_corrected.data(),
+        12 * sizeof(float));
+    const int first_resolve_eye = g_config.engine_taau_reverse_eye_order ? 0 : 1;
+    if (g_config.engine_taau_pure_camera_motion_all ||
+        (g_config.engine_taau_first_eye_pure_camera_motion &&
+            hmd_motion.matched_eye == first_resolve_eye)) {
+        // This row translation is otherwise unused by the correction output.
+        hmd_constants[15] = 1.0f;
+    }
+    const float projection_constants[4] = {
+        tanf(hmd_motion.vertical_fov_degrees *
+            (3.14159265358979323846f / 360.0f)),
+        hmd_motion.aspect,
+        hmd_motion.near_plane,
+        hmd_motion.far_plane};
+    memcpy(hmd_constants + 24, projection_constants, sizeof(projection_constants));
+    memcpy(constants.data() + 32, hmd_constants, sizeof(hmd_constants));
+
+    TaauComposeSlot* compose_slot{};
+    bool compose_slot_initialized{};
+    if (!acquire_taau_compose_slot(
+            command_list, original_mvec.resource,
+            compose_slot, compose_slot_initialized)) {
+        const auto failure = g_taau_health_compose_fail.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        log_taau_early_failure("compose", failure);
+        return false;
+    }
+    auto* compose_heap = compose_slot->heap;
+    auto* original_mvec_snapshot = compose_slot->snapshot;
+
+    auto cpu = compose_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC original_srv{};
+    original_srv.Format = original_mvec.format;
+    original_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    original_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    original_srv.Texture2D.MipLevels = 1;
+    g_d3d12_device->CreateShaderResourceView(
+        original_mvec_snapshot, &original_srv, cpu);
+    cpu.ptr += g_taau_mvec_descriptor_increment;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
+    depth_srv.Format = depth.format;
+    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth_srv.Texture2D.MipLevels = 1;
+    g_d3d12_device->CreateShaderResourceView(depth.resource, &depth_srv, cpu);
+    cpu.ptr += g_taau_mvec_descriptor_increment;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav{};
+    output_uav.Format = original_mvec.format;
+    output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    g_d3d12_device->CreateUnorderedAccessView(
+        original_mvec.resource, nullptr, &output_uav, cpu);
+
+    std::array<D3D12_RESOURCE_BARRIER, 2> to_copy{};
+    UINT to_copy_count{};
+    if (compose_slot_initialized) {
+        auto& barrier = to_copy[to_copy_count++];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = original_mvec_snapshot;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    auto& source_to_copy = to_copy[to_copy_count++];
+    source_to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    source_to_copy.Transition.pResource = original_mvec.resource;
+    source_to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    source_to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    source_to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    command_list->ResourceBarrier(to_copy_count, to_copy.data());
+    command_list->CopyResource(original_mvec_snapshot, original_mvec.resource);
+
+    D3D12_RESOURCE_BARRIER to_compute[2]{};
+    to_compute[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_compute[0].Transition.pResource = original_mvec_snapshot;
+    to_compute[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_compute[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    to_compute[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    to_compute[1] = source_to_copy;
+    to_compute[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    to_compute[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    command_list->ResourceBarrier(static_cast<UINT>(std::size(to_compute)), to_compute);
+
+    ID3D12DescriptorHeap* marker_heaps[] = {compose_heap};
+    command_list->SetDescriptorHeaps(1, marker_heaps);
+    command_list->SetComputeRootSignature(g_taau_mvec_root_signature);
+    command_list->SetPipelineState(g_taau_mvec_pipeline);
+    command_list->SetComputeRootDescriptorTable(0,
+        compose_heap->GetGPUDescriptorHandleForHeapStart());
+    auto output_gpu = compose_heap->GetGPUDescriptorHandleForHeapStart();
+    output_gpu.ptr += static_cast<UINT64>(2) * g_taau_mvec_descriptor_increment;
+    command_list->SetComputeRootDescriptorTable(1, output_gpu);
+    const auto mvec_desc = original_mvec.resource->GetDesc();
+    command_list->SetComputeRoot32BitConstants(
+        2, static_cast<UINT>(constants.size()), constants.data(), 0);
+    g_dispatch(command_list,
+        static_cast<UINT>((mvec_desc.Width + 7) / 8),
+        static_cast<UINT>((mvec_desc.Height + 7) / 8), 1);
+
+    D3D12_RESOURCE_BARRIER uav_barrier{};
+    uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uav_barrier.UAV.pResource = original_mvec.resource;
+    command_list->ResourceBarrier(1, &uav_barrier);
+
+    D3D12_RESOURCE_BARRIER to_srv{};
+    to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_srv.Transition.pResource = original_mvec.resource;
+    to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    command_list->ResourceBarrier(1, &to_srv);
+
+    ID3D12DescriptorHeap* original_heaps[] = {
+        snapshot.cbv_srv_uav_heap, snapshot.sampler_heap};
+    command_list->SetDescriptorHeaps(static_cast<UINT>(std::size(original_heaps)), original_heaps);
+    command_list->SetComputeRootSignature(snapshot.compute_root_signature);
+    command_list->SetPipelineState(snapshot.pipeline_state);
+    for (UINT root = 0; root < 4; ++root) {
+        command_list->SetComputeRootDescriptorTable(root, snapshot.compute_tables[root]);
+    }
+
+    bool isolated_history_dispatch{};
+    const int history_eye = hmd_motion.matched_eye;
+    if (history_eye >= 0 && history_eye <= 1 && history_found && output_found &&
+        native_history.resource != nullptr && native_output.resource != nullptr &&
+        native_history.resource != native_output.resource &&
+        ensure_taau_matrix_fallback_resources() && g_copy_descriptors_simple != nullptr) {
+        const auto history_desc = native_history.resource->GetDesc();
+        const auto output_desc = native_output.resource->GetDesc();
+        const bool compatible = history_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            output_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            history_desc.Width == output_desc.Width &&
+            history_desc.Height == output_desc.Height &&
+            history_desc.Format == output_desc.Format;
+        TaauEyeHistory* eye_history{};
+        bool history_created{};
+        bool history_was_initialized{};
+        uint64_t history_previous_pair{};
+        uint64_t history_previous_present{};
+        if (compatible) {
+            std::scoped_lock lock{g_taau_eye_history_mutex};
+            auto& candidate = g_taau_eye_histories[static_cast<size_t>(history_eye)];
+            if (candidate.texture == nullptr) {
+                D3D12_HEAP_PROPERTIES heap_properties{};
+                heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                heap_properties.CreationNodeMask = 1;
+                heap_properties.VisibleNodeMask = 1;
+                auto private_desc = history_desc;
+                if (SUCCEEDED(g_d3d12_device->CreateCommittedResource(
+                        &heap_properties, D3D12_HEAP_FLAG_NONE, &private_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                        IID_PPV_ARGS(&candidate.texture)))) {
+                    candidate.width = history_desc.Width;
+                    candidate.height = history_desc.Height;
+                    candidate.format = history_desc.Format;
+                    history_created = true;
+                    log_line("TAAU private eye history created eye=%d size=%llux%u format=%u",
+                        history_eye,
+                        static_cast<unsigned long long>(candidate.width), candidate.height,
+                        static_cast<unsigned>(candidate.format));
+                }
+            }
+            if (candidate.texture != nullptr && candidate.width == history_desc.Width &&
+                candidate.height == history_desc.Height &&
+                candidate.format == history_desc.Format) {
+                eye_history = &candidate;
+                history_was_initialized = candidate.initialized;
+                history_previous_pair = candidate.last_pair_id;
+                history_previous_present = candidate.last_present;
+            }
+        }
+
+        const bool history_backward = history_was_initialized &&
+            history_previous_pair != 0 &&
+            hmd_motion.matched_pair_id < history_previous_pair;
+        const bool history_gap = history_was_initialized &&
+            history_previous_pair != 0 &&
+            hmd_motion.matched_pair_id > history_previous_pair + 1;
+        const bool history_predecessor_mismatch = history_was_initialized &&
+            history_previous_pair != 0 &&
+            hmd_motion.previous_matched_pair_id != history_previous_pair;
+        if (history_backward || history_predecessor_mismatch) {
+            static std::atomic<uint64_t> history_identity_anomaly_count{};
+            const uint64_t count = history_identity_anomaly_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (count <= 64 || count % 120 == 0) {
+                log_line(
+                    "TAAU history identity anomaly count=%llu present=%llu eye=%d history_pair=%llu history_present=%llu incoming_pair=%llu incoming_present=%llu direction=%s",
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(
+                        g_present_count.load(std::memory_order_relaxed)),
+                    history_eye,
+                    static_cast<unsigned long long>(history_previous_pair),
+                    static_cast<unsigned long long>(history_previous_present),
+                    static_cast<unsigned long long>(hmd_motion.matched_pair_id),
+                    static_cast<unsigned long long>(hmd_motion.matched_present),
+                    history_backward ? "backward" : "predecessor_mismatch");
+            }
+        }
+        if (history_gap && !history_predecessor_mismatch) {
+            static std::atomic<uint64_t> aligned_history_gap_count{};
+            const uint64_t count = aligned_history_gap_count.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (count <= 16 || count % 120 == 0) {
+                log_line(
+                    "TAAU history gap aligned count=%llu present=%llu eye=%d history_pair=%llu incoming_pair=%llu motion_previous_pair=%llu",
+                    static_cast<unsigned long long>(count),
+                    static_cast<unsigned long long>(
+                        g_present_count.load(std::memory_order_relaxed)),
+                    history_eye,
+                    static_cast<unsigned long long>(history_previous_pair),
+                    static_cast<unsigned long long>(hmd_motion.matched_pair_id),
+                    static_cast<unsigned long long>(
+                        hmd_motion.previous_matched_pair_id));
+            }
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE source_cbv{};
+        D3D12_CPU_DESCRIPTOR_HANDLE source_srv{};
+        D3D12_CPU_DESCRIPTOR_HANDLE source_uav{};
+        if (eye_history != nullptr &&
+            taau_table_cpu_handle(snapshot, snapshot.compute_tables[0], 14, source_cbv) &&
+            taau_table_cpu_handle(snapshot, snapshot.compute_tables[1], 16, source_srv) &&
+            taau_table_cpu_handle(snapshot, snapshot.compute_tables[3], 4, source_uav)) {
+            uint32_t slot_index{};
+            if (!acquire_taau_override_slot(command_list, slot_index)) {
+                const auto failure = g_taau_health_history_fallback.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                log_taau_early_failure("retirement", failure);
+                eye_history = nullptr;
+            }
+            auto* override_heap = eye_history != nullptr
+                ? g_taau_override_slots[slot_index].heap
+                : nullptr;
+            if (override_heap == nullptr) {
+                // The original resolve below is safer than waiting for the GPU.
+            } else {
+            const auto private_cpu = override_heap->GetCPUDescriptorHandleForHeapStart();
+            const auto private_gpu = override_heap->GetGPUDescriptorHandleForHeapStart();
+            auto copy_table = [&](UINT destination_offset, UINT count,
+                                  D3D12_CPU_DESCRIPTOR_HANDLE source) {
+                D3D12_CPU_DESCRIPTOR_HANDLE destination{private_cpu.ptr +
+                    static_cast<SIZE_T>(destination_offset) * g_taau_descriptor_increment};
+                g_copy_descriptors_simple(g_d3d12_device, count, destination, source,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            };
+            copy_table(kTaauCbvOffset, 14, source_cbv);
+            copy_table(kTaauSrvOffset, 16, source_srv);
+            copy_table(kTaauUavOffset, 4, source_uav);
+
+            if (history_was_initialized) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC history_srv{};
+                history_srv.Format = native_history.format;
+                history_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                history_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                history_srv.Texture2D.MostDetailedMip = native_history.most_detailed_mip;
+                history_srv.Texture2D.MipLevels = native_history.mip_levels;
+                D3D12_CPU_DESCRIPTOR_HANDLE history_cpu{private_cpu.ptr +
+                    static_cast<SIZE_T>(kTaauSrvOffset + 2) * g_taau_descriptor_increment};
+                g_d3d12_device->CreateShaderResourceView(
+                    eye_history->texture, &history_srv, history_cpu);
+            }
+
+            ID3D12DescriptorHeap* override_heaps[] = {override_heap, snapshot.sampler_heap};
+            command_list->SetDescriptorHeaps(
+                static_cast<UINT>(std::size(override_heaps)), override_heaps);
+            command_list->SetComputeRootSignature(snapshot.compute_root_signature);
+            command_list->SetPipelineState(snapshot.pipeline_state);
+            command_list->SetComputeRootDescriptorTable(0,
+                D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
+                    static_cast<UINT64>(kTaauCbvOffset) * g_taau_descriptor_increment});
+            command_list->SetComputeRootDescriptorTable(1,
+                D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
+                    static_cast<UINT64>(kTaauSrvOffset) * g_taau_descriptor_increment});
+            command_list->SetComputeRootDescriptorTable(2, snapshot.compute_tables[2]);
+            command_list->SetComputeRootDescriptorTable(3,
+                D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
+                    static_cast<UINT64>(kTaauUavOffset) * g_taau_descriptor_increment});
+            g_dispatch(command_list, x, y, z);
+
+            D3D12_RESOURCE_BARRIER copy_barriers[3]{};
+            copy_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            copy_barriers[0].UAV.pResource = native_output.resource;
+            copy_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            copy_barriers[1].Transition.pResource = native_output.resource;
+            copy_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            copy_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            copy_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            copy_barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            copy_barriers[2].Transition.pResource = eye_history->texture;
+            copy_barriers[2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            copy_barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            copy_barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            command_list->ResourceBarrier(
+                history_was_initialized ? 3u : 2u, copy_barriers);
+            command_list->CopyResource(eye_history->texture, native_output.resource);
+            copy_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            copy_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            copy_barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            copy_barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            command_list->ResourceBarrier(2, copy_barriers + 1);
+            {
+                std::scoped_lock lock{g_taau_eye_history_mutex};
+                eye_history->initialized = true;
+                eye_history->last_pair_id = hmd_motion.matched_pair_id;
+                eye_history->last_present = hmd_motion.matched_present;
+                eye_history->last_command_list = command_list;
+                eye_history->last_native_output = native_output.resource;
+                eye_history->last_native_history = native_history.resource;
+                eye_history->last_cb10_gpu_va = cb10.gpu_va;
+                eye_history->last_cb10_hash = cb10_hash;
+            }
+
+            command_list->SetDescriptorHeaps(
+                static_cast<UINT>(std::size(original_heaps)), original_heaps);
+            for (UINT root = 0; root < 4; ++root) {
+                command_list->SetComputeRootDescriptorTable(root, snapshot.compute_tables[root]);
+            }
+            isolated_history_dispatch = true;
+            static std::atomic<uint32_t> isolated_history_logs{};
+            if (g_config.runtime_diagnostics &&
+                isolated_history_logs.fetch_add(1) < 24) {
+                log_line("TAAU private eye history resolved eye=%d pair=%llu slot=%u initialized=%u",
+                    history_eye,
+                    static_cast<unsigned long long>(hmd_motion.matched_pair_id),
+                    slot_index, history_created ? 1u : 0u);
+            }
+            }
+        }
+    }
+    if (!isolated_history_dispatch) {
+        const auto failure = g_taau_health_history_fallback.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        log_taau_early_failure("history", failure);
+        // The custom motion pass has already overwritten t7. A native resolve
+        // with a missing private-history route would combine half of each path.
+        // Restore the exact snapshot and let hook_dispatch issue the untouched
+        // native resolve instead.
+        D3D12_RESOURCE_BARRIER restore_to_copy[2]{};
+        restore_to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_to_copy[0].Transition.pResource = original_mvec.resource;
+        restore_to_copy[0].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        restore_to_copy[0].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        restore_to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        restore_to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore_to_copy[1].Transition.pResource = original_mvec_snapshot;
+        restore_to_copy[1].Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        restore_to_copy[1].Transition.StateBefore =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        restore_to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        command_list->ResourceBarrier(
+            static_cast<UINT>(std::size(restore_to_copy)), restore_to_copy);
+        command_list->CopyResource(original_mvec.resource, original_mvec_snapshot);
+        std::swap(restore_to_copy[0].Transition.StateBefore,
+            restore_to_copy[0].Transition.StateAfter);
+        std::swap(restore_to_copy[1].Transition.StateBefore,
+            restore_to_copy[1].Transition.StateAfter);
+        command_list->ResourceBarrier(
+            static_cast<UINT>(std::size(restore_to_copy)), restore_to_copy);
+        return false;
+    }
+    if (g_config.runtime_diagnostics && g_taau_override_log_count.fetch_add(1) < 12) {
+        log_line("TAAU in-place HMD motion composed mvec=%p command_list=%p",
+            original_mvec.resource, command_list);
+    }
+    if (g_config.runtime_diagnostics) {
+        const auto corrected = g_taau_health_corrected.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (corrected <= 256 && (corrected & (corrected - 1)) == 0) {
+            log_line("TAAU health early milestone corrected=%llu total=%llu history_fallback=%llu present=%llu",
+                static_cast<unsigned long long>(corrected),
+                static_cast<unsigned long long>(g_taau_health_total.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_taau_health_history_fallback.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)));
+        }
+    }
+    return true;
+}
+
+bool dispatch_taau_matrix_fallback(
+    ID3D12GraphicsCommandList* command_list,
+    UINT x,
+    UINT y,
+    UINT z) {
+    if (!ensure_taau_matrix_fallback_resources() || g_copy_descriptors_simple == nullptr) {
+        return false;
+    }
+
+    CommandListInfo snapshot{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto it = g_command_list_infos.find(command_list);
+        if (it == g_command_list_infos.end()) {
+            return false;
+        }
+        snapshot = it->second;
+    }
+    snapshot.pipeline_state = load_command_list_pipeline(command_list);
+    if (snapshot.cbv_srv_uav_heap == nullptr || snapshot.sampler_heap == nullptr ||
+        snapshot.compute_tables[0].ptr == 0 || snapshot.compute_tables[1].ptr == 0 ||
+        snapshot.compute_tables[2].ptr == 0 || snapshot.compute_tables[3].ptr == 0) {
+        return false;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE source_cbv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_srv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_uav{};
+    if (!taau_table_cpu_handle(snapshot, snapshot.compute_tables[0], 14, source_cbv) ||
+        !taau_table_cpu_handle(snapshot, snapshot.compute_tables[1], 16, source_srv) ||
+        !taau_table_cpu_handle(snapshot, snapshot.compute_tables[3], 4, source_uav)) {
+        return false;
+    }
+    uint32_t slot_index{};
+    if (!acquire_taau_override_slot(command_list, slot_index)) {
+        return false;
+    }
+    auto* override_heap = g_taau_override_slots[slot_index].heap;
+    const auto private_cpu = override_heap->GetCPUDescriptorHandleForHeapStart();
+    const auto private_gpu = override_heap->GetGPUDescriptorHandleForHeapStart();
+    auto copy_table = [&](UINT destination_offset, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE source) {
+        D3D12_CPU_DESCRIPTOR_HANDLE destination{private_cpu.ptr +
+            static_cast<SIZE_T>(destination_offset) * g_taau_descriptor_increment};
+        g_copy_descriptors_simple(g_d3d12_device, count, destination, source,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    };
+    copy_table(kTaauCbvOffset, 14, source_cbv);
+    copy_table(kTaauSrvOffset, 16, source_srv);
+    copy_table(kTaauUavOffset, 4, source_uav);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC sentinel_srv{};
+    sentinel_srv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    sentinel_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sentinel_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sentinel_srv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE sentinel_cpu{private_cpu.ptr +
+        static_cast<SIZE_T>(kTaauSrvOffset + 7) * g_taau_descriptor_increment};
+    g_d3d12_device->CreateShaderResourceView(
+        g_taau_invalid_mvec_texture, &sentinel_srv, sentinel_cpu);
+
+    ID3D12DescriptorHeap* override_heaps[] = {override_heap, snapshot.sampler_heap};
+    command_list->SetDescriptorHeaps(static_cast<UINT>(std::size(override_heaps)), override_heaps);
+
+    D3D12_RESOURCE_BARRIER to_uav{};
+    to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_uav.Transition.pResource = g_taau_invalid_mvec_texture;
+    to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    command_list->ResourceBarrier(1, &to_uav);
+    D3D12_CPU_DESCRIPTOR_HANDLE sentinel_uav_cpu{private_cpu.ptr +
+        static_cast<SIZE_T>(kTaauDummyUavOffset) * g_taau_descriptor_increment};
+    D3D12_GPU_DESCRIPTOR_HANDLE sentinel_uav_gpu{private_gpu.ptr +
+        static_cast<UINT64>(kTaauDummyUavOffset) * g_taau_descriptor_increment};
+    const float native_zero_motion[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    command_list->ClearUnorderedAccessViewFloat(
+        sentinel_uav_gpu, sentinel_uav_cpu, g_taau_invalid_mvec_texture,
+        native_zero_motion, 0, nullptr);
+
+    D3D12_RESOURCE_BARRIER to_srv = to_uav;
+    to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    command_list->ResourceBarrier(1, &to_srv);
+
+    command_list->SetComputeRootSignature(snapshot.compute_root_signature);
+    command_list->SetPipelineState(snapshot.pipeline_state);
+    command_list->SetComputeRootDescriptorTable(0,
+        D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr + static_cast<UINT64>(kTaauCbvOffset) * g_taau_descriptor_increment});
+    command_list->SetComputeRootDescriptorTable(1,
+        D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr + static_cast<UINT64>(kTaauSrvOffset) * g_taau_descriptor_increment});
+    command_list->SetComputeRootDescriptorTable(2, snapshot.compute_tables[2]);
+    command_list->SetComputeRootDescriptorTable(3,
+        D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr + static_cast<UINT64>(kTaauUavOffset) * g_taau_descriptor_increment});
+    g_dispatch(command_list, x, y, z);
+
+    ID3D12DescriptorHeap* original_heaps[] = {snapshot.cbv_srv_uav_heap, snapshot.sampler_heap};
+    command_list->SetDescriptorHeaps(static_cast<UINT>(std::size(original_heaps)), original_heaps);
+    for (UINT root = 0; root < 4; ++root) {
+        command_list->SetComputeRootDescriptorTable(root, snapshot.compute_tables[root]);
+    }
+    if (g_taau_override_log_count.fetch_add(1) < 12) {
+        log_line("TAAU 320x180 zero-map diagnostic dispatched slot=%u command_list=%p", slot_index, command_list);
+    }
+    return true;
+}
+
+void log_taau_engine_matrix_match(const float* taau_matrix) {
+    if (taau_matrix == nullptr || g_taau_view_matrix_match_logs.fetch_add(1) >= 4) {
+        return;
+    }
+    std::array<float, 512> before{};
+    std::array<float, 512> after{};
+    uint64_t snapshot_present{};
+    {
+        std::scoped_lock lock{g_engine_view_snapshot_mutex};
+        before = g_engine_view_before_hmd;
+        after = g_engine_view_after_rebuild;
+        snapshot_present = g_engine_view_snapshot_present;
+    }
+    float best_error = FLT_MAX;
+    size_t best_offset{};
+    bool best_transposed{};
+    for (size_t offset = 0; offset + 16 <= after.size(); ++offset) {
+        float direct_error{};
+        float transpose_error{};
+        for (size_t row = 0; row < 4; ++row) {
+            for (size_t column = 0; column < 4; ++column) {
+                const float target = taau_matrix[row * 4 + column];
+                direct_error += fabsf(after[offset + row * 4 + column] - target);
+                transpose_error += fabsf(after[offset + row * 4 + column] -
+                    taau_matrix[column * 4 + row]);
+            }
+        }
+        if (direct_error < best_error) {
+            best_error = direct_error;
+            best_offset = offset;
+            best_transposed = false;
+        }
+        if (transpose_error < best_error) {
+            best_error = transpose_error;
+            best_offset = offset;
+            best_transposed = true;
+        }
+    }
+    log_line("TAAU engine matrix match snapshot_present=%llu current_present=%llu offset=0x%zX transpose=%u error=%.9g",
+        static_cast<unsigned long long>(snapshot_present),
+        static_cast<unsigned long long>(g_present_count.load()),
+        best_offset * sizeof(float), best_transposed ? 1u : 0u, best_error);
+    for (size_t row = 0; row < 4; ++row) {
+        log_line("TAAU engine matrix row=%zu target=%.7g,%.7g,%.7g,%.7g before=%.7g,%.7g,%.7g,%.7g after=%.7g,%.7g,%.7g,%.7g",
+            row,
+            taau_matrix[row * 4], taau_matrix[row * 4 + 1],
+            taau_matrix[row * 4 + 2], taau_matrix[row * 4 + 3],
+            before[best_offset + row * 4], before[best_offset + row * 4 + 1],
+            before[best_offset + row * 4 + 2], before[best_offset + row * 4 + 3],
+            after[best_offset + row * 4], after[best_offset + row * 4 + 1],
+            after[best_offset + row * 4 + 2], after[best_offset + row * 4 + 3]);
+    }
+}
+
+void log_taau_cbv_registers(
+    uint32_t sample,
+    const char* label,
+    const CbvDescriptorInfo& cbv,
+    const UINT* registers,
+    size_t register_count) {
+    ResourceInfo resource_info{};
+    size_t offset{};
+    ID3D12Resource* resource{};
+    if (cbv.gpu_va == 0 || !resolve_gpu_va(cbv.gpu_va, resource_info, offset, resource) ||
+        resource_info.mapped == nullptr || offset >= resource_info.mapped_size) {
+        log_line("TAAU %s sample=%u unavailable gpuva=0x%llX size=%u",
+            label, sample, static_cast<unsigned long long>(cbv.gpu_va), cbv.size_in_bytes);
+        return;
+    }
+
+    const auto* data = static_cast<const uint8_t*>(resource_info.mapped) + offset;
+    const size_t available = std::min<size_t>(resource_info.mapped_size - offset, cbv.size_in_bytes);
+    if (strcmp(label, "cb10") == 0 && available >= 10 * 16) {
+        log_taau_engine_matrix_match(reinterpret_cast<const float*>(data + 6 * 16));
+    }
+    for (size_t index = 0; index < register_count; ++index) {
+        const UINT reg = registers[index];
+        const size_t byte_offset = static_cast<size_t>(reg) * 16;
+        if (byte_offset + 16 > available) {
+            continue;
+        }
+        std::array<uint32_t, 4> words{};
+        std::array<float, 4> values{};
+        memcpy(words.data(), data + byte_offset, 16);
+        memcpy(values.data(), words.data(), 16);
+        log_line("TAAU %s sample=%u reg=%u hex=%08X,%08X,%08X,%08X float=%.9g,%.9g,%.9g,%.9g",
+            label, sample, reg, words[0], words[1], words[2], words[3],
+            values[0], values[1], values[2], values[3]);
+    }
+}
+
+void log_taau_compute_bindings(ID3D12GraphicsCommandList* command_list, uint64_t present) {
+    const uint32_t sample = g_taau_binding_sample_count.fetch_add(1);
+    if (sample >= 4) {
+        return;
+    }
+
+    CommandListInfo snapshot{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto it = g_command_list_infos.find(command_list);
+        if (it == g_command_list_infos.end()) {
+            return;
+        }
+        snapshot = it->second;
+    }
+    snapshot.pipeline_state = load_command_list_pipeline(command_list);
+
+    log_line("TAAU resolve bindings sample=%u present=%llu command_list=%p pso=%p rs=%p heap=%p",
+        sample + 1,
+        static_cast<unsigned long long>(present),
+        command_list,
+        snapshot.pipeline_state,
+        snapshot.compute_root_signature,
+        snapshot.cbv_srv_uav_heap);
+
+    for (UINT root = 0; root < 32; ++root) {
+        if (snapshot.compute_tables[root].ptr != 0) {
+            CbvDescriptorInfo cbv{};
+            SIZE_T cpu_handle{};
+            bool known_cbv{};
+            {
+                std::scoped_lock lock{g_reverse_mutex};
+                known_cbv = resolve_descriptor_table_cbv(
+                    snapshot, snapshot.compute_tables[root], cbv, cpu_handle);
+            }
+            log_line("TAAU resolve table sample=%u root=%u gpu=0x%zX known_cbv=%u cpu=0x%zX gpuva=0x%llX size=%u",
+                sample + 1, root, snapshot.compute_tables[root].ptr,
+                known_cbv ? 1u : 0u, cpu_handle,
+                static_cast<unsigned long long>(cbv.gpu_va), cbv.size_in_bytes);
+            if (root == 1 || root == 3) {
+                static constexpr UINT srv_offsets[] = {0, 1, 2, 3, 4, 7, 8};
+                static constexpr UINT uav_offsets[] = {0};
+                const UINT* offsets = root == 1 ? srv_offsets : uav_offsets;
+                const size_t offset_count = root == 1 ? std::size(srv_offsets) : std::size(uav_offsets);
+                for (size_t offset_index = 0; offset_index < offset_count; ++offset_index) {
+                    ResourceDescriptorInfo descriptor{};
+                    SIZE_T descriptor_cpu{};
+                    bool known_resource{};
+                    {
+                        std::scoped_lock lock{g_reverse_mutex};
+                        known_resource = resolve_descriptor_table_resource(
+                            snapshot, snapshot.compute_tables[root], offsets[offset_index],
+                            descriptor, descriptor_cpu);
+                    }
+                    if (!known_resource || descriptor.resource == nullptr) {
+                        log_line("TAAU resource sample=%u root=%u binding=%u unknown cpu=0x%zX",
+                            sample + 1, root, offsets[offset_index], descriptor_cpu);
+                        continue;
+                    }
+                    const auto resource_desc = descriptor.resource->GetDesc();
+                    log_line("TAAU resource sample=%u root=%u binding=%u resource=%p view_format=%u resource_format=%u dimension=%u size=%llux%u flags=0x%X uav=%u",
+                        sample + 1, root, offsets[offset_index], descriptor.resource,
+                        static_cast<unsigned>(descriptor.format),
+                        static_cast<unsigned>(resource_desc.Format),
+                        static_cast<unsigned>(resource_desc.Dimension),
+                        static_cast<unsigned long long>(resource_desc.Width), resource_desc.Height,
+                        static_cast<unsigned>(resource_desc.Flags), descriptor.uav ? 1u : 0u);
+                }
+            }
+            if (root == 0) {
+                CbvDescriptorInfo cb10{};
+                CbvDescriptorInfo cb12{};
+                SIZE_T cb10_cpu{};
+                SIZE_T cb12_cpu{};
+                bool have_cb10{};
+                bool have_cb12{};
+                {
+                    std::scoped_lock lock{g_reverse_mutex};
+                    have_cb10 = resolve_descriptor_table_cbv(
+                        snapshot, snapshot.compute_tables[root], cb10, cb10_cpu, 10);
+                    have_cb12 = resolve_descriptor_table_cbv(
+                        snapshot, snapshot.compute_tables[root], cb12, cb12_cpu, 12);
+                }
+                log_line("TAAU exact CBVs sample=%u cb10=%u cpu10=0x%zX gpuva10=0x%llX size10=%u cb12=%u cpu12=0x%zX gpuva12=0x%llX size12=%u",
+                    sample + 1, have_cb10 ? 1u : 0u, cb10_cpu,
+                    static_cast<unsigned long long>(cb10.gpu_va), cb10.size_in_bytes,
+                    have_cb12 ? 1u : 0u, cb12_cpu,
+                    static_cast<unsigned long long>(cb12.gpu_va), cb12.size_in_bytes);
+                static constexpr UINT cb10_registers[] = {0, 1, 2, 3, 5, 6, 7, 8, 9, 15, 16};
+                static constexpr UINT cb12_registers[] = {21, 22};
+                if (have_cb10) {
+                    log_taau_cbv_registers(sample + 1, "cb10", cb10,
+                        cb10_registers, std::size(cb10_registers));
+                }
+                if (have_cb12) {
+                    log_taau_cbv_registers(sample + 1, "cb12", cb12,
+                        cb12_registers, std::size(cb12_registers));
+                }
+            }
+        }
+
+        if (snapshot.compute_cbv[root] != 0) {
+            ResourceInfo resource_info{};
+            size_t offset{};
+            ID3D12Resource* resource{};
+            uint64_t data_hash{};
+            std::array<uint32_t, 8> words{};
+            if (resolve_gpu_va(snapshot.compute_cbv[root], resource_info, offset, resource) &&
+                resource_info.mapped != nullptr && offset < resource_info.mapped_size) {
+                const size_t available = resource_info.mapped_size - offset;
+                const size_t bytes = std::min<size_t>(available, 256);
+                const auto* data = static_cast<const uint8_t*>(resource_info.mapped) + offset;
+                data_hash = fnv1a64(data, bytes);
+                memcpy(words.data(), data, std::min(bytes, sizeof(words)));
+            }
+            log_line("TAAU resolve cbv sample=%u root=%u gpuva=0x%llX resource=%p offset=0x%zX hash=0x%llX words=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                sample + 1, root,
+                static_cast<unsigned long long>(snapshot.compute_cbv[root]),
+                resource, offset, static_cast<unsigned long long>(data_hash),
+                words[0], words[1], words[2], words[3],
+                words[4], words[5], words[6], words[7]);
+        }
+
+        const uint64_t mask = snapshot.compute_constant_masks[root];
+        if (mask != 0) {
+            const auto& values = snapshot.compute_constants[root];
+            log_line("TAAU resolve constants sample=%u root=%u mask=0x%llX values=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                sample + 1, root, static_cast<unsigned long long>(mask),
+                values[0], values[1], values[2], values[3],
+                values[4], values[5], values[6], values[7],
+                values[8], values[9], values[10], values[11],
+                values[12], values[13], values[14], values[15]);
+        }
+    }
+}
+
+void STDMETHODCALLTYPE hook_dispatch(
+    ID3D12GraphicsCommandList* command_list,
+    UINT thread_group_count_x,
+    UINT thread_group_count_y,
+    UINT thread_group_count_z) {
+    if (!taau_runtime_tracking_active()) {
+        g_dispatch(command_list, thread_group_count_x, thread_group_count_y,
+            thread_group_count_z);
+        return;
+    }
+    const uint64_t present = g_present_count.load();
+
+    if (g_compute_probe_active.load()) {
+        ID3D12PipelineState* pipeline{};
+        CommandListInfo dispatch_snapshot{};
+        {
+            std::scoped_lock lock{g_reverse_mutex};
+            const auto it = g_command_list_infos.find(command_list);
+            if (it != g_command_list_infos.end()) {
+                dispatch_snapshot = it->second;
+            }
+        }
+        pipeline = load_command_list_pipeline(command_list);
+        dispatch_snapshot.pipeline_state = pipeline;
+        if (pipeline != nullptr) {
+            const auto pipeline_info = lookup_pipeline_info(pipeline);
+            const uint64_t dispatch_serial = g_taau_dispatch_serial.fetch_add(1) + 1;
+            if (pipeline_info.cs_hash == kTaauResolveComputeHash) {
+                log_taau_compute_bindings(command_list, present);
+                ResourceDescriptorInfo t7{};
+                SIZE_T t7_cpu{};
+                TaauUavWriter writer{};
+                TaauRtvWriter rtv_writer{};
+                TaauResourceTransition transition{};
+                bool have_t7{};
+                bool have_writer{};
+                bool have_rtv_writer{};
+                bool have_transition{};
+                {
+                    std::scoped_lock lock{g_reverse_mutex};
+                    have_t7 = resolve_descriptor_table_resource(
+                        dispatch_snapshot, dispatch_snapshot.compute_tables[1], 7, t7, t7_cpu);
+                    if (have_t7 && t7.resource != nullptr) {
+                        const auto writer_it = g_taau_uav_writers.find(t7.resource);
+                        if (writer_it != g_taau_uav_writers.end()) {
+                            writer = writer_it->second;
+                            have_writer = true;
+                        }
+                        const auto rtv_writer_it = g_taau_rtv_writers.find(t7.resource);
+                        if (rtv_writer_it != g_taau_rtv_writers.end()) {
+                            rtv_writer = rtv_writer_it->second;
+                            have_rtv_writer = true;
+                        }
+                        const auto transition_it = g_taau_resource_transitions.find(t7.resource);
+                        if (transition_it != g_taau_resource_transitions.end()) {
+                            transition = transition_it->second;
+                            have_transition = true;
+                        }
+                    }
+                }
+                if (g_taau_writer_log_count.fetch_add(1) < 16) {
+                    log_line("TAAU t7 writer present=%llu resource=%p cpu=0x%zX found=%u writer_present=%llu age_dispatches=%llu command_list=%p pso=%p cs=0x%llX dispatch=%ux%ux%u",
+                        static_cast<unsigned long long>(present), t7.resource, t7_cpu,
+                        have_writer ? 1u : 0u,
+                        static_cast<unsigned long long>(writer.present),
+                        have_writer && dispatch_serial >= writer.dispatch_serial
+                            ? static_cast<unsigned long long>(dispatch_serial - writer.dispatch_serial)
+                            : 0ull,
+                        writer.command_list, writer.pipeline,
+                        static_cast<unsigned long long>(writer.cs_hash),
+                        writer.x, writer.y, writer.z);
+                    log_line("TAAU t7 RTV writer present=%llu resource=%p found=%u writer_present=%llu command_list=%p pso=%p vs=0x%llX ps=0x%llX indexed=%u elements=%u instances=%u",
+                        static_cast<unsigned long long>(present), t7.resource,
+                        have_rtv_writer ? 1u : 0u,
+                        static_cast<unsigned long long>(rtv_writer.present),
+                        rtv_writer.command_list, rtv_writer.pipeline,
+                        static_cast<unsigned long long>(rtv_writer.vs_hash),
+                        static_cast<unsigned long long>(rtv_writer.ps_hash),
+                        rtv_writer.indexed ? 1u : 0u, rtv_writer.elements,
+                        rtv_writer.instances);
+                    const auto t7_desc = t7.resource != nullptr
+                        ? t7.resource->GetDesc() : D3D12_RESOURCE_DESC{};
+                    log_line("TAAU t7 view present=%llu srv_dim=%u mip=%u mip_levels=%u first_slice=%u array_size=%u resource_array=%u resource_mips=%u transition_found=%u transition_present=%llu command_list=%p state=0x%X->0x%X subresource=%u",
+                        static_cast<unsigned long long>(present),
+                        static_cast<unsigned>(t7.srv_dimension), t7.most_detailed_mip,
+                        t7.mip_levels, t7.first_array_slice, t7.array_size,
+                        t7_desc.DepthOrArraySize, t7_desc.MipLevels,
+                        have_transition ? 1u : 0u,
+                        static_cast<unsigned long long>(transition.present),
+                        transition.command_list, static_cast<unsigned>(transition.before),
+                        static_cast<unsigned>(transition.after), transition.subresource);
+                }
+            } else {
+                std::scoped_lock lock{g_reverse_mutex};
+                for (auto* resource : dispatch_snapshot.active_uav_resources) {
+                    if (resource != nullptr) {
+                        g_taau_uav_writers[resource] = TaauUavWriter{
+                            command_list, pipeline, pipeline_info.cs_hash, present,
+                            dispatch_serial, thread_group_count_x, thread_group_count_y,
+                            thread_group_count_z};
+                    }
+                }
+            }
+            const ComputeDispatchKey key{
+                pipeline, thread_group_count_x, thread_group_count_y, thread_group_count_z};
+            std::scoped_lock lock{g_compute_probe_mutex};
+            ++g_compute_probe_counts[key];
+        }
+
+        if (present >= g_compute_probe_end_present.load() &&
+            g_compute_probe_active.exchange(false)) {
+            std::vector<std::pair<ComputeDispatchKey, uint64_t>> samples{};
+            {
+                std::scoped_lock lock{g_compute_probe_mutex};
+                samples.assign(g_compute_probe_counts.begin(), g_compute_probe_counts.end());
+            }
+            std::sort(samples.begin(), samples.end(), [](const auto& a, const auto& b) {
+                return a.second > b.second;
+            });
+            const uint32_t capture = g_compute_probe_capture_id.load();
+            log_line("TAAU compute capture %u complete signatures=%zu", capture, samples.size());
+            for (size_t index = 0; index < std::min<size_t>(samples.size(), 256); ++index) {
+                const auto& [key, count] = samples[index];
+                const auto info = lookup_pipeline_info(key.pipeline);
+                log_line("TAAU compute capture=%u count=%llu dispatch=%ux%ux%u pso=%p cs=0x%llX rs=%p",
+                    capture,
+                    static_cast<unsigned long long>(count),
+                    key.x, key.y, key.z,
+                    key.pipeline,
+                    static_cast<unsigned long long>(info.cs_hash),
+                    info.root_signature);
+            }
+        }
+    }
+
+    if (g_taau_force_matrix_fallback.load()) {
+        auto* pipeline = load_command_list_pipeline(command_list);
+        if (pipeline != nullptr &&
+            pipeline == g_taau_resolve_pipeline.load(std::memory_order_acquire)) {
+            g_hang_diag_taau_present.store(present, std::memory_order_relaxed);
+            g_hang_diag_taau_pair.store(g_engine_render_pair_id, std::memory_order_relaxed);
+            g_hang_diag_taau_eye.store(g_engine_render_eye, std::memory_order_relaxed);
+            g_hang_diag_taau_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+            g_hang_diag_taau_enter.fetch_add(1, std::memory_order_relaxed);
+            const bool handled = dispatch_taau_inplace_marker(command_list,
+                thread_group_count_x, thread_group_count_y, thread_group_count_z);
+            g_hang_diag_taau_exit.fetch_add(1, std::memory_order_relaxed);
+            if (handled) {
+                return;
+            }
+        }
+    }
+
+    g_dispatch(command_list, thread_group_count_x, thread_group_count_y, thread_group_count_z);
+}
+
+bool try_bridge_transition_eye0_before_5ea_barrier(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_barriers,
+    const D3D12_RESOURCE_BARRIER* barriers) {
+    if (command_list == nullptr || barriers == nullptr ||
+        g_streamline_canonical_output == nullptr ||
+        g_streamline_private_outputs[0] == nullptr ||
+        !temporal_backend_is_dlss_packed() ||
+        g_config.openxr_mode != 4 ||
+        !g_packed_transition_ordered_recovery_active.load(
+            std::memory_order_acquire)) {
+        return false;
+    }
+
+    constexpr uint64_t kTransitionColorEntryPixelHash =
+        0x5EA46427B418AF5Bull;
+    const auto pipeline = lookup_pipeline_info(
+        load_command_list_pipeline(command_list));
+    if (pipeline.ps_hash != kTransitionColorEntryPixelHash) {
+        return false;
+    }
+
+    bool native_5ea_barrier{};
+    for (UINT index = 0; index < num_barriers; ++index) {
+        const auto& barrier = barriers[index];
+        if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+            barrier.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE &&
+            barrier.Transition.pResource ==
+                g_streamline_canonical_output &&
+            barrier.Transition.StateBefore ==
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE &&
+            barrier.Transition.StateAfter ==
+                D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            native_5ea_barrier = true;
+            break;
+        }
+    }
+    if (!native_5ea_barrier) {
+        return false;
+    }
+
+    const uint64_t pending_pair =
+        g_packed_transition_pending_eye0_pair.load(
+            std::memory_order_acquire);
+    if (pending_pair == UINT64_MAX) {
+        return false;
+    }
+    EngineFrameTag existing_route{};
+    if (lookup_streamline_command_list_route(
+            command_list, existing_route)) {
+        return false;
+    }
+
+    EngineFrameTag queue_back{};
+    {
+        std::scoped_lock queue_lock{
+            g_engine_completed_tag_queue_mutex};
+        if (g_engine_completed_tag_queue.empty()) {
+            return false;
+        }
+        queue_back = g_engine_completed_tag_queue.back();
+    }
+    const uint32_t generation =
+        g_streamline_capture_generation.load(
+            std::memory_order_acquire);
+    if (queue_back.eye != 0 || queue_back.pair_id != pending_pair ||
+        queue_back.generation != generation) {
+        return false;
+    }
+
+    uint64_t expected = pending_pair;
+    if (!g_packed_transition_pending_eye0_pair.compare_exchange_strong(
+            expected, UINT64_MAX, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return false;
+    }
+
+    // CS5694 normally leaves the canonical resource in PIXEL_SHADER_RESOURCE.
+    // Supply the already-produced private eye-0 image while that state is
+    // still true, then let REDengine record its untouched PS_RESOURCE ->
+    // RENDER_TARGET barrier and natural 5EA/post chain immediately afterward.
+    record_streamline_command_list_route(command_list, queue_back);
+    begin_dlss_gpu_profile_bridge(command_list);
+    bridge_streamline_private_output(
+        command_list, g_streamline_private_outputs[0],
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    finish_dlss_gpu_profile(command_list);
+    mark_streamline_command_list_bridged(
+        command_list,
+        g_present_count.load(std::memory_order_acquire));
+    static std::atomic<uint32_t> transition_pre_barrier_logs{};
+    if (transition_pre_barrier_logs.fetch_add(
+            1, std::memory_order_relaxed) < 64) {
+        log_line(
+            "Packed transition eye0 handed off before native 5EA barrier pair=%llu command_list=%p present=%llu",
+            static_cast<unsigned long long>(pending_pair), command_list,
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_acquire)));
+    }
+    return true;
+}
+
+void STDMETHODCALLTYPE hook_resource_barrier(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_barriers,
+    const D3D12_RESOURCE_BARRIER* barriers) {
+    try_bridge_transition_eye0_before_5ea_barrier(
+        command_list, num_barriers, barriers);
+    if (g_config.ngx_trace && barriers != nullptr) {
+        for (UINT barrier_index = 0; barrier_index < num_barriers; ++barrier_index) {
+            const auto& barrier = barriers[barrier_index];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr) {
+                continue;
+            }
+            for (uint32_t input_index = 0; input_index < 3; ++input_index) {
+                if (g_ngx_input_resources[input_index].load(
+                        std::memory_order_acquire) == barrier.Transition.pResource) {
+                    g_ngx_input_states[input_index].store(
+                        static_cast<uint32_t>(barrier.Transition.StateAfter),
+                        std::memory_order_release);
+                }
+            }
+        }
+    }
+    if (reverse_enabled() && g_compute_probe_active.load() && barriers != nullptr) {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& active = g_command_list_infos[command_list].active_uav_resources;
+        for (UINT index = 0; index < num_barriers; ++index) {
+            const auto& barrier = barriers[index];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr) {
+                continue;
+            }
+            auto* resource = barrier.Transition.pResource;
+            g_taau_resource_transitions[resource] = TaauResourceTransition{
+                command_list, barrier.Transition.StateBefore,
+                barrier.Transition.StateAfter, barrier.Transition.Subresource,
+                g_present_count.load()};
+            const bool enters_uav =
+                (barrier.Transition.StateAfter & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0;
+            const bool leaves_uav =
+                (barrier.Transition.StateBefore & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0 &&
+                !enters_uav;
+            const auto found = std::find(active.begin(), active.end(), resource);
+            if (enters_uav && found == active.end()) {
+                active.push_back(resource);
+            } else if (leaves_uav && found != active.end()) {
+                active.erase(found);
+            }
+        }
+    }
+    const auto tracked_output = g_streamline_output_frame.output;
+    bool capture_after_barrier{};
+    D3D12_RESOURCE_STATES capture_state{};
+    ID3D12Resource* tagged_backbuffer{};
+    EngineFrameTag packed_engine_route_tag{};
+    EngineFrameTag packed_route_tag{};
+    bool packed_route_valid{};
+    if (g_engine_dual_render_active.load() && tracked_output != nullptr && barriers != nullptr) {
+        for (UINT index = 0; index < num_barriers; ++index) {
+            const auto& barrier = barriers[index];
+            if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                barrier.Transition.pResource == tracked_output &&
+                g_streamline_output_barrier_log_count.fetch_add(1) < 32) {
+                log_line("Streamline output barrier eye=%u command_list=%p output=%p 0x%X -> 0x%X",
+                    g_streamline_output_frame.eye,
+                    command_list,
+                    tracked_output,
+                    static_cast<unsigned>(barrier.Transition.StateBefore),
+                    static_cast<unsigned>(barrier.Transition.StateAfter));
+            }
+            if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                barrier.Transition.pResource == tracked_output &&
+                barrier.Transition.StateBefore == D3D12_RESOURCE_STATE_UNORDERED_ACCESS &&
+                barrier.Transition.StateAfter == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                capture_after_barrier = true;
+                capture_state = barrier.Transition.StateAfter;
+            }
+        }
+    }
+    if (g_streamline_canonical_output != nullptr && barriers != nullptr) {
+        for (UINT index = 0; index < num_barriers; ++index) {
+            const auto& barrier = barriers[index];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource != g_streamline_canonical_output) {
+                continue;
+            }
+            const auto log_index =
+                g_streamline_canonical_output_barrier_logs.fetch_add(1);
+            if (log_index < 64) {
+                auto* pipeline = load_command_list_pipeline(command_list);
+                const auto pipeline_info = lookup_pipeline_info(pipeline);
+                log_line(
+                    "Streamline canonical barrier command_list=%p 0x%X -> 0x%X "
+                    "last_ngx_eye=%d pso=%p cs=0x%llX vs=0x%llX ps=0x%llX "
+                    "engine_eye=%d pair=%llu tid=%lu present=%llu",
+                    command_list,
+                    static_cast<unsigned>(barrier.Transition.StateBefore),
+                    static_cast<unsigned>(barrier.Transition.StateAfter),
+                    static_cast<int>(lookup_streamline_command_list_last_eye(command_list)),
+                    pipeline,
+                    static_cast<unsigned long long>(pipeline_info.cs_hash),
+                    static_cast<unsigned long long>(pipeline_info.vs_hash),
+                    static_cast<unsigned long long>(pipeline_info.ps_hash),
+                    g_engine_render_eye,
+                    static_cast<unsigned long long>(g_engine_render_pair_id),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long long>(g_present_count.load()));
+
+                constexpr uint64_t kStreamlinePostDlssComputeHash =
+                    0x56943A9F9B85D104ull;
+                const uint32_t last_eye =
+                    lookup_streamline_command_list_last_eye(command_list);
+                if (pipeline_info.cs_hash == kStreamlinePostDlssComputeHash &&
+                    last_eye <= 1 &&
+                    !g_streamline_post_compute_bindings_logged[last_eye].exchange(true)) {
+                    CommandListInfo snapshot{};
+                    RootSignatureInfo root_signature_info{};
+                    {
+                        std::scoped_lock lock{g_reverse_mutex};
+                        const auto found = g_command_list_infos.find(command_list);
+                        if (found != g_command_list_infos.end()) {
+                            snapshot = found->second;
+                        }
+                        const auto root_found =
+                            g_root_signature_infos.find(snapshot.compute_root_signature);
+                        if (root_found != g_root_signature_infos.end()) {
+                            root_signature_info = root_found->second;
+                        }
+                    }
+                    log_line(
+                        "Streamline post-DLSS compute bindings eye=%u command_list=%p "
+                        "heap=%p root_signature=%p",
+                        last_eye, command_list, snapshot.cbv_srv_uav_heap,
+                        snapshot.compute_root_signature);
+                    for (UINT root = 0;
+                         root < static_cast<UINT>(root_signature_info.parameters.size());
+                         ++root) {
+                        const auto& parameter = root_signature_info.parameters[root];
+                        log_line(
+                            "Streamline post-DLSS root-layout eye=%u root=%u type=%u "
+                            "visibility=%u ranges=%zu",
+                            last_eye, root, static_cast<unsigned>(parameter.type),
+                            static_cast<unsigned>(parameter.visibility),
+                            parameter.ranges.size());
+                        for (UINT range = 0;
+                             range < static_cast<UINT>(parameter.ranges.size()); ++range) {
+                            const auto& descriptor_range = parameter.ranges[range];
+                            log_line(
+                                "Streamline post-DLSS root-range eye=%u root=%u range=%u "
+                                "type=%u count=%u register=%u space=%u offset=%u",
+                                last_eye, root, range,
+                                static_cast<unsigned>(descriptor_range.type),
+                                descriptor_range.num_descriptors,
+                                descriptor_range.base_shader_register,
+                                descriptor_range.register_space,
+                                descriptor_range.offset);
+                        }
+                    }
+                    for (UINT root = 0; root < 8; ++root) {
+                        if (snapshot.compute_tables[root].ptr == 0) {
+                            continue;
+                        }
+                        for (UINT offset = 0; offset < 16; ++offset) {
+                            ResourceDescriptorInfo descriptor{};
+                            SIZE_T cpu_handle{};
+                            bool resolved{};
+                            {
+                                std::scoped_lock lock{g_reverse_mutex};
+                                resolved = resolve_descriptor_table_resource(
+                                    snapshot, snapshot.compute_tables[root], offset,
+                                    descriptor, cpu_handle);
+                            }
+                            if (resolved && descriptor.resource != nullptr) {
+                                const auto desc = descriptor.resource->GetDesc();
+                                log_line(
+                                    "Streamline post-DLSS descriptor eye=%u root=%u offset=%u "
+                                    "gpu=0x%zX cpu=0x%zX resource=%p view_format=%u "
+                                    "resource_format=%u size=%llux%u uav=%u",
+                                    last_eye, root, offset,
+                                    snapshot.compute_tables[root].ptr, cpu_handle,
+                                    descriptor.resource,
+                                    static_cast<unsigned>(descriptor.format),
+                                    static_cast<unsigned>(desc.Format),
+                                    static_cast<unsigned long long>(desc.Width), desc.Height,
+                                    descriptor.uav ? 1u : 0u);
+                            }
+
+                            CbvDescriptorInfo cbv{};
+                            SIZE_T cbv_cpu_handle{};
+                            bool cbv_resolved{};
+                            {
+                                std::scoped_lock lock{g_reverse_mutex};
+                                cbv_resolved = resolve_descriptor_table_cbv(
+                                    snapshot, snapshot.compute_tables[root], cbv,
+                                    cbv_cpu_handle, offset);
+                            }
+                            if (cbv_resolved && cbv.gpu_va != 0) {
+                                ResourceInfo resource_info{};
+                                size_t cbv_offset{};
+                                ID3D12Resource* cbv_resource{};
+                                uint64_t data_hash{};
+                                std::array<uint32_t, 16> words{};
+                                if (resolve_gpu_va(cbv.gpu_va, resource_info, cbv_offset,
+                                        cbv_resource) && resource_info.mapped != nullptr &&
+                                    cbv_offset < resource_info.mapped_size) {
+                                    const size_t available =
+                                        resource_info.mapped_size - cbv_offset;
+                                    const size_t bytes = std::min<size_t>(available,
+                                        std::min<size_t>(cbv.size_in_bytes, 256));
+                                    const auto* data =
+                                        static_cast<const uint8_t*>(resource_info.mapped) +
+                                        cbv_offset;
+                                    data_hash = fnv1a64(data, bytes);
+                                    memcpy(words.data(), data,
+                                        std::min(bytes, sizeof(words)));
+                                }
+                                log_line(
+                                    "Streamline post-DLSS table-cbv eye=%u root=%u offset=%u "
+                                    "cpu=0x%zX gpuva=0x%llX size=%u resource=%p "
+                                    "resource_offset=0x%zX hash=0x%llX "
+                                    "words=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,"
+                                    "%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                                    last_eye, root, offset, cbv_cpu_handle,
+                                    static_cast<unsigned long long>(cbv.gpu_va),
+                                    cbv.size_in_bytes, cbv_resource, cbv_offset,
+                                    static_cast<unsigned long long>(data_hash),
+                                    words[0], words[1], words[2], words[3],
+                                    words[4], words[5], words[6], words[7],
+                                    words[8], words[9], words[10], words[11],
+                                    words[12], words[13], words[14], words[15]);
+                            }
+                        }
+                    }
+                }
+                if (pipeline_info.cs_hash == kStreamlinePostDlssComputeHash &&
+                    last_eye <= 1 &&
+                    !g_streamline_post_compute_constants_logged[last_eye].exchange(true)) {
+                    CommandListInfo snapshot{};
+                    {
+                        std::scoped_lock lock{g_reverse_mutex};
+                        const auto found = g_command_list_infos.find(command_list);
+                        if (found != g_command_list_infos.end()) {
+                            snapshot = found->second;
+                        }
+                    }
+                    for (UINT root = 0; root < 8; ++root) {
+                        if (snapshot.compute_cbv[root] != 0) {
+                            ResourceInfo resource_info{};
+                            size_t offset{};
+                            ID3D12Resource* resource{};
+                            uint64_t data_hash{};
+                            std::array<uint32_t, 16> words{};
+                            if (resolve_gpu_va(snapshot.compute_cbv[root], resource_info,
+                                    offset, resource) &&
+                                resource_info.mapped != nullptr &&
+                                offset < resource_info.mapped_size) {
+                                const size_t available = resource_info.mapped_size - offset;
+                                const size_t bytes = std::min<size_t>(available, 256);
+                                const auto* data =
+                                    static_cast<const uint8_t*>(resource_info.mapped) + offset;
+                                data_hash = fnv1a64(data, bytes);
+                                memcpy(words.data(), data,
+                                    std::min(bytes, sizeof(words)));
+                            }
+                            log_line(
+                                "Streamline post-DLSS cbv eye=%u root=%u gpuva=0x%llX "
+                                "resource=%p offset=0x%zX hash=0x%llX "
+                                "words=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,"
+                                "%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                                last_eye, root,
+                                static_cast<unsigned long long>(snapshot.compute_cbv[root]),
+                                resource, offset,
+                                static_cast<unsigned long long>(data_hash),
+                                words[0], words[1], words[2], words[3],
+                                words[4], words[5], words[6], words[7],
+                                words[8], words[9], words[10], words[11],
+                                words[12], words[13], words[14], words[15]);
+                        }
+                        const uint64_t mask = snapshot.compute_constant_masks[root];
+                        if (mask != 0) {
+                            const auto& values = snapshot.compute_constants[root];
+                            log_line(
+                                "Streamline post-DLSS constants eye=%u root=%u mask=0x%llX "
+                                "values=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,"
+                                "%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                                last_eye, root, static_cast<unsigned long long>(mask),
+                                values[0], values[1], values[2], values[3],
+                                values[4], values[5], values[6], values[7],
+                                values[8], values[9], values[10], values[11],
+                                values[12], values[13], values[14], values[15]);
+                        }
+                    }
+                }
+            }
+            const bool private_consumer_bridge_active =
+                !temporal_backend_is_dlss_packed() ||
+                (g_engine_dual_render_active.load(std::memory_order_acquire) &&
+                    g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
+                    !g_cinema_mode_active.load(std::memory_order_relaxed));
+            if (private_consumer_bridge_active &&
+                !g_streamline_transition_replay &&
+                barrier.Transition.StateBefore ==
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS &&
+                barrier.Transition.StateAfter ==
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                auto* bridge_pipeline = load_command_list_pipeline(command_list);
+                const auto bridge_pipeline_info =
+                    lookup_pipeline_info(bridge_pipeline);
+                constexpr uint64_t kStreamlineRawConsumerPixelHash =
+                    0xCBAB7210DBBD5199ull;
+                if (bridge_pipeline_info.ps_hash !=
+                    kStreamlineRawConsumerPixelHash) {
+                    continue;
+                }
+                const uint32_t eye = take_streamline_command_list_eye(command_list);
+                if (eye <= 1) {
+                    bridge_streamline_private_output(
+                        command_list, g_streamline_private_outputs[eye],
+                        barrier.Transition.StateBefore);
+                    mark_streamline_command_list_bridged(
+                        command_list, g_present_count.load());
+                    if (g_streamline_consumer_bridge_logs.fetch_add(1) < 32) {
+                        log_line(
+                            "Streamline consumer bridge eye=%u command_list=%p "
+                            "canonical=%p present=%llu",
+                            eye, command_list, g_streamline_canonical_output,
+                            static_cast<unsigned long long>(g_present_count.load()));
+                    }
+                }
+            }
+        }
+    }
+    if (g_config.openxr_mode == 4 && g_engine_dual_render_active.load() &&
+        !g_packed_capture_internal && barriers != nullptr) {
+        for (UINT index = 0; index < num_barriers; ++index) {
+            const auto& barrier = barriers[index];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr ||
+                barrier.Transition.StateAfter != D3D12_RESOURCE_STATE_PRESENT) {
+                continue;
+            }
+            const auto desc = barrier.Transition.pResource->GetDesc();
+            if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                desc.Width == g_game_render_width && desc.Height == g_game_render_height) {
+                if (temporal_backend_is_dlss_packed()) {
+                    const auto final_present_pipeline =
+                        lookup_pipeline_info(
+                            load_command_list_pipeline(command_list));
+                    diagnose_final_present_resource_identity(
+                        command_list, barrier.Transition.pResource,
+                        final_present_pipeline);
+                    packed_route_valid = take_streamline_command_list_route(
+                        command_list, packed_engine_route_tag) &&
+                        packed_engine_route_tag.generation ==
+                            g_streamline_capture_generation.load(
+                                std::memory_order_acquire);
+                } else {
+                    std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+                    if (!g_engine_completed_tag_queue.empty()) {
+                        packed_engine_route_tag =
+                            g_engine_completed_tag_queue.front();
+                        g_engine_completed_tag_queue.pop_front();
+                        packed_route_valid = true;
+                    }
+                }
+            }
+            if (packed_route_valid &&
+                !route_packed_dlss_present_tag(
+                    packed_engine_route_tag, packed_route_tag)) {
+                packed_route_tag = packed_engine_route_tag;
+            }
+            static std::atomic<uint32_t> packed_present_route_logs{};
+            const auto route_log = packed_route_valid
+                ? packed_present_route_logs.fetch_add(1)
+                : UINT32_MAX;
+            if (route_log < 16) {
+                log_line(
+                    "Packed PRESENT route command_list=%p resource=%p size=%llux%u format=%u "
+                    "queue_routed=%d route_eye=%u route_pair=%llu tid=%lu present=%llu",
+                    command_list, barrier.Transition.pResource,
+                    static_cast<unsigned long long>(desc.Width), desc.Height,
+                    static_cast<unsigned>(desc.Format), packed_route_valid ? 1 : 0,
+                    packed_route_tag.eye,
+                    static_cast<unsigned long long>(packed_route_tag.pair_id),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long long>(g_present_count.load()));
+            }
+            if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                desc.Width == g_game_render_width && desc.Height == g_game_render_height &&
+                packed_route_valid &&
+                packed_route_tag.generation == g_streamline_capture_generation.load()) {
+                tagged_backbuffer = barrier.Transition.pResource;
+                break;
+            }
+        }
+    }
+    if (g_config.openxr_mode == 2 && !g_packed_capture_internal &&
+        barriers != nullptr) {
+        for (UINT index = 0; index < num_barriers; ++index) {
+            const auto& barrier = barriers[index];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr ||
+                barrier.Transition.StateAfter != D3D12_RESOURCE_STATE_PRESENT) {
+                continue;
+            }
+            const auto desc = barrier.Transition.pResource->GetDesc();
+            static std::atomic<uint32_t> mono_present_barrier_logs{};
+            const auto barrier_log = mono_present_barrier_logs.fetch_add(1);
+            if (barrier_log < 16) {
+                size_t queue_depth{};
+                g_engine_completed_tag_queue_mutex.lock();
+                queue_depth = g_engine_completed_tag_queue.size();
+                g_engine_completed_tag_queue_mutex.unlock();
+                log_line(
+                    "Mono route PRESENT barrier resource=%p size=%llux%u expected=%ux%u "
+                    "queue_depth=%zu present=%llu",
+                    barrier.Transition.pResource,
+                    static_cast<unsigned long long>(desc.Width), desc.Height,
+                    g_game_render_width, g_game_render_height, queue_depth,
+                    static_cast<unsigned long long>(g_present_count.load()));
+            }
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                desc.Width != g_game_render_width ||
+                desc.Height != g_game_render_height) {
+                continue;
+            }
+            size_t queue_depth{};
+            g_engine_completed_tag_queue_mutex.lock();
+            queue_depth = g_engine_completed_tag_queue.size();
+            if (!g_engine_completed_tag_queue.empty()) {
+                packed_route_tag = g_engine_completed_tag_queue.front();
+                g_engine_completed_tag_queue.pop_front();
+                packed_route_valid = packed_route_tag.render_view_valid;
+            }
+            g_engine_completed_tag_queue_mutex.unlock();
+            static std::atomic<uint32_t> mono_present_match_logs{};
+            if (mono_present_match_logs.fetch_add(1) < 16) {
+                log_line(
+                    "Mono route PRESENT match resource=%p queue_before=%zu routed=%d "
+                    "id=%llu valid=%d generation=%u current_generation=%u present=%llu",
+                    barrier.Transition.pResource, queue_depth,
+                    packed_route_tag.pair_id != 0 ? 1 : 0,
+                    static_cast<unsigned long long>(packed_route_tag.pair_id),
+                    packed_route_tag.render_view_valid ? 1 : 0,
+                    packed_route_tag.generation,
+                    g_streamline_capture_generation.load(),
+                    static_cast<unsigned long long>(g_present_count.load()));
+            }
+            if (packed_route_valid) {
+                tagged_backbuffer = barrier.Transition.pResource;
+            }
+            break;
+        }
+    }
+    g_resource_barrier(command_list, num_barriers, barriers);
+    if (capture_after_barrier && !capture_streamline_output(command_list, capture_state)) {
+        log_line("Streamline stereo capture skipped eye=%u output=%p state=0x%X",
+            g_streamline_output_frame.eye, tracked_output, static_cast<unsigned>(capture_state));
+    }
+    bool tagged_capture_succeeded{};
+    if (g_config.openxr_mode == 2 && tagged_backbuffer != nullptr &&
+        g_mono_hud_outputs_valid.load(std::memory_order_acquire)) {
+        tagged_capture_succeeded = true;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            tagged_capture_succeeded =
+                capture_tagged_backbuffer_output(
+                    command_list, g_mono_hud_outputs[eye],
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    eye, packed_route_tag.generation,
+                    packed_route_tag.pair_id,
+                    packed_route_tag.render_view,
+                    packed_route_tag.render_view_valid) &&
+                tagged_capture_succeeded;
+        }
+    } else {
+        tagged_capture_succeeded = tagged_backbuffer != nullptr &&
+            capture_tagged_backbuffer_output(
+                command_list, tagged_backbuffer, D3D12_RESOURCE_STATE_PRESENT,
+                packed_route_tag.eye, packed_route_tag.generation,
+                packed_route_tag.pair_id, packed_route_tag.render_view,
+                packed_route_tag.render_view_valid);
+    }
+    if (tagged_backbuffer != nullptr && !tagged_capture_succeeded) {
+        static std::atomic<uint32_t> tagged_capture_failures{};
+        if (tagged_capture_failures.fetch_add(1) < 4) {
+            log_line("Packed tagged backbuffer capture skipped eye=%d pair=%llu resource=%p",
+                static_cast<int>(packed_route_tag.eye),
+                static_cast<unsigned long long>(packed_route_tag.pair_id),
+                tagged_backbuffer);
+        }
+    }
+    if (g_config.openxr_mode == 4 && tagged_backbuffer != nullptr &&
+        packed_route_valid) {
+        finish_packed_dlss_present_capture(packed_engine_route_tag);
+    }
+}
+
+void install_streamline_resource_barrier_probe() {
+    if (g_resource_barrier != nullptr || g_d3d12_device == nullptr) {
+        return;
+    }
+
+    ID3D12CommandAllocator* allocator{};
+    ID3D12GraphicsCommandList* command_list{};
+    if (FAILED(g_d3d12_device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(g_d3d12_device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&command_list)))) {
+        if (command_list != nullptr) command_list->Release();
+        if (allocator != nullptr) allocator->Release();
+        return;
+    }
+
+    auto target = method<void*>(command_list, 26);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_resource_barrier),
+            reinterpret_cast<void**>(&g_resource_barrier)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Streamline output ResourceBarrier probe hooked at %p", target);
+    }
+    command_list->Close();
+    command_list->Release();
+    allocator->Release();
+}
+
+const char* xr_result_name(XrResult result) {
+    switch (result) {
+    case XR_SUCCESS: return "XR_SUCCESS";
+    case XR_TIMEOUT_EXPIRED: return "XR_TIMEOUT_EXPIRED";
+    case XR_SESSION_LOSS_PENDING: return "XR_SESSION_LOSS_PENDING";
+    case XR_EVENT_UNAVAILABLE: return "XR_EVENT_UNAVAILABLE";
+    case XR_SPACE_BOUNDS_UNAVAILABLE: return "XR_SPACE_BOUNDS_UNAVAILABLE";
+    case XR_SESSION_NOT_FOCUSED: return "XR_SESSION_NOT_FOCUSED";
+    case XR_FRAME_DISCARDED: return "XR_FRAME_DISCARDED";
+    case XR_ERROR_VALIDATION_FAILURE: return "XR_ERROR_VALIDATION_FAILURE";
+    case XR_ERROR_RUNTIME_FAILURE: return "XR_ERROR_RUNTIME_FAILURE";
+    case XR_ERROR_OUT_OF_MEMORY: return "XR_ERROR_OUT_OF_MEMORY";
+    case XR_ERROR_API_VERSION_UNSUPPORTED: return "XR_ERROR_API_VERSION_UNSUPPORTED";
+    case XR_ERROR_INITIALIZATION_FAILED: return "XR_ERROR_INITIALIZATION_FAILED";
+    case XR_ERROR_FUNCTION_UNSUPPORTED: return "XR_ERROR_FUNCTION_UNSUPPORTED";
+    case XR_ERROR_FEATURE_UNSUPPORTED: return "XR_ERROR_FEATURE_UNSUPPORTED";
+    case XR_ERROR_EXTENSION_NOT_PRESENT: return "XR_ERROR_EXTENSION_NOT_PRESENT";
+    case XR_ERROR_LIMIT_REACHED: return "XR_ERROR_LIMIT_REACHED";
+    case XR_ERROR_SIZE_INSUFFICIENT: return "XR_ERROR_SIZE_INSUFFICIENT";
+    case XR_ERROR_HANDLE_INVALID: return "XR_ERROR_HANDLE_INVALID";
+    case XR_ERROR_INSTANCE_LOST: return "XR_ERROR_INSTANCE_LOST";
+    case XR_ERROR_SESSION_RUNNING: return "XR_ERROR_SESSION_RUNNING";
+    case XR_ERROR_SESSION_NOT_RUNNING: return "XR_ERROR_SESSION_NOT_RUNNING";
+    case XR_ERROR_SESSION_LOST: return "XR_ERROR_SESSION_LOST";
+    case XR_ERROR_SYSTEM_INVALID: return "XR_ERROR_SYSTEM_INVALID";
+    case XR_ERROR_PATH_INVALID: return "XR_ERROR_PATH_INVALID";
+    case XR_ERROR_PATH_COUNT_EXCEEDED: return "XR_ERROR_PATH_COUNT_EXCEEDED";
+    case XR_ERROR_PATH_FORMAT_INVALID: return "XR_ERROR_PATH_FORMAT_INVALID";
+    case XR_ERROR_PATH_UNSUPPORTED: return "XR_ERROR_PATH_UNSUPPORTED";
+    case XR_ERROR_LAYER_INVALID: return "XR_ERROR_LAYER_INVALID";
+    case XR_ERROR_LAYER_LIMIT_EXCEEDED: return "XR_ERROR_LAYER_LIMIT_EXCEEDED";
+    case XR_ERROR_SWAPCHAIN_RECT_INVALID: return "XR_ERROR_SWAPCHAIN_RECT_INVALID";
+    case XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED: return "XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED";
+    case XR_ERROR_ACTION_TYPE_MISMATCH: return "XR_ERROR_ACTION_TYPE_MISMATCH";
+    case XR_ERROR_SESSION_NOT_READY: return "XR_ERROR_SESSION_NOT_READY";
+    case XR_ERROR_SESSION_NOT_STOPPING: return "XR_ERROR_SESSION_NOT_STOPPING";
+    case XR_ERROR_TIME_INVALID: return "XR_ERROR_TIME_INVALID";
+    case XR_ERROR_REFERENCE_SPACE_UNSUPPORTED: return "XR_ERROR_REFERENCE_SPACE_UNSUPPORTED";
+    case XR_ERROR_FILE_ACCESS_ERROR: return "XR_ERROR_FILE_ACCESS_ERROR";
+    case XR_ERROR_FILE_CONTENTS_INVALID: return "XR_ERROR_FILE_CONTENTS_INVALID";
+    case XR_ERROR_FORM_FACTOR_UNSUPPORTED: return "XR_ERROR_FORM_FACTOR_UNSUPPORTED";
+    case XR_ERROR_FORM_FACTOR_UNAVAILABLE: return "XR_ERROR_FORM_FACTOR_UNAVAILABLE";
+    case XR_ERROR_API_LAYER_NOT_PRESENT: return "XR_ERROR_API_LAYER_NOT_PRESENT";
+    case XR_ERROR_CALL_ORDER_INVALID: return "XR_ERROR_CALL_ORDER_INVALID";
+    case XR_ERROR_GRAPHICS_DEVICE_INVALID: return "XR_ERROR_GRAPHICS_DEVICE_INVALID";
+    case XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING: return "XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING";
+    case XR_ERROR_RUNTIME_UNAVAILABLE: return "XR_ERROR_RUNTIME_UNAVAILABLE";
+    default: return "XR_UNKNOWN";
+    }
+}
+
+template <typename T>
+bool load_xr_proc(XrInstance instance, const char* name, T& out) {
+    PFN_xrVoidFunction fn{};
+    const auto result = pfn_xrGetInstanceProcAddr(instance, name, &fn);
+    if (XR_FAILED(result) || fn == nullptr) {
+        log_line("OpenXR missing proc %s result=%s (%d)", name, xr_result_name(result), result);
+        return false;
+    }
+
+    out = reinterpret_cast<T>(fn);
+    return true;
+}
+
+FARPROC real_proc(const char* name) {
+    if (g_real_dxgi == nullptr) {
+        char system_dir[MAX_PATH]{};
+        GetSystemDirectoryA(system_dir, sizeof(system_dir));
+        strcat_s(system_dir, "\\dxgi.dll");
+        g_real_dxgi = LoadLibraryA(system_dir);
+        log_line("Loaded real DXGI: %p", g_real_dxgi);
+    }
+
+    return g_real_dxgi != nullptr ? GetProcAddress(g_real_dxgi, name) : nullptr;
+}
+
+void __fastcall hook_engine_view_constants(void* self, void* view_data, char flags) {
+    const auto call = g_config.runtime_diagnostics
+        ? g_engine_view_call_count.fetch_add(1) + 1
+        : 0;
+    const auto present = g_present_count.load();
+
+    if (g_config.runtime_diagnostics && view_data != nullptr &&
+        (present < 20 || present % 30 == 0) &&
+        g_engine_view_last_logged_present.exchange(present) != present) {
+        __try {
+            const auto* bytes = static_cast<const uint8_t*>(view_data);
+            uint32_t frame_id{};
+            uint32_t dimensions[4]{};
+            float translations[5][3]{};
+            memcpy(&frame_id, bytes + 0xAA4, sizeof(frame_id));
+            memcpy(dimensions, bytes + 0xA3C, sizeof(dimensions));
+
+            constexpr size_t matrix_offsets[] = {0x520, 0x550, 0x560, 0x570, 0x580};
+            for (size_t i = 0; i < std::size(matrix_offsets); ++i) {
+                memcpy(translations[i], bytes + matrix_offsets[i] + 12 * sizeof(float), sizeof(translations[i]));
+            }
+
+            log_line(
+                "Engine view call=%llu present=%llu self=%p view=%p flags=%u frame_id=%u dims_raw=%u,%u,%u,%u "
+                "t520=%.4f,%.4f,%.4f t550=%.4f,%.4f,%.4f t560=%.4f,%.4f,%.4f "
+                "t570=%.4f,%.4f,%.4f t580=%.4f,%.4f,%.4f",
+                static_cast<unsigned long long>(call),
+                static_cast<unsigned long long>(present),
+                self,
+                view_data,
+                static_cast<unsigned>(static_cast<uint8_t>(flags)),
+                frame_id,
+                dimensions[0], dimensions[1], dimensions[2], dimensions[3],
+                translations[0][0], translations[0][1], translations[0][2],
+                translations[1][0], translations[1][1], translations[1][2],
+                translations[2][0], translations[2][1], translations[2][2],
+                translations[3][0], translations[3][1], translations[3][2],
+                translations[4][0], translations[4][1], translations[4][2]);
+            if (g_config.hmd_freelook && (present % 30 == 0)) {
+                for (size_t matrix_offset : matrix_offsets) {
+                    float matrix[16]{};
+                    memcpy(matrix, bytes + matrix_offset, sizeof(matrix));
+                    log_line("HMD matrix present=%llu offset=0x%zX diag=%.6f,%.6f,%.6f,%.6f proj=%.6f,%.6f,%.6f,%.6f",
+                        static_cast<unsigned long long>(present), matrix_offset,
+                        matrix[0], matrix[5], matrix[10], matrix[15],
+                        matrix[8], matrix[9], matrix[11], matrix[14]);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine view probe read fault call=%llu present=%llu view=%p",
+                static_cast<unsigned long long>(call),
+                static_cast<unsigned long long>(present),
+                view_data);
+        }
+    }
+
+    // V594's matrix dump established that this late hook only feeds
+    // Streamline constants. Keep it disabled in the gameplay test build.
+    if (false && view_data != nullptr &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0) {
+        const uint64_t last_hmd_camera =
+            g_engine_hmd_camera_last_present.load(std::memory_order_relaxed);
+        const uint64_t camera_age =
+            last_hmd_camera != UINT64_MAX && present >= last_hmd_camera
+            ? present - last_hmd_camera
+            : UINT64_MAX;
+        const bool cinema_active =
+            g_cinema_mode_active.load(std::memory_order_relaxed);
+        const bool probe_transition =
+            !cinema_active && camera_age != UINT64_MAX && camera_age >= 8;
+        const bool probe_cinema = cinema_active && present % 15 == 0;
+        static std::atomic<uint64_t> last_cinema_matrix_probe_present{
+            UINT64_MAX};
+        if ((probe_transition || probe_cinema) &&
+            last_cinema_matrix_probe_present.exchange(
+                present, std::memory_order_relaxed) != present) {
+            __try {
+                const auto* bytes = static_cast<const uint8_t*>(view_data);
+                uint32_t frame_id{};
+                uint32_t dimensions[4]{};
+                memcpy(&frame_id, bytes + 0xAA4, sizeof(frame_id));
+                memcpy(dimensions, bytes + 0xA3C, sizeof(dimensions));
+                log_line(
+                    "V594 final view present=%llu cinema=%d last_hmd=%llu "
+                    "age=%llu self=%p view=%p flags=%u frame_id=%u "
+                    "dims=%u,%u,%u,%u",
+                    static_cast<unsigned long long>(present),
+                    cinema_active ? 1 : 0,
+                    static_cast<unsigned long long>(last_hmd_camera),
+                    static_cast<unsigned long long>(camera_age),
+                    self, view_data,
+                    static_cast<unsigned>(static_cast<uint8_t>(flags)),
+                    frame_id,
+                    dimensions[0], dimensions[1],
+                    dimensions[2], dimensions[3]);
+                constexpr size_t matrix_offsets[] = {
+                    0x520, 0x550, 0x560, 0x570, 0x580};
+                for (const size_t matrix_offset : matrix_offsets) {
+                    float matrix[16]{};
+                    memcpy(matrix, bytes + matrix_offset, sizeof(matrix));
+                    log_line(
+                        "V594 matrix present=%llu offset=0x%zX "
+                        "m=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
+                        "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g",
+                        static_cast<unsigned long long>(present),
+                        matrix_offset,
+                        matrix[0], matrix[1], matrix[2], matrix[3],
+                        matrix[4], matrix[5], matrix[6], matrix[7],
+                        matrix[8], matrix[9], matrix[10], matrix[11],
+                        matrix[12], matrix[13], matrix[14], matrix[15]);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                log_line(
+                    "V594 final view read fault present=%llu view=%p",
+                    static_cast<unsigned long long>(present), view_data);
+            }
+        }
+    }
+
+    g_engine_view_constants(self, view_data, flags);
+}
+
+void install_engine_view_probe() {
+    // V594 uses this existing hook for a bounded cinema-only matrix probe even
+    // when the broad engine view probe is disabled in the INI.
+    if ((!g_config.engine_view_probe && !g_config.logging_enabled) ||
+        g_engine_view_constants != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineViewConstantsRva = 0x01CFE280;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineViewConstantsRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_view_constants),
+            reinterpret_cast<void**>(&g_engine_view_constants)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine view probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineViewConstantsRva), target);
+    } else {
+        log_line("Engine view probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineViewConstantsRva), target);
+    }
+}
+
+// [FIX:DLSS-PACKED 1/10] Publish completion of each eye's temporal constants;
+// the packed evaluation must never consume a half-prepared stereo pair.
+void publish_packed_temporal_preparation(uint64_t pair_id, uint32_t eye) {
+    if (pair_id == 0 || pair_id == UINT64_MAX || eye > 1) {
+        return;
+    }
+
+    uint8_t ready_mask{};
+    {
+        std::scoped_lock lock{g_packed_temporal_preparation_mutex};
+        auto& mask = g_packed_temporal_preparation_masks[pair_id];
+        mask = static_cast<uint8_t>(mask | (1u << eye));
+        ready_mask = mask;
+
+        // Pair ids are monotonic. Retain enough history for a delayed command,
+        // but do not let menu/teardown work grow this hot-path table forever.
+        if (g_packed_temporal_preparation_masks.size() > 256) {
+            const uint64_t oldest_retained_pair = pair_id > 128
+                ? pair_id - 128
+                : 0;
+            for (auto candidate = g_packed_temporal_preparation_masks.begin();
+                 candidate != g_packed_temporal_preparation_masks.end();) {
+                if (candidate->first < oldest_retained_pair) {
+                    candidate = g_packed_temporal_preparation_masks.erase(candidate);
+                } else {
+                    ++candidate;
+                }
+            }
+        }
+    }
+    g_packed_temporal_preparation_publishes.fetch_add(
+        1, std::memory_order_relaxed);
+    if (ready_mask == 0x3) {
+        g_packed_temporal_preparation_cv.notify_all();
+    }
+}
+
+struct PackedTemporalPreparationWaitResult {
+    uint8_t ready_mask{};
+    bool generation_changed{};
+    uint64_t elapsed_us{};
+};
+
+PackedTemporalPreparationWaitResult wait_for_packed_temporal_preparations(
+    uint64_t pair_id,
+    uint32_t generation,
+    uint64_t timeout_ms) {
+    const auto wait_begin = std::chrono::steady_clock::now();
+    std::unique_lock lock{g_packed_temporal_preparation_mutex};
+    const auto ready_or_cancelled = [&]() {
+        const auto found = g_packed_temporal_preparation_masks.find(pair_id);
+        const uint8_t mask = found != g_packed_temporal_preparation_masks.end()
+            ? found->second
+            : 0;
+        return mask == 0x3 ||
+            g_streamline_capture_generation.load(std::memory_order_acquire) !=
+                generation;
+    };
+    g_packed_temporal_preparation_cv.wait_for(
+        lock, std::chrono::milliseconds(timeout_ms), ready_or_cancelled);
+
+    PackedTemporalPreparationWaitResult result{};
+    const auto found = g_packed_temporal_preparation_masks.find(pair_id);
+    if (found != g_packed_temporal_preparation_masks.end()) {
+        result.ready_mask = found->second;
+    }
+    result.generation_changed =
+        g_streamline_capture_generation.load(std::memory_order_acquire) !=
+            generation;
+    result.elapsed_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - wait_begin).count());
+    return result;
+}
+
+// [FIX:DLSS-PACKED 2/10] Tag REDengine temporal writes with their eye and pair,
+// while retaining the engine's original jitter values for replay.
+void __fastcall hook_engine_temporal_writer(
+    void* temporal_data,
+    float value0,
+    float value1,
+    uint32_t value2,
+    uint32_t value3) {
+    float routed_value0 = value0;
+    float routed_value1 = value1;
+    constexpr uintptr_t kTemporalSampleReturnRva = 0x01D86EA5;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva =
+        reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const uint64_t pair_id = g_engine_render_pair_id;
+    const int render_eye = g_engine_render_eye;
+    const bool packed_pair_preparation =
+        temporal_backend_is_dlss_packed() &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        temporal_data != nullptr && caller_rva == kTemporalSampleReturnRva &&
+        pair_id != 0 && pair_id != UINT64_MAX &&
+        render_eye >= 0 && render_eye <= 1;
+    if (packed_pair_preparation) {
+        uint32_t value0_bits{};
+        uint32_t value1_bits{};
+        memcpy(&value0_bits, &value0, sizeof(value0_bits));
+        memcpy(&value1_bits, &value1, sizeof(value1_bits));
+        auto& jitter_slot = g_packed_source_jitter_slots[
+            pair_id % kPackedSourceJitterSlotCount];
+        if (render_eye == 1) {
+            // Publish the first eye's exact producer sample. Invalidating the
+            // pair before updating the payload keeps a later reader from
+            // observing bits from two different pairs without taking a lock.
+            jitter_slot.pair_id.store(
+                UINT64_MAX, std::memory_order_release);
+            jitter_slot.x_bits.store(
+                value0_bits, std::memory_order_relaxed);
+            jitter_slot.y_bits.store(
+                value1_bits, std::memory_order_relaxed);
+            jitter_slot.pair_id.store(
+                pair_id, std::memory_order_release);
+            const auto captures = g_packed_source_jitter_captures.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (g_config.ngx_trace && captures <= 64) {
+                log_line(
+                    "Packed source jitter captured pair=%llu eye=1 jitter=%.9g,%.9g bits=0x%08X,0x%08X",
+                    static_cast<unsigned long long>(pair_id), value0, value1,
+                    value0_bits, value1_bits);
+            }
+        } else {
+            const auto published_pair = jitter_slot.pair_id.load(
+                std::memory_order_acquire);
+            const auto routed0_bits = jitter_slot.x_bits.load(
+                std::memory_order_relaxed);
+            const auto routed1_bits = jitter_slot.y_bits.load(
+                std::memory_order_relaxed);
+            if (published_pair == pair_id &&
+                jitter_slot.pair_id.load(
+                    std::memory_order_acquire) == pair_id) {
+                memcpy(&routed_value0, &routed0_bits, sizeof(routed_value0));
+                memcpy(&routed_value1, &routed1_bits, sizeof(routed_value1));
+                const auto overrides =
+                    g_packed_source_jitter_overrides.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                if (g_config.ngx_trace && overrides <= 64) {
+                    log_line(
+                        "Packed source jitter shared pair=%llu eye=0 original=%.9g,%.9g shared=%.9g,%.9g bits=0x%08X,0x%08X",
+                        static_cast<unsigned long long>(pair_id), value0, value1,
+                        routed_value0, routed_value1,
+                        routed0_bits, routed1_bits);
+                }
+            } else {
+                const auto misses = g_packed_source_jitter_misses.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                if (g_config.ngx_trace && misses <= 32) {
+                    log_line(
+                        "Packed source jitter miss pair=%llu slot=%zu published_pair=%llu eye=0 original=%.9g,%.9g",
+                        static_cast<unsigned long long>(pair_id),
+                        pair_id % kPackedSourceJitterSlotCount,
+                        static_cast<unsigned long long>(published_pair),
+                        value0, value1);
+                }
+            }
+        }
+    }
+    g_engine_temporal_writer(
+        temporal_data, routed_value0, routed_value1, value2, value3);
+    if (packed_pair_preparation) {
+        // Publish only after REDengine has consumed this eye's final (possibly
+        // shared) jitter. The packed command may then wait for both eyes
+        // without depending on an unrelated descriptor-copy mutex.
+        publish_packed_temporal_preparation(
+            pair_id, static_cast<uint32_t>(render_eye));
+    }
+}
+
+void install_engine_temporal_writer_hook() {
+    if (!temporal_backend_is_dlss_packed() ||
+        g_engine_temporal_writer != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineTemporalWriterRva = 0x015E5A90;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr
+        ? module + kEngineTemporalWriterRva
+        : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_engine_temporal_writer),
+            reinterpret_cast<void**>(&g_engine_temporal_writer)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line(
+            "Hooked REDengine temporal writer for packed shared source jitter RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineTemporalWriterRva), target);
+    } else {
+        log_line(
+            "Failed REDengine temporal writer shared-jitter hook target=%p",
+            target);
+    }
+}
+
+void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data, void* extra) {
+    const auto present = g_present_count.load();
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const auto caller_rva = return_address - module;
+    const int previous_eye = g_engine_render_eye;
+    const uint64_t previous_pair_id = g_engine_render_pair_id;
+    if (g_engine_dual_render_active.load() && g_engine_render_eye < 0 && frame_data != nullptr) {
+        g_engine_dual_frame_mutex.lock();
+        const auto found = g_engine_dual_frame_eyes.find(frame_data);
+        if (found != g_engine_dual_frame_eyes.end()) {
+            g_engine_render_eye = static_cast<int>(found->second.eye);
+            g_engine_render_generation = found->second.generation;
+            g_engine_render_pair_id = found->second.pair_id;
+            g_engine_render_view = found->second.render_view;
+            g_engine_render_view_valid = found->second.render_view_valid;
+        }
+        g_engine_dual_frame_mutex.unlock();
+    }
+    if (g_config.runtime_diagnostics && frame_data != nullptr &&
+        (present < 20 || present % 30 == 0) &&
+        g_engine_frame_builder_last_logged_present.exchange(present) != present) {
+        __try {
+            const auto* bytes = static_cast<const uint8_t*>(frame_data);
+            uint32_t dimensions[4]{};
+            float camera_translation[3]{};
+            memcpy(dimensions, bytes + 0xA4C, sizeof(dimensions));
+            memcpy(camera_translation, bytes + 0x560 + 12 * sizeof(float), sizeof(camera_translation));
+            log_line(
+                "Engine frame builder present=%llu caller_rva=0x%llX context=%p frame=%p extra=%p dims=%u,%u,%u,%u camera=%.4f,%.4f,%.4f",
+                static_cast<unsigned long long>(present),
+                static_cast<unsigned long long>(caller_rva),
+                render_context,
+                frame_data,
+                extra,
+                dimensions[0], dimensions[1], dimensions[2], dimensions[3],
+                camera_translation[0], camera_translation[1], camera_translation[2]);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine frame builder probe read fault present=%llu frame=%p",
+                static_cast<unsigned long long>(present), frame_data);
+        }
+    }
+
+    // [FIX:CINEMA-5X4 2/3] Match raster and culling cameras while the optional
+    // workaround is active; changing only presentation would stretch the image.
+    float saved_cinema_raster_aspect{};
+    float saved_cinema_culling_aspect{};
+    bool cinema_aspect_applied{};
+    if (frame_data != nullptr &&
+        g_config.cinema_5x4 &&
+        g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0) {
+        __try {
+            auto* bytes = static_cast<uint8_t*>(frame_data);
+            uint32_t dimensions[4]{};
+            memcpy(dimensions, bytes + 0xA4C, sizeof(dimensions));
+            auto* raster_camera = reinterpret_cast<float*>(bytes + 0x20);
+            auto* culling_camera = reinterpret_cast<float*>(bytes + 0x530);
+            const float render_aspect = dimensions[1] != 0
+                ? static_cast<float>(dimensions[0]) /
+                    static_cast<float>(dimensions[1])
+                : 0.0f;
+            const bool raster_camera_valid =
+                dimensions[0] > 0 &&
+                dimensions[1] > 0 &&
+                fabsf(raster_camera[10] - render_aspect) < 0.02f &&
+                raster_camera[12] > 0.0f &&
+                raster_camera[13] > raster_camera[12];
+            const bool culling_camera_valid =
+                fabsf(culling_camera[10] - render_aspect) < 0.02f &&
+                culling_camera[12] > 0.0f &&
+                culling_camera[13] > culling_camera[12];
+            if (raster_camera_valid && culling_camera_valid) {
+                constexpr float kCinemaAspect = 5.0f / 4.0f;
+                saved_cinema_raster_aspect = raster_camera[10];
+                saved_cinema_culling_aspect = culling_camera[10];
+                raster_camera[10] = kCinemaAspect;
+                culling_camera[10] = kCinemaAspect;
+                cinema_aspect_applied = true;
+                static std::atomic<uint64_t> last_cinema_aspect_log_present{
+                    UINT64_MAX};
+                if (present % 30 == 0 &&
+                    last_cinema_aspect_log_present.exchange(
+                        present, std::memory_order_relaxed) != present) {
+                    log_line(
+                        "Cinema 5:4 matched cameras present=%llu "
+                        "dimensions=%ux%u raster=%.6f->%.6f "
+                        "culling=%.6f->%.6f near=%.4f far=%.2f",
+                        static_cast<unsigned long long>(present),
+                        dimensions[0], dimensions[1],
+                        saved_cinema_raster_aspect, raster_camera[10],
+                        saved_cinema_culling_aspect, culling_camera[10],
+                        raster_camera[12], raster_camera[13]);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line(
+                "Cinema 5:4 camera write fault present=%llu frame=%p",
+                static_cast<unsigned long long>(present), frame_data);
+        }
+    }
+
+    float saved_camera_x{};
+    bool native_stereo_applied{};
+    constexpr uintptr_t kGameplayFrameBuilderCallerRva = 0x01D002CF;
+    if (frame_data != nullptr &&
+        caller_rva == kGameplayFrameBuilderCallerRva &&
+        (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
+        (g_present_count.load() & 1ull) != 0 &&
+        g_config.engine_native_stereo_offset != 0.0f) {
+        __try {
+            // The fourth row of this engine camera transform contains its world position.
+            auto* camera_x = reinterpret_cast<float*>(static_cast<uint8_t*>(frame_data) + 0x590);
+            saved_camera_x = *camera_x;
+            *camera_x += g_config.engine_native_stereo_offset;
+            native_stereo_applied = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine native stereo write fault frame=%p", frame_data);
+        }
+    }
+
+    g_hang_diag_builder_present.store(present, std::memory_order_relaxed);
+    g_hang_diag_builder_pair.store(g_engine_render_pair_id, std::memory_order_relaxed);
+    g_hang_diag_builder_eye.store(g_engine_render_eye, std::memory_order_relaxed);
+    g_hang_diag_builder_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_hang_diag_builder_enter.fetch_add(1, std::memory_order_relaxed);
+    g_engine_frame_builder(render_context, frame_data, extra);
+    g_hang_diag_builder_exit.fetch_add(1, std::memory_order_relaxed);
+
+    if (cinema_aspect_applied) {
+        __try {
+            auto* bytes = static_cast<uint8_t*>(frame_data);
+            auto* raster_camera = reinterpret_cast<float*>(bytes + 0x20);
+            auto* culling_camera = reinterpret_cast<float*>(bytes + 0x530);
+            raster_camera[10] = saved_cinema_raster_aspect;
+            culling_camera[10] = saved_cinema_culling_aspect;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line(
+                "V601 cinema matched 5:4 camera restore fault present=%llu frame=%p",
+                static_cast<unsigned long long>(present), frame_data);
+        }
+    }
+
+    if (native_stereo_applied) {
+        __try {
+            *reinterpret_cast<float*>(static_cast<uint8_t*>(frame_data) + 0x590) = saved_camera_x;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine native stereo restore fault frame=%p", frame_data);
+        }
+    }
+    g_engine_render_eye = previous_eye;
+    g_engine_render_pair_id = previous_pair_id;
+}
+
+void install_engine_frame_builder_probe() {
+    if ((!g_config.engine_frame_builder_probe && !g_engine_dual_render_active.load()) ||
+        g_engine_frame_builder != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineFrameBuilderRva = 0x01D86400;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineFrameBuilderRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frame_builder),
+            reinterpret_cast<void**>(&g_engine_frame_builder)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine frame builder probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineFrameBuilderRva), target);
+    } else {
+        log_line("Engine frame builder probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineFrameBuilderRva), target);
+    }
+}
+
+bool read_engine_dlss_command_probe(
+    const uint8_t* stream, uint32_t& command_word, void*& command_list) {
+    __try {
+        memcpy(&command_word, stream, sizeof(command_word));
+        memcpy(&command_list, stream + 0x28, sizeof(command_list));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        command_word = 0;
+        command_list = nullptr;
+        return false;
+    }
+}
+
+void __fastcall hook_engine_dlss_command(void* context, uint8_t** stream) {
+    uint32_t route_eye = UINT32_MAX;
+    uint64_t route_pair = UINT64_MAX;
+    size_t route_depth{};
+    EngineFrameTag route_tag{};
+    bool route_tag_valid{};
+    if (g_config.openxr_mode == 4 && stream != nullptr && *stream != nullptr) {
+        {
+            std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+            route_depth = g_engine_completed_tag_queue.size();
+            if (!g_engine_completed_tag_queue.empty()) {
+                const auto& tag = g_engine_completed_tag_queue.front();
+                if (tag.generation == g_streamline_capture_generation.load()) {
+                    route_eye = tag.eye;
+                    route_pair = tag.pair_id;
+                    route_tag = tag;
+                    route_tag_valid = true;
+                }
+            }
+        }
+    }
+    if (route_tag_valid) {
+        record_packed_dlss_pair_metadata(route_tag);
+    }
+    if (g_config.ngx_trace && stream != nullptr && *stream != nullptr &&
+        g_packed_accepted_pair_id >= 30) {
+        static std::atomic<uint32_t> command_logs{};
+        if (command_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+            void* command_list{};
+            uint32_t command_word{};
+            read_engine_dlss_command_probe(*stream, command_word, command_list);
+            log_line(
+                "Engine DLSS command context=%p stream=%p word0=0x%X command_list_28=%p "
+                "tid=%lu present=%llu route_eye=%u route_pair=%llu route_depth=%zu",
+                context, *stream, command_word, command_list,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(g_present_count.load()),
+                route_eye, static_cast<unsigned long long>(route_pair), route_depth);
+        }
+    }
+    if (temporal_backend_is_dlss_packed() && route_tag_valid) {
+        constexpr uint64_t kPackedPreparationTimeoutMs = 16;
+        g_packed_temporal_preparation_waits.fetch_add(
+            1, std::memory_order_relaxed);
+        const auto preparation = wait_for_packed_temporal_preparations(
+            route_pair, route_tag.generation, kPackedPreparationTimeoutMs);
+        const bool ready = preparation.ready_mask == 0x3;
+        if (ready) {
+            g_packed_temporal_preparation_hits.fetch_add(
+                1, std::memory_order_relaxed);
+        } else if (!preparation.generation_changed) {
+            g_packed_temporal_preparation_timeouts.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (g_config.ngx_trace) {
+            static std::atomic<uint32_t> preparation_logs{};
+            const auto log_index = preparation_logs.fetch_add(
+                1, std::memory_order_relaxed);
+            if (log_index < 32 ||
+                (!ready && !preparation.generation_changed && log_index < 64)) {
+                log_line(
+                    "Packed temporal preparation barrier pair=%llu generation=%u ready_mask=0x%X ready=%u cancelled=%u wait_us=%llu tid=%lu present=%llu",
+                    static_cast<unsigned long long>(route_pair),
+                    route_tag.generation,
+                    static_cast<unsigned>(preparation.ready_mask),
+                    ready ? 1u : 0u,
+                    preparation.generation_changed ? 1u : 0u,
+                    static_cast<unsigned long long>(preparation.elapsed_us),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long long>(g_present_count.load()));
+            }
+        }
+    }
+    const int previous_forced_eye = g_streamline_forced_eye;
+    if (route_eye <= 1) {
+        g_streamline_forced_eye = static_cast<int>(route_eye);
+    }
+    const bool capture_recipe = !g_streamline_dlss_recipe_replay &&
+        route_eye <= 1 && route_pair != UINT64_MAX;
+    if (capture_recipe) {
+        g_streamline_dlss_capture = {};
+        g_streamline_dlss_capture.eye = route_eye;
+        g_streamline_dlss_capture.pair_id = route_pair;
+        g_streamline_dlss_capture_active = true;
+    }
+    const uint64_t previous_pair = g_streamline_dlss_pair_id;
+    if (route_pair != UINT64_MAX) {
+        g_streamline_dlss_pair_id = route_pair;
+    }
+    g_engine_dlss_command(context, stream);
+    g_streamline_dlss_pair_id = previous_pair;
+    if (capture_recipe) {
+        g_streamline_dlss_capture_active = false;
+        if (g_streamline_dlss_capture.evaluate.valid) {
+            const auto token = g_streamline_dlss_capture.evaluate.frame_token;
+            StreamlineCapturedConstantsCall cached_constants{};
+            bool constants_match{};
+            {
+                std::scoped_lock lock{g_streamline_constants_cache_mutex};
+                cached_constants = g_streamline_constants_cache[
+                    token % kStreamlineConstantsCacheSize];
+                constants_match = cached_constants.valid &&
+                    cached_constants.frame_token == token;
+            }
+            if (constants_match) {
+                g_streamline_dlss_capture.constants = cached_constants;
+            }
+            if (g_config.ngx_trace) {
+                static std::atomic<uint32_t> constants_lookup_logs{};
+                if (constants_lookup_logs.fetch_add(1) < 32) {
+                    log_line(
+                        "Streamline constants lookup token=%u hit=%u constants_eye=%u constants_pair=%llu command_pair=%llu command_tid=%lu",
+                        token,
+                        constants_match ? 1u : 0u,
+                        cached_constants.eye,
+                        static_cast<unsigned long long>(cached_constants.pair_id),
+                        static_cast<unsigned long long>(route_pair),
+                        GetCurrentThreadId());
+                }
+            }
+            g_streamline_dlss_capture.valid = true;
+            std::scoped_lock lock{g_streamline_dlss_recipe_mutex};
+            g_streamline_dlss_recipe = g_streamline_dlss_capture;
+        }
+    }
+    g_streamline_forced_eye = previous_forced_eye;
+}
+
+float streamline_halton(uint32_t index, uint32_t base) {
+    float result{};
+    float fraction = 1.0f;
+    while (index != 0) {
+        fraction /= static_cast<float>(base);
+        result += fraction * static_cast<float>(index % base);
+        index /= base;
+    }
+    return result;
+}
+
+void advance_streamline_replay_jitter(void* constants, uint32_t token) {
+    DlssCpuScope cpu_scope{kDlssCpuReplayJitter};
+    if (constants == nullptr) {
+        return;
+    }
+    auto* values = static_cast<float*>(constants);
+    const float original_x = values[80];
+    const float original_y = values[81];
+    uint32_t best_x_index{1};
+    uint32_t best_y_index{1};
+    float best_x_error = FLT_MAX;
+    float best_y_error = FLT_MAX;
+    for (uint32_t index = 1; index <= 1024; ++index) {
+        const float x = streamline_halton(index, 3) - 0.5f;
+        const float y = streamline_halton(index, 2) - 0.5f;
+        const float x_error = fabsf(x - original_x);
+        const float y_error = fabsf(y - original_y);
+        if (x_error < best_x_error) {
+            best_x_error = x_error;
+            best_x_index = index;
+        }
+        if (y_error < best_y_error) {
+            best_y_error = y_error;
+            best_y_index = index;
+        }
+    }
+    values[80] = streamline_halton(best_x_index + 1, 3) - 0.5f;
+    values[81] = streamline_halton(best_y_index + 1, 2) - 0.5f;
+    static std::atomic<uint32_t> logs{};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+        log_line(
+            "Streamline replay next jitter token=%u indices=%u,%u errors=%.9f,%.9f original=%.6f,%.6f replay=%.6f,%.6f",
+            token, best_x_index, best_y_index, best_x_error, best_y_error,
+            original_x, original_y,
+            values[80], values[81]);
+    }
+}
+
+// [FIX:DLSS-PACKED 3/10] Replay the captured Streamline recipe for the missing
+// eye so both views reach NGX with matching frame identity and graphics state.
+bool prepare_engine_dlss_output_for_eye(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t eye,
+    uint64_t pair_id) {
+    DlssCpuScope cpu_scope{kDlssCpuRecipeReplay};
+    if (command_list == nullptr || eye > 1 || pair_id == UINT64_MAX ||
+        g_sl_set_constants == nullptr || g_sl_set_tag == nullptr ||
+        g_sl_set_feature_constants == nullptr || g_sl_evaluate_feature == nullptr) {
+        return false;
+    }
+    if (temporal_backend_is_dlss_packed() &&
+        pair_id <= g_packed_dlss_last_published_pair.load(
+            std::memory_order_acquire)) {
+        g_packed_dlss_stale_pair_drops.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+
+    StreamlineCapturedDlssRecipe recipe{};
+    {
+        std::scoped_lock lock{g_streamline_dlss_recipe_mutex};
+        if (!g_streamline_dlss_recipe.valid ||
+            g_streamline_dlss_recipe.pair_id != pair_id) {
+            return false;
+        }
+        if (g_streamline_dlss_recipe.eye == eye ||
+            (g_streamline_dlss_replayed_pair == pair_id &&
+                g_streamline_dlss_replayed_eye == eye)) {
+            return true;
+        }
+        recipe = g_streamline_dlss_recipe;
+    }
+    if (recipe.eye > 1 || !recipe.constants.valid || recipe.tag_count == 0 ||
+        !recipe.feature.valid || !recipe.evaluate.valid) {
+        return false;
+    }
+
+    struct InputTransition {
+        ID3D12Resource* resource{};
+        D3D12_RESOURCE_STATES before{};
+        D3D12_RESOURCE_STATES after{};
+    } inputs[3]{};
+    for (uint32_t index = 0; index < recipe.tag_count; ++index) {
+        const auto& call = recipe.tags[index];
+        if (!call.has_resource || (call.tag != 0 && call.tag != 1 && call.tag != 3)) {
+            continue;
+        }
+        const uint32_t input_index = call.tag == 3 ? 0u : (call.tag == 0 ? 1u : 2u);
+        memcpy(&inputs[input_index].resource, call.resource.data() + 8,
+            sizeof(inputs[input_index].resource));
+        uint32_t state{};
+        memcpy(&state, call.resource.data() + 32, sizeof(state));
+        inputs[input_index].after = static_cast<D3D12_RESOURCE_STATES>(state);
+    }
+
+    D3D12_RESOURCE_BARRIER input_barriers[3]{};
+    UINT input_barrier_count{};
+    for (uint32_t index = 0; index < 3; ++index) {
+        if (inputs[index].resource == nullptr) {
+            continue;
+        }
+        const auto tracked_resource = g_ngx_input_resources[index].load(
+            std::memory_order_acquire);
+        const auto tracked_state = g_ngx_input_states[index].load(
+            std::memory_order_acquire);
+        if (tracked_resource != inputs[index].resource || tracked_state == UINT32_MAX) {
+            continue;
+        }
+        inputs[index].before = static_cast<D3D12_RESOURCE_STATES>(tracked_state);
+        if (inputs[index].before == inputs[index].after) {
+            continue;
+        }
+        auto& barrier = input_barriers[input_barrier_count++];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = inputs[index].resource;
+        barrier.Transition.StateBefore = inputs[index].before;
+        barrier.Transition.StateAfter = inputs[index].after;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    if (input_barrier_count != 0) {
+        command_list->ResourceBarrier(input_barrier_count, input_barriers);
+    }
+
+    const int previous_forced_eye = g_streamline_forced_eye;
+    const bool previous_replay = g_streamline_dlss_recipe_replay;
+    g_streamline_forced_eye = static_cast<int>(eye);
+    g_streamline_dlss_recipe_replay = true;
+    const bool packed_pair_pending = temporal_backend_is_dlss_packed() &&
+        g_packed_dlss_pending_pair.load(std::memory_order_acquire) == pair_id;
+    if (eye == 0 && !packed_pair_pending) {
+        advance_streamline_replay_jitter(
+            recipe.constants.constants.data(), recipe.constants.frame_token);
+    }
+    g_sl_set_constants(
+        recipe.constants.constants.data(), recipe.constants.frame_token,
+        streamline_viewport_for_eye(recipe.constants.viewport));
+    int tag_result{};
+    for (uint32_t index = 0; index < recipe.tag_count; ++index) {
+        const auto& call = recipe.tags[index];
+        const void* resource = call.has_resource ? call.resource.data() : nullptr;
+        const void* extent = call.has_extent ? call.extent.data() : nullptr;
+        const int result = hook_sl_set_tag(
+            resource, call.tag, call.viewport, extent);
+        if (result != 0 && tag_result == 0) {
+            tag_result = result;
+        }
+    }
+    const int feature_result = hook_sl_set_feature_constants(
+        recipe.feature.feature, recipe.feature.constants.data(),
+        recipe.feature.frame_token, recipe.feature.viewport);
+    const uint64_t previous_pair = g_streamline_dlss_pair_id;
+    g_streamline_dlss_pair_id = pair_id;
+    const int evaluate_result = hook_sl_evaluate_feature(
+        command_list, recipe.evaluate.feature, recipe.evaluate.frame_token,
+        recipe.evaluate.viewport);
+    g_streamline_dlss_pair_id = previous_pair;
+    g_streamline_dlss_recipe_replay = previous_replay;
+    g_streamline_forced_eye = previous_forced_eye;
+
+    if (input_barrier_count != 0) {
+        for (UINT index = 0; index < input_barrier_count; ++index) {
+            std::swap(input_barriers[index].Transition.StateBefore,
+                input_barriers[index].Transition.StateAfter);
+        }
+        command_list->ResourceBarrier(input_barrier_count, input_barriers);
+    }
+
+    // This Witcher 3 Streamline build exposes the pre-Result bool ABI: the
+    // calls return 1 after a successful evaluate (confirmed by the emitted NGX
+    // work), not sl::Result::eOk (0) used by newer public headers.
+    const bool succeeded = tag_result == 1 && feature_result == 1 &&
+        evaluate_result == 1;
+    if (succeeded) {
+        std::scoped_lock lock{g_streamline_dlss_recipe_mutex};
+        g_streamline_dlss_replayed_pair = pair_id;
+        g_streamline_dlss_replayed_eye = eye;
+    }
+    static std::atomic<uint32_t> replay_logs{};
+    if (replay_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+        log_line(
+            "Streamline DLSS recipe replay source_eye=%u target_eye=%u pair=%llu "
+            "command_list=%p constants_eye=%u token=%u constants_pair=%llu "
+            "tags=%u barriers=%u "
+            "results=%d,%d,%d",
+            recipe.eye, eye, static_cast<unsigned long long>(pair_id),
+            command_list, recipe.constants.eye, recipe.constants.frame_token,
+            static_cast<unsigned long long>(recipe.constants.pair_id),
+            recipe.tag_count, input_barrier_count,
+            tag_result, feature_result, evaluate_result);
+    }
+    return succeeded;
+}
+
+void install_engine_dlss_command_probe() {
+    if (!temporal_backend_is_dlss() || !g_config.ngx_trace ||
+        g_engine_dlss_command != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineDlssCommandRva = 0x00830330;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineDlssCommandRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, &hook_engine_dlss_command,
+            reinterpret_cast<void**>(&g_engine_dlss_command)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Hooked REDengine DLSS command RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineDlssCommandRva), target);
+    } else {
+        log_line("Failed REDengine DLSS command hook target=%p", target);
+    }
+}
+
+void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
+    const auto present = g_present_count.load();
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const int previous_eye = g_engine_render_eye;
+    const uint32_t previous_generation = g_engine_render_generation;
+    const uint64_t previous_pair_id = g_engine_render_pair_id;
+    const XrView previous_view = g_engine_render_view;
+    const bool previous_view_valid = g_engine_render_view_valid;
+    void* mono_lookup_frame_data{};
+    bool mono_lookup_hit{};
+    if ((g_engine_dual_render_active.load() || g_config.openxr_mode == 2) &&
+        frame_task != nullptr) {
+        __try {
+            void* frame_data{};
+            memcpy(&frame_data, static_cast<const uint8_t*>(frame_task) + 0x8, sizeof(frame_data));
+            mono_lookup_frame_data = frame_data;
+            g_engine_dual_frame_mutex.lock();
+            const auto found = g_engine_dual_frame_eyes.find(frame_data);
+            if (found != g_engine_dual_frame_eyes.end()) {
+                g_engine_render_eye = static_cast<int>(found->second.eye);
+                g_engine_render_generation = found->second.generation;
+                g_engine_render_pair_id = found->second.pair_id;
+                g_engine_render_view = found->second.render_view;
+                g_engine_render_view_valid = found->second.render_view_valid;
+                mono_lookup_hit = true;
+            }
+            g_engine_dual_frame_mutex.unlock();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine gameplay eye-map read fault task=%p", frame_task);
+        }
+    }
+    if (g_config.openxr_mode == 2 && frame_task != nullptr) {
+        static std::atomic<uint32_t> mono_task_lookup_logs{};
+        if (mono_task_lookup_logs.fetch_add(1) < 16) {
+            log_line(
+                "Mono route gameplay lookup task=%p frame=%p hit=%d id=%llu valid=%d "
+                "tid=%lu present=%llu",
+                frame_task, mono_lookup_frame_data, mono_lookup_hit ? 1 : 0,
+                static_cast<unsigned long long>(
+                    mono_lookup_hit ? g_engine_render_pair_id : 0),
+                mono_lookup_hit && g_engine_render_view_valid ? 1 : 0,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(present));
+        }
+    }
+    if (g_config.openxr_mode == 4 && g_engine_dual_render_active.load() &&
+        g_engine_render_eye >= 0) {
+        apply_performance_cpu_sets_to_current_thread(
+            "render-worker", g_render_worker_performance_cpu_sets_applied);
+    }
+    if (g_config.ngx_trace) {
+        static std::atomic<uint32_t> dlss_task_route_logs{};
+        if (dlss_task_route_logs.fetch_add(1) < 8) {
+            log_line(
+                "DLSS task route phase=entry caller_rva=0x%llX task=%p eye=%d pair=%llu tid=%lu present=%llu",
+                static_cast<unsigned long long>(caller_rva), frame_task,
+                g_engine_render_eye,
+                static_cast<unsigned long long>(g_engine_render_pair_id),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(present));
+        }
+    }
+    if (g_config.runtime_diagnostics && frame_task != nullptr &&
+        (present < 20 || present % 30 == 0) &&
+        g_engine_gameplay_entry_last_logged_present.exchange(present) != present) {
+        __try {
+            const auto* bytes = static_cast<const uint8_t*>(frame_task);
+            void* frame_data{};
+            void* extra{};
+            uint64_t task_words[4]{};
+            memcpy(task_words, bytes, sizeof(task_words));
+            memcpy(&frame_data, bytes + 0x8, sizeof(frame_data));
+            memcpy(&extra, bytes + 0x10, sizeof(extra));
+            log_line(
+                "Engine gameplay entry present=%llu caller_rva=0x%llX task=%p frame=%p extra=%p "
+                "task_qwords=%llX,%llX,%llX,%llX",
+                static_cast<unsigned long long>(present),
+                static_cast<unsigned long long>(caller_rva),
+                frame_task,
+                frame_data,
+                extra,
+                static_cast<unsigned long long>(task_words[0]),
+                static_cast<unsigned long long>(task_words[1]),
+                static_cast<unsigned long long>(task_words[2]),
+                static_cast<unsigned long long>(task_words[3]));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine gameplay entry probe read fault present=%llu task=%p",
+                static_cast<unsigned long long>(present), frame_task);
+        }
+    }
+
+    g_hang_diag_gameplay_present.store(present, std::memory_order_relaxed);
+    g_hang_diag_gameplay_pair.store(g_engine_render_pair_id, std::memory_order_relaxed);
+    g_hang_diag_gameplay_eye.store(g_engine_render_eye, std::memory_order_relaxed);
+    g_hang_diag_gameplay_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_hang_diag_gameplay_enter.fetch_add(1, std::memory_order_relaxed);
+    g_engine_gameplay_frame_entry(frame_task);
+    g_hang_diag_gameplay_exit.fetch_add(1, std::memory_order_relaxed);
+    if (g_config.openxr_mode == 2 && g_engine_render_eye == 0 &&
+        g_engine_render_pair_id != 0 && g_engine_render_view_valid) {
+        EngineFrameTag completed_tag{};
+        completed_tag.eye = 0;
+        completed_tag.generation = g_engine_render_generation;
+        completed_tag.pair_id = g_engine_render_pair_id;
+        completed_tag.render_view = g_engine_render_view;
+        completed_tag.render_view_valid = true;
+        g_engine_completed_tag_queue_mutex.lock();
+        if (g_engine_completed_tag_queue.size() >= 32) {
+            g_engine_completed_tag_queue.pop_front();
+        }
+        g_engine_completed_tag_queue.push_back(completed_tag);
+        const auto completed_queue_depth = g_engine_completed_tag_queue.size();
+        g_engine_completed_tag_queue_mutex.unlock();
+        static std::atomic<uint32_t> mono_completed_queue_logs{};
+        if (mono_completed_queue_logs.fetch_add(1) < 16) {
+            log_line(
+                "Mono route completed queued id=%llu generation=%u depth=%zu "
+                "tid=%lu present=%llu",
+                static_cast<unsigned long long>(completed_tag.pair_id),
+                completed_tag.generation, completed_queue_depth,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(present));
+        }
+    }
+    if (g_engine_dual_render_active.load() && g_engine_render_eye >= 0 &&
+        g_engine_render_generation == g_streamline_capture_generation.load() &&
+        g_engine_render_pair_id >=
+            g_engine_pair_wait_floor.load(std::memory_order_relaxed)) {
+        g_engine_completed_view_mutex.lock();
+        g_engine_completed_view = g_engine_render_view;
+        g_engine_completed_view_valid = g_engine_render_view_valid;
+        g_engine_completed_view_mutex.unlock();
+        g_engine_completed_eye.store(g_engine_render_eye);
+        g_engine_completed_generation.store(g_engine_render_generation);
+        g_engine_completed_pair_id.store(g_engine_render_pair_id);
+        g_engine_completed_serial.fetch_add(1);
+        if (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) {
+            g_engine_pair_completion_mutex.lock();
+            auto& completion_mask = g_engine_pair_completion_masks[g_engine_render_pair_id];
+            completion_mask = static_cast<uint8_t>(
+                completion_mask | (1u << static_cast<uint32_t>(g_engine_render_eye)));
+            if (completion_mask == 0x3) {
+                auto completed = g_engine_pair_completed_signal.load(std::memory_order_relaxed);
+                while (completed < g_engine_render_pair_id &&
+                    !g_engine_pair_completed_signal.compare_exchange_weak(
+                        completed, g_engine_render_pair_id,
+                        std::memory_order_release, std::memory_order_relaxed)) {
+                }
+            }
+            g_engine_pair_completion_mutex.unlock();
+        }
+        if (g_config.openxr_mode == 4) {
+            EngineFrameTag completed_tag{};
+            completed_tag.eye = static_cast<uint32_t>(g_engine_render_eye);
+            completed_tag.generation = g_engine_render_generation;
+            completed_tag.pair_id = g_engine_render_pair_id;
+            completed_tag.render_view = g_engine_render_view;
+            completed_tag.render_view_valid = g_engine_render_view_valid;
+            size_t queued_tags{};
+            g_engine_completed_tag_queue_mutex.lock();
+            if (g_engine_completed_tag_queue.size() >= 32) {
+                g_engine_completed_tag_queue.pop_front();
+            }
+            g_engine_completed_tag_queue.push_back(completed_tag);
+            queued_tags = g_engine_completed_tag_queue.size();
+            g_engine_completed_tag_queue_mutex.unlock();
+            static std::atomic<uint32_t> completed_tag_logs{};
+            if (completed_tag_logs.fetch_add(1) < 16) {
+                log_line("Packed completed tag queued eye=%u pair=%llu depth=%zu tid=%lu present=%llu",
+                    completed_tag.eye,
+                    static_cast<unsigned long long>(completed_tag.pair_id), queued_tags,
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long long>(g_present_count.load()));
+            }
+        }
+        if (g_config.runtime_diagnostics) {
+            g_sync_completed_task_count.fetch_add(1);
+        }
+    }
+    g_engine_render_eye = previous_eye;
+    g_engine_render_generation = previous_generation;
+    g_engine_render_pair_id = previous_pair_id;
+    g_engine_render_view = previous_view;
+    g_engine_render_view_valid = previous_view_valid;
+}
+
+void install_engine_gameplay_entry_probe() {
+    if ((!g_config.engine_gameplay_entry_probe &&
+            !g_engine_dual_render_active.load() &&
+            g_config.openxr_mode != 2) ||
+        g_engine_gameplay_frame_entry != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineGameplayEntryRva = 0x01D00260;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineGameplayEntryRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_gameplay_frame_entry),
+            reinterpret_cast<void**>(&g_engine_gameplay_frame_entry)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine gameplay entry probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineGameplayEntryRva), target);
+    } else {
+        log_line("Engine gameplay entry probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineGameplayEntryRva), target);
+    }
+}
+
+uint64_t __fastcall hook_engine_render_queue_pump(void* scheduler, int64_t* frame_start) {
+    uint32_t tagged_frames{};
+    if (g_config.openxr_mode == 4 && g_engine_dual_render_active.load()) {
+        g_engine_dual_frame_mutex.lock();
+        tagged_frames = static_cast<uint32_t>(g_engine_dual_frame_eyes.size());
+        g_engine_dual_frame_mutex.unlock();
+    }
+
+    LARGE_INTEGER begin{};
+    QueryPerformanceCounter(&begin);
+    const auto result = g_engine_render_queue_pump(scheduler, frame_start);
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&end);
+
+    if (tagged_frames > 0 && g_engine_render_queue_probe_logs.fetch_add(1) < 48) {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        const double elapsed_ms = frequency.QuadPart > 0
+            ? static_cast<double>(end.QuadPart - begin.QuadPart) * 1000.0 /
+                static_cast<double>(frequency.QuadPart)
+            : 0.0;
+        log_line(
+            "Packed render queue pump scheduler=%p tagged=%u tid=%lu present=%llu "
+            "frame_start=%lld elapsed_ms=%.3f result=%llu",
+            scheduler, tagged_frames, static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(g_present_count.load()),
+            frame_start != nullptr ? static_cast<long long>(*frame_start) : 0ll,
+            elapsed_ms, static_cast<unsigned long long>(result));
+    }
+    return result;
+}
+
+void install_engine_render_queue_probe() {
+    if (g_engine_render_queue_pump != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineRenderQueuePumpRva = 0x01CFF380;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineRenderQueuePumpRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_render_queue_pump),
+            reinterpret_cast<void**>(&g_engine_render_queue_pump)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine render queue probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineRenderQueuePumpRva), target);
+    } else {
+        log_line("Engine render queue probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineRenderQueuePumpRva), target);
+    }
+}
+
+void __fastcall hook_engine_scene_enqueue(void* render_context, void* frame_data) {
+    const auto present = g_present_count.load();
+    if (g_config.runtime_diagnostics && (present < 20 || present % 30 == 0) &&
+        g_engine_scene_enqueue_last_logged_present.exchange(present) != present) {
+        const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+        log_line("Engine scene enqueue present=%llu caller_rva=0x%llX context=%p frame=%p",
+            static_cast<unsigned long long>(present),
+            static_cast<unsigned long long>(caller_rva), render_context, frame_data);
+    }
+
+    g_engine_scene_enqueue(render_context, frame_data);
+}
+
+void install_engine_scene_enqueue_probe() {
+    if (!g_config.engine_scene_enqueue_probe || g_engine_scene_enqueue != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineSceneEnqueueRva = 0x01621FC0;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineSceneEnqueueRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_scene_enqueue),
+            reinterpret_cast<void**>(&g_engine_scene_enqueue)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine scene enqueue probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineSceneEnqueueRva), target);
+    } else {
+        log_line("Engine scene enqueue probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineSceneEnqueueRva), target);
+    }
+}
+
+bool wait_for_engine_pair_completion(uint64_t pair_id, uint64_t timeout_ms) {
+    const auto wait_begin = GetTickCount64();
+    constexpr uint32_t kMaxCooperativeWaitIterations = 10'000'000;
+    uint32_t wait_iterations{};
+    bool pair_complete{};
+    bool pair_captured{};
+    bool pair_accepted{};
+    while (GetTickCount64() - wait_begin < timeout_ms &&
+        wait_iterations++ < kMaxCooperativeWaitIterations) {
+        pair_complete =
+            g_engine_pair_completed_signal.load(std::memory_order_acquire) >= pair_id;
+        pair_captured =
+            g_engine_pair_captured_signal.load(std::memory_order_acquire) >= pair_id;
+        pair_accepted = g_packed_accepted_pair_signal.load(std::memory_order_acquire) >= pair_id;
+        if (pair_complete || pair_captured || pair_accepted) {
+            break;
+        }
+        // Do not enter the scheduler here. REDengine's render worker can spin
+        // without yielding, leaving this producer parked despite the deadline.
+        YieldProcessor();
+    }
+    g_engine_pair_completion_mutex.lock();
+    g_engine_pair_completion_masks.erase(pair_id);
+    g_engine_pair_completion_mutex.unlock();
+    g_engine_pair_capture_mutex.lock();
+    g_engine_pair_capture_masks.erase(pair_id);
+    g_engine_pair_capture_mutex.unlock();
+    auto wait_floor = g_engine_pair_wait_floor.load(std::memory_order_relaxed);
+    while (wait_floor <= pair_id &&
+        !g_engine_pair_wait_floor.compare_exchange_weak(
+            wait_floor, pair_id + 1, std::memory_order_relaxed)) {
+    }
+    if (!pair_complete) {
+        auto capture_floor = g_engine_pair_capture_floor.load(std::memory_order_relaxed);
+        while (capture_floor <= pair_id &&
+            !g_engine_pair_capture_floor.compare_exchange_weak(
+                capture_floor, pair_id + 1, std::memory_order_relaxed)) {
+        }
+    }
+    const auto wait_elapsed = GetTickCount64() - wait_begin;
+    static std::atomic<uint32_t> producer_wait_logs{};
+    if (((!pair_complete && !pair_captured && !pair_accepted) ||
+            g_config.runtime_diagnostics) &&
+        producer_wait_logs.fetch_add(1) < 16) {
+        log_line(
+            "Packed producer barrier pair=%llu complete=%d captured=%d accepted=%d wait_ms=%llu tid=%lu present=%llu",
+            static_cast<unsigned long long>(pair_id), pair_complete ? 1 : 0,
+            pair_captured ? 1 : 0,
+            pair_accepted ? 1 : 0,
+            static_cast<unsigned long long>(wait_elapsed),
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+    if (!pair_complete && !pair_captured && !pair_accepted) {
+        const auto present = g_present_count.load(std::memory_order_relaxed);
+        const auto retry_present = present + 2;
+        auto current_retry = g_engine_pair_retry_present.load(std::memory_order_relaxed);
+        while (current_retry < retry_present &&
+            !g_engine_pair_retry_present.compare_exchange_weak(
+                 current_retry, retry_present, std::memory_order_relaxed)) {
+        }
+        log_line(
+            "Packed producer dropped timed-out pair=%llu wait_ms=%llu "
+            "retry_present=%llu present=%llu",
+            static_cast<unsigned long long>(pair_id),
+            static_cast<unsigned long long>(wait_elapsed),
+            static_cast<unsigned long long>(retry_present),
+            static_cast<unsigned long long>(present));
+    }
+    return pair_complete || pair_captured || pair_accepted;
+}
+
+void mark_engine_pair_output_captured(uint64_t pair_id, uint32_t eye) {
+    if (pair_id == 0 || eye > 1 ||
+        pair_id < g_engine_pair_capture_floor.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::scoped_lock lock{g_engine_pair_capture_mutex};
+    auto& capture_mask = g_engine_pair_capture_masks[pair_id];
+    capture_mask = static_cast<uint8_t>(capture_mask | (1u << eye));
+    if (capture_mask == 0x3) {
+        auto captured = g_engine_pair_captured_signal.load(std::memory_order_relaxed);
+        while (captured < pair_id &&
+            !g_engine_pair_captured_signal.compare_exchange_weak(
+                captured, pair_id, std::memory_order_release, std::memory_order_relaxed)) {
+        }
+    }
+}
+
+void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time) {
+    if (g_config.openxr_mode == 4 && g_engine_dual_render_active.load()) {
+        apply_performance_cpu_sets_to_current_thread(
+            "producer", g_producer_performance_cpu_sets_applied);
+    }
+    const auto previous_pair = g_engine_producer_pair_id;
+    g_engine_producer_pair_id = 0;
+    g_hang_diag_scene_present.store(
+        g_present_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    g_hang_diag_scene_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_hang_diag_scene_enter.fetch_add(1, std::memory_order_relaxed);
+    g_engine_render_scene_setup(renderer, delta_time);
+    g_hang_diag_scene_exit.fetch_add(1, std::memory_order_relaxed);
+    const auto produced_pair = g_engine_producer_pair_id;
+    g_engine_producer_pair_id = previous_pair;
+    if ((g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
+        g_engine_dual_render_active.load() &&
+        produced_pair != 0) {
+        wait_for_engine_pair_completion(produced_pair, 64);
+    }
+}
+
+void install_engine_render_scene_setup_probe() {
+    if (g_engine_render_scene_setup != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineRenderSceneSetupRva = 0x01553070;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineRenderSceneSetupRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_render_scene_setup),
+            reinterpret_cast<void**>(&g_engine_render_scene_setup)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine render-scene producer barrier hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineRenderSceneSetupRva), target);
+    } else {
+        log_line("Engine render-scene producer barrier hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineRenderSceneSetupRva), target);
+    }
+}
+
+bool safe_copy_engine_view_snapshot(float* view, float* destination, size_t bytes) {
+    __try {
+        memcpy(destination, view, bytes);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool safe_rebuild_shadow_view(float* shadow_view) {
+    __try {
+        g_engine_view_rebuild(shadow_view);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool safe_copy_invisibles_camera(
+    void* frame_data, void*& camera_out,
+    float* position_out, float* matrix_out) {
+    MEMORY_BASIC_INFORMATION frame_memory{};
+    auto* camera_slot = static_cast<uint8_t*>(frame_data) + 0x28;
+    if (VirtualQuery(camera_slot, &frame_memory, sizeof(frame_memory)) == 0 ||
+        frame_memory.State != MEM_COMMIT ||
+        (frame_memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+        reinterpret_cast<uintptr_t>(camera_slot) + sizeof(void*) >
+            reinterpret_cast<uintptr_t>(frame_memory.BaseAddress) + frame_memory.RegionSize) {
+        return false;
+    }
+    __try {
+        auto* camera = *reinterpret_cast<uint8_t**>(camera_slot);
+        if (camera == nullptr) {
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION camera_memory{};
+        if (VirtualQuery(camera, &camera_memory, sizeof(camera_memory)) == 0 ||
+            camera_memory.State != MEM_COMMIT ||
+            (camera_memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+            reinterpret_cast<uintptr_t>(camera) + 0x80 + 16 * sizeof(float) >
+                reinterpret_cast<uintptr_t>(camera_memory.BaseAddress) + camera_memory.RegionSize) {
+            return false;
+        }
+        memcpy(position_out, camera, 3 * sizeof(float));
+        memcpy(matrix_out, camera + 0x80, 16 * sizeof(float));
+        camera_out = camera;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void log_engine_factory_aux_camera(void* frame_data, int eye, uint64_t pair_id) {
+    auto reads = g_engine_factory_aux_camera_reads.load(std::memory_order_relaxed);
+    while (reads != 0 &&
+        !g_engine_factory_aux_camera_reads.compare_exchange_weak(
+            reads, reads - 1, std::memory_order_relaxed)) {
+    }
+    if (reads == 0) {
+        return;
+    }
+    if (frame_data == nullptr || g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        !g_hmd_pose_valid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const auto log_index = g_engine_factory_aux_camera_logs.fetch_add(
+        1, std::memory_order_relaxed);
+    if (log_index >= 48) {
+        return;
+    }
+
+    void* camera{};
+    std::array<float, 3> position{};
+    std::array<float, 16> matrix{};
+    if (!safe_copy_invisibles_camera(
+            frame_data, camera, position.data(), matrix.data())) {
+        log_line("Factory aux camera read fault frame=%p eye=%d pair=%llu",
+            frame_data, eye, static_cast<unsigned long long>(pair_id));
+        return;
+    }
+
+    std::array<float, 512> before{};
+    std::array<float, 512> after{};
+    uint64_t snapshot_present{};
+    {
+        std::scoped_lock lock{g_engine_view_snapshot_mutex};
+        before = g_engine_view_before_hmd;
+        after = g_engine_view_after_rebuild;
+        snapshot_present = g_engine_view_snapshot_present;
+    }
+    auto best_match = [&](const std::array<float, 512>& snapshot) {
+        float best_error = FLT_MAX;
+        size_t best_offset{};
+        bool transposed{};
+        for (size_t offset = 0; offset + 16 <= snapshot.size(); ++offset) {
+            float direct_error{};
+            float transpose_error{};
+            for (size_t row = 0; row < 4; ++row) {
+                for (size_t column = 0; column < 4; ++column) {
+                    const float target = matrix[row * 4 + column];
+                    direct_error += fabsf(snapshot[offset + row * 4 + column] - target);
+                    transpose_error += fabsf(
+                        snapshot[offset + row * 4 + column] -
+                        matrix[column * 4 + row]);
+                }
+            }
+            if (direct_error < best_error) {
+                best_error = direct_error;
+                best_offset = offset;
+                transposed = false;
+            }
+            if (transpose_error < best_error) {
+                best_error = transpose_error;
+                best_offset = offset;
+                transposed = true;
+            }
+        }
+        return std::tuple<float, size_t, bool>{best_error, best_offset, transposed};
+    };
+    const auto [before_error, before_offset, before_transposed] = best_match(before);
+    const auto [after_error, after_offset, after_transposed] = best_match(after);
+    log_line("Factory aux camera present=%llu snapshot_present=%llu eye=%d pair=%llu frame=%p camera=%p position=%.4f,%.4f,%.4f before_position=%.4f,%.4f,%.4f after_position=%.4f,%.4f,%.4f before_error=%.7g before_offset=0x%zX before_transpose=%u after_error=%.7g after_offset=0x%zX after_transpose=%u",
+        static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(snapshot_present), eye,
+        static_cast<unsigned long long>(pair_id), frame_data, camera,
+        position[0], position[1], position[2],
+        before[0], before[1], before[2], after[0], after[1], after[2],
+        before_error, before_offset * sizeof(float), before_transposed ? 1u : 0u,
+        after_error, after_offset * sizeof(float), after_transposed ? 1u : 0u);
+}
+
+void __fastcall hook_engine_invisibles_processing(void* collector, void* frame_data) {
+    g_engine_invisibles_processing(collector, frame_data);
+
+    if (frame_data == nullptr || g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        !g_hmd_pose_valid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const auto log_index = g_engine_invisibles_route_logs.fetch_add(
+        1, std::memory_order_relaxed);
+    if (log_index >= 48) {
+        return;
+    }
+
+    void* camera{};
+    std::array<float, 3> position{};
+    std::array<float, 16> matrix{};
+    if (!safe_copy_invisibles_camera(
+            frame_data, camera, position.data(), matrix.data())) {
+        log_line("Invisibles route source read fault frame=%p", frame_data);
+        return;
+    }
+
+    std::array<float, 512> before{};
+    std::array<float, 512> after{};
+    uint64_t snapshot_present{};
+    {
+        std::scoped_lock lock{g_engine_view_snapshot_mutex};
+        before = g_engine_view_before_hmd;
+        after = g_engine_view_after_rebuild;
+        snapshot_present = g_engine_view_snapshot_present;
+    }
+    auto best_match = [&](const std::array<float, 512>& snapshot) {
+        float best_error = FLT_MAX;
+        size_t best_offset{};
+        bool transposed{};
+        for (size_t offset = 0; offset + 16 <= snapshot.size(); ++offset) {
+            float direct_error{};
+            float transpose_error{};
+            for (size_t row = 0; row < 4; ++row) {
+                for (size_t column = 0; column < 4; ++column) {
+                    const float target = matrix[row * 4 + column];
+                    direct_error += fabsf(snapshot[offset + row * 4 + column] - target);
+                    transpose_error += fabsf(
+                        snapshot[offset + row * 4 + column] -
+                        matrix[column * 4 + row]);
+                }
+            }
+            if (direct_error < best_error) {
+                best_error = direct_error;
+                best_offset = offset;
+                transposed = false;
+            }
+            if (transpose_error < best_error) {
+                best_error = transpose_error;
+                best_offset = offset;
+                transposed = true;
+            }
+        }
+        return std::tuple<float, size_t, bool>{best_error, best_offset, transposed};
+    };
+    const auto [before_error, before_offset, before_transposed] = best_match(before);
+    const auto [after_error, after_offset, after_transposed] = best_match(after);
+    log_line("Invisibles route present=%llu snapshot_present=%llu collector=%p frame=%p camera=%p position=%.4f,%.4f,%.4f before_error=%.7g before_offset=0x%zX before_transpose=%u after_error=%.7g after_offset=0x%zX after_transpose=%u",
+        static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(snapshot_present), collector, frame_data, camera,
+        position[0], position[1], position[2],
+        before_error, before_offset * sizeof(float), before_transposed ? 1u : 0u,
+        after_error, after_offset * sizeof(float), after_transposed ? 1u : 0u);
+}
+
+void install_engine_invisibles_processing_probe() {
+    if (g_engine_invisibles_processing != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineInvisiblesProcessingRva = 0x01DAD2C0;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineInvisiblesProcessingRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_invisibles_processing),
+            reinterpret_cast<void**>(&g_engine_invisibles_processing)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine invisibles route hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineInvisiblesProcessingRva), target);
+    } else {
+        log_line("Engine invisibles route hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineInvisiblesProcessingRva), target);
+    }
+}
+
+void __fastcall hook_engine_animation_budget_config(void* config) {
+    g_engine_animation_budget_config(config);
+    if (config == nullptr) {
+        return;
+    }
+
+    auto* bytes = static_cast<uint8_t*>(config);
+    const uint8_t use_behavior_lod = bytes[0xDC];
+    const uint8_t force_behavior_lod = bytes[0xDD];
+    bytes[0xDC] = 0;
+    log_line("Behavior LOD config loaded config=%p use=%u->0 force=%u force_level=%d",
+        config, use_behavior_lod, force_behavior_lod,
+        *reinterpret_cast<int32_t*>(bytes + 0xE0));
+}
+
+void install_engine_animation_budget_config_hook() {
+    if (g_engine_animation_budget_config != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineAnimationBudgetConfigRva = 0x01607D10;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    auto* target = module != 0
+        ? reinterpret_cast<void*>(module + kEngineAnimationBudgetConfigRva)
+        : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_engine_animation_budget_config),
+            reinterpret_cast<void**>(&g_engine_animation_budget_config)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Animation budget config hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineAnimationBudgetConfigRva), target);
+    } else {
+        log_line("Animation budget config hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineAnimationBudgetConfigRva), target);
+    }
+}
+
+void __fastcall hook_engine_scene_culling(
+    void* collector, void* frame_view, void* unknown,
+    void* occlusion, void* frame_data) {
+    g_engine_scene_culling(collector, frame_view, unknown, occlusion, frame_data);
+
+    const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+    uint64_t last_fingerprint =
+        g_render_fingerprint_culling_present.load(std::memory_order_relaxed);
+    if (frame_data != nullptr && present >= last_fingerprint + 120 &&
+        g_render_fingerprint_culling_present.compare_exchange_strong(
+            last_fingerprint, present, std::memory_order_relaxed)) {
+        std::array<float, 16> matrix{};
+        auto* source = reinterpret_cast<float*>(
+            static_cast<uint8_t*>(frame_data) + 0x730);
+        if (safe_copy_engine_view_snapshot(
+                source, matrix.data(), sizeof(matrix))) {
+            log_line(
+                "Render fingerprint culling present=%llu collector=%p frame=%p "
+                "matrix=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,"
+                "%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g",
+                static_cast<unsigned long long>(present), collector, frame_data,
+                matrix[0], matrix[1], matrix[2], matrix[3],
+                matrix[4], matrix[5], matrix[6], matrix[7],
+                matrix[8], matrix[9], matrix[10], matrix[11],
+                matrix[12], matrix[13], matrix[14], matrix[15]);
+        }
+    }
+
+    if (frame_data == nullptr || g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        !g_hmd_pose_valid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const auto log_index = g_engine_scene_culling_route_logs.fetch_add(
+        1, std::memory_order_relaxed);
+    if (log_index >= 48) {
+        return;
+    }
+
+    std::array<float, 16> culling_matrix{};
+    auto* matrix_source = reinterpret_cast<float*>(
+        static_cast<uint8_t*>(frame_data) + 0x730);
+    if (!safe_copy_engine_view_snapshot(
+            matrix_source, culling_matrix.data(), sizeof(culling_matrix))) {
+        log_line("Scene culling route source read fault frame=%p", frame_data);
+        return;
+    }
+
+    std::array<float, 512> before{};
+    std::array<float, 512> after{};
+    uint64_t snapshot_present{};
+    {
+        std::scoped_lock lock{g_engine_view_snapshot_mutex};
+        before = g_engine_view_before_hmd;
+        after = g_engine_view_after_rebuild;
+        snapshot_present = g_engine_view_snapshot_present;
+    }
+    auto best_match = [&](const std::array<float, 512>& snapshot) {
+        float best_error = FLT_MAX;
+        size_t best_offset{};
+        bool transposed{};
+        for (size_t offset = 0; offset + 16 <= snapshot.size(); ++offset) {
+            float direct_error{};
+            float transpose_error{};
+            for (size_t row = 0; row < 4; ++row) {
+                for (size_t column = 0; column < 4; ++column) {
+                    const float target = culling_matrix[row * 4 + column];
+                    direct_error += fabsf(snapshot[offset + row * 4 + column] - target);
+                    transpose_error += fabsf(
+                        snapshot[offset + row * 4 + column] -
+                        culling_matrix[column * 4 + row]);
+                }
+            }
+            if (direct_error < best_error) {
+                best_error = direct_error;
+                best_offset = offset;
+                transposed = false;
+            }
+            if (transpose_error < best_error) {
+                best_error = transpose_error;
+                best_offset = offset;
+                transposed = true;
+            }
+        }
+        return std::tuple<float, size_t, bool>{best_error, best_offset, transposed};
+    };
+    const auto [before_error, before_offset, before_transposed] = best_match(before);
+    const auto [after_error, after_offset, after_transposed] = best_match(after);
+    log_line("Scene culling route present=%llu snapshot_present=%llu collector=%p frame=%p before_error=%.7g before_offset=0x%zX before_transpose=%u after_error=%.7g after_offset=0x%zX after_transpose=%u",
+        static_cast<unsigned long long>(g_present_count.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(snapshot_present), collector, frame_data,
+        before_error, before_offset * sizeof(float), before_transposed ? 1u : 0u,
+        after_error, after_offset * sizeof(float), after_transposed ? 1u : 0u);
+}
+
+void install_engine_scene_culling_probe() {
+    if (g_engine_scene_culling != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineSceneCullingRva = 0x01DE4560;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineSceneCullingRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_scene_culling),
+            reinterpret_cast<void**>(&g_engine_scene_culling)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine scene culling route hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineSceneCullingRva), target);
+    } else {
+        log_line("Engine scene culling route hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineSceneCullingRva), target);
+    }
+}
+
+void __fastcall hook_engine_frustum_from_matrix(void* output, const float* matrix) {
+    const auto return_address = _ReturnAddress();
+    if (!g_config.engine_animation_hmd_frustum ||
+        return_address != g_engine_animation_frustum_return ||
+        output == nullptr || !g_config.hmd_freelook ||
+        !g_hmd_pose_valid.load(std::memory_order_relaxed) ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0) {
+        g_engine_frustum_from_matrix(output, matrix);
+        return;
+    }
+
+    std::array<float, 16> hmd_matrix{};
+    uint64_t snapshot_present{};
+    {
+        std::scoped_lock lock{g_engine_view_snapshot_mutex};
+        std::copy_n(g_engine_view_after_rebuild.data() + 0x80, 16, hmd_matrix.data());
+        snapshot_present = g_engine_view_after_snapshot_present;
+    }
+
+    const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+    bool valid = snapshot_present != 0 && present >= snapshot_present &&
+        present - snapshot_present <= 8;
+    for (float value : hmd_matrix) {
+        valid = valid && std::isfinite(value);
+    }
+    if (!valid) {
+        g_engine_frustum_from_matrix(output, matrix);
+        return;
+    }
+
+    g_engine_frustum_from_matrix(output, hmd_matrix.data());
+    if (g_engine_animation_frustum_apply_logs.fetch_add(
+            1, std::memory_order_relaxed) == 0) {
+        float matrix_delta{};
+        if (matrix != nullptr) {
+            for (size_t index = 0; index < hmd_matrix.size(); ++index) {
+                matrix_delta += fabsf(hmd_matrix[index] - matrix[index]);
+            }
+        }
+        log_line("Animation HMD frustum applied present=%llu snapshot_present=%llu delta=%.7g",
+            static_cast<unsigned long long>(present),
+            static_cast<unsigned long long>(snapshot_present), matrix_delta);
+    }
+}
+
+void install_engine_animation_frustum_hook() {
+    if (!g_config.engine_animation_hmd_frustum ||
+        g_engine_frustum_from_matrix != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineFrustumFromMatrixRva = 0x02017230;
+    constexpr uintptr_t kAnimationFrustumReturnRva = 0x018AD077;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineFrustumFromMatrixRva : nullptr;
+    g_engine_animation_frustum_return =
+        module != nullptr ? module + kAnimationFrustumReturnRva : nullptr;
+    if (target != nullptr && g_engine_animation_frustum_return != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frustum_from_matrix),
+            reinterpret_cast<void**>(&g_engine_frustum_from_matrix)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Animation HMD frustum hooked converter_rva=0x%llX caller_return_rva=0x%llX",
+            static_cast<unsigned long long>(kEngineFrustumFromMatrixRva),
+            static_cast<unsigned long long>(kAnimationFrustumReturnRva));
+    } else {
+        log_line("Animation HMD frustum hook failed converter_rva=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineFrustumFromMatrixRva), target);
+    }
+}
+
+int __fastcall hook_engine_frustum_aabb_test(void* frustum, const void* bounds) {
+    const int result = g_engine_frustum_aabb_test(frustum, bounds);
+    const auto present = g_present_count.load(std::memory_order_relaxed);
+    const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
+        std::memory_order_relaxed);
+    const bool hmd_camera_recent = last_hmd_camera != UINT64_MAX &&
+        present >= last_hmd_camera && present - last_hmd_camera <= 8;
+    if (!g_config.engine_animated_component_visible ||
+        _ReturnAddress() != g_engine_animated_component_visibility_return ||
+        !g_config.hmd_freelook ||
+        !g_hmd_pose_valid.load(std::memory_order_relaxed) ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        g_cinema_mode_active.load(std::memory_order_relaxed) ||
+        !hmd_camera_recent) {
+        return result;
+    }
+
+    const uint64_t count = g_engine_animated_component_visibility_forces.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (count == 1 || (g_config.runtime_diagnostics && count % 10000 == 0)) {
+        log_line("Animated component visibility forced full count=%llu original=%d",
+            static_cast<unsigned long long>(count), result);
+    }
+    return 0;
+}
+
+void install_engine_animated_component_visibility_hook() {
+    if (!g_config.engine_animated_component_visible ||
+        g_engine_frustum_aabb_test != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineFrustumAabbTestRva = 0x0031E050;
+    constexpr uintptr_t kAnimatedComponentVisibilityReturnRva = 0x015E186C;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineFrustumAabbTestRva : nullptr;
+    g_engine_animated_component_visibility_return =
+        module != nullptr ? module + kAnimatedComponentVisibilityReturnRva : nullptr;
+    if (target != nullptr && g_engine_animated_component_visibility_return != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frustum_aabb_test),
+            reinterpret_cast<void**>(&g_engine_frustum_aabb_test)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Animated component visibility hooked tester_rva=0x%llX caller_return_rva=0x%llX",
+            static_cast<unsigned long long>(kEngineFrustumAabbTestRva),
+            static_cast<unsigned long long>(kAnimatedComponentVisibilityReturnRva));
+    } else {
+        log_line("Animated component visibility hook failed tester_rva=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineFrustumAabbTestRva), target);
+    }
+}
+
+void capture_engine_original_temporal_matrix(float* view, uint64_t present) {
+    std::array<float, 512> shadow{};
+    if (view == nullptr || !safe_copy_engine_view_snapshot(view, shadow.data(), sizeof(shadow)) ||
+        !safe_rebuild_shadow_view(shadow.data())) {
+        return;
+    }
+    constexpr size_t kTemporalMatrixFloatOffset = 0x3C0 / sizeof(float);
+    const int routed_eye = g_engine_factory_eye >= 0
+        ? g_engine_factory_eye
+        : g_engine_render_eye;
+    const int eye = g_config.openxr_mode == 2 && routed_eye < 0
+        ? 0
+        : (routed_eye >= 0 || !g_config.streamline_taau_bridge ||
+                g_config.openxr_mode == 3 || g_config.openxr_mode == 4
+            ? routed_eye
+            : 0);
+    const uint64_t pair_id = g_engine_producer_pair_id != 0
+        ? g_engine_producer_pair_id
+        : g_engine_render_pair_id;
+    // Mode 4 reserves even/odd slots for eye 0/1. An untagged auxiliary
+    // camera has eye=-1, which the old index expression treated as eye 0 and
+    // could overwrite the left eye's exact predecessor. Untagged matrices are
+    // not valid stereo temporal inputs, so never publish them into this ring.
+    if (g_config.openxr_mode == 4 &&
+        (eye < 0 || eye > 1 || pair_id == 0 || pair_id == UINT64_MAX)) {
+        return;
+    }
+    const uint64_t sequence = pair_id != 0 ? pair_id : present;
+    const size_t slot_index =
+        (sequence % (g_engine_temporal_matrix_ring.size() / 2)) * 2 +
+        (eye == 1 ? 1 : 0);
+    std::scoped_lock lock{g_engine_temporal_matrix_mutex};
+    auto& pair = g_engine_temporal_matrix_ring[slot_index];
+    pair = {};
+    pair.present = present;
+    pair.pair_id = pair_id;
+    pair.eye = eye;
+    memcpy(pair.original.data(), shadow.data() + kTemporalMatrixFloatOffset, 64);
+    pair.original_valid = true;
+}
+
+void capture_engine_corrected_temporal_matrix(
+    float* view,
+    uint64_t present,
+    const XrQuaternionf& hmd_orientation,
+    const XrVector3f& hmd_position,
+    const std::array<float, 12>& base_camera) {
+    constexpr size_t kTemporalMatrixFloatOffset = 0x3C0 / sizeof(float);
+    std::array<float, 16> matrix{};
+    if (view == nullptr || !safe_copy_engine_view_snapshot(
+            view + kTemporalMatrixFloatOffset, matrix.data(), sizeof(matrix))) {
+        return;
+    }
+    const int routed_eye = g_engine_factory_eye >= 0
+        ? g_engine_factory_eye
+        : g_engine_render_eye;
+    const int eye = g_config.openxr_mode == 2 && routed_eye < 0
+        ? 0
+        : (routed_eye >= 0 || !g_config.streamline_taau_bridge ||
+                g_config.openxr_mode == 3 || g_config.openxr_mode == 4
+            ? routed_eye
+            : 0);
+    const uint64_t pair_id = g_engine_producer_pair_id != 0
+        ? g_engine_producer_pair_id
+        : g_engine_render_pair_id;
+    // Keep the stereo eye partitions private. In particular, eye=-1 must not
+    // fall through to the even (left-eye) slot and destroy its history matrix.
+    if (g_config.openxr_mode == 4 &&
+        (eye < 0 || eye > 1 || pair_id == 0 || pair_id == UINT64_MAX)) {
+        return;
+    }
+    const uint64_t sequence = pair_id != 0 ? pair_id : present;
+    const size_t slot_index =
+        (sequence % (g_engine_temporal_matrix_ring.size() / 2)) * 2 +
+        (eye == 1 ? 1 : 0);
+    std::scoped_lock lock{g_engine_temporal_matrix_mutex};
+    auto& pair = g_engine_temporal_matrix_ring[slot_index];
+    if (pair.present != present || pair.pair_id != pair_id || pair.eye != eye) {
+        pair = {};
+        pair.present = present;
+        pair.pair_id = pair_id;
+        pair.eye = eye;
+    }
+    pair.corrected = matrix;
+    pair.corrected_valid = true;
+    pair.hmd_orientation = hmd_orientation;
+    pair.hmd_position = hmd_position;
+    pair.base_camera = base_camera;
+    pair.corrected_camera = {
+        view[0], view[1], view[2],
+        view[0xA0], view[0xA1], view[0xA2],
+        view[0xA8], view[0xA9], view[0xAA],
+        view[0xA4], view[0xA5], view[0xA6]};
+    const float corrected_position[3] = {view[0], view[1], view[2]};
+    const float corrected_basis[3][3] = {
+        {view[0xA0], view[0xA1], view[0xA2]},
+        {view[0xA8], view[0xA9], view[0xAA]},
+        {view[0xA4], view[0xA5], view[0xA6]}};
+    const float* base_position = base_camera.data();
+    const float* base_basis[3] = {
+        base_camera.data() + 3,
+        base_camera.data() + 6,
+        base_camera.data() + 9};
+    for (size_t base_axis = 0; base_axis < 3; ++base_axis) {
+        for (size_t corrected_axis = 0; corrected_axis < 3; ++corrected_axis) {
+            float value{};
+            for (size_t component = 0; component < 3; ++component) {
+                value += base_basis[base_axis][component] *
+                    corrected_basis[corrected_axis][component];
+            }
+            pair.hmd_to_base_rotation[base_axis * 3 + corrected_axis] = value;
+        }
+    }
+    float* base_translation = &pair.hmd_to_base_translation.x;
+    for (size_t base_axis = 0; base_axis < 3; ++base_axis) {
+        for (size_t component = 0; component < 3; ++component) {
+            base_translation[base_axis] += base_basis[base_axis][component] *
+                (corrected_position[component] - base_position[component]);
+        }
+    }
+    pair.vertical_fov_degrees = view[7];
+    pair.aspect = view[10];
+    pair.near_plane = view[12];
+    pair.far_plane = view[13];
+    if (g_xr_views.size() >= 2) {
+        for (size_t render_view_eye = 0; render_view_eye < 2; ++render_view_eye) {
+            pair.render_views[render_view_eye] = g_config.hmd_compositor_only
+                ? g_hmd_center_views[render_view_eye]
+                : g_xr_views[render_view_eye];
+            if (g_config.openxr_mode == 2 && !g_config.hmd_compositor_only) {
+                pair.render_views[render_view_eye].pose.position.x -=
+                    g_mono_neck_pose_correction.x;
+                pair.render_views[render_view_eye].pose.position.y -=
+                    g_mono_neck_pose_correction.y;
+                pair.render_views[render_view_eye].pose.position.z -=
+                    g_mono_neck_pose_correction.z;
+            }
+        }
+        pair.render_views_valid = true;
+    }
+    pair.hmd_pose_valid = true;
+}
+
+void capture_engine_view_snapshot(float* view, uint64_t present, bool after_rebuild) {
+    std::array<float, 512> snapshot{};
+    if (view == nullptr || !safe_copy_engine_view_snapshot(view, snapshot.data(), sizeof(snapshot))) {
+        return;
+    }
+    std::scoped_lock lock{g_engine_view_snapshot_mutex};
+    if (after_rebuild) {
+        g_engine_view_after_rebuild = snapshot;
+        g_engine_view_after_snapshot_present = present;
+    } else {
+        g_engine_view_before_hmd = snapshot;
+    }
+    g_engine_view_snapshot_present = present;
+}
+
+void record_world_marker_diagnostic(
+    int kind,
+    uint64_t present,
+    const WorldMarkerProjectionMetadata& metadata,
+    uint64_t matrix_hash,
+    void* camera,
+    void* stack,
+    const uint8_t* result) {
+    if (!g_config.world_marker_diagnostics) {
+        return;
+    }
+    const uint64_t ordinal = g_world_marker_diagnostic_write.fetch_add(
+        1, std::memory_order_relaxed);
+    auto& entry = g_world_marker_diagnostic_ring[
+        ordinal % kWorldMarkerDiagnosticRingSize];
+    const uint64_t writing_sequence = ordinal * 2 + 1;
+    entry.sequence.store(writing_sequence, std::memory_order_release);
+    entry.ordinal = ordinal;
+    entry.present = present;
+    entry.projection_present = metadata.present;
+    entry.pair_id = metadata.pair_id;
+    entry.projection_sequence = metadata.sequence;
+    entry.matrix_hash = matrix_hash;
+    entry.stack_hash = 0;
+    entry.camera = reinterpret_cast<uintptr_t>(camera);
+    entry.stack = reinterpret_cast<uintptr_t>(stack);
+    entry.thread = GetCurrentThreadId();
+    entry.kind = kind;
+    entry.projection_eye = metadata.eye;
+    entry.factory_eye = g_engine_factory_eye;
+    entry.render_eye = g_engine_render_eye;
+    entry.result_bits.fill(0);
+    __try {
+        if (stack != nullptr) {
+            entry.stack_hash = fnv1a64(stack, 64);
+        }
+        if (result != nullptr) {
+            memcpy(entry.result_bits.data(), result,
+                entry.result_bits.size() * sizeof(uint32_t));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        entry.stack_hash = UINT64_MAX;
+    }
+    entry.sequence.store(writing_sequence + 1, std::memory_order_release);
+}
+
+void dump_world_marker_diagnostic_ring(uint64_t current_present) {
+    if (!g_config.world_marker_diagnostics) {
+        return;
+    }
+    const uint64_t end = g_world_marker_diagnostic_write.load(
+        std::memory_order_acquire);
+    const uint64_t begin = end > 2048 ? end - 2048 : 0;
+    log_line(
+        "MARKER_RING_BEGIN trigger_present=%llu begin=%llu end=%llu count=%llu",
+        static_cast<unsigned long long>(current_present),
+        static_cast<unsigned long long>(begin),
+        static_cast<unsigned long long>(end),
+        static_cast<unsigned long long>(end - begin));
+    for (uint64_t ordinal = begin; ordinal < end; ++ordinal) {
+        auto& entry = g_world_marker_diagnostic_ring[
+            ordinal % kWorldMarkerDiagnosticRingSize];
+        const uint64_t expected_sequence = ordinal * 2 + 2;
+        const uint64_t sequence_before = entry.sequence.load(
+            std::memory_order_acquire);
+        if (sequence_before != expected_sequence || entry.ordinal != ordinal) {
+            continue;
+        }
+        const auto snapshot_result = entry.result_bits;
+        const uint64_t sequence_after = entry.sequence.load(
+            std::memory_order_acquire);
+        if (sequence_after != sequence_before) {
+            continue;
+        }
+        float result_values[4]{};
+        memcpy(result_values, snapshot_result.data(), sizeof(result_values));
+        log_line(
+            "MARKER_RING n=%llu kind=%d present=%llu projection_present=%llu "
+            "age=%lld pair=%llu projection_seq=%llu projection_eye=%d "
+            "factory_eye=%d render_eye=%d tid=%lu camera=%p stack=%p "
+            "stack_hash=%016llX matrix_hash=%016llX "
+            "result=%08X,%08X,%08X,%08X floats=%.6f,%.6f,%.6f,%.6f",
+            static_cast<unsigned long long>(entry.ordinal), entry.kind,
+            static_cast<unsigned long long>(entry.present),
+            static_cast<unsigned long long>(entry.projection_present),
+            entry.projection_present == UINT64_MAX
+                ? -1ll
+                : static_cast<long long>(entry.present - entry.projection_present),
+            static_cast<unsigned long long>(entry.pair_id),
+            static_cast<unsigned long long>(entry.projection_sequence),
+            entry.projection_eye, entry.factory_eye, entry.render_eye,
+            static_cast<unsigned long>(entry.thread),
+            reinterpret_cast<void*>(entry.camera),
+            reinterpret_cast<void*>(entry.stack),
+            static_cast<unsigned long long>(entry.stack_hash),
+            static_cast<unsigned long long>(entry.matrix_hash),
+            snapshot_result[0], snapshot_result[1],
+            snapshot_result[2], snapshot_result[3],
+            result_values[0], result_values[1],
+            result_values[2], result_values[3]);
+    }
+    log_line("MARKER_RING_END trigger_present=%llu",
+        static_cast<unsigned long long>(current_present));
+}
+
+void publish_packed_world_marker_camera(
+    const float* view,
+    uint64_t present) {
+    if (view == nullptr || g_config.openxr_mode != 4 ||
+        !g_engine_dual_gameplay_armed.load(std::memory_order_acquire) ||
+        g_engine_factory_eye != 1 || g_engine_producer_pair_id == 0) {
+        return;
+    }
+    auto& slot = g_packed_world_marker_camera;
+    slot.sequence.fetch_add(1, std::memory_order_acq_rel);
+    for (size_t index = 0; index < slot.view_bits.size(); ++index) {
+        uint32_t bits{};
+        memcpy(&bits, view + index, sizeof(bits));
+        slot.view_bits[index].store(bits, std::memory_order_relaxed);
+    }
+    uint32_t pitch_bits{};
+    uint32_t yaw_bits{};
+    uint32_t roll_bits{};
+    memcpy(&pitch_bits, &g_hmd_pitch_degrees, sizeof(pitch_bits));
+    memcpy(&yaw_bits, &g_hmd_yaw_degrees, sizeof(yaw_bits));
+    memcpy(&roll_bits, &g_hmd_roll_degrees, sizeof(roll_bits));
+    slot.hmd_pitch_bits.store(pitch_bits, std::memory_order_relaxed);
+    slot.hmd_yaw_bits.store(yaw_bits, std::memory_order_relaxed);
+    slot.hmd_roll_bits.store(roll_bits, std::memory_order_relaxed);
+    slot.present.store(present, std::memory_order_relaxed);
+    slot.pair_id.store(g_engine_producer_pair_id, std::memory_order_relaxed);
+    slot.sequence.fetch_add(1, std::memory_order_release);
+}
+
+bool load_packed_world_marker_camera(
+    std::array<float, kWorldMarkerCameraFloatCount>& view,
+    float& hmd_pitch,
+    float& hmd_yaw,
+    float& hmd_roll,
+    uint64_t& present,
+    uint64_t& pair_id) {
+    auto& slot = g_packed_world_marker_camera;
+    const uint64_t sequence_before = slot.sequence.load(std::memory_order_acquire);
+    if (sequence_before == 0 || (sequence_before & 1ull) != 0) {
+        return false;
+    }
+    for (size_t index = 0; index < slot.view_bits.size(); ++index) {
+        const uint32_t bits = slot.view_bits[index].load(std::memory_order_relaxed);
+        memcpy(view.data() + index, &bits, sizeof(bits));
+    }
+    const uint32_t pitch_bits =
+        slot.hmd_pitch_bits.load(std::memory_order_relaxed);
+    const uint32_t yaw_bits = slot.hmd_yaw_bits.load(std::memory_order_relaxed);
+    const uint32_t roll_bits = slot.hmd_roll_bits.load(std::memory_order_relaxed);
+    present = slot.present.load(std::memory_order_relaxed);
+    pair_id = slot.pair_id.load(std::memory_order_relaxed);
+    const uint64_t sequence_after = slot.sequence.load(std::memory_order_acquire);
+    if (sequence_after != sequence_before || (sequence_after & 1ull) != 0 ||
+        present == UINT64_MAX || pair_id == 0) {
+        return false;
+    }
+    memcpy(&hmd_pitch, &pitch_bits, sizeof(hmd_pitch));
+    memcpy(&hmd_yaw, &yaw_bits, sizeof(hmd_yaw));
+    memcpy(&hmd_roll, &roll_bits, sizeof(hmd_roll));
+    return true;
+}
+
+void publish_world_marker_projection(const float* projection, uint64_t present) {
+    if (projection == nullptr) {
+        return;
+    }
+
+    // Once packed stereo has armed, floating markers must consume one stable
+    // camera authority. The view factory publishes tagged left and right
+    // matrices in sequence, and an additional untagged rebuild can occur
+    // between pairs. Letting all three overwrite one Present-keyed slot made
+    // callbacks alternate from the right-eye projection to the next left-eye
+    // projection, producing the observed intermittent duplicate to the right.
+    // Eye 1 was already the normal last-writer authority; make that ordering
+    // explicit and retain its previous complete sample until the next tagged
+    // right eye arrives.
+    if (g_config.openxr_mode == 4 &&
+        g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
+        (g_engine_factory_eye != 1 || g_engine_producer_pair_id == 0)) {
+        WorldMarkerProjectionMetadata rejected_metadata{};
+        rejected_metadata.present = present;
+        rejected_metadata.pair_id = g_engine_producer_pair_id;
+        rejected_metadata.eye = g_engine_factory_eye;
+        record_world_marker_diagnostic(
+            3, present, rejected_metadata,
+            fnv1a64(projection, sizeof(float) * 16),
+            nullptr, nullptr, nullptr);
+        return;
+    }
+
+    auto& slot = g_world_marker_projection_slots[
+        present % kWorldMarkerProjectionSlotCount];
+    // The same engine Present can rebuild this descriptor more than once. A
+    // monotonic seqlock detects that ABA case as well as an ordinary overwrite,
+    // while keeping the HUD callback independent from the temporal/DLSS mutex.
+    slot.sequence.fetch_add(1, std::memory_order_acq_rel);
+    for (size_t index = 0; index < slot.matrix_bits.size(); ++index) {
+        uint32_t bits{};
+        memcpy(&bits, projection + index, sizeof(bits));
+        slot.matrix_bits[index].store(bits, std::memory_order_relaxed);
+    }
+    slot.present.store(present, std::memory_order_relaxed);
+    slot.pair_id.store(g_engine_producer_pair_id, std::memory_order_relaxed);
+    slot.eye.store(g_engine_factory_eye, std::memory_order_relaxed);
+    slot.sequence.fetch_add(1, std::memory_order_release);
+    WorldMarkerProjectionMetadata metadata{};
+    metadata.present = present;
+    metadata.pair_id = g_engine_producer_pair_id;
+    metadata.sequence = slot.sequence.load(std::memory_order_relaxed);
+    metadata.eye = g_engine_factory_eye;
+    record_world_marker_diagnostic(
+        0, present, metadata, fnv1a64(projection, sizeof(float) * 16),
+        nullptr, nullptr, nullptr);
+}
+
+bool load_world_marker_projection(
+    uint64_t current_present,
+    std::array<float, 16>& projection,
+    WorldMarkerProjectionMetadata* metadata) {
+    constexpr uint64_t kMaximumAge = 4;
+    for (uint64_t age = 0; age <= kMaximumAge && age <= current_present; ++age) {
+        const uint64_t candidate_present = current_present - age;
+        auto& slot = g_world_marker_projection_slots[
+            candidate_present % kWorldMarkerProjectionSlotCount];
+        const uint64_t sequence_before = slot.sequence.load(std::memory_order_acquire);
+        if ((sequence_before & 1ull) != 0 ||
+            slot.present.load(std::memory_order_relaxed) != candidate_present) {
+            continue;
+        }
+        for (size_t index = 0; index < slot.matrix_bits.size(); ++index) {
+            const uint32_t bits = slot.matrix_bits[index].load(std::memory_order_relaxed);
+            memcpy(projection.data() + index, &bits, sizeof(bits));
+        }
+        const uint64_t sequence_after = slot.sequence.load(std::memory_order_acquire);
+        if (sequence_after == sequence_before && (sequence_after & 1ull) == 0) {
+            if (metadata != nullptr) {
+                metadata->present = candidate_present;
+                metadata->pair_id = slot.pair_id.load(std::memory_order_relaxed);
+                metadata->sequence = sequence_after;
+                metadata->eye = slot.eye.load(std::memory_order_relaxed);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void __fastcall hook_engine_view_rebuild(float* view) {
+    constexpr uintptr_t kViewFactoryReturnRva = 0x0162196D;
+    constexpr float kCinemaProjectionAspect = 16.0f / 9.0f;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    const auto present = g_present_count.load();
+    const auto world_pipeline_present = g_gameplay_world_pipeline_present.load(
+        std::memory_order_relaxed);
+    const bool gameplay_pipeline_ready = world_pipeline_present != UINT64_MAX &&
+        present >= world_pipeline_present + 30;
+    const bool world_camera = caller_rva == kViewFactoryReturnRva &&
+        view != nullptr && view[7] != 0.0f &&
+        view[12] >= 0.02f && view[12] <= 0.25f &&
+        (view[13] > 6000.0f ||
+            (gameplay_pipeline_ready && view[13] >= 4999.0f));
+
+    const int projection_probe_remaining = g_projection_class_probe_remaining.load();
+    if (view != nullptr && projection_probe_remaining > 0 &&
+        g_projection_class_probe_remaining.fetch_sub(1) > 0) {
+        __try {
+            uint32_t viewport_width{};
+            uint32_t viewport_height{};
+            memcpy(&viewport_width, view + 0x102, sizeof(viewport_width));
+            memcpy(&viewport_height, view + 0x103, sizeof(viewport_height));
+            const auto* bytes = reinterpret_cast<const uint8_t*>(view);
+            log_line(
+                "Projection class present=%llu caller=0x%llX eye=%d kind=%s "
+                "pos=%.3f,%.3f,%.3f fov=%.3f aspect=%.4f scale=%.4f near=%.4f far=%.2f "
+                "alt_fov=%.3f flags=%u,%u,%u center=%.3f,%.3f viewport=%ux%u",
+                static_cast<unsigned long long>(present),
+                static_cast<unsigned long long>(caller_rva),
+                g_engine_factory_eye,
+                view[7] == 0.0f ? "ortho" : "perspective",
+                view[0], view[1], view[2], view[7], view[10], view[11], view[12], view[13],
+                view[0x11a], bytes[0x2B4], bytes[0x2B5], bytes[0x2B6],
+                view[0x100], view[0x101], viewport_width, viewport_height);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Projection class probe read fault present=%llu view=%p",
+                static_cast<unsigned long long>(present), view);
+        }
+    }
+
+    if (g_config.runtime_diagnostics && view != nullptr && caller_rva == kViewFactoryReturnRva &&
+        (present < 20 || present % 30 == 0) &&
+        g_engine_view_factory_last_logged_present.exchange(present) != present) {
+        __try {
+            float pose[20]{};
+            float basis[12]{};
+            memcpy(pose, view, sizeof(pose));
+            memcpy(basis, view + 0xA0, sizeof(basis));
+            log_line(
+                "Engine view factory present=%llu view=%p pos=%.4f,%.4f,%.4f p3=%.4f "
+                "transform=[%.4f,%.4f,%.4f,%.4f;%.4f,%.4f,%.4f,%.4f;%.4f,%.4f,%.4f,%.4f;%.4f,%.4f,%.4f,%.4f] "
+                "basis=%.4f,%.4f,%.4f / %.4f,%.4f,%.4f / %.4f,%.4f,%.4f",
+                static_cast<unsigned long long>(present), view,
+                pose[0], pose[1], pose[2], pose[3],
+                pose[4], pose[5], pose[6], pose[7],
+                pose[8], pose[9], pose[10], pose[11],
+                pose[12], pose[13], pose[14], pose[15],
+                pose[16], pose[17], pose[18], pose[19],
+                basis[0], basis[1], basis[2], basis[4], basis[5], basis[6],
+                basis[8], basis[9], basis[10]);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine view factory probe read fault present=%llu view=%p",
+                static_cast<unsigned long long>(present), view);
+        }
+    }
+
+    const bool force_2d_camera =
+        g_force_mono_cinema.load(std::memory_order_acquire);
+    const bool projection_probe_candidate =
+        caller_rva == kViewFactoryReturnRva &&
+        view != nullptr &&
+        view[7] > 0.1f &&
+        view[10] > 0.1f &&
+        view[12] > 0.0f &&
+        view[13] > view[12];
+    const float projection_aspect_before =
+        projection_probe_candidate ? view[10] : 0.0f;
+    const bool cinema_projection =
+        g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        projection_probe_candidate;
+    if (cinema_projection) {
+        // REDengine derives the horizontal field of view from this aspect and
+        // the authored vertical FOV. Keep the square render targets unchanged,
+        // but frame the active cinema route as its intended 16:9 shot. Cinema
+        // state already excludes gameplay, so do not depend on the transient
+        // factory-eye tag while REDengine constructs the locked camera.
+        view[10] = kCinemaProjectionAspect;
+    }
+    if (world_camera && !force_2d_camera && g_xr_views.size() >= 2) {
+        const auto& xr_fov = g_xr_views[0].fov;
+        const float left = tanf(xr_fov.angleLeft);
+        const float right = tanf(xr_fov.angleRight);
+        const float down = tanf(xr_fov.angleDown);
+        const float up = tanf(xr_fov.angleUp);
+        // presentation_scale controls the visible inset; render resolution only
+        // limits how much black guard band can physically fit in the swapchain.
+        float horizontal_scale = g_config.presentation_scale;
+        float vertical_scale = g_config.presentation_scale;
+        if (g_xr_eye_swapchains[0].width > 0 && g_xr_eye_swapchains[0].height > 0 &&
+            g_game_render_width > 0 && g_game_render_height > 0) {
+            horizontal_scale = std::max(horizontal_scale, std::clamp(
+                static_cast<float>(g_game_render_width) / g_xr_eye_swapchains[0].width,
+                0.01f, 1.0f));
+            vertical_scale = std::max(vertical_scale, std::clamp(
+                static_cast<float>(g_game_render_height) / g_xr_eye_swapchains[0].height,
+                0.01f, 1.0f));
+        }
+        const float horizontal_inset = (1.0f - horizontal_scale) * 0.5f;
+        const float vertical_inset = (1.0f - vertical_scale) * 0.5f;
+        const float active_left = left + (right - left) * horizontal_inset;
+        const float active_right = left + (right - left) * (1.0f - horizontal_inset);
+        const float active_down = down + (up - down) * vertical_inset;
+        const float active_up = down + (up - down) * (1.0f - vertical_inset);
+        const float fov_scale = g_config.hmd_freelook
+            ? g_hmd_fov_scale.load(std::memory_order_relaxed)
+            : 1.0f;
+        const float horizontal_span = (active_right - active_left) * fov_scale;
+        const float vertical_span = (active_up - active_down) * fov_scale;
+        const float vertical_fov = g_config.hmd_freelook
+            ? 2.0f * atanf(vertical_span * 0.5f)
+            : atanf(active_up) - atanf(active_down);
+        if (vertical_fov > 0.1f && vertical_span > 0.1f && horizontal_span > 0.1f) {
+            view[7] = vertical_fov * (180.0f / 3.14159265358979323846f);
+            view[10] = horizontal_span / vertical_span;
+            if (g_config.hmd_freelook) {
+                const float horizontal_half = atanf(horizontal_span * 0.5f);
+                const float vertical_half = vertical_fov * 0.5f;
+                g_hmd_render_fov_left.store(-horizontal_half);
+                g_hmd_render_fov_right.store(horizontal_half);
+                g_hmd_render_fov_up.store(vertical_half);
+                g_hmd_render_fov_down.store(-vertical_half);
+                g_hmd_render_fov_valid.store(true);
+            }
+        }
+    }
+
+    const bool render_right_eye = g_engine_factory_eye >= 0
+        ? g_engine_factory_eye == 1
+        : (present & 1ull) != 0;
+    if (!world_camera && caller_rva == kViewFactoryReturnRva && view != nullptr &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0) {
+        static std::atomic<uint32_t> rejected_world_camera_logs{};
+        if (rejected_world_camera_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+            log_line("HMD world camera rejected present=%llu factory_eye=%d fov=%.4f aspect=%.6f near=%.5f far=%.2f",
+                static_cast<unsigned long long>(present), g_engine_factory_eye,
+                view[7], view[10], view[12], view[13]);
+        }
+    }
+    if (world_camera && !force_2d_camera &&
+        g_engine_menu_state.load() == 0) {
+        const int camera_mode = g_camera_mode.load(std::memory_order_relaxed);
+        float forward_offset{};
+        float up_offset{};
+        if (camera_mode == 1) {
+            forward_offset = g_config.engine_close_camera_offset;
+        } else if (camera_mode == 2) {
+            forward_offset = g_config.engine_first_person_camera_offset +
+                g_config.engine_first_person_camera_eye_nudge;
+            up_offset = g_config.engine_first_person_camera_up_offset;
+        }
+        view[0] += view[0xA4] * forward_offset + view[0xA8] * up_offset;
+        view[1] += view[0xA5] * forward_offset + view[0xA9] * up_offset;
+        view[2] += view[0xA6] * forward_offset + view[0xAA] * up_offset;
+    }
+    // Build the same game/FOV/camera-mode view without HMD pose. Its vertical
+    // column is the factor-1 base; only the later HMD delta is amplified for
+    // world markers.
+    std::array<float, 512> world_marker_camera_view{};
+    bool world_marker_camera_valid = world_camera && !force_2d_camera &&
+        g_config.hmd_freelook && g_engine_menu_state.load() == 0 &&
+        safe_copy_engine_view_snapshot(
+            view, world_marker_camera_view.data(),
+            sizeof(world_marker_camera_view));
+    XrQuaternionf applied_hmd_orientation{0.0f, 0.0f, 0.0f, 1.0f};
+    XrVector3f applied_hmd_position{};
+    bool applied_hmd_pose_valid{};
+    std::array<float, 12> base_camera{};
+    bool base_camera_valid{};
+    if (world_camera && !force_2d_camera && g_config.hmd_freelook &&
+        g_engine_menu_state.load() == 0) {
+        capture_engine_view_snapshot(view, present, false);
+        const uint64_t activation = g_taau_differential_activation_present.load();
+        if (activation != UINT64_MAX && present >= activation + 30) {
+            capture_engine_original_temporal_matrix(view, present);
+        }
+    }
+    if (world_camera && !force_2d_camera && g_config.hmd_freelook &&
+        g_hmd_pose_valid.load() &&
+        g_engine_menu_state.load() == 0) {
+        base_camera = {
+            view[0], view[1], view[2],
+            view[0xA0], view[0xA1], view[0xA2],
+            view[0xA8], view[0xA9], view[0xAA],
+            view[0xA4], view[0xA5], view[0xA6]};
+        base_camera_valid = true;
+        const float original_pitch = view[5];
+        const float original_yaw = view[6];
+        const float original_roll = view[4];
+        if (!g_config.hmd_compositor_only) {
+            const float position_scale = g_config.hmd_position_scale;
+            const float local_right = g_hmd_position_x * position_scale;
+            const float local_up = g_hmd_position_y * position_scale;
+            const float local_forward = -g_hmd_position_z * position_scale;
+            const float right_length = sqrtf(
+                view[0xA0] * view[0xA0] + view[0xA1] * view[0xA1]);
+            const float forward_length = sqrtf(
+                view[0xA4] * view[0xA4] + view[0xA5] * view[0xA5]);
+            const float right_x = right_length > 0.0001f
+                ? view[0xA0] / right_length : 1.0f;
+            const float right_y = right_length > 0.0001f
+                ? view[0xA1] / right_length : 0.0f;
+            const float forward_x = forward_length > 0.0001f
+                ? view[0xA4] / forward_length : 0.0f;
+            const float forward_y = forward_length > 0.0001f
+                ? view[0xA5] / forward_length : 1.0f;
+            view[0] += right_x * local_right + forward_x * local_forward;
+            view[1] += right_y * local_right + forward_y * local_forward;
+            view[2] += local_up;
+            if (world_marker_camera_valid) {
+                world_marker_camera_view[0] +=
+                    right_x * local_right + forward_x * local_forward;
+                world_marker_camera_view[1] +=
+                    right_y * local_right + forward_y * local_forward;
+                world_marker_camera_view[2] += local_up;
+            }
+            if (g_config.hmd_lock_game_pitch &&
+                (g_hmd_game_pitch_lock_pending.exchange(false) ||
+                    !g_hmd_game_pitch_lock_valid)) {
+                g_hmd_game_pitch_lock = original_pitch;
+                g_hmd_game_pitch_lock_valid = true;
+                log_line("HMD game pitch locked value=%.4f present=%llu",
+                    g_hmd_game_pitch_lock,
+                    static_cast<unsigned long long>(present));
+            }
+            const float game_pitch = g_config.hmd_lock_game_pitch &&
+                    g_hmd_game_pitch_lock_valid
+                ? g_hmd_game_pitch_lock
+                : original_pitch;
+            // The scene no longer uses the live mouse pitch when pitch lock is
+            // enabled. Runtime bounds show that the marker needs half of the
+            // original game-pitch response: the fully live V416 base moved too
+            // much, while the fully locked V417 base moved too little.
+            if (world_marker_camera_valid) {
+                float game_pitch_delta = fmodf(
+                    original_pitch - game_pitch + 180.0f, 360.0f);
+                if (game_pitch_delta < 0.0f) {
+                    game_pitch_delta += 360.0f;
+                }
+                game_pitch_delta -= 180.0f;
+                if (g_config.world_marker_game_pitch_depth_enabled) {
+                    // REDengine's mouse-driven vertical orbit is a camera
+                    // translation, so reproduce the marker correction in
+                    // camera space. Projection then supplies the required
+                    // inverse-depth response for each world-space anchor.
+                    world_marker_camera_view[2] += game_pitch_delta *
+                        g_config.world_marker_game_pitch_depth_scale;
+                }
+                world_marker_camera_view[5] = game_pitch +
+                    (g_config.world_marker_game_pitch_depth_enabled
+                        ? 0.0f
+                        : game_pitch_delta *
+                            g_config.world_marker_game_pitch_gain) +
+                    g_hmd_pitch_degrees * g_config.hmd_pitch_scale *
+                        g_config.world_marker_hmd_vertical_gain;
+                world_marker_camera_view[6] +=
+                    g_hmd_yaw_degrees * g_config.hmd_yaw_scale;
+                world_marker_camera_view[4] +=
+                    g_hmd_roll_degrees * g_config.hmd_roll_scale;
+            }
+            view[5] = game_pitch +
+                g_hmd_pitch_degrees * g_config.hmd_pitch_scale;
+            view[6] += g_hmd_yaw_degrees * g_config.hmd_yaw_scale;
+            view[4] += g_hmd_roll_degrees * g_config.hmd_roll_scale;
+            applied_hmd_orientation = quaternion_from_hmd_euler(
+                g_hmd_pitch_degrees * g_config.hmd_pitch_scale,
+                g_hmd_yaw_degrees * g_config.hmd_yaw_scale,
+                g_hmd_roll_degrees * g_config.hmd_roll_scale);
+            applied_hmd_position = {local_right, local_up, local_forward};
+            applied_hmd_pose_valid = true;
+        }
+        if (g_config.engine_view_probe && present % 30 == 0) {
+            log_line("HMD camera apply present=%llu pos=%.4f,%.4f,%.4f roll=%.4f->%.4f pitch=%.4f->%.4f yaw=%.4f->%.4f rotation=%.4f,%.4f,%.4f translation=%.4f,%.4f,%.4f fov=%.4f aspect=%.6f near=%.4f far=%.1f",
+                static_cast<unsigned long long>(present),
+                view[0], view[1], view[2], original_roll, view[4],
+                original_pitch, view[5], original_yaw, view[6],
+                g_hmd_roll_degrees, g_hmd_pitch_degrees, g_hmd_yaw_degrees,
+                g_hmd_position_x, g_hmd_position_y, g_hmd_position_z,
+                view[7], view[10], view[12], view[13]);
+        }
+    }
+    const bool native_projection_ready = g_config.engine_native_projection_shift &&
+        (!g_engine_dual_render_active.load() ||
+            present > g_dual_render_activation_present.load() + 300);
+    if (world_camera && !force_2d_camera && native_projection_ready &&
+        g_game_render_width > 0 && g_game_render_height > 0) {
+        view[0x100] = render_right_eye
+            ? static_cast<float>(g_config.engine_native_projection_shift_px)
+            : -static_cast<float>(g_config.engine_native_projection_shift_px);
+        view[0x101] = 0.0f;
+        view[0x102] = static_cast<float>(g_game_render_width);
+        view[0x103] = static_cast<float>(g_game_render_height);
+        if (world_marker_camera_valid) {
+            world_marker_camera_view[0x100] = view[0x100];
+            world_marker_camera_view[0x101] = view[0x101];
+            world_marker_camera_view[0x102] = view[0x102];
+            world_marker_camera_view[0x103] = view[0x103];
+        }
+    }
+    if (!force_2d_camera &&
+        (world_camera || (view != nullptr && caller_rva == kViewFactoryReturnRva &&
+            g_engine_factory_eye >= 0)) &&
+        (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
+        g_config.engine_factory_stereo_offset != 0.0f) {
+        __try {
+            // Keep the original camera at the cyclopean center and distribute
+            // the configured eye separation symmetrically around it. Rebuild a
+            // private descriptor first: view[0xA0..] still contains the basis
+            // from before HMD yaw/pitch/roll until the real rebuild below.
+            std::array<float, 512> stereo_basis_view{};
+            const float* stereo_right = view + 0xA0;
+            if (safe_copy_engine_view_snapshot(
+                    view, stereo_basis_view.data(), sizeof(stereo_basis_view)) &&
+                safe_rebuild_shadow_view(stereo_basis_view.data())) {
+                stereo_right = stereo_basis_view.data() + 0xA0;
+            }
+            const float offset = g_config.engine_factory_stereo_offset *
+                (render_right_eye ? 0.5f : -0.5f);
+            view[0] += stereo_right[0] * offset;
+            view[1] += stereo_right[1] * offset;
+            view[2] += stereo_right[2] * offset;
+            if (world_marker_camera_valid) {
+                world_marker_camera_view[0] +=
+                    stereo_right[0] * offset;
+                world_marker_camera_view[1] +=
+                    stereo_right[1] * offset;
+                world_marker_camera_view[2] +=
+                    stereo_right[2] * offset;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log_line("Engine factory stereo write fault present=%llu view=%p",
+                static_cast<unsigned long long>(present), view);
+        }
+    }
+
+    if (world_marker_camera_valid) {
+        world_marker_camera_valid =
+            safe_rebuild_shadow_view(world_marker_camera_view.data());
+        if (world_marker_camera_valid) {
+            publish_packed_world_marker_camera(
+                world_marker_camera_view.data(), present);
+        }
+    }
+
+    g_engine_view_rebuild(view);
+
+    if (projection_probe_candidate &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        (g_cinema_mode_active.load(std::memory_order_relaxed) ||
+            !world_camera)) {
+        static std::atomic<uint64_t> last_projection_probe_present{UINT64_MAX};
+        if (last_projection_probe_present.exchange(
+                present, std::memory_order_relaxed) != present) {
+            const auto* projection = view + 0x80;
+            const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
+                std::memory_order_relaxed);
+            const uint64_t camera_age =
+                last_hmd_camera != UINT64_MAX && present >= last_hmd_camera
+                ? present - last_hmd_camera
+                : UINT64_MAX;
+            log_line(
+                "V592 cinema view present=%llu cinema=%d world=%d applied=%d "
+                "eye=%d fov=%.4f aspect=%.6f->%.6f near=%.5f far=%.2f "
+                "last_hmd=%llu age=%llu projection=%.7f,%.7f,%.7f,%.7f",
+                static_cast<unsigned long long>(present),
+                g_cinema_mode_active.load(std::memory_order_relaxed) ? 1 : 0,
+                world_camera ? 1 : 0,
+                cinema_projection ? 1 : 0,
+                g_engine_factory_eye,
+                view[7], projection_aspect_before, view[10],
+                view[12], view[13],
+                static_cast<unsigned long long>(last_hmd_camera),
+                static_cast<unsigned long long>(camera_age),
+                projection[0], projection[5], projection[10], projection[15]);
+        }
+    }
+
+    if (world_camera && !force_2d_camera && g_config.hmd_freelook &&
+        g_engine_menu_state.load() == 0) {
+        std::array<float, 16> world_marker_projection{};
+        memcpy(world_marker_projection.data(), view + 0x80,
+            sizeof(world_marker_projection));
+        if (world_marker_camera_valid) {
+            const float* marker_projection =
+                world_marker_camera_view.data() + 0x80;
+            for (size_t row = 0; row < 4; ++row) {
+                const size_t index = row * 4 + 1;
+                world_marker_projection[index] = marker_projection[index];
+            }
+        }
+        publish_world_marker_projection(world_marker_projection.data(), present);
+        capture_engine_view_snapshot(view, present, true);
+        if (applied_hmd_pose_valid) {
+            const auto previous_hmd_camera_present =
+                g_engine_hmd_camera_last_present.exchange(
+                    present, std::memory_order_relaxed);
+            if (previous_hmd_camera_present == UINT64_MAX ||
+                present > previous_hmd_camera_present + 8) {
+                log_line("HMD camera route resumed present=%llu previous=%llu view=%p factory_eye=%d fov=%.4f aspect=%.6f near=%.5f far=%.2f",
+                    static_cast<unsigned long long>(present),
+                    static_cast<unsigned long long>(previous_hmd_camera_present),
+                    view, g_engine_factory_eye, view[7], view[10], view[12], view[13]);
+            }
+            g_engine_dual_gameplay_armed.store(true, std::memory_order_relaxed);
+        }
+        if ((g_config.streamline_taau_bridge ||
+                g_taau_force_matrix_fallback.load() ||
+                g_taau_matrix_warmup_active.load(std::memory_order_relaxed)) &&
+            applied_hmd_pose_valid &&
+            base_camera_valid) {
+            capture_engine_corrected_temporal_matrix(
+                view, present, applied_hmd_orientation, applied_hmd_position,
+                base_camera);
+        }
+    }
+
+    if (world_camera && !force_2d_camera && g_config.hmd_freelook &&
+        g_engine_menu_state.load() == 0) {
+        __try {
+            g_engine_hmd_forward_x.store(view[0xA4]);
+            g_engine_hmd_forward_y.store(view[0xA5]);
+            g_engine_hmd_forward_z.store(view[0xA6]);
+            g_engine_hmd_forward_valid.store(true);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_engine_hmd_forward_valid.store(false);
+        }
+    }
+}
+
+void __fastcall hook_engine_camera_direction(void* camera, void* stack, float* result) {
+    g_engine_camera_direction(camera, stack, result);
+    if (result == nullptr || !g_config.hmd_freelook ||
+        g_force_mono_cinema.load(std::memory_order_acquire) ||
+        !g_engine_hmd_forward_valid.load()) {
+        return;
+    }
+
+    const uint64_t present = g_present_count.load();
+    const uint64_t crosshair_present = g_aim_crosshair_last_present.load();
+    if (crosshair_present == UINT64_MAX || present < crosshair_present ||
+        present - crosshair_present > 4) {
+        return;
+    }
+
+    const float x = g_engine_hmd_forward_x.load();
+    const float y = g_engine_hmd_forward_y.load();
+    const float z = g_engine_hmd_forward_z.load();
+    const float length = sqrtf(x * x + y * y + z * z);
+    if (length < 0.001f) {
+        return;
+    }
+    __try {
+        const float old_x = result[0];
+        const float old_y = result[1];
+        const float old_z = result[2];
+        result[0] = x / length;
+        result[1] = y / length;
+        result[2] = z / length;
+        result[3] = 0.0f;
+        if (g_config.runtime_diagnostics && g_aim_direction_log_count.fetch_add(1) < 40) {
+            log_line("Aim direction override present=%llu source=%.4f,%.4f,%.4f hmd=%.4f,%.4f,%.4f",
+                static_cast<unsigned long long>(present), old_x, old_y, old_z,
+                result[0], result[1], result[2]);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_line("Aim direction override write fault result=%p", result);
+    }
+}
+
+void install_engine_camera_direction_hook() {
+    if (!g_config.hmd_freelook || g_engine_camera_direction != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineCameraDirectionRva = 0x0161BBC0;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineCameraDirectionRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_camera_direction),
+            reinterpret_cast<void**>(&g_engine_camera_direction)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Hooked CameraDirector.GetCameraDirection RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineCameraDirectionRva), target);
+    } else {
+        log_line("Failed CameraDirector.GetCameraDirection hook target=%p", target);
+    }
+}
+
+void __fastcall hook_engine_world_vector_to_view_ratio(
+    void* camera,
+    void* stack,
+    uint8_t* result) {
+    const uint64_t present = g_present_count.load(std::memory_order_relaxed);
+    if (camera == nullptr || !g_config.hmd_freelook ||
+        g_force_mono_cinema.load(std::memory_order_acquire) ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0) {
+        g_engine_world_vector_to_view_ratio(camera, stack, result);
+        record_world_marker_diagnostic(
+            2, present, {}, 0, camera, stack, result);
+        return;
+    }
+
+    std::array<float, 16> hmd_view_projection{};
+    WorldMarkerProjectionMetadata projection_metadata{};
+    // The rebuilt world-view descriptor stores world-to-clip at float offset
+    // 0x80. Read its dedicated published copy; do not serialize HUD projection
+    // against the temporal snapshot consumed by DLSS/TAAU.
+    const bool projection_valid = load_world_marker_projection(
+        present, hmd_view_projection, &projection_metadata);
+
+    if (projection_valid && g_config.openxr_mode == 4 &&
+        g_engine_dual_gameplay_armed.load(std::memory_order_acquire)) {
+        std::array<float, kWorldMarkerCameraFloatCount> extrapolated_view{};
+        float published_pitch{};
+        float published_yaw{};
+        float published_roll{};
+        uint64_t camera_present{};
+        uint64_t camera_pair{};
+        if (load_packed_world_marker_camera(
+                extrapolated_view,
+                published_pitch,
+                published_yaw,
+                published_roll,
+                camera_present,
+                camera_pair)) {
+            auto shortest_angle_delta = [](float current, float previous) {
+                float delta = fmodf(current - previous + 180.0f, 360.0f);
+                if (delta < 0.0f) {
+                    delta += 360.0f;
+                }
+                return delta - 180.0f;
+            };
+            // Packed DLSS retains this producer image and later submits it
+            // with the XrView metadata captured for the same pair. Applying a
+            // newer live HMD pose here bakes a variable 1-3-Present lead into
+            // the marker before OpenXR performs its own reprojection. Keep the
+            // exact producer-pair pose for DLSS Packed. No-AA and TAAU retain
+            // the validated V498 live extrapolation.
+            if (!temporal_backend_is_dlss_packed()) {
+                const float pitch_delta = shortest_angle_delta(
+                    g_hmd_pitch_degrees, published_pitch);
+                const float yaw_delta = shortest_angle_delta(
+                    g_hmd_yaw_degrees, published_yaw);
+                const float roll_delta = shortest_angle_delta(
+                    g_hmd_roll_degrees, published_roll);
+                extrapolated_view[5] += pitch_delta * g_config.hmd_pitch_scale *
+                    g_config.world_marker_hmd_vertical_gain;
+                extrapolated_view[6] += yaw_delta * g_config.hmd_yaw_scale;
+                extrapolated_view[4] += roll_delta * g_config.hmd_roll_scale;
+            }
+            if (safe_rebuild_shadow_view(extrapolated_view.data())) {
+                memcpy(
+                    hmd_view_projection.data(),
+                    extrapolated_view.data() + 0x80,
+                    sizeof(hmd_view_projection));
+                projection_metadata.present = camera_present;
+                projection_metadata.pair_id = camera_pair;
+                projection_metadata.eye = 1;
+            }
+        }
+    }
+
+    if (projection_valid && g_config.world_marker_vertical_offset_ndc != 0.0f) {
+        // REDengine uses row-vector world-to-clip matrices here. Adding a
+        // fraction of clip W to the vertical clip column creates a constant
+        // post-perspective screen-space lift, independent of marker depth.
+        for (size_t row = 0; row < 4; ++row) {
+            hmd_view_projection[row * 4 + 1] +=
+                g_config.world_marker_vertical_offset_ndc *
+                hmd_view_projection[row * 4 + 3];
+        }
+    }
+
+    alignas(16) uint8_t camera_shadow[0x320]{};
+    if (!projection_valid || !safe_copy_engine_view_snapshot(
+            static_cast<float*>(camera),
+            reinterpret_cast<float*>(camera_shadow),
+            sizeof(camera_shadow))) {
+        g_engine_world_vector_to_view_ratio(camera, stack, result);
+        record_world_marker_diagnostic(
+            2, present, projection_metadata, 0, camera, stack, result);
+        return;
+    }
+
+    // The native callback reads world-to-clip from camera+0x2E0. Keep the
+    // shared CameraDirector immutable and project through a private clone.
+    memcpy(camera_shadow + 0x2E0,
+        hmd_view_projection.data(), sizeof(hmd_view_projection));
+    g_engine_world_vector_to_view_ratio(camera_shadow, stack, result);
+    record_world_marker_diagnostic(
+        1, present, projection_metadata,
+        fnv1a64(hmd_view_projection.data(), sizeof(hmd_view_projection)),
+        camera, stack, result);
+}
+
+void install_engine_world_vector_to_view_ratio_hook() {
+    if (!g_config.hmd_freelook ||
+        g_engine_world_vector_to_view_ratio != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kWorldVectorToViewRatioRva = 0x0161BDA0;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kWorldVectorToViewRatioRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_engine_world_vector_to_view_ratio),
+            reinterpret_cast<void**>(&g_engine_world_vector_to_view_ratio)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Hooked CameraDirector.WorldVectorToViewRatio RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kWorldVectorToViewRatioRva), target);
+    } else {
+        log_line("Failed CameraDirector.WorldVectorToViewRatio hook target=%p", target);
+    }
+}
+
+void install_engine_view_factory_probe() {
+    if ((!g_config.engine_view_factory_probe && g_config.engine_factory_stereo_offset == 0.0f) ||
+        g_engine_view_rebuild != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineViewRebuildRva = 0x015FE550;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineViewRebuildRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_view_rebuild),
+            reinterpret_cast<void**>(&g_engine_view_rebuild)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine view factory probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineViewRebuildRva), target);
+    } else {
+        log_line("Engine view factory probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineViewRebuildRva), target);
+    }
+}
+
+void poll_engine_menu_state() {
+    auto* gui_manager = g_engine_gui_manager.load();
+    if (gui_manager == nullptr) {
+        return;
+    }
+
+    __try {
+        auto** vtable = *static_cast<void***>(gui_manager);
+        auto is_any_menu = reinterpret_cast<bool(__fastcall*)(void*)>(vtable[0x1E0 / sizeof(void*)]);
+        const int menu_open = is_any_menu(gui_manager) ? 1 : 0;
+        const int previous = g_engine_menu_state.exchange(menu_open);
+        if (menu_open != 0) {
+            g_engine_dual_gameplay_armed.store(false, std::memory_order_relaxed);
+        }
+        if (previous != menu_open) {
+            log_line("REDengine menu state polled open=%d gui_manager=%p present=%llu",
+                menu_open, gui_manager,
+                static_cast<unsigned long long>(g_present_count.load()));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void apply_engine_dual_render_transition(bool enabled, const char* source) {
+    if (g_engine_dual_render_active.load() == enabled) {
+        return;
+    }
+
+    const auto present = g_present_count.load();
+    const auto generation = g_streamline_capture_generation.fetch_add(1) + 1;
+    g_streamline_capture_latest_slot[0].store(UINT32_MAX);
+    g_streamline_capture_latest_slot[1].store(UINT32_MAX);
+    g_stereo_eye_cache_view_valid[0] = false;
+    g_stereo_eye_cache_view_valid[1] = false;
+    g_packed_present_cache_valid = false;
+    g_packed_present_cache_view_valid[0] = false;
+    g_packed_present_cache_view_valid[1] = false;
+    g_packed_pending_pair_id[0] = 0;
+    g_packed_pending_pair_id[1] = 0;
+    g_packed_accepted_pair_id = 0;
+    g_packed_accepted_pair_signal.store(0, std::memory_order_release);
+    g_engine_pair_completed_signal.store(0, std::memory_order_release);
+    g_engine_pair_captured_signal.store(0, std::memory_order_release);
+    g_packed_last_accepted_present = UINT64_MAX;
+    g_packed_runtime_ready.store(false, std::memory_order_relaxed);
+    g_packed_eye_version[0] = 0;
+    g_packed_eye_version[1] = 0;
+    g_packed_submitted_version[0] = 0;
+    g_packed_submitted_version[1] = 0;
+    g_streamline_output_frame = {};
+    {
+        std::scoped_lock lock{g_engine_dual_frame_mutex};
+        g_engine_dual_frame_eyes.clear();
+    }
+    {
+        std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+        g_engine_completed_tag_queue.clear();
+    }
+    {
+        std::scoped_lock lock{g_streamline_command_list_eye_mutex};
+        g_streamline_command_list_routes.clear();
+    }
+    g_packed_transition_ordered_recovery_active.store(
+        false, std::memory_order_release);
+    g_packed_transition_replayed_pair.store(
+        UINT64_MAX, std::memory_order_release);
+    g_packed_transition_pending_eye0_pair.store(
+        UINT64_MAX, std::memory_order_release);
+    g_packed_transition_pending_eye0_final_route_pair.store(
+        UINT64_MAX, std::memory_order_release);
+    {
+        // Evaluation and publication already serialize through this mutex.
+        // Reset the complete packed transaction under the same ownership so
+        // an evaluation from the previous capture generation cannot re-arm a
+        // stale output after the transition has cleared it.
+        std::scoped_lock packed_lock{g_packed_dlss_mutex};
+        g_packed_dlss_first_inputs = {};
+        g_packed_dlss_first_eye = UINT32_MAX;
+        g_packed_dlss_pair_id = UINT64_MAX;
+        g_packed_dlss_first_ready = false;
+        g_packed_dlss_pending_pair.store(
+            UINT64_MAX, std::memory_order_release);
+        g_packed_dlss_output_pending_pair.store(
+            UINT64_MAX, std::memory_order_relaxed);
+        g_packed_dlss_output_pending_publish.store(
+            false, std::memory_order_release);
+        g_packed_dlss_last_published_pair.store(
+            0, std::memory_order_release);
+        {
+            std::scoped_lock history_lock{g_streamline_mvec_mutex};
+            for (auto& commit : g_packed_dlss_camera_commit_slots) {
+                commit = {};
+            }
+        }
+        std::scoped_lock present_lock{g_packed_dlss_present_mutex};
+        g_packed_dlss_collect_metadata = {};
+        g_packed_dlss_next_metadata = {};
+        g_packed_dlss_active_metadata = {};
+        g_packed_dlss_capture_cycle_pair = UINT64_MAX;
+        g_packed_dlss_capture_cycle_mask = 0;
+    }
+    {
+        std::scoped_lock lock{g_engine_pair_completion_mutex};
+        g_engine_pair_completion_masks.clear();
+    }
+    {
+        std::scoped_lock lock{g_engine_pair_capture_mutex};
+        g_engine_pair_capture_masks.clear();
+    }
+    {
+        std::scoped_lock lock{g_packed_temporal_preparation_mutex};
+        g_packed_temporal_preparation_masks.clear();
+    }
+    g_packed_temporal_preparation_cv.notify_all();
+    g_engine_factory_eye = -1;
+    g_engine_render_eye = -1;
+    g_engine_render_generation = 0;
+    g_engine_render_pair_id = 0;
+    g_engine_pair_retry_present.store(0, std::memory_order_relaxed);
+    g_engine_hmd_camera_last_present.store(UINT64_MAX, std::memory_order_relaxed);
+    g_cinema_mode_active.store(false, std::memory_order_relaxed);
+    g_engine_last_packed_pair_present.store(UINT64_MAX, std::memory_order_relaxed);
+    g_engine_packed_factory_throttle_logs.store(0, std::memory_order_relaxed);
+    g_engine_completed_eye.store(-1);
+    g_engine_completed_generation.store(0);
+    g_engine_completed_pair_id.store(0);
+    g_engine_completed_consumed_serial = g_engine_completed_serial.load();
+    g_engine_completed_view_mutex.lock();
+    g_engine_completed_view = {XR_TYPE_VIEW};
+    g_engine_completed_view_valid = false;
+    g_engine_completed_view_mutex.unlock();
+    {
+        std::scoped_lock lock{g_streamline_mvec_mutex};
+        g_streamline_mvec_temporal_frames.clear();
+        g_streamline_dlss_previous_camera_valid[0] = false;
+        g_streamline_dlss_previous_camera_valid[1] = false;
+    }
+    g_streamline_dual_capture_sequence.store(0);
+    g_streamline_dual_evaluate_log_count.store(0);
+    g_taau_packed_core_prearmed.store(
+        (temporal_backend_is_taau() || temporal_backend_is_dlss()) && enabled &&
+            g_config.openxr_mode == 4 && reverse_enabled(),
+        std::memory_order_relaxed);
+    update_taau_hot_hook_state();
+    g_engine_dual_render_active.store(enabled);
+
+    if (enabled) {
+        g_dual_render_activation_present.store(present);
+        install_engine_frame_builder_probe();
+        install_engine_gameplay_entry_probe();
+        install_engine_render_scene_setup_probe();
+        install_streamline_resource_barrier_probe();
+    }
+    log_line("Engine dual render %s by %s at safe Present boundary present=%llu generation=%u",
+        enabled ? "enabled" : "disabled", source,
+        static_cast<unsigned long long>(present), generation);
+}
+
+size_t copy_readable_scene_descriptor(
+    std::vector<uint8_t>& destination, const void* source, size_t requested_bytes) {
+    destination.assign(requested_bytes, 0);
+    if (source == nullptr || requested_bytes == 0) {
+        return 0;
+    }
+
+    size_t copied_bytes{};
+    const auto source_address = reinterpret_cast<uintptr_t>(source);
+    while (copied_bytes < requested_bytes) {
+        const auto cursor = source_address + copied_bytes;
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory,
+                sizeof(memory)) == 0 ||
+            memory.State != MEM_COMMIT ||
+            (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            break;
+        }
+        const auto region_end = reinterpret_cast<uintptr_t>(memory.BaseAddress) +
+            memory.RegionSize;
+        if (region_end <= cursor) {
+            break;
+        }
+        const size_t chunk_bytes = std::min(
+            requested_bytes - copied_bytes,
+            static_cast<size_t>(region_end - cursor));
+        bool copied_chunk{};
+        __try {
+            memcpy(destination.data() + copied_bytes,
+                reinterpret_cast<const void*>(cursor), chunk_bytes);
+            copied_chunk = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            copied_chunk = false;
+        }
+        if (!copied_chunk) {
+            break;
+        }
+        copied_bytes += chunk_bytes;
+    }
+    return copied_bytes;
+}
+
+void* __fastcall hook_engine_frame_data_factory(void* render_context, void* render_settings, void* scene_descriptor) {
+    prepare_openxr_render_frame();
+    poll_engine_menu_state();
+    const auto present = g_present_count.load();
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
+    constexpr size_t kSceneDescriptorBytes = 0xC000;
+    constexpr size_t kSceneDescriptorMinimumBytes = 0xB000;
+    std::vector<uint8_t>* right_scene_descriptor{};
+    const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
+        std::memory_order_relaxed);
+    const bool hmd_camera_recent = last_hmd_camera != UINT64_MAX &&
+        present >= last_hmd_camera && present - last_hmd_camera <= 8;
+    const bool dual_render_auto_ready = g_config.engine_dual_render_start &&
+        hmd_camera_recent && render_context != nullptr && render_settings != nullptr &&
+        scene_descriptor != nullptr;
+    if (g_config.engine_dual_render_probe && !g_engine_dual_render_active.load() &&
+        dual_render_auto_ready && !g_dual_render_auto_start_consumed.exchange(true)) {
+        g_engine_dual_render_requested.store(1);
+        log_line("Engine dual render INI auto-start queued present=%llu",
+            static_cast<unsigned long long>(present));
+    }
+
+    bool duplicate_render = g_engine_dual_render_active.load() &&
+        g_engine_dual_gameplay_armed.load(std::memory_order_relaxed) &&
+        !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        present >= g_engine_pair_retry_present.load(std::memory_order_relaxed) &&
+        scene_descriptor != nullptr;
+    if (duplicate_render && g_config.openxr_mode == 4) {
+        auto last_present = g_engine_last_packed_pair_present.load(
+            std::memory_order_relaxed);
+        bool cadence_claimed{};
+        while (last_present == UINT64_MAX ||
+               (present > last_present && present - last_present >= 2)) {
+            if (g_engine_last_packed_pair_present.compare_exchange_weak(
+                    last_present, present, std::memory_order_relaxed)) {
+                cadence_claimed = true;
+                break;
+            }
+        }
+        if (!cadence_claimed) {
+            duplicate_render = false;
+            if (g_engine_packed_factory_throttle_logs.fetch_add(
+                    1, std::memory_order_relaxed) < 4) {
+                log_line("Packed factory burst throttled present=%llu last_pair_present=%llu",
+                    static_cast<unsigned long long>(present),
+                    static_cast<unsigned long long>(last_present));
+            }
+        }
+    }
+    if (duplicate_render) {
+        right_scene_descriptor = &g_engine_dual_scene_descriptors[
+            present % g_engine_dual_scene_descriptors.size()];
+        const auto copied_bytes = copy_readable_scene_descriptor(
+            *right_scene_descriptor, scene_descriptor, kSceneDescriptorBytes);
+        if (copied_bytes == 0) {
+            log_line("Engine dual render skipped unreadable scene descriptor=%p present=%llu",
+                scene_descriptor, static_cast<unsigned long long>(present));
+            right_scene_descriptor = nullptr;
+        } else if (copied_bytes < kSceneDescriptorMinimumBytes) {
+            static std::atomic<uint32_t> truncated_copy_log_count{};
+            if (truncated_copy_log_count.fetch_add(1) < 8) {
+                log_line("Engine dual render skipped truncated scene descriptor source=%p copied=0x%zX requested=0x%zX present=%llu",
+                    scene_descriptor, copied_bytes, kSceneDescriptorBytes,
+                    static_cast<unsigned long long>(present));
+            }
+            right_scene_descriptor = nullptr;
+        } else if (copied_bytes < kSceneDescriptorBytes) {
+            static std::atomic<uint32_t> padded_copy_log_count{};
+            if (padded_copy_log_count.fetch_add(1) < 8) {
+                log_line("Engine dual render zero-padded scene descriptor source=%p copied=0x%zX padded=0x%zX present=%llu",
+                    scene_descriptor, copied_bytes, kSceneDescriptorBytes - copied_bytes,
+                    static_cast<unsigned long long>(present));
+            }
+        }
+        if (right_scene_descriptor == nullptr) {
+            duplicate_render = false;
+        }
+    }
+
+    const bool tag_mono_frame = g_config.openxr_mode == 2 &&
+        hmd_camera_recent &&
+        !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        render_context != nullptr && render_settings != nullptr &&
+        scene_descriptor != nullptr;
+    const uint64_t pair_id = duplicate_render || tag_mono_frame
+        ? g_engine_pair_sequence.fetch_add(1, std::memory_order_relaxed) + 1
+        : 0;
+    if (duplicate_render || tag_mono_frame) {
+        g_engine_producer_pair_id = pair_id;
+    }
+    if (duplicate_render) {
+        static std::atomic<uint32_t> factory_pair_logs{};
+        if (factory_pair_logs.fetch_add(1) < 12) {
+            log_line("Packed factory pair created pair=%llu tid=%lu present=%llu",
+                static_cast<unsigned long long>(pair_id),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(present));
+        }
+    }
+
+    const int previous_eye = g_engine_factory_eye;
+    const int primary_eye = g_config.engine_taau_reverse_eye_order ? 1 : 0;
+    const int duplicate_eye = 1 - primary_eye;
+    if (duplicate_render) {
+        g_engine_factory_eye = primary_eye;
+    }
+    void* result = g_engine_frame_data_factory(render_context, render_settings, scene_descriptor);
+    g_engine_factory_eye = previous_eye;
+
+    if (tag_mono_frame && result != nullptr) {
+        EngineFrameTag tag{};
+        tag.eye = 0;
+        tag.generation = g_streamline_capture_generation.load();
+        tag.pair_id = pair_id;
+        if (g_hmd_pose_valid.load() && g_xr_views.size() >= 2) {
+            tag.render_view = g_xr_views[0];
+            tag.render_view.pose.position = {
+                (g_xr_views[0].pose.position.x +
+                    g_xr_views[1].pose.position.x) * 0.5f -
+                    g_mono_neck_pose_correction.x,
+                (g_xr_views[0].pose.position.y +
+                    g_xr_views[1].pose.position.y) * 0.5f -
+                    g_mono_neck_pose_correction.y,
+                (g_xr_views[0].pose.position.z +
+                    g_xr_views[1].pose.position.z) * 0.5f -
+                    g_mono_neck_pose_correction.z};
+            tag.render_view_valid = true;
+        }
+        g_engine_dual_frame_mutex.lock();
+        if (g_engine_dual_frame_eyes.size() > 1024) {
+            g_engine_dual_frame_eyes.clear();
+        }
+        g_engine_dual_frame_eyes[result] = tag;
+        g_engine_dual_frame_mutex.unlock();
+        static std::atomic<uint32_t> mono_factory_tag_logs{};
+        if (mono_factory_tag_logs.fetch_add(1) < 16) {
+            log_line(
+                "Mono route factory tag frame=%p id=%llu generation=%u valid=%d "
+                "tid=%lu present=%llu",
+                result, static_cast<unsigned long long>(tag.pair_id),
+                tag.generation, tag.render_view_valid ? 1 : 0,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(present));
+        }
+    }
+
+    if (duplicate_render && right_scene_descriptor != nullptr) {
+        if (result != nullptr) {
+            std::scoped_lock lock{g_engine_dual_frame_mutex};
+            if (g_engine_dual_frame_eyes.size() > 1024) {
+                g_engine_dual_frame_eyes.clear();
+            }
+            EngineFrameTag tag{};
+            tag.eye = static_cast<uint32_t>(primary_eye);
+            tag.generation = g_streamline_capture_generation.load();
+            tag.pair_id = pair_id;
+            if (g_hmd_pose_valid.load() &&
+                g_xr_views.size() > static_cast<size_t>(primary_eye)) {
+                tag.render_view = g_config.hmd_compositor_only
+                    ? g_hmd_center_views[primary_eye]
+                    : g_xr_views[primary_eye];
+                tag.render_view_valid = true;
+            }
+            g_engine_dual_frame_eyes[result] = tag;
+        }
+
+        g_engine_factory_eye = duplicate_eye;
+        void* right_frame_data = g_engine_frame_data_factory(
+            render_context, render_settings, right_scene_descriptor->data());
+        g_engine_factory_eye = previous_eye;
+        if (right_frame_data != nullptr) {
+            {
+                std::scoped_lock lock{g_engine_dual_frame_mutex};
+                EngineFrameTag tag{};
+                tag.eye = static_cast<uint32_t>(duplicate_eye);
+                tag.generation = g_streamline_capture_generation.load();
+                tag.pair_id = pair_id;
+                if (g_hmd_pose_valid.load() &&
+                    g_xr_views.size() > static_cast<size_t>(duplicate_eye)) {
+                    tag.render_view = g_config.hmd_compositor_only
+                        ? g_hmd_center_views[duplicate_eye]
+                        : g_xr_views[duplicate_eye];
+                    tag.render_view_valid = true;
+                }
+                g_engine_dual_frame_eyes[right_frame_data] = tag;
+            }
+            constexpr uintptr_t kEngineSceneEnqueueRva = 0x01621FC0;
+            auto enqueue = reinterpret_cast<EngineSceneEnqueueFn>(module + kEngineSceneEnqueueRva);
+            enqueue(render_context, right_frame_data);
+
+            using ReleaseFrameDataFn = void(__fastcall*)(void*);
+            auto* vtable = *reinterpret_cast<void***>(right_frame_data);
+            auto release = reinterpret_cast<ReleaseFrameDataFn>(vtable[2]);
+            release(right_frame_data);
+
+            if (g_config.runtime_diagnostics &&
+                g_engine_dual_render_log_count.fetch_add(1) < 2) {
+                log_line("Engine dual render queued present=%llu left=%p right=%p descriptor=%p",
+                    static_cast<unsigned long long>(present),
+                    result,
+                    right_frame_data,
+                    right_scene_descriptor->data());
+            }
+        } else {
+            log_line("Engine dual render factory returned null present=%llu", static_cast<unsigned long long>(present));
+        }
+    }
+
+    if (g_config.runtime_diagnostics && (present < 20 || present % 30 == 0) &&
+        g_engine_frame_factory_last_logged_present.exchange(present) != present) {
+        uint32_t ref_count{};
+        uint32_t scheduler_flags{};
+        void* shared_render_context{};
+        void* render_scheduler{};
+        if (result != nullptr) {
+            ref_count = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(result) + 8);
+        }
+        if (render_context != nullptr) {
+            memcpy(&shared_render_context, static_cast<const uint8_t*>(render_context) + 0x620,
+                sizeof(shared_render_context));
+        }
+        memcpy(&render_scheduler, reinterpret_cast<const void*>(module + 0x057F5930), sizeof(render_scheduler));
+        if (render_scheduler != nullptr) {
+            memcpy(&scheduler_flags, static_cast<const uint8_t*>(render_scheduler) + 0x3C,
+                sizeof(scheduler_flags));
+        }
+        log_line("Engine frame factory present=%llu caller_rva=0x%llX context=%p settings=%p descriptor=%p result=%p refs=%u scheduler_flags=0x%X shared=%p",
+            static_cast<unsigned long long>(present),
+            static_cast<unsigned long long>(caller_rva),
+            render_context,
+            render_settings,
+            scene_descriptor,
+            result,
+            ref_count,
+            scheduler_flags,
+            shared_render_context);
+    }
+
+    return result;
+}
+
+void install_engine_frame_factory_probe() {
+    if ((!g_config.engine_frame_factory_probe &&
+            !g_config.engine_dual_render_probe &&
+            g_config.openxr_mode != 2) ||
+        g_engine_frame_data_factory != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineFrameDataFactoryRva = 0x016214C0;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineFrameDataFactoryRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_frame_data_factory),
+            reinterpret_cast<void**>(&g_engine_frame_data_factory)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine frame data factory probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineFrameDataFactoryRva), target);
+    } else {
+        log_line("Engine frame data factory probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineFrameDataFactoryRva), target);
+    }
+}
+
+void __fastcall hook_engine_is_any_menu(void* gui_manager, void* script_context, uint8_t* result) {
+    g_engine_gui_manager.store(gui_manager);
+    g_engine_is_any_menu(gui_manager, script_context, result);
+    if (result == nullptr) {
+        return;
+    }
+
+    const int menu_open = *result != 0 ? 1 : 0;
+    const int previous = g_engine_menu_state.exchange(menu_open);
+    if (menu_open != 0) {
+        g_engine_dual_gameplay_armed.store(false, std::memory_order_relaxed);
+    }
+    if (previous != menu_open) {
+        log_line("REDengine menu state changed open=%d gui_manager=%p present=%llu",
+            menu_open, gui_manager,
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+}
+
+void install_engine_menu_state_probe() {
+    if (!g_config.engine_menu_state_probe || g_engine_is_any_menu != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineIsAnyMenuRva = 0x01F3C5C0;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kEngineIsAnyMenuRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_engine_is_any_menu),
+            reinterpret_cast<void**>(&g_engine_is_any_menu)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Engine IsAnyMenu probe hooked RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineIsAnyMenuRva), target);
+    } else {
+        log_line("Engine IsAnyMenu probe hook failed RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineIsAnyMenuRva), target);
+    }
+}
+
+void multiply_row_major_4x4(const float* left, const float* right, float* out) {
+    float result[16]{};
+    for (size_t row = 0; row < 4; ++row) {
+        for (size_t column = 0; column < 4; ++column) {
+            for (size_t i = 0; i < 4; ++i) {
+                result[row * 4 + column] += left[row * 4 + i] * right[i * 4 + column];
+            }
+        }
+    }
+    memcpy(out, result, sizeof(result));
+}
+
+std::array<float, 12> invert_rigid_transform_3x4(const std::array<float, 12>& transform) {
+    std::array<float, 12> inverse{};
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            inverse[row * 4 + column] = transform[column * 4 + row];
+        }
+        inverse[row * 4 + 3] = -(
+            inverse[row * 4] * transform[3] +
+            inverse[row * 4 + 1] * transform[7] +
+            inverse[row * 4 + 2] * transform[11]);
+    }
+    return inverse;
+}
+
+std::array<float, 12> camera_to_previous_transform(
+    const std::array<float, 12>& current,
+    const std::array<float, 12>& previous) {
+    std::array<float, 12> transform{};
+    const float* current_basis[3] = {
+        current.data() + 3, current.data() + 6, current.data() + 9};
+    const float* previous_basis[3] = {
+        previous.data() + 3, previous.data() + 6, previous.data() + 9};
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            for (size_t axis = 0; axis < 3; ++axis) {
+                transform[row * 4 + column] +=
+                    previous_basis[row][axis] * current_basis[column][axis];
+            }
+        }
+        for (size_t axis = 0; axis < 3; ++axis) {
+            transform[row * 4 + 3] += previous_basis[row][axis] *
+                (current[axis] - previous[axis]);
+        }
+    }
+    return transform;
+}
+
+void apply_right_eye_temporal_offset(void* constants, float offset) {
+    auto* values = static_cast<float*>(constants);
+
+    // Streamline 1.5 sl::Constants, row-major: view-to-clip, clip-to-view,
+    // clip-to-previous clip, and previous-to-current clip matrices.
+    const float* view_to_clip = values;
+    const float* clip_to_view = values + 16;
+    float positive_view_shift[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        offset, 0.0f, 0.0f, 1.0f,
+    };
+    float negative_view_shift[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        -offset, 0.0f, 0.0f, 1.0f,
+    };
+    float clip_positive[16]{};
+    float clip_negative[16]{};
+    float temporary[16]{};
+
+    multiply_row_major_4x4(clip_to_view, positive_view_shift, temporary);
+    multiply_row_major_4x4(temporary, view_to_clip, clip_positive);
+    multiply_row_major_4x4(clip_to_view, negative_view_shift, temporary);
+    multiply_row_major_4x4(temporary, view_to_clip, clip_negative);
+
+    for (size_t matrix_offset : {size_t{48}, size_t{64}}) {
+        multiply_row_major_4x4(clip_positive, values + matrix_offset, temporary);
+        multiply_row_major_4x4(temporary, clip_negative, values + matrix_offset);
+    }
+}
+
+uint32_t streamline_eye() {
+    if (g_streamline_forced_eye >= 0) {
+        return static_cast<uint32_t>(g_streamline_forced_eye);
+    }
+    if (g_engine_dual_render_active.load() && g_engine_render_eye >= 0) {
+        return static_cast<uint32_t>(g_engine_render_eye);
+    }
+    return static_cast<uint32_t>(g_present_count.load() & 1ull);
+}
+
+uint32_t streamline_history_eye() {
+    if (g_config.streamline_split_viewports &&
+        (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
+        g_engine_dual_render_active.load()) {
+        return streamline_eye() & 1u;
+    }
+    return 0;
+}
+
+bool initialize_streamline_mvec_clear_heap() {
+    std::call_once(g_streamline_mvec_clear_heap_once, []() {
+        if (g_d3d12_device == nullptr) {
+            return;
+        }
+
+        D3D12_DESCRIPTOR_HEAP_DESC desc{};
+        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        desc.NumDescriptors = 1;
+        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (SUCCEEDED(g_d3d12_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&g_streamline_mvec_clear_heap)))) {
+            log_line("Streamline MVec clear descriptor heap initialized");
+        }
+    });
+    return g_streamline_mvec_clear_heap != nullptr;
+}
+
+bool clear_streamline_mvec(ID3D12GraphicsCommandList* command_list, StreamlineMVecFrameState& frame) {
+    if (command_list == nullptr || frame.mvec == nullptr ||
+        frame.mvec_state != D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE ||
+        !initialize_streamline_mvec_clear_heap()) {
+        return false;
+    }
+
+    const auto desc = frame.mvec->GetDesc();
+    if (desc.Format != DXGI_FORMAT_R16G16_FLOAT) {
+        return false;
+    }
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R16G16_FLOAT;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    const auto cpu = g_streamline_mvec_clear_heap->GetCPUDescriptorHandleForHeapStart();
+    const auto gpu = g_streamline_mvec_clear_heap->GetGPUDescriptorHandleForHeapStart();
+    g_d3d12_device->CreateUnorderedAccessView(frame.mvec, nullptr, &uav, cpu);
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = frame.mvec;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    command_list->ResourceBarrier(1, &barrier);
+    ID3D12DescriptorHeap* heaps[] = {g_streamline_mvec_clear_heap};
+    command_list->SetDescriptorHeaps(1, heaps);
+    const float zeros[4]{};
+    command_list->ClearUnorderedAccessViewFloat(gpu, cpu, frame.mvec, zeros, 0, nullptr);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    command_list->ResourceBarrier(1, &barrier);
+    return true;
+}
+
+bool initialize_streamline_mvec_pipeline() {
+    std::call_once(g_streamline_mvec_pipeline_once, []() {
+        if (g_d3d12_device == nullptr || !initialize_dxc()) {
+            return;
+        }
+
+        static constexpr char kShaderSource[] = R"(
+Texture2D<float> depth_texture : register(t0);
+RWTexture2D<float2> mvec_texture : register(u0);
+RWStructuredBuffer<float4> component_probe : register(u1);
+cbuffer Parameters : register(b0) {
+    float4x4 original_clip_to_previous;
+    float4 current_to_previous_hmd_row0;
+    float4 current_to_previous_hmd_row1;
+    float4 current_to_previous_hmd_row2;
+    float4 hmd_projection;
+    float2 mvec_scale;
+    uint2 texture_size;
+    uint probe_enabled;
+};
+[numthreads(8, 8, 1)]
+void main(uint3 dispatch_id : SV_DispatchThreadID) {
+    if (any(dispatch_id.xy >= texture_size)) return;
+    float2 uv = (float2(dispatch_id.xy) + 0.5) / float2(texture_size);
+    float depth = depth_texture.Load(int3(dispatch_id.xy, 0));
+    float2 native_motion = mvec_texture[dispatch_id.xy];
+
+    float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    float4 previous_engine = mul(original_clip_to_previous, clip);
+    float2 engine_camera_motion = float2(0.0, 0.0);
+    if (abs(previous_engine.w) >= 1e-6) {
+        float3 previous_engine_ndc = previous_engine.xyz / previous_engine.w;
+        float2 previous_engine_uv = float2(
+            previous_engine_ndc.x * 0.5 + 0.5,
+            previous_engine_ndc.y * -0.5 + 0.5);
+        engine_camera_motion = previous_engine_uv - uv;
+    }
+
+    float tan_half_y = hmd_projection.x;
+    float tan_half_x = tan_half_y * hmd_projection.y;
+    float near_plane = hmd_projection.z;
+    float far_plane = hmd_projection.w;
+    float linear_depth = near_plane * far_plane /
+        max(near_plane + depth * (far_plane - near_plane), 1e-6);
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    float3 current_position = float3(
+        ndc.x * tan_half_x, ndc.y * tan_half_y, 1.0) * linear_depth;
+    float3 previous_hmd_position = float3(
+        dot(current_to_previous_hmd_row0.xyz, current_position) +
+            current_to_previous_hmd_row0.w,
+        dot(current_to_previous_hmd_row1.xyz, current_position) +
+            current_to_previous_hmd_row1.w,
+        dot(current_to_previous_hmd_row2.xyz, current_position) +
+            current_to_previous_hmd_row2.w);
+    float2 hmd_camera_motion = float2(0.0, 0.0);
+    if (previous_hmd_position.z > 1e-5) {
+        float2 previous_hmd_ndc = float2(
+            previous_hmd_position.x / (previous_hmd_position.z * tan_half_x),
+            previous_hmd_position.y / (previous_hmd_position.z * tan_half_y));
+        float2 previous_hmd_uv = float2(
+            previous_hmd_ndc.x * 0.5 + 0.5,
+            0.5 - previous_hmd_ndc.y * 0.5);
+        hmd_camera_motion = previous_hmd_uv - uv;
+    }
+
+    // REDengine stores normalized UV displacement. Streamline's original NGX
+    // MV scales convert it to input pixels during evaluation.
+    // V199: REDengine's native velocity points from the HMD-corrected current
+    // image toward its uncorrected/centered previous camera. Remove that camera
+    // component and replace it with the actual corrected N-to-N-1 camera motion,
+    // preserving the native per-object residual.
+    float2 raw_engine_camera_motion = engine_camera_motion;
+    // V206 camera-only diagnostic with token-stable routing. Keep native
+    // object residuals out until the HMD camera field direction is validated.
+    float2 corrected_motion = hmd_camera_motion;
+    if (probe_enabled != 0) {
+        uint column = min(dispatch_id.x * 24 / texture_size.x, 23u);
+        uint row = min(dispatch_id.y * 24 / texture_size.y, 23u);
+        uint sample_x = ((2 * column + 1) * texture_size.x) / 48;
+        uint sample_y = ((2 * row + 1) * texture_size.y) / 48;
+        if (dispatch_id.x == sample_x && dispatch_id.y == sample_y) {
+            uint sample = row * 24 + column;
+            component_probe[sample * 2] =
+                float4(native_motion, raw_engine_camera_motion);
+            component_probe[sample * 2 + 1] =
+                float4(hmd_camera_motion, corrected_motion);
+        }
+    }
+    mvec_texture[dispatch_id.xy] = corrected_motion;
+}
+)";
+
+        DxcBuffer source{};
+        source.Ptr = kShaderSource;
+        source.Size = sizeof(kShaderSource) - 1;
+        source.Encoding = DXC_CP_UTF8;
+        LPCWSTR arguments[] = {L"-E", L"main", L"-T", L"cs_6_0", L"-O3"};
+        IDxcResult* result{};
+        if (FAILED(g_dxc_compiler->Compile(&source, arguments, static_cast<UINT32>(std::size(arguments)),
+                nullptr, IID_PPV_ARGS(&result))) || result == nullptr) {
+            return;
+        }
+
+        HRESULT status{};
+        result->GetStatus(&status);
+        if (FAILED(status)) {
+            IDxcBlobUtf8* errors{};
+            result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+            log_line("Streamline MVec compute shader compile failed: %s",
+                errors != nullptr ? errors->GetStringPointer() : "unknown");
+            if (errors != nullptr) errors->Release();
+            result->Release();
+            return;
+        }
+
+        IDxcBlob* shader{};
+        if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shader), nullptr)) || shader == nullptr) {
+            result->Release();
+            return;
+        }
+
+        D3D12_DESCRIPTOR_RANGE ranges[2]{};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 1;
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 2;
+        ranges[1].BaseShaderRegister = 0;
+        ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER parameters[3]{};
+        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+        parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
+        parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+        parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
+        parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[2].Constants.ShaderRegister = 0;
+        parameters[2].Constants.Num32BitValues = 37;
+        parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC root_desc{};
+        root_desc.NumParameters = static_cast<UINT>(std::size(parameters));
+        root_desc.pParameters = parameters;
+        root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ID3DBlob* serialized{};
+        ID3DBlob* errors{};
+        if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors))) {
+            log_line("Streamline MVec root signature serialization failed: %s",
+                errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown");
+            if (errors != nullptr) errors->Release();
+            shader->Release();
+            result->Release();
+            return;
+        }
+
+        if (FAILED(g_d3d12_device->CreateRootSignature(0, serialized->GetBufferPointer(),
+                serialized->GetBufferSize(), IID_PPV_ARGS(&g_streamline_mvec_root_signature)))) {
+            serialized->Release();
+            shader->Release();
+            result->Release();
+            return;
+        }
+        serialized->Release();
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{};
+        pipeline_desc.pRootSignature = g_streamline_mvec_root_signature;
+        pipeline_desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+        const auto pipeline_result = g_d3d12_device->CreateComputePipelineState(
+            &pipeline_desc, IID_PPV_ARGS(&g_streamline_mvec_pipeline));
+        shader->Release();
+        result->Release();
+        if (FAILED(pipeline_result)) {
+            return;
+        }
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = 3;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_d3d12_device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_streamline_mvec_heap)))) {
+            return;
+        }
+        g_streamline_mvec_descriptor_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+
+        const UINT64 probe_bytes =
+            static_cast<UINT64>(kDlssComponentProbeElements) * sizeof(float) * 4;
+        D3D12_RESOURCE_DESC probe_desc{};
+        probe_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        probe_desc.Width = probe_bytes;
+        probe_desc.Height = 1;
+        probe_desc.DepthOrArraySize = 1;
+        probe_desc.MipLevels = 1;
+        probe_desc.SampleDesc.Count = 1;
+        probe_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        probe_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES default_heap{};
+        default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_HEAP_PROPERTIES readback_heap{};
+        readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+        auto readback_desc = probe_desc;
+        readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &default_heap, D3D12_HEAP_FLAG_NONE, &probe_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                IID_PPV_ARGS(&g_dlss_component_probe_buffer))) ||
+            FAILED(g_d3d12_device->CreateCommittedResource(
+                &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&g_dlss_component_probe_readback))) ||
+            FAILED(g_d3d12_device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE,
+                IID_PPV_ARGS(&g_dlss_component_probe_fence)))) {
+            log_line("DLSS component probe resource initialization failed");
+            return;
+        }
+        D3D12_UNORDERED_ACCESS_VIEW_DESC probe_uav{};
+        probe_uav.Format = DXGI_FORMAT_UNKNOWN;
+        probe_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        probe_uav.Buffer.NumElements = kDlssComponentProbeElements;
+        probe_uav.Buffer.StructureByteStride = sizeof(float) * 4;
+        auto probe_cpu = g_streamline_mvec_heap->GetCPUDescriptorHandleForHeapStart();
+        probe_cpu.ptr += static_cast<SIZE_T>(2) * g_streamline_mvec_descriptor_increment;
+        g_d3d12_device->CreateUnorderedAccessView(
+            g_dlss_component_probe_buffer, nullptr, &probe_uav, probe_cpu);
+        log_line("Streamline MVec compute pipeline initialized");
+    });
+
+    return g_streamline_mvec_pipeline != nullptr && g_streamline_mvec_root_signature != nullptr &&
+        g_streamline_mvec_heap != nullptr && g_dlss_component_probe_buffer != nullptr &&
+        g_dlss_component_probe_readback != nullptr && g_dlss_component_probe_fence != nullptr;
+}
+
+bool schedule_dlss_mvec_readback(
+    ID3D12GraphicsCommandList* command_list, ID3D12Resource* motion_vectors);
+
+bool dispatch_streamline_mvec_correction(ID3D12GraphicsCommandList* command_list, StreamlineMVecFrameState& frame) {
+    if (command_list == nullptr || frame.depth == nullptr || frame.mvec == nullptr ||
+        !frame.hmd_motion_valid ||
+        frame.depth_state != D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE ||
+        frame.mvec_state != D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE ||
+        !initialize_streamline_mvec_pipeline()) {
+        return false;
+    }
+
+    const auto depth_desc = frame.depth->GetDesc();
+    const auto mvec_desc = frame.mvec->GetDesc();
+    if (depth_desc.Width != mvec_desc.Width || depth_desc.Height != mvec_desc.Height ||
+        mvec_desc.Format != DXGI_FORMAT_R16G16_FLOAT ||
+        (mvec_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+        return false;
+    }
+
+    DXGI_FORMAT depth_srv_format = DXGI_FORMAT_UNKNOWN;
+    switch (depth_desc.Format) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        depth_srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        break;
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT:
+        depth_srv_format = DXGI_FORMAT_R32_FLOAT;
+        break;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        depth_srv_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        break;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_D16_UNORM:
+        depth_srv_format = DXGI_FORMAT_R16_UNORM;
+        break;
+    default:
+        return false;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
+    depth_srv.Format = depth_srv_format;
+    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth_srv.Texture2D.MipLevels = 1;
+    auto cpu_handle = g_streamline_mvec_heap->GetCPUDescriptorHandleForHeapStart();
+    g_d3d12_device->CreateShaderResourceView(frame.depth, &depth_srv, cpu_handle);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC mvec_uav{};
+    mvec_uav.Format = DXGI_FORMAT_R16G16_FLOAT;
+    mvec_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    cpu_handle.ptr += g_streamline_mvec_descriptor_increment;
+    g_d3d12_device->CreateUnorderedAccessView(frame.mvec, nullptr, &mvec_uav, cpu_handle);
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = frame.mvec;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    command_list->ResourceBarrier(1, &barrier);
+
+    ID3D12DescriptorHeap* heaps[] = {g_streamline_mvec_heap};
+    command_list->SetDescriptorHeaps(1, heaps);
+    command_list->SetComputeRootSignature(g_streamline_mvec_root_signature);
+    command_list->SetPipelineState(g_streamline_mvec_pipeline);
+    auto gpu_handle = g_streamline_mvec_heap->GetGPUDescriptorHandleForHeapStart();
+    command_list->SetComputeRootDescriptorTable(0, gpu_handle);
+    gpu_handle.ptr += g_streamline_mvec_descriptor_increment;
+    command_list->SetComputeRootDescriptorTable(1, gpu_handle);
+
+    float constants[37]{};
+    memcpy(constants, frame.original_clip_to_previous, sizeof(frame.original_clip_to_previous));
+    memcpy(constants + 16, frame.current_to_previous_hmd,
+        sizeof(frame.current_to_previous_hmd));
+    memcpy(constants + 28, frame.hmd_projection, sizeof(frame.hmd_projection));
+    constants[32] = frame.mvec_scale[0];
+    constants[33] = frame.mvec_scale[1];
+    const uint32_t width = static_cast<uint32_t>(mvec_desc.Width);
+    const uint32_t height = mvec_desc.Height;
+    memcpy(constants + 34, &width, sizeof(width));
+    memcpy(constants + 35, &height, sizeof(height));
+    const bool component_probe = g_config.logging_enabled && g_config.ngx_trace &&
+        !g_dlss_component_probe_scheduled.load() &&
+        fabsf(g_hmd_yaw_degrees) > 10.0f &&
+        g_streamline_hmd_motion_angle.load() < 0.0015f;
+    const uint32_t component_probe_flag = component_probe ? 1u : 0u;
+    memcpy(constants + 36, &component_probe_flag, sizeof(component_probe_flag));
+    command_list->SetComputeRoot32BitConstants(2, static_cast<UINT>(std::size(constants)), constants, 0);
+    static std::atomic<bool> dispatch_begin_logged{};
+    if (!dispatch_begin_logged.exchange(true)) {
+        log_line("Streamline MVec dispatch begin depth=%p mvec=%p depth_format=%u srv_format=%u size=%ux%u mvec_state=0x%X scale=%.7f,%.7f",
+            frame.depth, frame.mvec,
+            static_cast<unsigned>(depth_desc.Format),
+            static_cast<unsigned>(depth_srv_format), width, height,
+            static_cast<unsigned>(frame.mvec_state),
+            frame.mvec_scale[0], frame.mvec_scale[1]);
+    }
+    command_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    command_list->ResourceBarrier(1, &barrier);
+    if (component_probe && !g_dlss_component_probe_scheduled.exchange(true)) {
+        D3D12_RESOURCE_BARRIER probe_barriers[2]{};
+        probe_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        probe_barriers[0].UAV.pResource = g_dlss_component_probe_buffer;
+        probe_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        probe_barriers[1].Transition.pResource = g_dlss_component_probe_buffer;
+        probe_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        probe_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        probe_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        command_list->ResourceBarrier(static_cast<UINT>(std::size(probe_barriers)), probe_barriers);
+        command_list->CopyResource(
+            g_dlss_component_probe_readback, g_dlss_component_probe_buffer);
+        std::swap(probe_barriers[1].Transition.StateBefore,
+            probe_barriers[1].Transition.StateAfter);
+        command_list->ResourceBarrier(1, &probe_barriers[1]);
+        g_dlss_component_probe_command_list.store(command_list);
+        log_line("DLSS component probe scheduled command_list=%p yaw=%.4f angle=%.7f samples=%u",
+            command_list, g_hmd_yaw_degrees,
+            g_streamline_hmd_motion_angle.load(),
+            kDlssComponentProbeColumns * kDlssComponentProbeRows);
+    }
+    g_streamline_mvec_dispatch_recorded.store(true);
+    // Capture on this command list, immediately after the custom write and
+    // before Streamline records NGX evaluation. A later NGX-hook capture can
+    // observe a subsequent REDengine rewrite of the shared motion resource.
+    if (g_config.logging_enabled && g_config.ngx_trace &&
+        g_streamline_hmd_motion_angle.load() > 0.0001f &&
+        !g_dlss_mvec_readback_scheduled.load()) {
+        schedule_dlss_mvec_readback(command_list, frame.mvec);
+    }
+    static std::atomic<bool> dispatch_end_logged{};
+    if (!dispatch_end_logged.exchange(true)) {
+        log_line("Streamline MVec dispatch recorded");
+    }
+    return true;
+}
+
+void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uint32_t viewport) {
+    const uint32_t eye = streamline_eye();
+    const uint32_t source_viewport = viewport;
+    const bool packed_private_active = !temporal_backend_is_dlss_packed() ||
+        (g_engine_dual_render_active.load(std::memory_order_acquire) &&
+            g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
+            !g_cinema_mode_active.load(std::memory_order_relaxed));
+    int physical_eye{-1};
+    uint64_t physical_pair{UINT64_MAX};
+    std::array<XrView, 2> physical_render_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    bool physical_render_views_valid{};
+    if (packed_private_active && constants != nullptr &&
+        g_config.streamline_force_camera_mvec &&
+        g_config.streamline_reconstruct_camera_motion) {
+        // Match the stable AER/DLSS route: the tagged field contains no camera
+        // velocity, so NGX reconstructs camera motion from sl::Constants.
+        static_cast<uint8_t*>(constants)[0x19D] = 0;
+    }
+    if (packed_private_active && constants != nullptr &&
+        g_config.streamline_taau_bridge) {
+        const auto* values = static_cast<const float*>(constants);
+        TaauHmdMotionParameters motion{};
+        const int expected_eye = g_config.openxr_mode == 2 ? 0 : -1;
+        if (find_taau_hmd_motion_parameters(
+                values + 48, expected_eye, 0, motion)) {
+            if (temporal_backend_is_dlss_packed() &&
+                !g_streamline_dlss_recipe_replay &&
+                motion.matched_eye >= 0 && motion.matched_eye <= 1 &&
+                motion.matched_pair_id != 0 &&
+                motion.matched_pair_id != UINT64_MAX) {
+                physical_eye = motion.matched_eye;
+                physical_pair = motion.matched_pair_id;
+                physical_render_views = motion.matched_render_views;
+                physical_render_views_valid = motion.matched_render_views_valid;
+            }
+            g_streamline_taau_bridge_matches.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock{g_streamline_mvec_mutex};
+                // A Streamline frame token is unique for one eye submission in
+                // the packed path. setConstants commonly runs one Present
+                // before evaluateFeature, so Present parity is not a stable
+                // part of the identity here.
+                auto& temporal = g_streamline_mvec_temporal_frames[frame_token];
+                memcpy(temporal.original_clip_to_previous, values + 48,
+                    sizeof(temporal.original_clip_to_previous));
+                memcpy(temporal.current_to_previous_hmd,
+                    motion.current_to_previous_base.data(),
+                    sizeof(temporal.current_to_previous_hmd));
+                temporal.matched_corrected_camera =
+                    motion.matched_corrected_camera;
+                temporal.matched_camera_valid = true;
+                temporal.matched_render_views = motion.matched_render_views;
+                temporal.matched_render_views_valid =
+                    motion.matched_render_views_valid;
+                const float rotation_trace =
+                    motion.current_to_previous_hmd_only[0] +
+                    motion.current_to_previous_hmd_only[5] +
+                    motion.current_to_previous_hmd_only[10];
+                const float hmd_motion_angle = acosf(std::clamp(
+                    (rotation_trace - 1.0f) * 0.5f, -1.0f, 1.0f));
+                g_streamline_hmd_motion_angle.store(hmd_motion_angle);
+                const auto delta_log = hmd_motion_angle > 0.0001f
+                    ? g_streamline_hmd_delta_logs.fetch_add(1) : UINT32_MAX;
+                if (g_config.ngx_trace && delta_log < 64) {
+                    const auto& h = motion.current_to_previous_hmd_only;
+                    log_line("Streamline HMD delta current=%llu pair=%llu previous=%llu pair=%llu gap=%lld angle=%.7f rows=[%.6f %.6f %.6f %.6f][%.6f %.6f %.6f %.6f][%.6f %.6f %.6f %.6f]",
+                        static_cast<unsigned long long>(motion.matched_present),
+                        static_cast<unsigned long long>(motion.matched_pair_id),
+                        static_cast<unsigned long long>(motion.previous_matched_present),
+                        static_cast<unsigned long long>(motion.previous_matched_pair_id),
+                        static_cast<long long>(motion.matched_present) -
+                            static_cast<long long>(motion.previous_matched_present),
+                        hmd_motion_angle,
+                        h[0], h[1], h[2], h[3],
+                        h[4], h[5], h[6], h[7],
+                        h[8], h[9], h[10], h[11]);
+                }
+                temporal.hmd_projection[0] =
+                    tanf(motion.vertical_fov_degrees *
+                        (3.14159265358979323846f / 360.0f));
+                temporal.hmd_projection[1] = motion.aspect;
+                temporal.hmd_projection[2] = motion.near_plane;
+                temporal.hmd_projection[3] = motion.far_plane;
+                temporal.hmd_motion_valid = true;
+                temporal.mvec_scale[0] = values[82];
+                temporal.mvec_scale[1] = values[83];
+                if (g_streamline_mvec_temporal_frames.size() > 32) {
+                    auto oldest = g_streamline_mvec_temporal_frames.end();
+                    int32_t oldest_age = 0;
+                    for (auto candidate =
+                             g_streamline_mvec_temporal_frames.begin();
+                         candidate != g_streamline_mvec_temporal_frames.end();
+                         ++candidate) {
+                        // Tokens are monotonically increasing modulo uint32.
+                        // A negative signed age is a newer, not-yet-consumed
+                        // token and must never be selected for eviction.
+                        const int32_t age = static_cast<int32_t>(
+                            frame_token - candidate->first);
+                        if (age > oldest_age) {
+                            oldest_age = age;
+                            oldest = candidate;
+                        }
+                    }
+                    if (oldest != g_streamline_mvec_temporal_frames.end()) {
+                        g_streamline_mvec_temporal_frames.erase(oldest);
+                    }
+                }
+            }
+            const auto log_index = g_streamline_taau_bridge_match_logs.fetch_add(
+                1, std::memory_order_relaxed);
+            if (log_index < 12) {
+                log_line("Streamline TAAU bridge matched present=%llu token=%u viewport=%u routed_eye=%d pair=%llu error=%.6f fov=%.4f aspect=%.6f",
+                    static_cast<unsigned long long>(g_present_count.load()),
+                    frame_token, viewport, motion.matched_eye,
+                    static_cast<unsigned long long>(motion.matched_pair_id),
+                    motion.matrix_error, motion.vertical_fov_degrees,
+                    motion.aspect);
+            }
+        } else {
+            const auto misses = g_streamline_taau_bridge_misses.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            if (misses <= 8) {
+                log_line("Streamline TAAU bridge miss present=%llu token=%u viewport=%u expected_eye=%d",
+                    static_cast<unsigned long long>(g_present_count.load()),
+                    frame_token, viewport, expected_eye);
+            }
+        }
+    }
+    if (packed_private_active && constants != nullptr &&
+        g_config.streamline_force_reset &&
+        (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
+        g_config.engine_factory_stereo_offset != 0.0f) {
+        // Streamline 1.5's sl::Constants::reset: force a fresh temporal
+        // history while the two eyes are still rendered on alternating frames.
+        auto* bytes = static_cast<uint8_t*>(constants);
+        bytes[0x19F] = 1;
+
+        const auto present = g_present_count.load();
+        if ((present < 20 || present % 300 == 0) &&
+            g_streamline_reset_last_logged_present.exchange(present) != present) {
+            log_line("Streamline DLSS history reset present=%llu token=%u viewport=%u constants=%p",
+                static_cast<unsigned long long>(present), frame_token, viewport, constants);
+        }
+    }
+
+    if (packed_private_active && g_config.streamline_split_viewports &&
+        (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
+        g_config.engine_factory_stereo_offset != 0.0f) {
+        viewport |= eye;
+    }
+
+    if (packed_private_active && constants != nullptr &&
+        g_config.streamline_split_viewports &&
+        g_config.streamline_right_temporal_offset != 0.0f &&
+        eye == static_cast<uint32_t>(g_config.streamline_temporal_eye)) {
+        apply_right_eye_temporal_offset(constants, g_config.streamline_right_temporal_offset);
+    }
+
+    if (packed_private_active && constants != nullptr &&
+        g_config.streamline_temporal_clip_correction != 0.0f) {
+        auto* values = static_cast<float*>(constants);
+        // The alternating eye contributes a fixed horizontal baseline to
+        // both inverse reprojection matrices. Remove it only when present.
+        if (values[56] > g_config.streamline_temporal_clip_correction * 0.5f) {
+            std::scoped_lock lock{g_streamline_mvec_mutex};
+            g_streamline_mvec_frame.frame_token = frame_token;
+            g_streamline_mvec_frame.ready = true;
+            memcpy(g_streamline_mvec_frame.original_clip_to_previous, values + 48,
+                sizeof(g_streamline_mvec_frame.original_clip_to_previous));
+            g_streamline_mvec_frame.mvec_scale[0] = values[82];
+            g_streamline_mvec_frame.mvec_scale[1] = values[83];
+            values[56] -= g_config.streamline_temporal_clip_correction;
+            values[72] += g_config.streamline_temporal_clip_correction;
+            if (g_config.streamline_reconstruct_camera_motion) {
+                // cameraMotionIncluded is immediately before the reset byte in
+                // Streamline 1.5's Constants. Let the DLSS plugin rebuild the
+                // camera component using the corrected clip-to-previous matrix.
+                static_cast<uint8_t*>(constants)[0x19D] = 0;
+            }
+            memcpy(g_streamline_mvec_frame.corrected_clip_to_previous, values + 48,
+                sizeof(g_streamline_mvec_frame.corrected_clip_to_previous));
+        }
+    }
+
+    if (constants != nullptr && g_config.streamline_trace &&
+        g_present_count.load() >= static_cast<uint64_t>(g_config.streamline_trace_start_frame) &&
+        g_streamline_trace_counts[eye].fetch_add(1) < 4) {
+        const auto* values = static_cast<const float*>(constants);
+        const auto* bytes = static_cast<const uint8_t*>(constants);
+            log_line(
+                "Streamline trace eye=%u present=%llu token=%u viewport=%u reset=%u jitter=%.6f,%.6f cam=%.5f,%.5f,%.5f right=%.5f,%.5f,%.5f "
+                "clip_prev_t=%.6f,%.6f,%.6f,%.6f prev_clip_t=%.6f,%.6f,%.6f,%.6f",
+                eye,
+                static_cast<unsigned long long>(g_present_count.load()),
+                frame_token,
+                viewport,
+                static_cast<unsigned>(bytes[0x19F]),
+                values[80], values[81],
+                values[86], values[87], values[88],
+                values[92], values[93], values[94],
+                values[60], values[61], values[62], values[63],
+                values[76], values[77], values[78], values[79]);
+            log_line(
+                "Streamline trace eye=%u clip_prev=[%.5f,%.5f,%.5f,%.5f; %.5f,%.5f,%.5f,%.5f; %.5f,%.5f,%.5f,%.5f; %.5f,%.5f,%.5f,%.5f]",
+                eye,
+                values[48], values[49], values[50], values[51],
+                values[52], values[53], values[54], values[55],
+                values[56], values[57], values[58], values[59],
+                values[60], values[61], values[62], values[63]);
+            log_line(
+                "Streamline trace eye=%u prev_clip=[%.5f,%.5f,%.5f,%.5f; %.5f,%.5f,%.5f,%.5f; %.5f,%.5f,%.5f,%.5f; %.5f,%.5f,%.5f,%.5f]",
+                eye,
+                values[64], values[65], values[66], values[67],
+                values[68], values[69], values[70], values[71],
+                values[72], values[73], values[74], values[75],
+                values[76], values[77], values[78], values[79]);
+    }
+
+    if (constants != nullptr && g_config.ngx_trace && g_config.openxr_mode == 4) {
+        {
+            std::scoped_lock lock{g_streamline_constants_cache_mutex};
+            auto& captured = g_streamline_constants_cache[
+                frame_token % kStreamlineConstantsCacheSize];
+            memcpy(captured.constants.data(), constants, captured.constants.size());
+            captured.frame_token = frame_token;
+            captured.viewport = source_viewport;
+            captured.eye = physical_eye >= 0
+                ? static_cast<uint32_t>(physical_eye)
+                : eye;
+            captured.pair_id = physical_pair != UINT64_MAX
+                ? physical_pair
+                : (g_engine_dual_render_active.load() &&
+                        g_engine_render_eye >= 0
+                    ? g_engine_render_pair_id
+                    : UINT64_MAX);
+            captured.present = g_present_count.load();
+            captured.render_views = physical_render_views;
+            captured.render_views_valid = physical_render_views_valid;
+            captured.valid = true;
+        }
+        static std::atomic<uint32_t> constants_capture_logs{};
+        if (constants_capture_logs.fetch_add(1) < 32) {
+            log_line(
+                "Streamline constants captured token=%u eye=%u viewport=%u pair=%llu present=%llu producer_tid=%lu",
+                frame_token,
+                eye,
+                source_viewport,
+                static_cast<unsigned long long>(
+                    g_engine_dual_render_active.load() && g_engine_render_eye >= 0
+                        ? g_engine_render_pair_id
+                        : UINT64_MAX),
+                static_cast<unsigned long long>(g_present_count.load()),
+                GetCurrentThreadId());
+        }
+    }
+
+    g_sl_set_constants(constants, frame_token, viewport);
+}
+
+uint32_t streamline_viewport_for_eye(uint32_t viewport) {
+    if (!g_config.streamline_split_viewports ||
+        (g_config.openxr_mode != 3 && g_config.openxr_mode != 4) ||
+        g_config.engine_factory_stereo_offset == 0.0f) {
+        return viewport;
+    }
+    if (temporal_backend_is_dlss_packed() &&
+        (g_cinema_mode_active.load(std::memory_order_relaxed) ||
+            !g_engine_dual_render_active.load(std::memory_order_acquire) ||
+            !g_engine_dual_gameplay_armed.load(std::memory_order_acquire))) {
+        return viewport;
+    }
+
+    return viewport | streamline_eye();
+}
+
+ID3D12Resource* ensure_streamline_private_output(
+    uint32_t eye,
+    ID3D12Resource* canonical,
+    D3D12_RESOURCE_STATES state) {
+    if (eye > 1 || canonical == nullptr || g_d3d12_device == nullptr) {
+        return nullptr;
+    }
+    std::scoped_lock lock{g_streamline_private_output_mutex};
+    const auto desc = canonical->GetDesc();
+    auto*& output = g_streamline_private_outputs[eye];
+    if (output != nullptr) {
+        const auto existing = output->GetDesc();
+        if (existing.Width != desc.Width || existing.Height != desc.Height ||
+            existing.Format != desc.Format) {
+            output->Release();
+            output = nullptr;
+        }
+    }
+    if (output == nullptr) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                IID_PPV_ARGS(&output)))) {
+            log_line("Streamline private output allocation failed eye=%u size=%llux%u format=%u state=0x%X",
+                eye, static_cast<unsigned long long>(desc.Width), desc.Height,
+                static_cast<unsigned>(desc.Format), static_cast<unsigned>(state));
+            return nullptr;
+        }
+        log_line("Streamline private output created eye=%u resource=%p canonical=%p size=%llux%u format=%u state=0x%X",
+            eye, output, canonical, static_cast<unsigned long long>(desc.Width),
+            desc.Height, static_cast<unsigned>(desc.Format),
+            static_cast<unsigned>(state));
+    }
+    if (g_streamline_canonical_output != canonical) {
+        if (g_streamline_canonical_output != nullptr) {
+            g_streamline_canonical_output->Release();
+        }
+        canonical->AddRef();
+        g_streamline_canonical_output = canonical;
+        g_streamline_prepost_pipeline.store(nullptr, std::memory_order_release);
+    }
+    g_streamline_canonical_output_state = state;
+    return output;
+}
+
+// [FIX:DLSS-PACKED 4/10] Copy an eye-specific private result back to the
+// canonical Streamline resource expected by the game's post-processing chain.
+void bridge_streamline_private_output(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* output,
+    D3D12_RESOURCE_STATES canonical_state) {
+    DlssCpuScope cpu_scope{kDlssCpuPrivateBridge};
+    if (command_list == nullptr || output == nullptr ||
+        g_streamline_canonical_output == nullptr ||
+        (output != g_streamline_private_outputs[0] &&
+            output != g_streamline_private_outputs[1])) {
+        return;
+    }
+    auto* canonical = g_streamline_canonical_output;
+    const auto output_state = g_streamline_canonical_output_state;
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = output;
+    barriers[0].Transition.StateBefore = output_state;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = canonical;
+    barriers[1].Transition.StateBefore = canonical_state;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    command_list->ResourceBarrier(2, barriers);
+    command_list->CopyResource(canonical, output);
+    std::swap(barriers[0].Transition.StateBefore,
+        barriers[0].Transition.StateAfter);
+    std::swap(barriers[1].Transition.StateBefore,
+        barriers[1].Transition.StateAfter);
+    command_list->ResourceBarrier(2, barriers);
+    if (g_streamline_private_output_bridge_logs.fetch_add(1) < 16) {
+        const uint32_t eye = output == g_streamline_private_outputs[1] ? 1u : 0u;
+        log_line("Streamline private output bridged eye=%u private=%p canonical=%p output_state=0x%X canonical_state=0x%X command_list=%p",
+            eye, output, canonical, static_cast<unsigned>(output_state),
+            static_cast<unsigned>(canonical_state), command_list);
+    }
+}
+
+int __fastcall hook_sl_set_tag(const void* resource, uint32_t tag, uint32_t viewport, const void* extent) {
+    if (g_streamline_dlss_capture_active && !g_streamline_dlss_recipe_replay &&
+        g_streamline_dlss_capture.tag_count < kStreamlineCapturedTagCount) {
+        auto& call = g_streamline_dlss_capture.tags[
+            g_streamline_dlss_capture.tag_count++];
+        call.tag = tag;
+        call.viewport = viewport;
+        call.has_resource = resource != nullptr;
+        call.has_extent = extent != nullptr;
+        if (resource != nullptr) {
+            memcpy(call.resource.data(), resource, call.resource.size());
+        }
+        if (extent != nullptr) {
+            memcpy(call.extent.data(), extent, call.extent.size());
+        }
+    }
+    const uint32_t eye = streamline_eye();
+    const void* routed_resource = resource;
+    if (resource != nullptr && tag == 4 &&
+        g_config.streamline_split_viewports && g_config.openxr_mode == 4 &&
+        (!temporal_backend_is_dlss_packed() ||
+            (g_engine_dual_render_active.load(std::memory_order_acquire) &&
+                g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
+                !g_cinema_mode_active.load(std::memory_order_relaxed)))) {
+        ID3D12Resource* canonical{};
+        uint32_t state{};
+        memcpy(&canonical, static_cast<const uint8_t*>(resource) + 8,
+            sizeof(canonical));
+        memcpy(&state, static_cast<const uint8_t*>(resource) + 32,
+            sizeof(state));
+        auto* private_output = ensure_streamline_private_output(
+            eye, canonical, static_cast<D3D12_RESOURCE_STATES>(state));
+        if (private_output != nullptr) {
+            std::scoped_lock lock{g_streamline_private_output_mutex};
+            auto& wrapper = g_streamline_private_output_wrappers[eye];
+            memcpy(wrapper.data(), resource, sizeof(wrapper));
+            memcpy(reinterpret_cast<uint8_t*>(wrapper.data()) + 8,
+                &private_output, sizeof(private_output));
+            routed_resource = wrapper.data();
+        }
+    }
+    struct StreamlineExtent {
+        uint32_t top;
+        uint32_t left;
+        uint32_t width;
+        uint32_t height;
+    } tagged_extent{};
+    if (extent != nullptr) {
+        memcpy(&tagged_extent, extent, sizeof(tagged_extent));
+    }
+    if (resource != nullptr && (tag == 0 || tag == 1 || tag == 3) &&
+        g_config.ngx_trace) {
+        ID3D12Resource* native{};
+        uint32_t state{};
+        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
+        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
+        const uint32_t input_index = tag == 3 ? 0u : (tag == 0 ? 1u : 2u);
+        g_ngx_input_resources[input_index].store(native, std::memory_order_release);
+        g_ngx_input_states[input_index].store(state, std::memory_order_release);
+    }
+    if (resource != nullptr && tag <= 4 && tag != 2 && g_config.ngx_trace) {
+        static std::atomic<uint32_t> tag_trace_counts[2][5]{};
+        const uint32_t bounded_eye = std::min(eye, 1u);
+        if (tag_trace_counts[bounded_eye][tag].fetch_add(1) < 12) {
+            void* native{};
+            void* view{};
+            uint32_t state{};
+            memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
+            memcpy(&view, static_cast<const uint8_t*>(resource) + 24, sizeof(view));
+            memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
+            log_line(
+                "Streamline tag route tag=%u eye=%u present=%llu engine_eye=%d tid=%lu "
+                "viewport=%u wrapper=%p native=%p view=%p state=0x%X rect=%u,%u %ux%u",
+                tag, eye, static_cast<unsigned long long>(g_present_count.load()),
+                g_engine_render_eye, static_cast<unsigned long>(GetCurrentThreadId()),
+                viewport, resource, native, view, state,
+                tagged_extent.left, tagged_extent.top,
+                tagged_extent.width, tagged_extent.height);
+        }
+    }
+    if (resource != nullptr && extent != nullptr && tag <= 4 &&
+        g_config.render_width > 0 && g_config.render_height > 0 &&
+        g_streamline_extent_fix_log_count.fetch_add(1) < 32) {
+        log_line("Streamline extent tag=%u viewport=%u rect=%u,%u %ux%u",
+            tag, viewport, tagged_extent.left, tagged_extent.top,
+            tagged_extent.width, tagged_extent.height);
+    }
+    if (resource != nullptr && tag <= 1 && g_config.streamline_mvec_probe &&
+        g_present_count.load() >= static_cast<uint64_t>(g_config.streamline_trace_start_frame) &&
+        g_streamline_mvec_probe_counts[eye].fetch_add(1) < 4) {
+        void* native{};
+        void* view{};
+        uint32_t state{};
+        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
+        memcpy(&view, static_cast<const uint8_t*>(resource) + 24, sizeof(view));
+        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
+        auto* texture = static_cast<ID3D12Resource*>(native);
+        const auto desc = texture != nullptr ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
+        log_line("Streamline %s eye=%u present=%llu viewport=%u resource=%p native=%p view=%p state=0x%X format=%u size=%llux%u flags=0x%X",
+            tag == 0 ? "Depth" : "MVec",
+            eye,
+            static_cast<unsigned long long>(g_present_count.load()),
+            viewport,
+            resource,
+            native,
+            view,
+            state,
+            static_cast<unsigned>(desc.Format),
+            static_cast<unsigned long long>(desc.Width),
+            desc.Height,
+            static_cast<unsigned>(desc.Flags));
+    }
+
+    if (resource != nullptr && (tag == 3 || tag == 4) && g_config.streamline_output_probe &&
+        g_streamline_output_probe_counts[eye].fetch_add(1) < 4) {
+        void* native{};
+        void* view{};
+        uint32_t state{};
+        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
+        memcpy(&view, static_cast<const uint8_t*>(resource) + 24, sizeof(view));
+        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
+        auto* texture = static_cast<ID3D12Resource*>(native);
+        const auto desc = texture != nullptr ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
+        log_line("Streamline %s eye=%u present=%llu viewport=%u resource=%p native=%p view=%p state=0x%X format=%u size=%llux%u flags=0x%X",
+            tag == 3 ? "ScalingInput" : "ScalingOutput",
+            eye,
+            static_cast<unsigned long long>(g_present_count.load()),
+            viewport,
+            resource,
+            native,
+            view,
+            state,
+            static_cast<unsigned>(desc.Format),
+            static_cast<unsigned long long>(desc.Width),
+            desc.Height,
+            static_cast<unsigned>(desc.Flags));
+    }
+
+    if (resource != nullptr && tag <= 1 &&
+        (g_config.streamline_mvec_correction || g_config.streamline_force_camera_mvec)) {
+        void* native{};
+        uint32_t state{};
+        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
+        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
+        auto* texture = static_cast<ID3D12Resource*>(native);
+        if (texture != nullptr) {
+            std::scoped_lock lock{g_streamline_mvec_mutex};
+            auto*& destination = tag == 0 ? g_streamline_mvec_frame.depth : g_streamline_mvec_frame.mvec;
+            if (destination != texture) {
+                if (destination != nullptr) destination->Release();
+                texture->AddRef();
+                destination = texture;
+            }
+            if (tag == 0) {
+                g_streamline_mvec_frame.depth_state = static_cast<D3D12_RESOURCE_STATES>(state);
+            } else {
+                g_streamline_mvec_frame.mvec_state = static_cast<D3D12_RESOURCE_STATES>(state);
+            }
+        }
+    }
+
+
+    if (resource != nullptr && tag == 4 && g_engine_dual_render_active.load() &&
+        g_engine_render_eye >= 0 &&
+        g_engine_render_generation == g_streamline_capture_generation.load()) {
+        void* native{};
+        uint32_t state{};
+        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
+        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
+        g_streamline_output_frame.output = static_cast<ID3D12Resource*>(native);
+        g_streamline_output_frame.state = static_cast<D3D12_RESOURCE_STATES>(state);
+        g_streamline_output_frame.eye = eye;
+        g_streamline_output_frame.pair_id = g_engine_render_pair_id;
+        g_streamline_output_frame.render_view = g_engine_render_view;
+        g_streamline_output_frame.render_view_valid = g_engine_render_view_valid;
+    }
+
+    return g_sl_set_tag(routed_resource, tag,
+        streamline_viewport_for_eye(viewport), extent);
+}
+
+int __fastcall hook_sl_set_feature_constants(
+    uint32_t feature, const void* constants, uint32_t frame_token, uint32_t viewport) {
+    if (g_streamline_dlss_capture_active && !g_streamline_dlss_recipe_replay &&
+        feature == 0 && constants != nullptr) {
+        auto& call = g_streamline_dlss_capture.feature;
+        memcpy(call.constants.data(), constants, call.constants.size());
+        call.feature = feature;
+        call.frame_token = frame_token;
+        call.viewport = viewport;
+        call.valid = true;
+    }
+    // Only DLSS owns the per-eye Streamline histories created by Packed mode.
+    // Other features (notably Reflex, feature 3) must keep the game's native
+    // viewport instead of alternating between the two DLSS viewport IDs.
+    const uint32_t routed_viewport =
+        feature == 0 ? streamline_viewport_for_eye(viewport) : viewport;
+    return g_sl_set_feature_constants(
+        feature, constants, frame_token, routed_viewport);
+}
+
+int __fastcall hook_sl_evaluate_feature(
+    void* command_buffer, uint32_t feature, uint32_t frame_token, uint32_t viewport) {
+    DlssCpuScope cpu_scope{kDlssCpuSlEvaluateHook};
+    const int previous_token_eye = g_streamline_forced_eye;
+    const uint64_t previous_token_pair = g_streamline_dlss_pair_id;
+    bool token_route_applied{};
+    if (feature == 0 && temporal_backend_is_dlss_packed() &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
+        !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        !g_streamline_dlss_recipe_replay) {
+        StreamlineCapturedConstantsCall token_constants{};
+        {
+            std::scoped_lock lock{g_streamline_constants_cache_mutex};
+            token_constants = g_streamline_constants_cache[
+                frame_token % kStreamlineConstantsCacheSize];
+        }
+        if (token_constants.valid &&
+            token_constants.frame_token == frame_token &&
+            token_constants.eye <= 1 &&
+            token_constants.pair_id != 0 &&
+            token_constants.pair_id != UINT64_MAX) {
+            g_streamline_forced_eye = static_cast<int>(token_constants.eye);
+            g_streamline_dlss_pair_id = token_constants.pair_id;
+            if (g_streamline_dlss_capture_active) {
+                g_streamline_dlss_capture.eye = token_constants.eye;
+                g_streamline_dlss_capture.pair_id = token_constants.pair_id;
+            }
+            EngineFrameTag token_tag{};
+            token_tag.eye = token_constants.eye;
+            token_tag.pair_id = token_constants.pair_id;
+            token_tag.generation =
+                g_streamline_capture_generation.load(std::memory_order_acquire);
+            if (token_constants.render_views_valid) {
+                token_tag.render_view =
+                    token_constants.render_views[token_constants.eye];
+                token_tag.render_view_valid = true;
+            }
+            record_streamline_command_list_route(
+                static_cast<ID3D12GraphicsCommandList*>(command_buffer),
+                token_tag);
+            record_packed_dlss_pair_metadata(token_tag);
+            token_route_applied = true;
+            if (token_constants.pair_id <=
+                g_packed_dlss_last_published_pair.load(
+                    std::memory_order_acquire)) {
+                g_packed_dlss_stale_pair_drops.fetch_add(
+                    1, std::memory_order_relaxed);
+                g_streamline_dlss_capture.evaluate.valid = false;
+                g_streamline_dlss_pair_id = previous_token_pair;
+                g_streamline_forced_eye = previous_token_eye;
+                return 1;
+            }
+        } else {
+            g_packed_dlss_invalid_token_drops.fetch_add(
+                1, std::memory_order_relaxed);
+            return 1;
+        }
+    }
+    if (g_streamline_dlss_capture_active && !g_streamline_dlss_recipe_replay &&
+        feature == 0) {
+        auto& call = g_streamline_dlss_capture.evaluate;
+        call.feature = feature;
+        call.frame_token = frame_token;
+        call.viewport = viewport;
+        call.valid = true;
+    }
+    if (feature == 0) {
+        g_streamline_dlss_evaluate_calls.fetch_add(1, std::memory_order_relaxed);
+        if (g_config.ngx_trace && g_config.openxr_mode == 4 &&
+            g_packed_accepted_pair_id >= 30) {
+            static std::atomic<uint32_t> callsite_logs{};
+            if (callsite_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+                uint32_t route_eye = UINT32_MAX;
+                uint64_t route_pair = UINT64_MAX;
+                size_t route_depth{};
+                {
+                    std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+                    route_depth = g_engine_completed_tag_queue.size();
+                    if (!g_engine_completed_tag_queue.empty()) {
+                        const auto& tag = g_engine_completed_tag_queue.front();
+                        if (tag.generation == g_streamline_capture_generation.load()) {
+                            route_eye = tag.eye;
+                            route_pair = tag.pair_id;
+                        }
+                    }
+                }
+                const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+                const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+                const auto caller_rva = caller >= module ? caller - module : UINT64_MAX;
+                log_line(
+                    "Streamline evaluate callsite caller=%p caller_rva=0x%llX tid=%lu "
+                    "present=%llu token=%u viewport=%u routed_viewport=%u "
+                    "engine_eye=%d route_eye=%u route_pair=%llu route_depth=%zu",
+                    reinterpret_cast<void*>(caller),
+                    static_cast<unsigned long long>(caller_rva),
+                    static_cast<unsigned long>(GetCurrentThreadId()),
+                    static_cast<unsigned long long>(g_present_count.load()),
+                    frame_token, viewport, streamline_viewport_for_eye(viewport),
+                    g_engine_render_eye, route_eye,
+                    static_cast<unsigned long long>(route_pair), route_depth);
+            }
+        }
+    }
+    if (g_engine_dual_render_active.load() && feature == 0 &&
+        g_streamline_dual_evaluate_log_count.fetch_add(1) < 32) {
+        log_line("Streamline dual evaluate command_list=%p thread_eye=%d present=%llu token=%u viewport=%u",
+            command_buffer, g_engine_render_eye,
+            static_cast<unsigned long long>(g_present_count.load()), frame_token, viewport);
+    }
+    const bool packed_private_active = !temporal_backend_is_dlss_packed() ||
+        (g_engine_dual_render_active.load(std::memory_order_acquire) &&
+            g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
+            !g_cinema_mode_active.load(std::memory_order_relaxed));
+    if (packed_private_active &&
+        (g_config.streamline_mvec_correction ||
+            g_config.streamline_force_camera_mvec) && feature == 0) {
+        StreamlineMVecFrameState frame{};
+        bool should_dispatch{};
+        {
+            std::scoped_lock lock{g_streamline_mvec_mutex};
+            const uint32_t history_eye = streamline_history_eye();
+            const auto temporal = g_streamline_mvec_temporal_frames.find(frame_token);
+            if (temporal != g_streamline_mvec_temporal_frames.end() &&
+                g_streamline_mvec_frame.depth != nullptr &&
+                g_streamline_mvec_frame.mvec != nullptr) {
+                frame = g_streamline_mvec_frame;
+                frame.frame_token = frame_token;
+                frame.ready = true;
+                memcpy(frame.original_clip_to_previous,
+                    temporal->second.original_clip_to_previous,
+                    sizeof(frame.original_clip_to_previous));
+                if (temporal->second.matched_camera_valid &&
+                    g_streamline_dlss_previous_camera_valid[history_eye]) {
+                    const auto history_motion = camera_to_previous_transform(
+                        temporal->second.matched_corrected_camera,
+                        g_streamline_dlss_previous_camera[history_eye]);
+                    memcpy(frame.current_to_previous_hmd, history_motion.data(),
+                        sizeof(frame.current_to_previous_hmd));
+                } else {
+                    memcpy(frame.current_to_previous_hmd,
+                        temporal->second.current_to_previous_hmd,
+                        sizeof(frame.current_to_previous_hmd));
+                }
+                if (temporal->second.matched_camera_valid) {
+                    if (temporal_backend_is_dlss_packed() &&
+                        g_streamline_dlss_pair_id != 0 &&
+                        g_streamline_dlss_pair_id != UINT64_MAX) {
+                        auto& commit = g_packed_dlss_camera_commit_slots[
+                            g_streamline_dlss_pair_id %
+                            kPackedDlssCameraCommitSlotCount];
+                        if (commit.pair_id != g_streamline_dlss_pair_id) {
+                            commit = {};
+                            commit.pair_id = g_streamline_dlss_pair_id;
+                        }
+                        commit.camera[history_eye] =
+                            temporal->second.matched_corrected_camera;
+                        commit.valid[history_eye] = true;
+                        g_packed_dlss_camera_history_deferred.fetch_add(
+                            1, std::memory_order_relaxed);
+                    } else {
+                        g_streamline_dlss_previous_camera[history_eye] =
+                            temporal->second.matched_corrected_camera;
+                        g_streamline_dlss_previous_camera_valid[history_eye] = true;
+                    }
+                }
+                if (g_config.openxr_mode == 2 &&
+                    temporal->second.matched_render_views_valid) {
+                    std::scoped_lock view_lock{g_engine_completed_view_mutex};
+                    g_mono_dlss_render_views[0] =
+                        temporal->second.matched_render_views[0];
+                    g_mono_dlss_render_views[1] =
+                        temporal->second.matched_render_views[1];
+                    g_mono_dlss_render_views_valid = true;
+                }
+                memcpy(frame.hmd_projection, temporal->second.hmd_projection,
+                    sizeof(frame.hmd_projection));
+                memcpy(frame.mvec_scale, temporal->second.mvec_scale,
+                    sizeof(frame.mvec_scale));
+                frame.hmd_motion_valid = temporal->second.hmd_motion_valid;
+                // The natural packed command and its public replay evaluate the
+                // same frame token on two independent viewport/NGX histories.
+                // Keep the temporal input alive after the natural eye consumes
+                // it, then release it after the replayed eye has consumed it.
+                const bool retain_for_packed_replay =
+                    g_config.openxr_mode == 4 &&
+                    g_config.streamline_split_viewports &&
+                    g_streamline_dlss_capture_active &&
+                    !g_streamline_dlss_recipe_replay;
+                if (!retain_for_packed_replay) {
+                    g_streamline_mvec_temporal_frames.erase(temporal);
+                }
+                should_dispatch = true;
+            } else if (g_streamline_mvec_frame.ready &&
+                g_streamline_mvec_frame.frame_token == frame_token &&
+                g_streamline_mvec_frame.depth != nullptr &&
+                g_streamline_mvec_frame.mvec != nullptr) {
+                frame = g_streamline_mvec_frame;
+                g_streamline_mvec_frame.ready = false;
+                should_dispatch = true;
+            }
+        }
+
+        dlss_gpu_profile_mark(
+            static_cast<ID3D12GraphicsCommandList*>(command_buffer), 1);
+        const bool corrected = should_dispatch && (g_config.streamline_force_camera_mvec
+            ? clear_streamline_mvec(static_cast<ID3D12GraphicsCommandList*>(command_buffer), frame)
+            : dispatch_streamline_mvec_correction(static_cast<ID3D12GraphicsCommandList*>(command_buffer), frame));
+        dlss_gpu_profile_mark(
+            static_cast<ID3D12GraphicsCommandList*>(command_buffer), 2);
+        if (corrected) {
+            g_streamline_mvec_dispatch_calls.fetch_add(1, std::memory_order_relaxed);
+        } else if (!should_dispatch) {
+            g_streamline_mvec_ready_misses.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (should_dispatch && !corrected && !g_streamline_mvec_skip_logged.exchange(true)) {
+            log_line("Streamline MVec correction skipped token=%u depth=%p state=0x%X mvec=%p state=0x%X scale=%.7f,%.7f",
+                frame_token,
+                frame.depth,
+                static_cast<unsigned>(frame.depth_state),
+                frame.mvec,
+                static_cast<unsigned>(frame.mvec_state),
+                frame.mvec_scale[0], frame.mvec_scale[1]);
+        }
+    }
+
+    dlss_gpu_profile_mark(
+        static_cast<ID3D12GraphicsCommandList*>(command_buffer), 3);
+    const uint32_t routed_viewport =
+        feature == 0 ? streamline_viewport_for_eye(viewport) : viewport;
+    const int result = g_sl_evaluate_feature(
+        command_buffer, feature, frame_token, routed_viewport);
+    dlss_gpu_profile_mark(
+        static_cast<ID3D12GraphicsCommandList*>(command_buffer), 4);
+    if (token_route_applied) {
+        g_streamline_dlss_pair_id = previous_token_pair;
+        g_streamline_forced_eye = previous_token_eye;
+    }
+    return result;
+}
+
+bool schedule_dlss_mvec_readback(
+    ID3D12GraphicsCommandList* command_list, ID3D12Resource* motion_vectors) {
+    if (command_list == nullptr || motion_vectors == nullptr || g_d3d12_device == nullptr ||
+        g_dlss_mvec_readback_scheduled.exchange(true)) {
+        return false;
+    }
+
+    const auto desc = motion_vectors->GetDesc();
+    if (desc.Format != DXGI_FORMAT_R16G16_FLOAT) {
+        g_dlss_mvec_readback_scheduled.store(false);
+        return false;
+    }
+
+    UINT64 total_bytes{};
+    g_d3d12_device->GetCopyableFootprints(&desc, 0, 1, 0,
+        &g_dlss_mvec_readback_footprint, nullptr, nullptr, &total_bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total_bytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_d3d12_device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&g_dlss_mvec_readback_buffer))) ||
+        FAILED(g_d3d12_device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dlss_mvec_readback_fence)))) {
+        log_line("DLSS MVec readback initialization failed");
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = motion_vectors;
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    command_list->ResourceBarrier(1, &to_copy);
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = motion_vectors;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = g_dlss_mvec_readback_buffer;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = g_dlss_mvec_readback_footprint;
+    command_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+
+    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+    command_list->ResourceBarrier(1, &to_copy);
+    g_dlss_mvec_readback_command_list.store(command_list);
+    log_line("DLSS MVec readback scheduled command_list=%p resource=%p size=%ux%u bytes=%llu",
+        command_list, motion_vectors, static_cast<unsigned>(desc.Width), desc.Height,
+        static_cast<unsigned long long>(total_bytes));
+    return true;
+}
+
+void schedule_dlss_output_luminance_readback(
+    ID3D12GraphicsCommandList* command_list,
+    const NVSDK_NGX_Handle* handle,
+    ID3D12Resource* output) {
+    if (command_list == nullptr || handle == nullptr || output == nullptr ||
+        g_d3d12_device == nullptr || g_packed_accepted_pair_id < 30) {
+        return;
+    }
+
+    uint32_t lane = 2;
+    {
+        std::scoped_lock lock{g_dlss_output_luma_mutex};
+        for (uint32_t index = 0; index < 2; ++index) {
+            if (g_dlss_output_luma_handles[index] == handle) {
+                lane = index;
+                break;
+            }
+        }
+        if (lane == 2) {
+            for (uint32_t index = 0; index < 2; ++index) {
+                if (g_dlss_output_luma_handles[index] == nullptr) {
+                    g_dlss_output_luma_handles[index] = handle;
+                    lane = index;
+                    break;
+                }
+            }
+        }
+        if (lane >= 2 || g_dlss_output_luma_scheduled[lane].load()) {
+            return;
+        }
+
+        const auto desc = output->GetDesc();
+        if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+            desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+            desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            log_line("DLSS output luminance unsupported lane=%u handle=%p format=%u",
+                lane, handle, static_cast<unsigned>(desc.Format));
+            g_dlss_output_luma_scheduled[lane].store(true);
+            return;
+        }
+        g_dlss_output_luma_formats[lane] = desc.Format;
+        g_d3d12_device->GetCopyableFootprints(&desc, 0, 1, 0,
+            &g_dlss_output_luma_footprints[lane], nullptr, nullptr,
+            &g_dlss_output_luma_bytes[lane]);
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = g_dlss_output_luma_bytes[lane];
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&g_dlss_output_luma_readback[lane]))) ||
+            FAILED(g_d3d12_device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE,
+                IID_PPV_ARGS(&g_dlss_output_luma_fences[lane])))) {
+            log_line("DLSS output luminance allocation failed lane=%u handle=%p",
+                lane, handle);
+            return;
+        }
+
+        D3D12_RESOURCE_BARRIER uav{};
+        uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = output;
+        command_list->ResourceBarrier(1, &uav);
+        D3D12_RESOURCE_BARRIER to_copy{};
+        to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy.Transition.pResource = output;
+        to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        command_list->ResourceBarrier(1, &to_copy);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = g_dlss_output_luma_readback[lane];
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = g_dlss_output_luma_footprints[lane];
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = output;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+        command_list->ResourceBarrier(1, &to_copy);
+        g_dlss_output_luma_command_lists[lane].store(command_list);
+        g_dlss_output_luma_scheduled[lane].store(true);
+        log_line("DLSS output luminance scheduled lane=%u handle=%p output=%p size=%ux%u",
+            lane, handle, output,
+            g_dlss_output_luma_footprints[lane].Footprint.Width,
+            g_dlss_output_luma_footprints[lane].Footprint.Height);
+    }
+}
+
+bool packed_dlss_resource_matches(
+    ID3D12Resource* resource,
+    const D3D12_RESOURCE_DESC& source_desc,
+    bool doubled_width) {
+    if (resource == nullptr) {
+        return false;
+    }
+    const auto desc = resource->GetDesc();
+    return desc.Width == source_desc.Width * (doubled_width ? 2ull : 1ull) &&
+        desc.Height == source_desc.Height && desc.DepthOrArraySize == source_desc.DepthOrArraySize &&
+        desc.MipLevels == source_desc.MipLevels && desc.Format == source_desc.Format &&
+        desc.SampleDesc.Count == source_desc.SampleDesc.Count;
+}
+
+void release_packed_dlss_resources_locked() {
+    ID3D12Resource** resources[] = {
+        &g_packed_dlss_color, &g_packed_dlss_depth,
+        &g_packed_dlss_mvec, &g_packed_dlss_output};
+    for (auto** resource : resources) {
+        if (*resource != nullptr) {
+            (*resource)->Release();
+            *resource = nullptr;
+        }
+    }
+    g_packed_dlss_first_inputs = {};
+    g_packed_dlss_first_eye = UINT32_MAX;
+    g_packed_dlss_pair_id = UINT64_MAX;
+    g_packed_dlss_first_ready = false;
+    g_packed_dlss_pending_pair.store(UINT64_MAX, std::memory_order_release);
+    g_packed_dlss_output_pending_pair.store(
+        UINT64_MAX, std::memory_order_relaxed);
+    g_packed_dlss_output_pending_publish.store(
+        false, std::memory_order_release);
+    {
+        std::scoped_lock lock{g_packed_dlss_present_mutex};
+        g_packed_dlss_collect_metadata = {};
+        g_packed_dlss_next_metadata = {};
+        g_packed_dlss_active_metadata = {};
+        g_packed_dlss_capture_cycle_pair = UINT64_MAX;
+        g_packed_dlss_capture_cycle_mask = 0;
+    }
+}
+
+// [FIX:DLSS-PACKED 5/10] Allocate the side-by-side color, depth, motion-vector,
+// and output atlas used by one stereo NGX evaluation.
+bool ensure_packed_dlss_resources_locked(const PackedDlssInputs& inputs) {
+    if (g_d3d12_device == nullptr || inputs.color == nullptr || inputs.depth == nullptr ||
+        inputs.mvec == nullptr || inputs.output == nullptr) {
+        return false;
+    }
+    const auto color_desc = inputs.color->GetDesc();
+    const auto depth_desc = inputs.depth->GetDesc();
+    const auto mvec_desc = inputs.mvec->GetDesc();
+    const auto output_desc = inputs.output->GetDesc();
+    if (packed_dlss_resource_matches(g_packed_dlss_color, color_desc, true) &&
+        packed_dlss_resource_matches(g_packed_dlss_depth, depth_desc, true) &&
+        packed_dlss_resource_matches(g_packed_dlss_mvec, mvec_desc, true) &&
+        packed_dlss_resource_matches(g_packed_dlss_output, output_desc, true)) {
+        return true;
+    }
+
+    release_packed_dlss_resources_locked();
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC descs[] = {
+        color_desc, depth_desc, mvec_desc, output_desc};
+    for (auto& desc : descs) {
+        desc.Width *= 2;
+    }
+    ID3D12Resource** resources[] = {
+        &g_packed_dlss_color, &g_packed_dlss_depth,
+        &g_packed_dlss_mvec, &g_packed_dlss_output};
+    for (uint32_t index = 0; index < std::size(resources); ++index) {
+        const auto initial_state = index == 3
+            ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            : D3D12_RESOURCE_STATE_COPY_DEST;
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &descs[index], initial_state,
+                nullptr, IID_PPV_ARGS(resources[index])))) {
+            log_line("Packed DLSS resource allocation failed index=%u size=%llux%u format=%u",
+                index, static_cast<unsigned long long>(descs[index].Width),
+                descs[index].Height, static_cast<unsigned>(descs[index].Format));
+            release_packed_dlss_resources_locked();
+            return false;
+        }
+    }
+    log_line(
+        "Packed DLSS atlas created input=%llux%u output=%llux%u input_format=%u output_format=%u",
+        static_cast<unsigned long long>(descs[0].Width), descs[0].Height,
+        static_cast<unsigned long long>(descs[3].Width), descs[3].Height,
+        static_cast<unsigned>(descs[0].Format),
+        static_cast<unsigned>(descs[3].Format));
+    return true;
+}
+
+// [FIX:DLSS-PACKED 6/10] Place each eye in its deterministic half of the
+// side-by-side atlas without changing the source resources' lasting state.
+void copy_packed_dlss_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t eye,
+    const PackedDlssInputs& inputs) {
+    DlssCpuScope cpu_scope{kDlssCpuPackedInputCopy};
+    ID3D12Resource* sources[] = {inputs.color, inputs.depth, inputs.mvec};
+    ID3D12Resource* destinations[] = {
+        g_packed_dlss_color, g_packed_dlss_depth, g_packed_dlss_mvec};
+    const D3D12_RESOURCE_STATES states[] = {
+        inputs.color_state, inputs.depth_state, inputs.mvec_state};
+    for (uint32_t index = 0; index < std::size(sources); ++index) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = sources[index];
+        barrier.Transition.StateBefore = states[index];
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        if (states[index] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            command_list->ResourceBarrier(1, &barrier);
+        }
+        const auto source_desc = sources[index]->GetDesc();
+        D3D12_TEXTURE_COPY_LOCATION source{
+            sources[index], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION destination{
+            destinations[index], D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_BOX source_box{0, 0, 0,
+            static_cast<UINT>(source_desc.Width), source_desc.Height, 1};
+        command_list->CopyTextureRegion(
+            &destination, eye * static_cast<UINT>(source_desc.Width), 0, 0,
+            &source, &source_box);
+        if (states[index] != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+            command_list->ResourceBarrier(1, &barrier);
+        }
+    }
+}
+
+void transition_packed_dlss_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    D3D12_RESOURCE_STATES before,
+    D3D12_RESOURCE_STATES after) {
+    ID3D12Resource* resources[] = {
+        g_packed_dlss_color, g_packed_dlss_depth, g_packed_dlss_mvec};
+    D3D12_RESOURCE_BARRIER barriers[3]{};
+    for (uint32_t index = 0; index < std::size(resources); ++index) {
+        barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[index].Transition.pResource = resources[index];
+        barriers[index].Transition.StateBefore = before;
+        barriers[index].Transition.StateAfter = after;
+        barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    command_list->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+}
+
+// [FIX:DLSS-PACKED 7/10] Split the completed atlas into private eye outputs and
+// publish it only after NGX has finished writing the full stereo result.
+bool publish_packed_dlss_output_after_draw(
+    ID3D12GraphicsCommandList* command_list) {
+    DlssCpuScope cpu_scope{kDlssCpuPublish};
+    if (!temporal_backend_is_dlss_packed() || command_list == nullptr ||
+        !g_packed_dlss_output_pending_publish.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::scoped_lock packed_lock{g_packed_dlss_mutex};
+    if (!g_packed_dlss_output_pending_publish.load(std::memory_order_relaxed) ||
+        g_packed_dlss_output == nullptr ||
+        g_streamline_private_outputs[0] == nullptr ||
+        g_streamline_private_outputs[1] == nullptr) {
+        return false;
+    }
+    const uint64_t published_pair =
+        g_packed_dlss_output_pending_pair.load(std::memory_order_relaxed);
+    const uint64_t previous_published_pair =
+        g_packed_dlss_last_published_pair.load(std::memory_order_acquire);
+    if (published_pair <= previous_published_pair) {
+        g_packed_dlss_stale_pair_drops.fetch_add(
+            1, std::memory_order_relaxed);
+        g_packed_dlss_output_pending_pair.store(
+            UINT64_MAX, std::memory_order_relaxed);
+        g_packed_dlss_output_pending_publish.store(
+            false, std::memory_order_release);
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER packed_barrier{};
+    packed_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    packed_barrier.Transition.pResource = g_packed_dlss_output;
+    packed_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    packed_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    packed_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    command_list->ResourceBarrier(1, &packed_barrier);
+
+    const auto packed_desc = g_packed_dlss_output->GetDesc();
+    const UINT eye_width = static_cast<UINT>(packed_desc.Width / 2);
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        auto* destination_resource = g_streamline_private_outputs[eye];
+        D3D12_RESOURCE_BARRIER destination_barrier{};
+        destination_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        destination_barrier.Transition.pResource = destination_resource;
+        destination_barrier.Transition.StateBefore =
+            g_streamline_canonical_output_state;
+        destination_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        destination_barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        command_list->ResourceBarrier(1, &destination_barrier);
+
+        D3D12_TEXTURE_COPY_LOCATION source{
+            g_packed_dlss_output, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_TEXTURE_COPY_LOCATION destination{
+            destination_resource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        D3D12_BOX source_box{
+            eye * eye_width, 0, 0, (eye + 1) * eye_width,
+            packed_desc.Height, 1};
+        command_list->CopyTextureRegion(
+            &destination, 0, 0, 0, &source, &source_box);
+
+        std::swap(destination_barrier.Transition.StateBefore,
+            destination_barrier.Transition.StateAfter);
+        command_list->ResourceBarrier(1, &destination_barrier);
+    }
+    std::swap(packed_barrier.Transition.StateBefore,
+        packed_barrier.Transition.StateAfter);
+    command_list->ResourceBarrier(1, &packed_barrier);
+
+    {
+        std::scoped_lock present_lock{g_packed_dlss_present_mutex};
+        if (g_packed_dlss_collect_metadata.valid &&
+            g_packed_dlss_collect_metadata.pair_id == published_pair) {
+            g_packed_dlss_next_metadata = g_packed_dlss_collect_metadata;
+        } else {
+            static std::atomic<uint32_t> incomplete_metadata_logs{};
+            if (incomplete_metadata_logs.fetch_add(
+                    1, std::memory_order_relaxed) < 32) {
+                log_line(
+                    "Packed DLSS publish metadata incomplete output_pair=%llu metadata_pair=%llu mask=0x%X",
+                    static_cast<unsigned long long>(published_pair),
+                    static_cast<unsigned long long>(
+                        g_packed_dlss_collect_metadata.pair_id),
+                    g_packed_dlss_collect_metadata.eye_mask);
+            }
+        }
+    }
+    g_packed_dlss_output_pending_pair.store(
+        UINT64_MAX, std::memory_order_relaxed);
+    g_packed_dlss_output_pending_publish.store(
+        false, std::memory_order_release);
+    g_packed_dlss_last_published_pair.store(
+        published_pair, std::memory_order_release);
+    const auto published_total = g_packed_dlss_outputs_published.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    static std::atomic<uint32_t> publish_logs{};
+    if (publish_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+        log_line(
+            "Packed DLSS output published after second post draw pair=%llu total=%llu",
+            static_cast<unsigned long long>(published_pair),
+            static_cast<unsigned long long>(published_total));
+    }
+    return true;
+}
+
+NVSDK_NGX_Handle* lookup_packed_dlss_handle(
+    const NVSDK_NGX_Handle* normal_handle) {
+    std::scoped_lock lock{g_packed_dlss_handle_mutex};
+    const auto found = g_packed_dlss_handles.find(normal_handle);
+    // This Streamline build does not pass the pointer returned by NGX
+    // CreateFeature back to EvaluateFeature; it evaluates through an internal
+    // handle wrapper. The extra feature itself is nevertheless a valid public
+    // NGX handle (the historical full-sequential path used it directly).
+    // Keep one packed handle for the single shared atlas history.
+    return found != g_packed_dlss_handles.end()
+        ? found->second
+        : g_packed_dlss_primary_handle;
+}
+
+void commit_packed_dlss_camera_history(uint64_t pair_id) {
+    if (pair_id == 0 || pair_id == UINT64_MAX) {
+        return;
+    }
+    std::scoped_lock lock{g_streamline_mvec_mutex};
+    auto& commit = g_packed_dlss_camera_commit_slots[
+        pair_id % kPackedDlssCameraCommitSlotCount];
+    if (commit.pair_id != pair_id) {
+        return;
+    }
+    uint32_t committed{};
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        if (!commit.valid[eye]) {
+            continue;
+        }
+        g_streamline_dlss_previous_camera[eye] = commit.camera[eye];
+        g_streamline_dlss_previous_camera_valid[eye] = true;
+        ++committed;
+    }
+    commit = {};
+    g_packed_dlss_camera_history_committed.fetch_add(
+        committed, std::memory_order_relaxed);
+}
+
+// [FIX:DLSS-PACKED 9/10] Collect both eye inputs, run a single packed NGX
+// evaluation, and reject stale or incomplete pairs before they can escape.
+NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature(
+    ID3D12GraphicsCommandList* command_list,
+    const NVSDK_NGX_Handle* handle,
+    const NVSDK_NGX_Parameter* parameters,
+    PFN_NVSDK_NGX_ProgressCallback callback) {
+    g_ngx_dlss_evaluate_calls.fetch_add(1, std::memory_order_relaxed);
+    if (temporal_backend_is_dlss_packed() && command_list != nullptr &&
+        parameters != nullptr && g_config.openxr_mode == 4 &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
+        !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        g_streamline_dlss_pair_id != UINT64_MAX) {
+        if (g_streamline_dlss_pair_id <=
+            g_packed_dlss_last_published_pair.load(
+                std::memory_order_acquire)) {
+            g_packed_dlss_stale_pair_drops.fetch_add(
+                1, std::memory_order_relaxed);
+            return NVSDK_NGX_Result_Success;
+        }
+        const uint32_t eye = streamline_eye();
+        auto* packed_handle = lookup_packed_dlss_handle(handle);
+        PackedDlssInputs inputs{};
+        parameters->Get(NVSDK_NGX_Parameter_Color, &inputs.color);
+        parameters->Get(NVSDK_NGX_Parameter_Depth, &inputs.depth);
+        parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &inputs.mvec);
+        parameters->Get(NVSDK_NGX_Parameter_Output, &inputs.output);
+        for (uint32_t index = 0; index < 3; ++index) {
+            const auto state = g_ngx_input_states[index].load(
+                std::memory_order_acquire);
+            const auto resolved = state != UINT32_MAX
+                ? static_cast<D3D12_RESOURCE_STATES>(state)
+                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            if (index == 0) inputs.color_state = resolved;
+            if (index == 1) inputs.depth_state = resolved;
+            if (index == 2) inputs.mvec_state = resolved;
+        }
+        if (eye < 2 && packed_handle != nullptr && inputs.color != nullptr &&
+            inputs.depth != nullptr && inputs.mvec != nullptr &&
+            inputs.output != nullptr) {
+            const int64_t mutex_wait_begin = dlss_cpu_profile_now();
+            g_packed_dlss_mutex.lock();
+            record_dlss_cpu_phase(
+                kDlssCpuPackedMutexWait, mutex_wait_begin);
+            if (ensure_packed_dlss_resources_locked(inputs)) {
+                g_packed_dlss_calls.fetch_add(1, std::memory_order_relaxed);
+                const bool completes_pair = g_packed_dlss_first_ready &&
+                    g_packed_dlss_pair_id == g_streamline_dlss_pair_id &&
+                    g_packed_dlss_first_eye < 2 &&
+                    g_packed_dlss_first_eye != eye;
+                if (!completes_pair) {
+                    if (g_packed_dlss_first_ready) {
+                        g_packed_dlss_resets.fetch_add(1, std::memory_order_relaxed);
+                        static std::atomic<uint32_t> reset_logs{};
+                        if (reset_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                            log_line(
+                                "Packed DLSS pair reset old_pair=%llu old_eye=%u new_pair=%llu new_eye=%u",
+                                static_cast<unsigned long long>(g_packed_dlss_pair_id),
+                                g_packed_dlss_first_eye,
+                                static_cast<unsigned long long>(g_streamline_dlss_pair_id),
+                                eye);
+                        }
+                    }
+                    copy_packed_dlss_inputs(command_list, eye, inputs);
+                    g_packed_dlss_first_inputs = inputs;
+                    g_packed_dlss_first_eye = eye;
+                    g_packed_dlss_pair_id = g_streamline_dlss_pair_id;
+                    g_packed_dlss_first_ready = true;
+                    g_packed_dlss_pending_pair.store(
+                        g_streamline_dlss_pair_id, std::memory_order_release);
+                    record_streamline_command_list_eye(command_list, eye);
+                    static std::atomic<uint32_t> first_logs{};
+                    if (first_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                        log_line(
+                            "Packed DLSS first half pair=%llu eye=%u command_list=%p output=%p",
+                            static_cast<unsigned long long>(g_streamline_dlss_pair_id),
+                            eye, command_list, inputs.output);
+                    }
+                    g_packed_dlss_mutex.unlock();
+                    return NVSDK_NGX_Result_Success;
+                }
+
+                copy_packed_dlss_inputs(command_list, eye, inputs);
+                transition_packed_dlss_inputs(
+                    command_list, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                auto* mutable_parameters =
+                    const_cast<NVSDK_NGX_Parameter*>(parameters);
+                unsigned original_subrect_width{};
+                unsigned original_subrect_height{};
+                parameters->Get(
+                    NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                    &original_subrect_width);
+                parameters->Get(
+                    NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                    &original_subrect_height);
+                const auto color_desc = inputs.color->GetDesc();
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_Color, g_packed_dlss_color);
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_Depth, g_packed_dlss_depth);
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_MotionVectors, g_packed_dlss_mvec);
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_Output, g_packed_dlss_output);
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                    static_cast<unsigned>(color_desc.Width * 2));
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                    color_desc.Height);
+
+                const int64_t evaluate_begin = dlss_cpu_profile_now();
+                const auto result = g_ngx_evaluate_feature(
+                    command_list, packed_handle, parameters, callback);
+                record_dlss_cpu_phase(kDlssCpuNgxEvaluate, evaluate_begin);
+
+                mutable_parameters->Set(NVSDK_NGX_Parameter_Color, inputs.color);
+                mutable_parameters->Set(NVSDK_NGX_Parameter_Depth, inputs.depth);
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_MotionVectors, inputs.mvec);
+                mutable_parameters->Set(NVSDK_NGX_Parameter_Output, inputs.output);
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                    original_subrect_width);
+                mutable_parameters->Set(
+                    NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                    original_subrect_height);
+                if (result == NVSDK_NGX_Result_Success) {
+                    commit_packed_dlss_camera_history(
+                        g_packed_dlss_pair_id);
+                    g_packed_dlss_output_pending_pair.store(
+                        g_packed_dlss_pair_id, std::memory_order_relaxed);
+                    g_packed_dlss_output_pending_publish.store(
+                        true, std::memory_order_release);
+                    g_packed_dlss_single_evaluations.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                transition_packed_dlss_inputs(
+                    command_list,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+                record_streamline_command_list_eye(command_list, eye);
+                static std::atomic<uint32_t> eval_logs{};
+                if (eval_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+                    log_line(
+                        "Packed DLSS single eval pair=%llu first_eye=%u second_eye=%u command_list=%p handle=%p result=0x%08X totals=%llu/%llu resets=%llu",
+                        static_cast<unsigned long long>(g_packed_dlss_pair_id),
+                        g_packed_dlss_first_eye, eye, command_list, packed_handle,
+                        static_cast<unsigned>(result),
+                        static_cast<unsigned long long>(
+                            g_packed_dlss_single_evaluations.load()),
+                        static_cast<unsigned long long>(g_packed_dlss_calls.load()),
+                        static_cast<unsigned long long>(g_packed_dlss_resets.load()));
+                }
+                g_packed_dlss_first_inputs = {};
+                g_packed_dlss_first_eye = UINT32_MAX;
+                g_packed_dlss_pair_id = UINT64_MAX;
+                g_packed_dlss_first_ready = false;
+                g_packed_dlss_pending_pair.store(
+                    UINT64_MAX, std::memory_order_release);
+                g_packed_dlss_mutex.unlock();
+                return result;
+            }
+            g_packed_dlss_mutex.unlock();
+        }
+    }
+    if (g_config.logging_enabled && g_config.ngx_trace &&
+        parameters != nullptr && g_ngx_trace_count.fetch_add(1) < 16) {
+        ID3D12Resource* color{};
+        ID3D12Resource* depth{};
+        ID3D12Resource* motion_vectors{};
+        ID3D12Resource* output{};
+        ID3D12Resource* exposure{};
+        int reset{};
+        float mv_scale_x{};
+        float mv_scale_y{};
+        float jitter_x{};
+        float jitter_y{};
+        float pre_exposure{};
+        float exposure_scale{};
+        unsigned int render_width{};
+        unsigned int render_height{};
+        unsigned int output_width{};
+        unsigned int output_height{};
+        unsigned int subrect_width{};
+        unsigned int subrect_height{};
+        int create_flags{};
+        parameters->Get(NVSDK_NGX_Parameter_Color, &color);
+        parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
+        parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motion_vectors);
+        parameters->Get(NVSDK_NGX_Parameter_Output, &output);
+        parameters->Get(NVSDK_NGX_Parameter_ExposureTexture, &exposure);
+        parameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
+        parameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &mv_scale_x);
+        parameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &mv_scale_y);
+        parameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitter_x);
+        parameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitter_y);
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &pre_exposure);
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, &exposure_scale);
+        parameters->Get(NVSDK_NGX_Parameter_Width, &render_width);
+        parameters->Get(NVSDK_NGX_Parameter_Height, &render_height);
+        parameters->Get(NVSDK_NGX_Parameter_OutWidth, &output_width);
+        parameters->Get(NVSDK_NGX_Parameter_OutHeight, &output_height);
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &subrect_width);
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &subrect_height);
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &create_flags);
+        uintptr_t handle_words[4]{};
+        __try {
+            memcpy(handle_words, handle, sizeof(handle_words));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        log_line("NGX DLSS eval eye=%u handle=%p command_list=%p reset=%d color=%p depth=%p mvec=%p output=%p",
+            streamline_eye(), handle, command_list, reset, color, depth, motion_vectors, output);
+        log_line("NGX DLSS handle words=%p [%p %p %p %p]",
+            handle,
+            reinterpret_cast<void*>(handle_words[0]), reinterpret_cast<void*>(handle_words[1]),
+            reinterpret_cast<void*>(handle_words[2]), reinterpret_cast<void*>(handle_words[3]));
+        log_line("NGX DLSS params mv_scale=%.6f,%.6f jitter=%.6f,%.6f render=%ux%u output=%ux%u subrect=%ux%u create_flags=0x%X mv_low_res=%u",
+            mv_scale_x, mv_scale_y, jitter_x, jitter_y,
+            render_width, render_height, output_width, output_height,
+            subrect_width, subrect_height, static_cast<unsigned>(create_flags),
+            (create_flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0 ? 1u : 0u);
+        log_line("NGX DLSS exposure eye=%u handle=%p texture=%p pre=%.9f scale=%.9f",
+            streamline_eye(), handle, exposure, pre_exposure, exposure_scale);
+        const auto color_desc = color != nullptr ? color->GetDesc() : D3D12_RESOURCE_DESC{};
+        const auto depth_desc = depth != nullptr ? depth->GetDesc() : D3D12_RESOURCE_DESC{};
+        const auto mvec_desc = motion_vectors != nullptr
+            ? motion_vectors->GetDesc() : D3D12_RESOURCE_DESC{};
+        const auto output_desc = output != nullptr ? output->GetDesc() : D3D12_RESOURCE_DESC{};
+        log_line("NGX DLSS resources color=%llux%u depth=%llux%u mvec=%llux%u output=%llux%u",
+            static_cast<unsigned long long>(color_desc.Width), color_desc.Height,
+            static_cast<unsigned long long>(depth_desc.Width), depth_desc.Height,
+            static_cast<unsigned long long>(mvec_desc.Width), mvec_desc.Height,
+            static_cast<unsigned long long>(output_desc.Width), output_desc.Height);
+    }
+    ID3D12Resource* probe_output{};
+    if (parameters != nullptr) {
+        parameters->Get(NVSDK_NGX_Parameter_Output, &probe_output);
+    }
+    const uint32_t eye = streamline_eye();
+    record_streamline_command_list_eye(command_list, eye);
+    const int64_t evaluate_begin = dlss_cpu_profile_now();
+    const auto result = g_ngx_evaluate_feature(
+        command_list, handle, parameters, callback);
+    record_dlss_cpu_phase(kDlssCpuNgxEvaluate, evaluate_begin);
+    if (g_config.logging_enabled && result == NVSDK_NGX_Result_Success) {
+        schedule_dlss_output_luminance_readback(
+            command_list, handle, probe_output);
+    }
+    return result;
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_ngx_create_feature(
+    ID3D12GraphicsCommandList* command_list,
+    NVSDK_NGX_Feature feature,
+    const NVSDK_NGX_Parameter* parameters,
+    NVSDK_NGX_Handle** handle) {
+    g_ngx_creating_feature = true;
+    const auto result = g_ngx_create_feature(command_list, feature, parameters, handle);
+    g_ngx_creating_feature = false;
+    if (temporal_backend_is_dlss_packed() &&
+        feature == NVSDK_NGX_Feature_SuperSampling && parameters != nullptr &&
+        result == NVSDK_NGX_Result_Success && handle != nullptr &&
+        *handle != nullptr) {
+        unsigned width{};
+        unsigned out_width{};
+        parameters->Get(NVSDK_NGX_Parameter_Width, &width);
+        parameters->Get(NVSDK_NGX_Parameter_OutWidth, &out_width);
+        auto* mutable_parameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
+        mutable_parameters->Set(NVSDK_NGX_Parameter_Width, width * 2);
+        mutable_parameters->Set(NVSDK_NGX_Parameter_OutWidth, out_width * 2);
+        NVSDK_NGX_Handle* packed_handle{};
+        g_ngx_creating_feature = true;
+        const auto packed_result = g_ngx_create_feature(
+            command_list, feature, parameters, &packed_handle);
+        g_ngx_creating_feature = false;
+        mutable_parameters->Set(NVSDK_NGX_Parameter_Width, width);
+        mutable_parameters->Set(NVSDK_NGX_Parameter_OutWidth, out_width);
+        if (packed_result == NVSDK_NGX_Result_Success && packed_handle != nullptr) {
+            std::scoped_lock lock{g_packed_dlss_handle_mutex};
+            g_packed_dlss_handles[*handle] = packed_handle;
+            if (g_packed_dlss_primary_handle == nullptr) {
+                g_packed_dlss_primary_handle = packed_handle;
+            }
+            log_line(
+                "Packed DLSS feature created normal=%p packed=%p primary=%p input=%ux? packed=%ux? output=%ux? packed=%ux?",
+                *handle, packed_handle, g_packed_dlss_primary_handle,
+                width, width * 2, out_width,
+                out_width * 2);
+        } else {
+            log_line(
+                "Packed DLSS feature creation failed normal=%p result=0x%08X input=%u output=%u",
+                *handle, static_cast<unsigned>(packed_result), width,
+                out_width);
+        }
+    }
+    if (g_config.ngx_trace && result == NVSDK_NGX_Result_Success) {
+        log_line("NGX create feature=%u handle=%p command_list=%p",
+            static_cast<unsigned>(feature), handle != nullptr ? *handle : nullptr, command_list);
+    }
+    return result;
+}
+
+void install_ngx_dlss_hook() {
+    if (!temporal_backend_is_dlss() || !g_config.ngx_trace ||
+        g_ngx_evaluate_feature != nullptr) {
+        return;
+    }
+
+    auto* module = GetModuleHandleW(L"nvngx_dlss.dll");
+    auto* target = module != nullptr ? GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature") : nullptr;
+    auto* create_target = module != nullptr ? GetProcAddress(module, "NVSDK_NGX_D3D12_CreateFeature") : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_ngx_evaluate_feature),
+            reinterpret_cast<void**>(&g_ngx_evaluate_feature)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("NGX DLSS EvaluateFeature hook installed target=%p", target);
+    }
+    if (create_target != nullptr && g_ngx_create_feature == nullptr &&
+        MH_CreateHook(create_target, reinterpret_cast<void*>(&hook_ngx_create_feature),
+            reinterpret_cast<void**>(&g_ngx_create_feature)) == MH_OK &&
+        MH_EnableHook(create_target) == MH_OK) {
+        log_line("NGX DLSS CreateFeature hook installed target=%p", create_target);
+    }
+}
+
+// ForceDLAA follows the proven DLSSTweaks approach: keep a supported quality
+// preset selected, but return the full target dimensions when NGX asks for the
+// optimal DLSS input size. See THIRD_PARTY_NOTICES.md.
+NVSDK_NGX_Result NVSDK_CONV hook_ngx_parameter_get_ui(
+    NVSDK_NGX_Parameter* parameters,
+    const char* name,
+    unsigned int* value) {
+    const auto result = g_ngx_parameter_get_ui(parameters, name, value);
+    if (result != NVSDK_NGX_Result_Success || !g_config.dlss_dlaa ||
+        parameters == nullptr || name == nullptr || value == nullptr ||
+        *value == 0) {
+        return result;
+    }
+
+    const bool dynamic_min_width =
+        _stricmp(name, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width) == 0;
+    const bool dynamic_min_height =
+        _stricmp(name, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height) == 0;
+    const bool width_query =
+        _stricmp(name, NVSDK_NGX_Parameter_OutWidth) == 0 ||
+        _stricmp(name, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width) == 0 ||
+        dynamic_min_width;
+    const bool height_query =
+        _stricmp(name, NVSDK_NGX_Parameter_OutHeight) == 0 ||
+        _stricmp(name, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height) == 0 ||
+        dynamic_min_height;
+    if (!width_query && !height_query) {
+        return result;
+    }
+
+    const auto original_value = *value;
+    unsigned int native_value{};
+    const auto native_result = g_ngx_parameter_get_ui(
+        parameters,
+        width_query ? NVSDK_NGX_Parameter_Width : NVSDK_NGX_Parameter_Height,
+        &native_value);
+    if (native_result == NVSDK_NGX_Result_Success && native_value != 0) {
+        // NGX dynamic-resolution paths expect min and max to differ. Match the
+        // DLSSTweaks compatibility default of native-1 for the minimum bound.
+        if ((dynamic_min_width || dynamic_min_height) && native_value > 1) {
+            --native_value;
+        }
+        *value = native_value;
+        if (g_ngx_dlaa_override_log_count.fetch_add(1) < 32) {
+            log_line("DLAA NGX optimal resolution %s original=%u native=%u",
+                name, original_value, native_value);
+        }
+    }
+    return result;
+}
+
+void install_ngx_parameter_get_ui_hook(NVSDK_NGX_Parameter* parameters) {
+    if (parameters == nullptr || g_ngx_parameter_get_ui != nullptr) {
+        return;
+    }
+
+    std::scoped_lock lock{g_ngx_dlaa_hook_mutex};
+    if (g_ngx_parameter_get_ui != nullptr) {
+        return;
+    }
+
+    auto** vtable = *reinterpret_cast<void***>(parameters);
+    // The binary nvngx parameter ABI uses GetUI at vtable offset 0x60. This
+    // order is stable across the NGX versions supported by DLSSTweaks.
+    auto* target = vtable != nullptr ? vtable[12] : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_ngx_parameter_get_ui),
+            reinterpret_cast<void**>(&g_ngx_parameter_get_ui)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("DLAA NGX Parameter::GetUI hook installed target=%p", target);
+    } else {
+        g_ngx_parameter_get_ui = nullptr;
+        log_line("DLAA NGX Parameter::GetUI hook failed target=%p", target);
+    }
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_ngx_allocate_parameters(
+    NVSDK_NGX_Parameter** parameters) {
+    const auto result = g_ngx_allocate_parameters(parameters);
+    if (parameters != nullptr) {
+        install_ngx_parameter_get_ui_hook(*parameters);
+    }
+    return result;
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_ngx_get_capability_parameters(
+    NVSDK_NGX_Parameter** parameters) {
+    const auto result = g_ngx_get_capability_parameters(parameters);
+    if (parameters != nullptr) {
+        install_ngx_parameter_get_ui_hook(*parameters);
+    }
+    return result;
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_ngx_get_parameters(
+    NVSDK_NGX_Parameter** parameters) {
+    const auto result = g_ngx_get_parameters(parameters);
+    if (parameters != nullptr) {
+        install_ngx_parameter_get_ui_hook(*parameters);
+    }
+    return result;
+}
+
+void install_ngx_dlaa_export_hooks(HMODULE module) {
+    if (!g_config.dlss_dlaa || !temporal_backend_is_dlss() || module == nullptr) {
+        return;
+    }
+
+    std::scoped_lock lock{g_ngx_dlaa_hook_mutex};
+    struct ExportHook {
+        const char* name;
+        void* detour;
+        void** original;
+    };
+    const ExportHook hooks[] = {
+        {"NVSDK_NGX_D3D12_AllocateParameters",
+            reinterpret_cast<void*>(&hook_ngx_allocate_parameters),
+            reinterpret_cast<void**>(&g_ngx_allocate_parameters)},
+        {"NVSDK_NGX_D3D12_GetCapabilityParameters",
+            reinterpret_cast<void*>(&hook_ngx_get_capability_parameters),
+            reinterpret_cast<void**>(&g_ngx_get_capability_parameters)},
+        {"NVSDK_NGX_D3D12_GetParameters",
+            reinterpret_cast<void*>(&hook_ngx_get_parameters),
+            reinterpret_cast<void**>(&g_ngx_get_parameters)},
+    };
+
+    for (const auto& hook : hooks) {
+        if (*hook.original != nullptr) {
+            continue;
+        }
+        auto* target = GetProcAddress(module, hook.name);
+        if (target != nullptr &&
+            MH_CreateHook(target, hook.detour, hook.original) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("DLAA NGX export hook installed %s target=%p",
+                hook.name, target);
+        } else {
+            *hook.original = nullptr;
+            log_line("DLAA NGX export hook failed %s target=%p",
+                hook.name, target);
+        }
+    }
+}
+
+void inspect_loaded_module_for_ngx(HMODULE module) {
+    if (module == nullptr) {
+        return;
+    }
+    wchar_t path[MAX_PATH]{};
+    if (GetModuleFileNameW(module, path, static_cast<DWORD>(std::size(path))) == 0) {
+        return;
+    }
+    const auto* filename = wcsrchr(path, L'\\');
+    filename = filename != nullptr ? filename + 1 : path;
+    if (_wcsicmp(filename, L"nvngx.dll") == 0 ||
+        _wcsicmp(filename, L"_nvngx.dll") == 0) {
+        install_ngx_dlaa_export_hooks(module);
+    }
+}
+
+HMODULE WINAPI hook_load_library_a(LPCSTR path) {
+    const auto module = g_load_library_a(path);
+    inspect_loaded_module_for_ngx(module);
+    return module;
+}
+
+HMODULE WINAPI hook_load_library_w(LPCWSTR path) {
+    const auto module = g_load_library_w(path);
+    inspect_loaded_module_for_ngx(module);
+    return module;
+}
+
+HMODULE WINAPI hook_load_library_ex_a(LPCSTR path, HANDLE file, DWORD flags) {
+    const auto module = g_load_library_ex_a(path, file, flags);
+    inspect_loaded_module_for_ngx(module);
+    return module;
+}
+
+HMODULE WINAPI hook_load_library_ex_w(LPCWSTR path, HANDLE file, DWORD flags) {
+    const auto module = g_load_library_ex_w(path, file, flags);
+    inspect_loaded_module_for_ngx(module);
+    return module;
+}
+
+void install_ngx_dlaa_loader_hooks() {
+    if (!g_config.dlss_dlaa || !temporal_backend_is_dlss()) {
+        return;
+    }
+
+    install_ngx_dlaa_export_hooks(GetModuleHandleW(L"nvngx.dll"));
+    install_ngx_dlaa_export_hooks(GetModuleHandleW(L"_nvngx.dll"));
+
+    auto* kernel32 = GetModuleHandleW(L"kernel32.dll");
+    struct LoaderHook {
+        const char* name;
+        void* detour;
+        void** original;
+    };
+    const LoaderHook hooks[] = {
+        {"LoadLibraryA", reinterpret_cast<void*>(&hook_load_library_a),
+            reinterpret_cast<void**>(&g_load_library_a)},
+        {"LoadLibraryW", reinterpret_cast<void*>(&hook_load_library_w),
+            reinterpret_cast<void**>(&g_load_library_w)},
+        {"LoadLibraryExA", reinterpret_cast<void*>(&hook_load_library_ex_a),
+            reinterpret_cast<void**>(&g_load_library_ex_a)},
+        {"LoadLibraryExW", reinterpret_cast<void*>(&hook_load_library_ex_w),
+            reinterpret_cast<void**>(&g_load_library_ex_w)},
+    };
+    for (const auto& hook : hooks) {
+        auto* target = kernel32 != nullptr ? GetProcAddress(kernel32, hook.name) : nullptr;
+        if (target != nullptr &&
+            MH_CreateHook(target, hook.detour, hook.original) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("DLAA loader hook installed %s target=%p", hook.name, target);
+        } else {
+            *hook.original = nullptr;
+            log_line("DLAA loader hook failed %s target=%p", hook.name, target);
+        }
+    }
+}
+
+void install_streamline_hook() {
+    if (!temporal_backend_is_dlss()) {
+        return;
+    }
+
+    if ((!g_config.streamline_force_reset && !g_config.streamline_split_viewports &&
+            g_config.streamline_right_temporal_offset == 0.0f &&
+            g_config.streamline_temporal_clip_correction == 0.0f &&
+            !g_config.streamline_mvec_correction && !g_config.streamline_force_camera_mvec &&
+            !g_config.streamline_taau_bridge &&
+            !g_config.ngx_trace &&
+            (g_config.render_width <= 0 || g_config.render_height <= 0))) {
+        return;
+    }
+
+    if (g_sl_set_constants != nullptr) {
+        install_ngx_dlss_hook();
+        return;
+    }
+
+    auto* module = GetModuleHandleW(L"sl.interposer.dll");
+    auto* constants_target = module != nullptr ? GetProcAddress(module, "slSetConstants") : nullptr;
+    auto* tag_target = module != nullptr ? GetProcAddress(module, "slSetTag") : nullptr;
+    auto* feature_constants_target = module != nullptr ? GetProcAddress(module, "slSetFeatureConstants") : nullptr;
+    auto* evaluate_target = module != nullptr ? GetProcAddress(module, "slEvaluateFeature") : nullptr;
+    if (constants_target == nullptr || tag_target == nullptr || feature_constants_target == nullptr || evaluate_target == nullptr) {
+        return;
+    }
+
+    if (MH_CreateHook(constants_target, reinterpret_cast<void*>(&hook_sl_set_constants),
+            reinterpret_cast<void**>(&g_sl_set_constants)) == MH_OK &&
+        MH_CreateHook(tag_target, reinterpret_cast<void*>(&hook_sl_set_tag),
+            reinterpret_cast<void**>(&g_sl_set_tag)) == MH_OK &&
+        MH_CreateHook(feature_constants_target, reinterpret_cast<void*>(&hook_sl_set_feature_constants),
+            reinterpret_cast<void**>(&g_sl_set_feature_constants)) == MH_OK &&
+        MH_CreateHook(evaluate_target, reinterpret_cast<void*>(&hook_sl_evaluate_feature),
+            reinterpret_cast<void**>(&g_sl_evaluate_feature)) == MH_OK &&
+        MH_EnableHook(constants_target) == MH_OK &&
+        MH_EnableHook(tag_target) == MH_OK &&
+        MH_EnableHook(feature_constants_target) == MH_OK &&
+        MH_EnableHook(evaluate_target) == MH_OK) {
+        log_line("Streamline viewport hooks installed constants=%p tag=%p feature_constants=%p evaluate=%p",
+            constants_target, tag_target, feature_constants_target, evaluate_target);
+    } else {
+        log_line("Streamline viewport hooks failed constants=%p tag=%p feature_constants=%p evaluate=%p",
+            constants_target, tag_target, feature_constants_target, evaluate_target);
+    }
+    install_ngx_dlss_hook();
+}
+
+void __fastcall hook_engine_viewport_resolution(
+    bool fullscreen, void* resolution_setting, uint32_t* width, uint32_t* height) {
+    g_engine_viewport_resolution(fullscreen, resolution_setting, width, height);
+    if (g_config.render_width > 0 && g_config.render_height > 0 &&
+        width != nullptr && height != nullptr) {
+        const auto original_width = *width;
+        const auto original_height = *height;
+        *width = static_cast<uint32_t>(g_config.render_width);
+        *height = static_cast<uint32_t>(g_config.render_height);
+        log_line("REDengine viewport resolution original=%ux%u forced=%ux%u fullscreen=%d",
+            original_width, original_height, *width, *height, fullscreen);
+    }
+}
+
+void install_engine_viewport_resolution_hook() {
+    if (g_engine_viewport_resolution != nullptr ||
+        g_config.render_width <= 0 || g_config.render_height <= 0) {
+        return;
+    }
+    constexpr uintptr_t kViewportResolutionRva = 0x01563DC0;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr ? module + kViewportResolutionRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, &hook_engine_viewport_resolution,
+            reinterpret_cast<void**>(&g_engine_viewport_resolution)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Hooked REDengine viewport resolution RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kViewportResolutionRva), target);
+    } else {
+        log_line("Failed REDengine viewport resolution hook target=%p", target);
+    }
+}
+
+HRESULT WINAPI hook_d3d12_create_device(
+    IUnknown* adapter,
+    D3D_FEATURE_LEVEL minimum_feature_level,
+    REFIID riid,
+    void** device) {
+    const auto hr = g_d3d12_create_device(
+        adapter, minimum_feature_level, riid, device);
+    if (SUCCEEDED(hr) && device != nullptr && *device != nullptr) {
+        ID3D12Device* base_device{};
+        auto* unknown = static_cast<IUnknown*>(*device);
+        if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&base_device))) &&
+            base_device != nullptr) {
+            if (g_d3d12_device == nullptr) {
+                g_d3d12_device = base_device;
+                log_line("Captured early D3D12 device=%p", g_d3d12_device);
+                install_reverse_hooks();
+            } else {
+                base_device->Release();
+            }
+        }
+    }
+    return hr;
+}
+
+void install_d3d12_create_device_hook() {
+    if (g_d3d12_create_device != nullptr) {
+        return;
+    }
+    auto* module = GetModuleHandleW(L"d3d12.dll");
+    if (module == nullptr) {
+        module = LoadLibraryW(L"d3d12.dll");
+    }
+    auto* target = module != nullptr
+        ? GetProcAddress(module, "D3D12CreateDevice")
+        : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_d3d12_create_device),
+            reinterpret_cast<void**>(&g_d3d12_create_device)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("Hooked D3D12CreateDevice at %p", target);
+    } else {
+        log_line("Failed D3D12CreateDevice hook target=%p", target);
+    }
+}
+
+void ensure_initialized() {
+    std::call_once(g_init_once, []() {
+        real_proc("CreateDXGIFactory");
+        MH_Initialize();
+        load_config();
+        install_ngx_dlaa_loader_hooks();
+        initialize_performance_cpu_sets();
+        install_engine_scene_culling_probe();
+        install_engine_view_probe();
+        install_engine_temporal_writer_hook();
+        install_engine_frame_builder_probe();
+        install_engine_gameplay_entry_probe();
+        install_engine_scene_enqueue_probe();
+        install_engine_view_factory_probe();
+        install_engine_camera_direction_hook();
+        install_engine_world_vector_to_view_ratio_hook();
+        install_engine_animated_component_visibility_hook();
+        install_engine_frame_factory_probe();
+        install_engine_dlss_command_probe();
+        install_engine_menu_state_probe();
+        install_engine_viewport_resolution_hook();
+        log_line("witcher3vr dxgi proxy initialized");
+    });
+}
+
+void capture_d3d12_objects(IUnknown* dxgi_device_parameter) {
+    if (dxgi_device_parameter == nullptr || g_command_queue != nullptr) {
+        return;
+    }
+
+    ID3D12CommandQueue* queue{};
+    if (FAILED(dxgi_device_parameter->QueryInterface(IID_PPV_ARGS(&queue))) || queue == nullptr) {
+        log_line("D3D12 command queue QueryInterface failed for swapchain device parameter=%p", dxgi_device_parameter);
+        return;
+    }
+
+    ID3D12Device* device{};
+    const auto device_hr = queue->GetDevice(IID_PPV_ARGS(&device));
+    if (FAILED(device_hr) || device == nullptr) {
+        log_line("D3D12 command queue GetDevice failed hr=0x%08X", static_cast<unsigned>(device_hr));
+        queue->Release();
+        return;
+    }
+
+    g_command_queue = queue;
+    if (g_d3d12_device != nullptr && g_d3d12_device != device) {
+        g_d3d12_device->Release();
+        g_d3d12_device = device;
+    } else if (g_d3d12_device == device) {
+        device->Release();
+    } else {
+        g_d3d12_device = device;
+    }
+    log_line("Captured D3D12 queue=%p device=%p", g_command_queue, g_d3d12_device);
+    install_reverse_hooks();
+    if (g_config.openxr_mode == 2) {
+        install_streamline_resource_barrier_probe();
+    }
+}
+
+void wait_for_xr_gpu() {
+    DlssCpuScope cpu_scope{kDlssCpuXrGpuWait};
+    if (g_xr_fence == nullptr || g_command_queue == nullptr || g_xr_fence_event == nullptr) {
+        return;
+    }
+
+    const auto value = ++g_xr_fence_value;
+    if (FAILED(g_command_queue->Signal(g_xr_fence, value))) {
+        return;
+    }
+
+    if (g_xr_fence->GetCompletedValue() < value) {
+        g_xr_fence->SetEventOnCompletion(value, g_xr_fence_event);
+        WaitForSingleObject(g_xr_fence_event, 1000);
+    }
+}
+
+bool wait_for_xr_allocator_slot(uint32_t image_index) {
+    if (g_xr_fence == nullptr || g_xr_fence_event == nullptr ||
+        image_index >= g_xr_allocator_fence_values.size()) {
+        return false;
+    }
+
+    const uint64_t value = g_xr_allocator_fence_values[image_index];
+    if (value == 0 || g_xr_fence->GetCompletedValue() >= value) {
+        return true;
+    }
+
+    DlssCpuScope cpu_scope{kDlssCpuXrGpuWait};
+    if (FAILED(g_xr_fence->SetEventOnCompletion(value, g_xr_fence_event))) {
+        return false;
+    }
+    return WaitForSingleObject(g_xr_fence_event, 1000) == WAIT_OBJECT_0;
+}
+
+bool signal_xr_allocator_slot(uint32_t image_index) {
+    if (g_xr_fence == nullptr || g_command_queue == nullptr ||
+        image_index >= g_xr_allocator_fence_values.size()) {
+        return false;
+    }
+
+    const uint64_t value = ++g_xr_fence_value;
+    if (FAILED(g_command_queue->Signal(g_xr_fence, value))) {
+        return false;
+    }
+    g_xr_allocator_fence_values[image_index] = value;
+    return true;
+}
+
+bool create_openxr_swapchains() {
+    if (g_xr_resources_ready) {
+        return true;
+    }
+
+    uint32_t view_count{};
+    auto result = pfn_xrEnumerateViewConfigurationViews(
+        g_xr_instance, g_xr_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &view_count, nullptr);
+    log_line("OpenXR xrEnumerateViewConfigurationViews count result=%s (%d) count=%u",
+        xr_result_name(result), result, view_count);
+    if (XR_FAILED(result) || view_count < 2) {
+        return false;
+    }
+
+    g_xr_view_configs.assign(view_count, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    result = pfn_xrEnumerateViewConfigurationViews(
+        g_xr_instance,
+        g_xr_system,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+        view_count,
+        &view_count,
+        g_xr_view_configs.data());
+    if (XR_FAILED(result)) {
+        log_line("OpenXR xrEnumerateViewConfigurationViews data result=%s (%d)", xr_result_name(result), result);
+        return false;
+    }
+
+    uint32_t format_count{};
+    result = pfn_xrEnumerateSwapchainFormats(g_xr_session, 0, &format_count, nullptr);
+    std::vector<int64_t> formats(format_count);
+    if (XR_SUCCEEDED(result) && format_count > 0) {
+        result = pfn_xrEnumerateSwapchainFormats(g_xr_session, format_count, &format_count, formats.data());
+    }
+    log_line("OpenXR xrEnumerateSwapchainFormats result=%s (%d) count=%u", xr_result_name(result), result, format_count);
+    if (XR_FAILED(result)) {
+        return false;
+    }
+
+    DXGI_FORMAT selected_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    bool found_format{};
+    for (auto format : formats) {
+        if (format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+            selected_format = static_cast<DXGI_FORMAT>(format);
+            found_format = true;
+            break;
+        }
+    }
+    if (!found_format && !formats.empty()) {
+        selected_format = static_cast<DXGI_FORMAT>(formats.front());
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap_desc.NumDescriptors = g_xr_view_configs[0].recommendedSwapchainSampleCount * 0 + 32;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (FAILED(g_d3d12_device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_xr_rtv_heap)))) {
+        log_line("OpenXR failed to create RTV heap");
+        return false;
+    }
+    g_xr_rtv_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    auto next_rtv = g_xr_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+
+    auto& config = g_xr_view_configs[0];
+    auto& swapchain = g_xr_eye_swapchains[0];
+    const auto resolution_scale = g_config.resolution_scale;
+    const uint32_t scaled_width = static_cast<uint32_t>(
+        config.recommendedImageRectWidth * resolution_scale);
+    const uint32_t scaled_height = static_cast<uint32_t>(
+        config.recommendedImageRectHeight * resolution_scale);
+    const uint32_t requested_width = g_config.render_width > 0
+        ? static_cast<uint32_t>(g_config.render_width)
+        : 0;
+    const uint32_t requested_height = g_config.render_height > 0
+        ? static_cast<uint32_t>(g_config.render_height)
+        : 0;
+    const float presentation_scale = std::clamp(
+        g_config.presentation_scale, 0.01f, 1.0f);
+    const uint32_t source_width = requested_width > 0
+        ? requested_width
+        : scaled_width;
+    const uint32_t source_height = requested_height > 0
+        ? requested_height
+        : scaled_height;
+    const uint32_t presentation_width = static_cast<uint32_t>(ceilf(
+        static_cast<float>(source_width) / presentation_scale));
+    const uint32_t presentation_height = static_cast<uint32_t>(ceilf(
+        static_cast<float>(source_height) / presentation_scale));
+    swapchain.width = std::min(
+        std::max(scaled_width, presentation_width), config.maxImageRectWidth);
+    swapchain.height = std::min(
+        std::max(scaled_height, presentation_height), config.maxImageRectHeight);
+    swapchain.format = selected_format;
+    swapchain.stereo_array = true;
+
+    g_xr_eye_swapchains[1].handle = swapchain.handle;
+    g_xr_eye_swapchains[1].width = swapchain.width;
+    g_xr_eye_swapchains[1].height = swapchain.height;
+    g_xr_eye_swapchains[1].format = selected_format;
+    g_xr_eye_swapchains[1].stereo_array = true;
+
+    XrSwapchainCreateInfo swapchain_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    swapchain_info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    swapchain_info.format = selected_format;
+    swapchain_info.sampleCount = config.recommendedSwapchainSampleCount;
+    swapchain_info.width = swapchain.width;
+    swapchain_info.height = swapchain.height;
+    swapchain_info.faceCount = 1;
+    swapchain_info.arraySize = 2;
+    swapchain_info.mipCount = 1;
+
+    result = pfn_xrCreateSwapchain(g_xr_session, &swapchain_info, &swapchain.handle);
+    g_xr_eye_swapchains[1].handle = swapchain.handle;
+    log_line("OpenXR xrCreateSwapchain stereo-array result=%s (%d) size=%ux%u recommended=%ux%u requested=%ux%u presentation=%.3f max=%ux%u format=%u samples=%u",
+        xr_result_name(result),
+        result,
+        swapchain.width,
+        swapchain.height,
+        config.recommendedImageRectWidth,
+        config.recommendedImageRectHeight,
+        requested_width,
+        requested_height,
+        presentation_scale,
+        config.maxImageRectWidth,
+        config.maxImageRectHeight,
+        static_cast<unsigned>(selected_format),
+        swapchain_info.sampleCount);
+    if (XR_FAILED(result)) {
+        return false;
+    }
+
+    uint32_t image_count{};
+    result = pfn_xrEnumerateSwapchainImages(swapchain.handle, 0, &image_count, nullptr);
+    if (XR_FAILED(result) || image_count == 0) {
+        log_line("OpenXR xrEnumerateSwapchainImages count stereo-array result=%s (%d)", xr_result_name(result), result);
+        return false;
+    }
+
+    swapchain.images.assign(image_count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    result = pfn_xrEnumerateSwapchainImages(
+        swapchain.handle,
+        image_count,
+        &image_count,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(swapchain.images.data()));
+    log_line("OpenXR xrEnumerateSwapchainImages stereo-array result=%s (%d) count=%u",
+        xr_result_name(result), result, image_count);
+    if (XR_FAILED(result)) {
+        return false;
+    }
+
+    swapchain.rtvs.resize(image_count * 2);
+    for (uint32_t i = 0; i < image_count; ++i) {
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
+            rtv_desc.Format = selected_format;
+            rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+            rtv_desc.Texture2DArray.MipSlice = 0;
+            rtv_desc.Texture2DArray.FirstArraySlice = eye;
+            rtv_desc.Texture2DArray.ArraySize = 1;
+            rtv_desc.Texture2DArray.PlaneSlice = 0;
+
+            swapchain.rtvs[i * 2 + eye] = next_rtv;
+            g_d3d12_device->CreateRenderTargetView(swapchain.images[i].texture, &rtv_desc, next_rtv);
+            next_rtv.ptr += g_xr_rtv_increment;
+        }
+    }
+
+    g_xr_command_allocators.assign(image_count, nullptr);
+    g_xr_allocator_fence_values.assign(image_count, 0);
+    bool allocator_creation_failed{};
+    for (auto*& allocator : g_xr_command_allocators) {
+        if (FAILED(g_d3d12_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&allocator)))) {
+            allocator_creation_failed = true;
+            break;
+        }
+    }
+    if (allocator_creation_failed ||
+        FAILED(g_d3d12_device->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            g_xr_command_allocators[0],
+            nullptr,
+            IID_PPV_ARGS(&g_xr_command_list))) ||
+        FAILED(g_xr_command_list->Close()) ||
+        FAILED(g_d3d12_device->CreateFence(
+            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_xr_fence)))) {
+        log_line("OpenXR failed to create D3D12 clear resources");
+        return false;
+    }
+
+    g_xr_fence_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    g_xr_views.assign(2, {XR_TYPE_VIEW});
+    g_xr_resources_ready = true;
+    log_line("OpenXR stereo swapchains ready allocator_slots=%u",
+        image_count);
+    return true;
+}
+
+void initialize_openxr_probe() {
+    if (g_d3d12_device == nullptr || g_command_queue == nullptr) {
+        log_line("OpenXR probe skipped: D3D12 device/queue not captured yet");
+        return;
+    }
+
+    std::call_once(g_openxr_once, []() {
+        if (!g_config.openxr_enabled) {
+            log_line("OpenXR probe disabled by witcher3vr.ini");
+            return;
+        }
+
+        g_openxr_loader = LoadLibraryA("openxr_loader.dll");
+        if (g_openxr_loader == nullptr) {
+            log_line("OpenXR loader not found via LoadLibrary(openxr_loader.dll), gle=%lu", GetLastError());
+            return;
+        }
+
+        pfn_xrCreateInstance = reinterpret_cast<PFN_xrCreateInstance>(GetProcAddress(g_openxr_loader, "xrCreateInstance"));
+        pfn_xrGetInstanceProcAddr = reinterpret_cast<PFN_xrGetInstanceProcAddr>(GetProcAddress(g_openxr_loader, "xrGetInstanceProcAddr"));
+
+        if (pfn_xrCreateInstance == nullptr || pfn_xrGetInstanceProcAddr == nullptr) {
+            log_line("OpenXR loader exports missing: xrCreateInstance=%p xrGetInstanceProcAddr=%p",
+                pfn_xrCreateInstance,
+                pfn_xrGetInstanceProcAddr);
+            return;
+        }
+
+        const char* extensions[] = {
+            XR_KHR_D3D12_ENABLE_EXTENSION_NAME,
+        };
+
+        XrInstanceCreateInfo create_info{XR_TYPE_INSTANCE_CREATE_INFO};
+        strcpy_s(create_info.applicationInfo.applicationName, "witcher3vr");
+        create_info.applicationInfo.applicationVersion = 1;
+        strcpy_s(create_info.applicationInfo.engineName, "witcher3vr");
+        create_info.applicationInfo.engineVersion = 1;
+        create_info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
+        create_info.enabledExtensionCount = static_cast<uint32_t>(std::size(extensions));
+        create_info.enabledExtensionNames = extensions;
+
+        auto result = pfn_xrCreateInstance(&create_info, &g_xr_instance);
+        log_line("OpenXR xrCreateInstance result=%s (%d) instance=%p", xr_result_name(result), result, g_xr_instance);
+        if (XR_FAILED(result)) {
+            return;
+        }
+
+        load_xr_proc(g_xr_instance, "xrDestroyInstance", pfn_xrDestroyInstance);
+        load_xr_proc(g_xr_instance, "xrGetSystem", pfn_xrGetSystem);
+        load_xr_proc(g_xr_instance, "xrGetSystemProperties", pfn_xrGetSystemProperties);
+        load_xr_proc(g_xr_instance, "xrCreateSession", pfn_xrCreateSession);
+        load_xr_proc(g_xr_instance, "xrDestroySession", pfn_xrDestroySession);
+        load_xr_proc(g_xr_instance, "xrGetD3D12GraphicsRequirementsKHR", pfn_xrGetD3D12GraphicsRequirementsKHR);
+        load_xr_proc(g_xr_instance, "xrEnumerateViewConfigurationViews", pfn_xrEnumerateViewConfigurationViews);
+        load_xr_proc(g_xr_instance, "xrEnumerateSwapchainFormats", pfn_xrEnumerateSwapchainFormats);
+        load_xr_proc(g_xr_instance, "xrCreateReferenceSpace", pfn_xrCreateReferenceSpace);
+        load_xr_proc(g_xr_instance, "xrDestroySpace", pfn_xrDestroySpace);
+        load_xr_proc(g_xr_instance, "xrCreateSwapchain", pfn_xrCreateSwapchain);
+        load_xr_proc(g_xr_instance, "xrDestroySwapchain", pfn_xrDestroySwapchain);
+        load_xr_proc(g_xr_instance, "xrEnumerateSwapchainImages", pfn_xrEnumerateSwapchainImages);
+        load_xr_proc(g_xr_instance, "xrAcquireSwapchainImage", pfn_xrAcquireSwapchainImage);
+        load_xr_proc(g_xr_instance, "xrWaitSwapchainImage", pfn_xrWaitSwapchainImage);
+        load_xr_proc(g_xr_instance, "xrReleaseSwapchainImage", pfn_xrReleaseSwapchainImage);
+        load_xr_proc(g_xr_instance, "xrPollEvent", pfn_xrPollEvent);
+        load_xr_proc(g_xr_instance, "xrBeginSession", pfn_xrBeginSession);
+        load_xr_proc(g_xr_instance, "xrEndSession", pfn_xrEndSession);
+        load_xr_proc(g_xr_instance, "xrWaitFrame", pfn_xrWaitFrame);
+        load_xr_proc(g_xr_instance, "xrBeginFrame", pfn_xrBeginFrame);
+        load_xr_proc(g_xr_instance, "xrEndFrame", pfn_xrEndFrame);
+        load_xr_proc(g_xr_instance, "xrLocateViews", pfn_xrLocateViews);
+
+        if (pfn_xrGetSystem == nullptr ||
+            pfn_xrGetSystemProperties == nullptr ||
+            pfn_xrCreateSession == nullptr ||
+            pfn_xrGetD3D12GraphicsRequirementsKHR == nullptr ||
+            pfn_xrCreateReferenceSpace == nullptr ||
+            pfn_xrPollEvent == nullptr ||
+            pfn_xrBeginSession == nullptr ||
+            pfn_xrWaitFrame == nullptr ||
+            pfn_xrBeginFrame == nullptr ||
+            pfn_xrEndFrame == nullptr ||
+            pfn_xrLocateViews == nullptr) {
+            return;
+        }
+
+        XrSystemGetInfo system_info{XR_TYPE_SYSTEM_GET_INFO};
+        system_info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+        result = pfn_xrGetSystem(g_xr_instance, &system_info, &g_xr_system);
+        log_line("OpenXR xrGetSystem result=%s (%d) system=%llu",
+            xr_result_name(result),
+            result,
+            static_cast<unsigned long long>(g_xr_system));
+        if (XR_FAILED(result)) {
+            return;
+        }
+
+        XrSystemProperties system_properties{XR_TYPE_SYSTEM_PROPERTIES};
+        result = pfn_xrGetSystemProperties(g_xr_instance, g_xr_system, &system_properties);
+        log_line("OpenXR xrGetSystemProperties result=%s (%d) name=%s vendor=%u max=%ux%u layers=%u",
+            xr_result_name(result),
+            result,
+            system_properties.systemName,
+            system_properties.vendorId,
+            system_properties.graphicsProperties.maxSwapchainImageWidth,
+            system_properties.graphicsProperties.maxSwapchainImageHeight,
+            system_properties.graphicsProperties.maxLayerCount);
+        if (XR_FAILED(result)) {
+            return;
+        }
+
+        XrGraphicsRequirementsD3D12KHR graphics_requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+        result = pfn_xrGetD3D12GraphicsRequirementsKHR(g_xr_instance, g_xr_system, &graphics_requirements);
+        log_line("OpenXR xrGetD3D12GraphicsRequirementsKHR result=%s (%d) adapterLuid=%08lX:%08lX minFeatureLevel=0x%X",
+            xr_result_name(result),
+            result,
+            graphics_requirements.adapterLuid.HighPart,
+            graphics_requirements.adapterLuid.LowPart,
+            static_cast<unsigned>(graphics_requirements.minFeatureLevel));
+        if (XR_FAILED(result)) {
+            return;
+        }
+
+        XrGraphicsBindingD3D12KHR d3d12_binding{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
+        d3d12_binding.device = g_d3d12_device;
+        d3d12_binding.queue = g_command_queue;
+
+        XrSessionCreateInfo session_info{XR_TYPE_SESSION_CREATE_INFO};
+        session_info.next = &d3d12_binding;
+        session_info.systemId = g_xr_system;
+        result = pfn_xrCreateSession(g_xr_instance, &session_info, &g_xr_session);
+        log_line("OpenXR xrCreateSession(D3D12) result=%s (%d) session=%p",
+            xr_result_name(result),
+            result,
+            g_xr_session);
+        if (XR_FAILED(result)) {
+            return;
+        }
+
+        XrReferenceSpaceCreateInfo space_info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        space_info.poseInReferenceSpace.orientation.w = 1.0f;
+        result = pfn_xrCreateReferenceSpace(g_xr_session, &space_info, &g_xr_space);
+        log_line("OpenXR xrCreateReferenceSpace(LOCAL) result=%s (%d) space=%p",
+            xr_result_name(result),
+            result,
+            g_xr_space);
+        if (XR_FAILED(result)) {
+            return;
+        }
+
+        space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+        result = pfn_xrCreateReferenceSpace(g_xr_session, &space_info, &g_xr_view_space);
+        log_line("OpenXR xrCreateReferenceSpace(VIEW) result=%s (%d) space=%p",
+            xr_result_name(result), result, g_xr_view_space);
+        if (XR_FAILED(result)) {
+            return;
+        }
+
+        create_openxr_swapchains();
+    });
+}
+
+void poll_openxr_events() {
+    if (g_xr_instance == XR_NULL_HANDLE || pfn_xrPollEvent == nullptr) {
+        return;
+    }
+
+    XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+    while (pfn_xrPollEvent(g_xr_instance, &event) == XR_SUCCESS) {
+        if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
+            g_xr_session_state = changed->state;
+            log_line("OpenXR session state changed=%d", static_cast<int>(g_xr_session_state));
+
+            if (g_xr_session_state == XR_SESSION_STATE_READY && !g_xr_session_running) {
+                XrSessionBeginInfo begin_info{XR_TYPE_SESSION_BEGIN_INFO};
+                begin_info.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                const auto result = pfn_xrBeginSession(g_xr_session, &begin_info);
+                g_xr_session_running = XR_SUCCEEDED(result);
+                log_line("OpenXR xrBeginSession result=%s (%d)", xr_result_name(result), result);
+            } else if ((g_xr_session_state == XR_SESSION_STATE_STOPPING ||
+                        g_xr_session_state == XR_SESSION_STATE_LOSS_PENDING ||
+                        g_xr_session_state == XR_SESSION_STATE_EXITING) &&
+                       g_xr_session_running &&
+                       pfn_xrEndSession != nullptr) {
+                const auto result = pfn_xrEndSession(g_xr_session);
+                g_xr_session_running = false;
+                log_line("OpenXR xrEndSession result=%s (%d)", xr_result_name(result), result);
+            }
+        }
+
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+
+XrQuaternionf multiply_quaternions(const XrQuaternionf& a, const XrQuaternionf& b) {
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+XrVector3f rotate_vector(const XrQuaternionf& rotation, const XrVector3f& vector) {
+    const XrQuaternionf pure{vector.x, vector.y, vector.z, 0.0f};
+    const XrQuaternionf inverse{
+        -rotation.x, -rotation.y, -rotation.z, rotation.w};
+    const auto rotated = multiply_quaternions(
+        multiply_quaternions(rotation, pure), inverse);
+    return {rotated.x, rotated.y, rotated.z};
+}
+
+void update_hmd_freelook_pose() {
+    if (!g_config.hmd_freelook || g_xr_views.size() < 2) {
+        return;
+    }
+
+    const auto current = g_xr_views[0].pose.orientation;
+    const XrVector3f current_position{
+        (g_xr_views[0].pose.position.x + g_xr_views[1].pose.position.x) * 0.5f,
+        (g_xr_views[0].pose.position.y + g_xr_views[1].pose.position.y) * 0.5f,
+        (g_xr_views[0].pose.position.z + g_xr_views[1].pose.position.z) * 0.5f};
+    if ((GetAsyncKeyState(VK_F9) & 1) != 0 || !g_hmd_center_valid.load()) {
+        g_hmd_center_orientation = current;
+        const float yaw_twist_length = sqrtf(
+            current.y * current.y + current.w * current.w);
+        g_hmd_center_yaw_orientation = yaw_twist_length > 0.000001f
+            ? XrQuaternionf{0.0f, current.y / yaw_twist_length, 0.0f,
+                  current.w / yaw_twist_length}
+            : XrQuaternionf{0.0f, 0.0f, 0.0f, 1.0f};
+        g_hmd_center_position = current_position;
+        g_hmd_center_views[0] = g_xr_views[0];
+        g_hmd_center_views[1] = g_xr_views[1];
+        g_hmd_center_valid.store(true);
+        log_line("HMD freelook recentered present=%llu",
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+
+    const XrQuaternionf inverse_center_yaw{
+        -g_hmd_center_yaw_orientation.x,
+        -g_hmd_center_yaw_orientation.y,
+        -g_hmd_center_yaw_orientation.z,
+        g_hmd_center_yaw_orientation.w};
+    // Recenter heading only. Pitch and roll remain tied to OpenXR's gravity
+    // frame so an off-horizon recenter cannot tilt the subsequent yaw axis.
+    const auto delta = multiply_quaternions(inverse_center_yaw, current);
+    const float pitch_sine = std::clamp(
+        2.0f * (delta.w * delta.x - delta.z * delta.y), -1.0f, 1.0f);
+    const float yaw_sine = 2.0f * (delta.w * delta.y + delta.x * delta.z);
+    const float yaw_cosine = 1.0f - 2.0f * (delta.x * delta.x + delta.y * delta.y);
+    const float roll_sine = 2.0f * (delta.w * delta.z + delta.x * delta.y);
+    const float roll_cosine = 1.0f - 2.0f * (delta.x * delta.x + delta.z * delta.z);
+    constexpr float kRadiansToDegrees = 180.0f / 3.14159265358979323846f;
+    g_hmd_pitch_degrees = asinf(pitch_sine) * kRadiansToDegrees;
+    g_hmd_yaw_degrees = atan2f(yaw_sine, yaw_cosine) * kRadiansToDegrees;
+    g_hmd_roll_degrees = atan2f(roll_sine, roll_cosine) * kRadiansToDegrees;
+    const auto present = g_present_count.load();
+    if (g_config.engine_view_probe && present % 30 == 0) {
+        log_line("HMD orientation probe present=%llu current=%.6f,%.6f,%.6f,%.6f center=%.6f,%.6f,%.6f,%.6f delta=%.6f,%.6f,%.6f,%.6f euler=%.4f,%.4f,%.4f",
+            static_cast<unsigned long long>(present),
+            current.x, current.y, current.z, current.w,
+            g_hmd_center_orientation.x, g_hmd_center_orientation.y,
+            g_hmd_center_orientation.z, g_hmd_center_orientation.w,
+            delta.x, delta.y, delta.z, delta.w,
+            g_hmd_roll_degrees, g_hmd_pitch_degrees, g_hmd_yaw_degrees);
+    }
+    const XrVector3f tracking_delta{
+        current_position.x - g_hmd_center_position.x,
+        current_position.y - g_hmd_center_position.y,
+        current_position.z - g_hmd_center_position.z};
+    g_mono_neck_pose_correction = {};
+    if (g_config.openxr_mode == 2 &&
+        g_config.mono_neck_pivot_compensation_m > 0.0f) {
+        // Preserve real room-scale translation while removing only the
+        // orientation-correlated arc produced by a virtual pivot behind the
+        // cyclopean camera. A forward head-local lever rotates around that
+        // pivot; subtracting its arc moves the effective mono pivot forward.
+        const XrVector3f pivot_to_eye{
+            0.0f, 0.0f, -g_config.mono_neck_pivot_compensation_m};
+        const auto center_lever = rotate_vector(
+            g_hmd_center_orientation, pivot_to_eye);
+        const auto current_lever = rotate_vector(current, pivot_to_eye);
+        g_mono_neck_pose_correction = {
+            current_lever.x - center_lever.x,
+            current_lever.y - center_lever.y,
+            current_lever.z - center_lever.z};
+    }
+    const XrVector3f corrected_tracking_delta{
+        tracking_delta.x - g_mono_neck_pose_correction.x,
+        tracking_delta.y - g_mono_neck_pose_correction.y,
+        tracking_delta.z - g_mono_neck_pose_correction.z};
+    // Translation uses only the recentered heading. Pitch and roll from the
+    // recenter must not mix physical forward motion into vertical motion.
+    const auto local_delta = rotate_vector(
+        inverse_center_yaw, corrected_tracking_delta);
+    g_hmd_position_x = local_delta.x;
+    g_hmd_position_y = local_delta.y;
+    g_hmd_position_z = local_delta.z;
+    g_hmd_pose_valid.store(true);
+}
+
+void prepare_openxr_render_frame() {
+    if (!g_config.hmd_freelook || g_xr_render_frame_prepared.load() ||
+        !g_xr_resources_ready || !g_xr_session_running) {
+        return;
+    }
+
+    poll_openxr_events();
+    if (!g_xr_session_running || g_xr_render_frame_prepared.load()) {
+        return;
+    }
+
+    XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
+    XrFrameState frame_state{XR_TYPE_FRAME_STATE};
+    auto result = pfn_xrWaitFrame(g_xr_session, &wait_info, &frame_state);
+    if (XR_FAILED(result)) {
+        log_line("OpenXR pre-render xrWaitFrame result=%s (%d)", xr_result_name(result), result);
+        return;
+    }
+    if (!g_xr_display_period_logged.exchange(true) && frame_state.predictedDisplayPeriod > 0) {
+        const double period_ms = static_cast<double>(frame_state.predictedDisplayPeriod) / 1000000.0;
+        const double refresh_hz = 1000000000.0 /
+            static_cast<double>(frame_state.predictedDisplayPeriod);
+        log_line("OpenXR display timing predicted_period_ns=%lld period_ms=%.6f refresh_hz=%.3f",
+            static_cast<long long>(frame_state.predictedDisplayPeriod), period_ms, refresh_hz);
+    }
+
+    XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
+    result = pfn_xrBeginFrame(g_xr_session, &begin_info);
+    if (XR_FAILED(result)) {
+        log_line("OpenXR pre-render xrBeginFrame result=%s (%d)", xr_result_name(result), result);
+        return;
+    }
+
+    XrViewState view_state{XR_TYPE_VIEW_STATE};
+    XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
+    locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    locate_info.displayTime = frame_state.predictedDisplayTime;
+    locate_info.space = g_xr_space;
+    uint32_t view_count{};
+    result = pfn_xrLocateViews(g_xr_session, &locate_info, &view_state,
+        static_cast<uint32_t>(g_xr_views.size()), &view_count, g_xr_views.data());
+
+    g_xr_render_frame_state = frame_state;
+    g_xr_render_views_valid = XR_SUCCEEDED(result) && view_count >= 2;
+    if (g_xr_render_views_valid) {
+        update_hmd_freelook_pose();
+    }
+    g_xr_render_frame_prepared.store(true);
+}
+
+bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
+    if (g_stereo_eye_cache[0] != nullptr && g_stereo_eye_cache[1] != nullptr &&
+        g_packed_present_cache[0] != nullptr && g_packed_present_cache[1] != nullptr &&
+        g_stereo_eye_cache_width == source_desc.Width &&
+        g_stereo_eye_cache_height == source_desc.Height &&
+        g_stereo_eye_cache_format == source_desc.Format) {
+        return true;
+    }
+
+    for (auto& cache : g_stereo_eye_cache) {
+        if (cache != nullptr) {
+            cache->Release();
+            cache = nullptr;
+        }
+    }
+    for (auto& cache : g_packed_present_cache) {
+        if (cache != nullptr) {
+            cache->Release();
+            cache = nullptr;
+        }
+    }
+    g_stereo_eye_cache_initialized[0] = false;
+    g_stereo_eye_cache_initialized[1] = false;
+    g_stereo_eye_cache_view_valid[0] = false;
+    g_stereo_eye_cache_view_valid[1] = false;
+    g_packed_present_cache_valid = false;
+    g_packed_present_cache_view_valid[0] = false;
+    g_packed_present_cache_view_valid[1] = false;
+    g_packed_pending_pair_id[0] = 0;
+    g_packed_pending_pair_id[1] = 0;
+    g_packed_accepted_pair_id = 0;
+    g_packed_accepted_pair_signal.store(0, std::memory_order_release);
+    g_engine_pair_completed_signal.store(0, std::memory_order_release);
+    g_engine_pair_captured_signal.store(0, std::memory_order_release);
+    g_packed_last_accepted_present = UINT64_MAX;
+    g_packed_runtime_ready.store(false, std::memory_order_relaxed);
+
+    auto cache_desc = source_desc;
+    cache_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_props.CreationNodeMask = 1;
+    heap_props.VisibleNodeMask = 1;
+
+    for (auto& cache : g_stereo_eye_cache) {
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap_props,
+                D3D12_HEAP_FLAG_NONE,
+                &cache_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&cache)))) {
+            return false;
+        }
+    }
+    for (auto& cache : g_packed_present_cache) {
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &heap_props,
+                D3D12_HEAP_FLAG_NONE,
+                &cache_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&cache)))) {
+            return false;
+        }
+    }
+
+    g_stereo_eye_cache_width = static_cast<UINT>(source_desc.Width);
+    g_stereo_eye_cache_height = source_desc.Height;
+    g_stereo_eye_cache_format = source_desc.Format;
+    log_line("Stereo eye cache created size=%ux%u format=%u",
+        g_stereo_eye_cache_width,
+        g_stereo_eye_cache_height,
+        static_cast<unsigned>(g_stereo_eye_cache_format));
+    return true;
+}
+
+bool schedule_stereo_luminance_readback(ID3D12GraphicsCommandList* command_list) {
+    if (command_list == nullptr || g_d3d12_device == nullptr ||
+        g_stereo_luma_scheduled.load() || !g_packed_present_cache_valid ||
+        g_packed_accepted_pair_id < 30 || g_packed_present_cache[0] == nullptr ||
+        g_packed_present_cache[1] == nullptr) {
+        return false;
+    }
+
+    const auto desc = g_packed_present_cache[0]->GetDesc();
+    if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+        desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        log_line("Stereo luminance readback unsupported format=%u",
+            static_cast<unsigned>(desc.Format));
+        g_stereo_luma_scheduled.store(true);
+        return false;
+    }
+
+    if (g_stereo_luma_readback[0] == nullptr ||
+        g_stereo_luma_readback[1] == nullptr) {
+        g_d3d12_device->GetCopyableFootprints(&desc, 0, 1, 0,
+            &g_stereo_luma_footprint, nullptr, nullptr,
+            &g_stereo_luma_readback_bytes);
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = g_stereo_luma_readback_bytes;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        for (auto*& readback : g_stereo_luma_readback) {
+            if (FAILED(g_d3d12_device->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&readback)))) {
+                log_line("Stereo luminance readback allocation failed bytes=%llu",
+                    static_cast<unsigned long long>(g_stereo_luma_readback_bytes));
+                return false;
+            }
+        }
+    }
+
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = g_stereo_luma_readback[eye];
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = g_stereo_luma_footprint;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = g_packed_present_cache[eye];
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    g_stereo_luma_scheduled.store(true);
+    log_line("Stereo luminance readback scheduled pair=%llu size=%ux%u row_pitch=%u",
+        static_cast<unsigned long long>(g_packed_accepted_pair_id),
+        g_stereo_luma_footprint.Footprint.Width,
+        g_stereo_luma_footprint.Footprint.Height,
+        g_stereo_luma_footprint.Footprint.RowPitch);
+    return true;
+}
+
+void log_stereo_luminance_readback() {
+    if (!g_stereo_luma_scheduled.load() || g_stereo_luma_logged.load()) {
+        return;
+    }
+
+    const UINT width = g_stereo_luma_footprint.Footprint.Width;
+    const UINT height = g_stereo_luma_footprint.Footprint.Height;
+    const UINT row_pitch = g_stereo_luma_footprint.Footprint.RowPitch;
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        uint8_t* mapped{};
+        const D3D12_RANGE read_range{0,
+            static_cast<SIZE_T>(g_stereo_luma_readback_bytes)};
+        if (g_stereo_luma_readback[eye] == nullptr || FAILED(
+                g_stereo_luma_readback[eye]->Map(
+                    0, &read_range, reinterpret_cast<void**>(&mapped)))) {
+            log_line("Stereo luminance readback map failed eye=%u", eye);
+            continue;
+        }
+
+        uint64_t sum_r{}, sum_g{}, sum_b{}, sum_luma{}, black{};
+        uint64_t samples{};
+        constexpr UINT kSampleStride = 4;
+        for (UINT y = 0; y < height; y += kSampleStride) {
+            const auto* row = mapped + g_stereo_luma_footprint.Offset +
+                static_cast<size_t>(y) * row_pitch;
+            for (UINT x = 0; x < width; x += kSampleStride) {
+                const auto* pixel = row + static_cast<size_t>(x) * 4;
+                const uint32_t r = pixel[0];
+                const uint32_t g = pixel[1];
+                const uint32_t b = pixel[2];
+                sum_r += r;
+                sum_g += g;
+                sum_b += b;
+                sum_luma += (54u * r + 183u * g + 19u * b) >> 8;
+                black += (r <= 2 && g <= 2 && b <= 2) ? 1u : 0u;
+                ++samples;
+            }
+        }
+        const double denominator = samples != 0 ? static_cast<double>(samples) : 1.0;
+        log_line("Stereo luminance packed eye=%u samples=%llu rgb=%.4f,%.4f,%.4f luma=%.4f black=%.4f%%",
+            eye, static_cast<unsigned long long>(samples),
+            sum_r / denominator, sum_g / denominator, sum_b / denominator,
+            sum_luma / denominator, 100.0 * black / denominator);
+        const D3D12_RANGE written_range{0, 0};
+        g_stereo_luma_readback[eye]->Unmap(0, &written_range);
+    }
+    g_stereo_luma_logged.store(true);
+}
+
+// [FIX:DLSS-PACKED 10/10] Atomically promote only a matching left/right pair to
+// the OpenXR cache; the previous complete pair remains valid during a miss.
+bool update_packed_eye_cache() {
+    if (g_config.openxr_mode != 4 || !g_engine_dual_render_active.load() ||
+        g_game_swapchain == nullptr || !g_xr_resources_ready) {
+        return false;
+    }
+
+    const auto left_slot_index = g_streamline_capture_latest_slot[0].load();
+    const auto right_slot_index = g_streamline_capture_latest_slot[1].load();
+    if (left_slot_index >= kStreamlineCaptureRingSize ||
+        right_slot_index >= kStreamlineCaptureRingSize) {
+        return false;
+    }
+    auto& left = g_streamline_capture_ring[0][left_slot_index];
+    auto& right = g_streamline_capture_ring[1][right_slot_index];
+    const auto generation = g_streamline_capture_generation.load();
+    if (!left.initialized || !right.initialized ||
+        left.generation != generation || right.generation != generation ||
+        left.pair_id == 0 || left.pair_id != right.pair_id ||
+        left.pair_id <= g_packed_accepted_pair_id) {
+        return false;
+    }
+
+    const uint64_t accepted_pair = left.pair_id;
+    const bool had_accepted_pair = g_packed_present_cache_valid;
+    StreamlineCaptureSlot* accepted_slots[2] = {&left, &right};
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        auto& slot = *accepted_slots[eye];
+        g_packed_present_cache_views[eye] = slot.render_view;
+        g_packed_present_cache_view_valid[eye] = slot.render_view_valid;
+        std::swap(slot.resource, g_packed_present_cache[eye]);
+        slot.initialized = had_accepted_pair;
+        slot.pair_id = 0;
+        slot.render_view_valid = false;
+    }
+    g_packed_present_cache_valid = true;
+    g_packed_accepted_pair_id = accepted_pair;
+    g_packed_accepted_pair_signal.store(accepted_pair, std::memory_order_release);
+    g_packed_last_accepted_present = g_present_count.load(std::memory_order_relaxed);
+    g_packed_runtime_ready.store(true, std::memory_order_relaxed);
+    g_packed_eye_version[0] = accepted_pair;
+    g_packed_eye_version[1] = accepted_pair;
+    auto capture_floor = g_engine_pair_capture_floor.load(std::memory_order_relaxed);
+    while (capture_floor <= accepted_pair &&
+        !g_engine_pair_capture_floor.compare_exchange_weak(
+            capture_floor, accepted_pair + 1, std::memory_order_relaxed)) {
+    }
+    commit_packed_taau_auto_activation(g_present_count.load(
+        std::memory_order_relaxed));
+    static std::atomic<uint32_t> accepted_pair_logs{};
+    if (accepted_pair_logs.load(std::memory_order_relaxed) < 8 &&
+        accepted_pair_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+        log_line("Packed strict pair accepted pair=%llu slots=%u/%u present=%llu",
+            static_cast<unsigned long long>(accepted_pair),
+            left_slot_index, right_slot_index,
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+    return true;
+
+#if 0
+
+    const auto completed_serial = g_engine_completed_serial.load();
+    const auto completed_generation = g_engine_completed_generation.load();
+    const auto completed_pair_id = g_engine_completed_pair_id.load();
+    if (completed_serial == g_engine_completed_consumed_serial ||
+        completed_generation != g_streamline_capture_generation.load() ||
+        completed_pair_id == 0) {
+        return false;
+    }
+
+    const int completed_eye = g_engine_completed_eye.load();
+    if (completed_eye < 0 || completed_eye > 1) {
+        return false;
+    }
+    g_engine_completed_consumed_serial = completed_serial;
+
+    XrView completed_view{XR_TYPE_VIEW};
+    bool completed_view_valid{};
+    {
+        std::scoped_lock lock{g_engine_completed_view_mutex};
+        completed_view = g_engine_completed_view;
+        completed_view_valid = g_engine_completed_view_valid;
+    }
+
+    IDXGISwapChain3* swapchain3{};
+    UINT backbuffer_index{};
+    if (SUCCEEDED(g_game_swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3))) &&
+        swapchain3 != nullptr) {
+        backbuffer_index = swapchain3->GetCurrentBackBufferIndex();
+        swapchain3->Release();
+    }
+    ID3D12Resource* backbuffer{};
+    if (FAILED(g_game_swapchain->GetBuffer(backbuffer_index, IID_PPV_ARGS(&backbuffer))) ||
+        backbuffer == nullptr || !ensure_stereo_eye_cache(backbuffer->GetDesc())) {
+        if (backbuffer != nullptr) {
+            backbuffer->Release();
+        }
+        return false;
+    }
+
+    const uint32_t eye = static_cast<uint32_t>(completed_eye);
+    wait_for_xr_gpu();
+    g_xr_command_allocator->Reset();
+    g_xr_command_list->Reset(g_xr_command_allocator, nullptr);
+
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = backbuffer;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    UINT barrier_count = 1;
+    if (g_stereo_eye_cache_initialized[eye]) {
+        barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[1].Transition.pResource = g_stereo_eye_cache[eye];
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier_count = 2;
+    }
+    g_xr_command_list->ResourceBarrier(barrier_count, barriers);
+    g_xr_command_list->CopyResource(g_stereo_eye_cache[eye], backbuffer);
+
+    std::swap(barriers[0].Transition.StateBefore, barriers[0].Transition.StateAfter);
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = g_stereo_eye_cache[eye];
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_xr_command_list->ResourceBarrier(2, barriers);
+    g_xr_command_list->Close();
+    ID3D12CommandList* lists[] = {g_xr_command_list};
+    g_command_queue->ExecuteCommandLists(1, lists);
+    wait_for_xr_gpu();
+    backbuffer->Release();
+
+    g_stereo_eye_cache_initialized[eye] = true;
+    g_packed_pending_pair_id[eye] = completed_pair_id;
+    if (completed_view_valid) {
+        g_stereo_eye_cache_views[eye] = completed_view;
+        g_stereo_eye_cache_view_valid[eye] = true;
+    }
+
+    if (!g_stereo_eye_cache_initialized[0] || !g_stereo_eye_cache_initialized[1] ||
+        g_packed_pending_pair_id[0] != g_packed_pending_pair_id[1] ||
+        g_packed_pending_pair_id[0] <= g_packed_accepted_pair_id) {
+        return false;
+    }
+
+    const uint64_t accepted_pair = g_packed_pending_pair_id[0];
+    const bool had_accepted_pair = g_packed_present_cache_valid;
+    for (uint32_t accepted_eye = 0; accepted_eye < 2; ++accepted_eye) {
+        std::swap(g_stereo_eye_cache[accepted_eye], g_packed_present_cache[accepted_eye]);
+        g_packed_present_cache_views[accepted_eye] = g_stereo_eye_cache_views[accepted_eye];
+        g_packed_present_cache_view_valid[accepted_eye] =
+            g_stereo_eye_cache_view_valid[accepted_eye];
+        g_stereo_eye_cache_initialized[accepted_eye] = had_accepted_pair;
+        g_packed_pending_pair_id[accepted_eye] = 0;
+    }
+    g_packed_present_cache_valid = true;
+    g_packed_accepted_pair_id = accepted_pair;
+    g_packed_accepted_pair_signal.store(accepted_pair, std::memory_order_release);
+    g_packed_eye_version[0] = accepted_pair;
+    g_packed_eye_version[1] = accepted_pair;
+    return true;
+#endif
+}
+
+bool ensure_streamline_capture_ring(const D3D12_RESOURCE_DESC& source_desc) {
+    std::scoped_lock lock{g_streamline_capture_mutex};
+    if (g_streamline_capture_ring[0][0].resource != nullptr &&
+        g_streamline_capture_width == source_desc.Width &&
+        g_streamline_capture_height == source_desc.Height &&
+        g_streamline_capture_format == source_desc.Format) {
+        return true;
+    }
+
+    for (auto& eye_ring : g_streamline_capture_ring) {
+        for (auto& slot : eye_ring) {
+            if (slot.resource != nullptr) {
+                slot.resource->Release();
+                slot.resource = nullptr;
+            }
+            slot.initialized = false;
+            slot.pair_id = 0;
+        }
+    }
+    g_streamline_capture_latest_slot[0].store(UINT32_MAX);
+    g_streamline_capture_latest_slot[1].store(UINT32_MAX);
+
+    auto capture_desc = source_desc;
+    capture_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_props.CreationNodeMask = 1;
+    heap_props.VisibleNodeMask = 1;
+
+    for (auto& eye_ring : g_streamline_capture_ring) {
+        for (auto& slot : eye_ring) {
+            if (FAILED(g_d3d12_device->CreateCommittedResource(
+                    &heap_props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &capture_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr,
+                    IID_PPV_ARGS(&slot.resource)))) {
+                return false;
+            }
+        }
+    }
+
+    g_streamline_capture_width = static_cast<UINT>(source_desc.Width);
+    g_streamline_capture_height = source_desc.Height;
+    g_streamline_capture_format = source_desc.Format;
+    log_line("Streamline stereo capture ring created size=%ux%u format=%u",
+        g_streamline_capture_width,
+        g_streamline_capture_height,
+        static_cast<unsigned>(g_streamline_capture_format));
+    return true;
+}
+
+bool capture_streamline_output(ID3D12GraphicsCommandList* command_list, D3D12_RESOURCE_STATES source_state) {
+    auto output = g_streamline_output_frame;
+    g_streamline_output_frame = {};
+    if (command_list == nullptr || output.output == nullptr || output.eye > 1 ||
+        !ensure_streamline_capture_ring(output.output->GetDesc())) {
+        return false;
+    }
+
+    const uint32_t slot_index = static_cast<uint32_t>(
+        g_streamline_capture_write_count[output.eye].fetch_add(1) % kStreamlineCaptureRingSize);
+    auto& slot = g_streamline_capture_ring[output.eye][slot_index];
+    if (slot.initialized) {
+        D3D12_RESOURCE_BARRIER to_copy_dest{};
+        to_copy_dest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy_dest.Transition.pResource = slot.resource;
+        to_copy_dest.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_copy_dest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        to_copy_dest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        command_list->ResourceBarrier(1, &to_copy_dest);
+    }
+
+    D3D12_RESOURCE_BARRIER output_to_copy_source{};
+    output_to_copy_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    output_to_copy_source.Transition.pResource = output.output;
+    output_to_copy_source.Transition.StateBefore = source_state;
+    output_to_copy_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    output_to_copy_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    command_list->ResourceBarrier(1, &output_to_copy_source);
+
+    command_list->CopyResource(slot.resource, output.output);
+
+    std::swap(output_to_copy_source.Transition.StateBefore, output_to_copy_source.Transition.StateAfter);
+    command_list->ResourceBarrier(1, &output_to_copy_source);
+
+    D3D12_RESOURCE_BARRIER to_copy_source{};
+    to_copy_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy_source.Transition.pResource = slot.resource;
+    to_copy_source.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    to_copy_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    to_copy_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    command_list->ResourceBarrier(1, &to_copy_source);
+    slot.initialized = true;
+    slot.generation = g_streamline_capture_generation.load();
+    slot.pair_id = output.pair_id;
+    if (output.render_view_valid) {
+        slot.render_view = output.render_view;
+        slot.render_view_valid = true;
+    } else {
+        slot.render_view_valid = false;
+    }
+    g_streamline_capture_latest_slot[output.eye].store(slot_index);
+    mark_engine_pair_output_captured(output.pair_id, output.eye);
+
+    if (g_streamline_capture_log_count[output.eye].fetch_add(1) < 4) {
+        log_line("Streamline stereo capture eye=%u slot=%u pair=%llu output=%p state=0x%X present=%llu",
+            output.eye,
+            slot_index,
+            static_cast<unsigned long long>(slot.pair_id),
+            output.output,
+            static_cast<unsigned>(output.state),
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+    return true;
+}
+
+bool capture_tagged_backbuffer_output(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* source,
+    D3D12_RESOURCE_STATES source_state,
+    uint32_t eye,
+    uint32_t generation,
+    uint64_t pair_id,
+    const XrView& render_view,
+    bool render_view_valid) {
+    if (command_list == nullptr || source == nullptr || eye > 1 || pair_id == 0 ||
+        pair_id < g_engine_pair_capture_floor.load(std::memory_order_relaxed) ||
+        generation != g_streamline_capture_generation.load() ||
+        !ensure_streamline_capture_ring(source->GetDesc())) {
+        return false;
+    }
+
+    const uint32_t slot_index = static_cast<uint32_t>(
+        g_streamline_capture_write_count[eye].fetch_add(1) % kStreamlineCaptureRingSize);
+    auto& slot = g_streamline_capture_ring[eye][slot_index];
+    g_packed_capture_internal = true;
+    if (slot.initialized) {
+        D3D12_RESOURCE_BARRIER to_copy_dest{};
+        to_copy_dest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy_dest.Transition.pResource = slot.resource;
+        to_copy_dest.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_copy_dest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        to_copy_dest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        command_list->ResourceBarrier(1, &to_copy_dest);
+    }
+
+    D3D12_RESOURCE_BARRIER source_to_copy{};
+    source_to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    source_to_copy.Transition.pResource = source;
+    source_to_copy.Transition.StateBefore = source_state;
+    source_to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    source_to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (source_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        command_list->ResourceBarrier(1, &source_to_copy);
+    }
+    command_list->CopyResource(slot.resource, source);
+    if (source_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        std::swap(source_to_copy.Transition.StateBefore, source_to_copy.Transition.StateAfter);
+        command_list->ResourceBarrier(1, &source_to_copy);
+    }
+
+    D3D12_RESOURCE_BARRIER slot_to_source{};
+    slot_to_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    slot_to_source.Transition.pResource = slot.resource;
+    slot_to_source.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    slot_to_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    slot_to_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    command_list->ResourceBarrier(1, &slot_to_source);
+    g_packed_capture_internal = false;
+
+    slot.initialized = true;
+    slot.generation = generation;
+    slot.pair_id = pair_id;
+    slot.render_view = render_view;
+    slot.render_view_valid = render_view_valid;
+    g_streamline_capture_latest_slot[eye].store(slot_index);
+    mark_engine_pair_output_captured(pair_id, eye);
+
+    if (g_streamline_capture_log_count[eye].fetch_add(1) < 4) {
+        log_line("Packed tagged backbuffer captured eye=%u slot=%u pair=%llu resource=%p present=%llu",
+            eye, slot_index, static_cast<unsigned long long>(slot.pair_id), source,
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+    return true;
+}
+
+bool native_stereo_capture_ready() {
+    if (!g_engine_dual_render_active.load()) {
+        return false;
+    }
+
+    const auto left_slot = g_streamline_capture_latest_slot[0].load();
+    const auto right_slot = g_streamline_capture_latest_slot[1].load();
+    return left_slot < kStreamlineCaptureRingSize && right_slot < kStreamlineCaptureRingSize &&
+        g_streamline_capture_ring[0][left_slot].initialized &&
+        g_streamline_capture_ring[1][right_slot].initialized &&
+        g_streamline_capture_ring[0][left_slot].generation == g_streamline_capture_generation.load() &&
+        g_streamline_capture_ring[1][right_slot].generation == g_streamline_capture_generation.load();
+}
+
+// [CORE] Submit projection views during gameplay and head-locked quad layers
+// during menus/cinematics, using only complete stereo resources.
+void render_openxr_test_frame() {
+    if (!g_xr_resources_ready || !g_xr_session_running) {
+        poll_openxr_events();
+        return;
+    }
+
+    poll_openxr_events();
+    if (!g_xr_session_running) {
+        return;
+    }
+
+    XrFrameState frame_state{XR_TYPE_FRAME_STATE};
+    XrResult result{XR_SUCCESS};
+    bool views_valid{};
+    if (g_xr_render_frame_prepared.load()) {
+        frame_state = g_xr_render_frame_state;
+        views_valid = g_xr_render_views_valid;
+    } else {
+        XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
+        result = pfn_xrWaitFrame(g_xr_session, &wait_info, &frame_state);
+        if (XR_FAILED(result)) {
+            log_line("OpenXR xrWaitFrame result=%s (%d)", xr_result_name(result), result);
+            return;
+        }
+
+        XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
+        result = pfn_xrBeginFrame(g_xr_session, &begin_info);
+        if (XR_FAILED(result)) {
+            log_line("OpenXR xrBeginFrame result=%s (%d)", xr_result_name(result), result);
+            return;
+        }
+
+        XrViewState view_state{XR_TYPE_VIEW_STATE};
+        XrViewLocateInfo locate_info{XR_TYPE_VIEW_LOCATE_INFO};
+        locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate_info.displayTime = frame_state.predictedDisplayTime;
+        locate_info.space = g_xr_space;
+        uint32_t view_count{};
+        result = pfn_xrLocateViews(g_xr_session, &locate_info, &view_state,
+            static_cast<uint32_t>(g_xr_views.size()), &view_count, g_xr_views.data());
+        views_valid = XR_SUCCEEDED(result) && view_count >= 2;
+    }
+
+    std::vector<XrCompositionLayerProjectionView> projection_views(2, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+    // Until REDengine exposes its GUI manager, startup/frontend frames are menus.
+    // Treating the unknown state as gameplay presents them as two world projections.
+    const auto current_present = g_present_count.load(std::memory_order_relaxed);
+    const bool fullscreen_menu = g_engine_menu_state.load() != 0;
+    const auto last_hmd_camera = g_engine_hmd_camera_last_present.load(
+        std::memory_order_relaxed);
+    constexpr uint64_t kCinemaExitCameraAge = 8;
+    // A valid gameplay camera refreshes much more frequently than this.  The
+    // former 120-present guard left a locked cinematic camera running through
+    // the packed/HMD route for roughly one second before selecting the quad.
+    // Twelve presents still absorb a short callback gap while making the
+    // gameplay-to-cinema handoff effectively immediate.
+    constexpr uint64_t kCinemaEnterCameraAge = 12;
+    const bool previous_cinema = g_cinema_mode_active.load(std::memory_order_relaxed);
+    bool cinema_mode = previous_cinema;
+    if (g_force_mono_cinema.load(std::memory_order_relaxed)) {
+        cinema_mode = true;
+    } else if (!fullscreen_menu) {
+        const bool camera_recent = last_hmd_camera != UINT64_MAX &&
+            current_present >= last_hmd_camera &&
+            current_present - last_hmd_camera <= kCinemaExitCameraAge;
+        if (previous_cinema) {
+            cinema_mode = !camera_recent;
+        } else {
+            cinema_mode = last_hmd_camera == UINT64_MAX ||
+                current_present < last_hmd_camera ||
+                current_present - last_hmd_camera > kCinemaEnterCameraAge;
+        }
+    }
+    if (current_present % 15 == 0 &&
+        (g_engine_dual_gameplay_armed.load(std::memory_order_relaxed) ||
+            previous_cinema ||
+            g_force_mono_cinema.load(std::memory_order_relaxed))) {
+        const uint64_t camera_age =
+            last_hmd_camera != UINT64_MAX && current_present >= last_hmd_camera
+            ? current_present - last_hmd_camera
+            : UINT64_MAX;
+        log_line(
+            "V592 cinema detector present=%llu previous=%d selected=%d "
+            "menu=%d forced=%d last_hmd=%llu age=%llu enter_age=%llu exit_age=%llu",
+            static_cast<unsigned long long>(current_present),
+            previous_cinema ? 1 : 0,
+            cinema_mode ? 1 : 0,
+            fullscreen_menu ? 1 : 0,
+            g_force_mono_cinema.load(std::memory_order_relaxed) ? 1 : 0,
+            static_cast<unsigned long long>(last_hmd_camera),
+            static_cast<unsigned long long>(camera_age),
+            static_cast<unsigned long long>(kCinemaEnterCameraAge),
+            static_cast<unsigned long long>(kCinemaExitCameraAge));
+    }
+    if (previous_cinema != cinema_mode) {
+        g_cinema_mode_active.store(cinema_mode, std::memory_order_relaxed);
+        if (cinema_mode) {
+            g_packed_transition_ordered_recovery_active.store(
+                false, std::memory_order_release);
+            g_packed_transition_replayed_pair.store(
+                UINT64_MAX, std::memory_order_release);
+            g_packed_transition_pending_eye0_pair.store(
+                UINT64_MAX, std::memory_order_release);
+            g_packed_transition_pending_eye0_final_route_pair.store(
+                UINT64_MAX, std::memory_order_release);
+        } else if (previous_cinema && temporal_backend_is_dlss_packed() &&
+            g_engine_dual_render_active.load(std::memory_order_acquire) &&
+            g_engine_dual_gameplay_armed.load(std::memory_order_acquire)) {
+            g_packed_transition_replayed_pair.store(
+                UINT64_MAX, std::memory_order_release);
+            g_packed_transition_pending_eye0_pair.store(
+                UINT64_MAX, std::memory_order_release);
+            g_packed_transition_pending_eye0_final_route_pair.store(
+                UINT64_MAX, std::memory_order_release);
+            g_packed_transition_ordered_recovery_active.store(
+                true, std::memory_order_release);
+            log_line(
+                "Packed ordered transition recovery armed present=%llu generation=%u",
+                static_cast<unsigned long long>(current_present),
+                g_streamline_capture_generation.load(
+                    std::memory_order_acquire));
+        }
+        if (cinema_mode) {
+            g_auto_recenter_on_packed_lock_armed.store(
+                true, std::memory_order_release);
+            if (g_config.openxr_mode == 2) {
+                g_mono_hud_outputs_valid.store(false, std::memory_order_release);
+                g_streamline_capture_latest_slot[0].store(UINT32_MAX);
+                g_streamline_capture_latest_slot[1].store(UINT32_MAX);
+                std::scoped_lock queue_lock{
+                    g_engine_completed_tag_queue_mutex};
+                g_engine_completed_tag_queue.clear();
+            }
+        }
+        log_line("OpenXR cinema mode active=%d present=%llu last_hmd_camera=%llu",
+            cinema_mode ? 1 : 0,
+            static_cast<unsigned long long>(current_present),
+            static_cast<unsigned long long>(last_hmd_camera));
+    }
+    const bool head_locked_quad = fullscreen_menu || cinema_mode;
+    XrRect2Di menu_image_rect{{0, 0}, {0, 0}};
+    XrRect2Di projection_image_rect{{0, 0}, {0, 0}};
+    bool submitted = views_valid && frame_state.shouldRender;
+
+    if (submitted) {
+        if (!g_xr_first_frame_logged) {
+            g_xr_first_frame_logged = true;
+            log_line("OpenXR submitting stereo test frames");
+        }
+
+        auto& swapchain = g_xr_eye_swapchains[0];
+        uint32_t image_index{};
+        bool acquired{};
+        bool command_list_recording{};
+        XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        result = pfn_xrAcquireSwapchainImage(swapchain.handle, &acquire_info, &image_index);
+        if (XR_FAILED(result)) {
+            submitted = false;
+        } else {
+            acquired = true;
+        }
+
+        if (submitted) {
+            XrSwapchainImageWaitInfo wait_swapchain_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            wait_swapchain_info.timeout = XR_INFINITE_DURATION;
+            result = pfn_xrWaitSwapchainImage(swapchain.handle, &wait_swapchain_info);
+            if (XR_FAILED(result)) {
+                submitted = false;
+            }
+        }
+
+        if (submitted) {
+            if (image_index >= g_xr_command_allocators.size() ||
+                g_xr_command_allocators[image_index] == nullptr ||
+                !wait_for_xr_allocator_slot(image_index) ||
+                FAILED(g_xr_command_allocators[image_index]->Reset()) ||
+                FAILED(g_xr_command_list->Reset(
+                    g_xr_command_allocators[image_index], nullptr))) {
+                log_line(
+                    "OpenXR allocator slot unavailable image=%u slots=%zu",
+                    image_index,
+                    g_xr_command_allocators.size());
+                submitted = false;
+            } else {
+                command_list_recording = true;
+            }
+        }
+
+        if (submitted) {
+            auto* texture = swapchain.images[image_index].texture;
+            UINT submitted_width = swapchain.width;
+            UINT submitted_height = swapchain.height;
+            D3D12_RESOURCE_BARRIER to_rtv{};
+            to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            to_rtv.Transition.pResource = texture;
+            to_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            to_rtv.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            to_rtv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_xr_command_list->ResourceBarrier(1, &to_rtv);
+
+            const auto mode = g_config.openxr_mode;
+            const bool direct_stereo = mode == 3 && native_stereo_capture_ready();
+            ID3D12Resource* direct_stereo_sources[2]{};
+            if (direct_stereo) {
+                const auto left_slot = g_streamline_capture_latest_slot[0].load();
+                const auto right_slot = g_streamline_capture_latest_slot[1].load();
+                direct_stereo_sources[0] = g_streamline_capture_ring[0][left_slot].resource;
+                direct_stereo_sources[1] = g_streamline_capture_ring[1][right_slot].resource;
+            }
+            StreamlineCaptureSlot* mono_capture_slots[2]{};
+            if (mode == 2 && !head_locked_quad) {
+                for (uint32_t eye = 0; eye < 2; ++eye) {
+                    const auto mono_slot_index =
+                        g_streamline_capture_latest_slot[eye].load();
+                    if (mono_slot_index >= kStreamlineCaptureRingSize) {
+                        continue;
+                    }
+                    auto& slot =
+                        g_streamline_capture_ring[eye][mono_slot_index];
+                    if (slot.initialized &&
+                        slot.generation ==
+                            g_streamline_capture_generation.load()) {
+                        mono_capture_slots[eye] = &slot;
+                    }
+                }
+            }
+            ID3D12Resource* game_backbuffer{};
+            bool copied_game{};
+            UINT game_backbuffer_index{};
+            if (!direct_stereo && g_game_swapchain != nullptr) {
+                IDXGISwapChain3* swapchain3{};
+                if (SUCCEEDED(g_game_swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3))) && swapchain3 != nullptr) {
+                    game_backbuffer_index = swapchain3->GetCurrentBackBufferIndex();
+                    swapchain3->Release();
+                }
+            }
+
+            if (!direct_stereo && g_game_swapchain != nullptr) {
+                g_game_swapchain->GetBuffer(game_backbuffer_index, IID_PPV_ARGS(&game_backbuffer));
+            }
+
+            if ((mode == 2 || mode == 3 || mode == 4) &&
+                (direct_stereo || game_backbuffer != nullptr)) {
+                ID3D12Resource* mono_captured_sources[2] = {
+                    mono_capture_slots[0] != nullptr
+                        ? mono_capture_slots[0]->resource : nullptr,
+                    mono_capture_slots[1] != nullptr
+                        ? mono_capture_slots[1]->resource : nullptr};
+                ID3D12Resource* mono_captured_source =
+                    mono_captured_sources[0];
+                const bool live_backbuffer_source = !direct_stereo &&
+                    mono_captured_source == nullptr;
+                D3D12_RESOURCE_BARRIER source_to_copy{};
+                if (live_backbuffer_source) {
+                    source_to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    source_to_copy.Transition.pResource = game_backbuffer;
+                    source_to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+                    source_to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    source_to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    g_xr_command_list->ResourceBarrier(1, &source_to_copy);
+                }
+
+                for (uint32_t eye = 0; eye < 2; ++eye) {
+                    const float mono_black[] = {0.0f, 0.0f, 0.0f, 1.0f};
+                    g_xr_command_list->ClearRenderTargetView(
+                        swapchain.rtvs[image_index * 2 + eye], mono_black, 0, nullptr);
+                }
+
+                std::swap(to_rtv.Transition.StateBefore, to_rtv.Transition.StateAfter);
+                to_rtv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                to_rtv.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                g_xr_command_list->ResourceBarrier(1, &to_rtv);
+
+                auto* primary_source = direct_stereo
+                    ? direct_stereo_sources[0]
+                    : (mono_captured_source != nullptr
+                        ? mono_captured_source
+                        : game_backbuffer);
+                auto source_desc = primary_source->GetDesc();
+                const UINT copy_width = static_cast<UINT>(std::min<uint64_t>(source_desc.Width, swapchain.width));
+                const UINT copy_height = std::min<UINT>(source_desc.Height, swapchain.height);
+                int calibrated_eye_shifts[2] = {
+                    g_config.openxr_mono_eye_shift_px,
+                    -g_config.openxr_mono_eye_shift_px};
+                float optical_centers[2] = {0.5f, 0.5f};
+                bool optical_centers_valid = g_xr_views.size() >= 2;
+                if (g_config.openxr_mono_eye_shift_auto) {
+                    for (uint32_t eye = 0; eye < 2 && optical_centers_valid; ++eye) {
+                        const float tan_left = tanf(g_xr_views[eye].fov.angleLeft);
+                        const float tan_right = tanf(g_xr_views[eye].fov.angleRight);
+                        const float span = tan_right - tan_left;
+                        optical_centers_valid = std::isfinite(tan_left) && std::isfinite(tan_right) &&
+                            span > 0.01f;
+                        if (optical_centers_valid) {
+                            optical_centers[eye] = -tan_left / span;
+                            optical_centers_valid = optical_centers[eye] > 0.0f &&
+                                optical_centers[eye] < 1.0f;
+                            calibrated_eye_shifts[eye] = static_cast<int>(lroundf(
+                                (optical_centers[eye] - 0.5f) * static_cast<float>(swapchain.width)));
+                        }
+                    }
+                    if (!optical_centers_valid) {
+                        calibrated_eye_shifts[0] = g_config.openxr_mono_eye_shift_px;
+                        calibrated_eye_shifts[1] = -g_config.openxr_mono_eye_shift_px;
+                    }
+                    if (!g_auto_eye_shift_logged.exchange(true)) {
+                        log_line("OpenXR optical eye shift valid=%d centers=%.6f,%.6f shifts=%d,%d game=%ux%u swapchain=%ux%u presentation=%.3f",
+                            optical_centers_valid, optical_centers[0], optical_centers[1],
+                            calibrated_eye_shifts[0], calibrated_eye_shifts[1],
+                            copy_width, copy_height, swapchain.width, swapchain.height,
+                            g_config.presentation_scale);
+                    }
+                }
+                submitted_width = swapchain.width;
+                submitted_height = swapchain.height;
+                const UINT centered_x = (swapchain.width - copy_width) / 2;
+                const UINT centered_y = (swapchain.height - copy_height) / 2;
+                menu_image_rect.offset = {
+                    static_cast<int32_t>(centered_x),
+                    static_cast<int32_t>(centered_y)};
+                menu_image_rect.extent = {
+                    static_cast<int32_t>(copy_width),
+                    static_cast<int32_t>(copy_height)};
+                const float requested_scale = std::clamp(
+                    g_config.presentation_scale, 0.01f, 1.0f);
+                const float effective_horizontal_scale = std::max(requested_scale,
+                    static_cast<float>(copy_width) / swapchain.width);
+                const float effective_vertical_scale = std::max(requested_scale,
+                    static_cast<float>(copy_height) / swapchain.height);
+                const UINT projection_width = std::min(swapchain.width,
+                    std::max(copy_width, static_cast<UINT>(lroundf(
+                        static_cast<float>(copy_width) / effective_horizontal_scale))));
+                const UINT projection_height = std::min(swapchain.height,
+                    std::max(copy_height, static_cast<UINT>(lroundf(
+                        static_cast<float>(copy_height) / effective_vertical_scale))));
+                projection_image_rect.offset = {
+                    static_cast<int32_t>((swapchain.width - projection_width) / 2),
+                    static_cast<int32_t>((swapchain.height - projection_height) / 2)};
+                projection_image_rect.extent = {
+                    static_cast<int32_t>(projection_width),
+                    static_cast<int32_t>(projection_height)};
+                const bool cache_resources_ready = !direct_stereo &&
+                    (mode == 3 || mode == 4) && ensure_stereo_eye_cache(source_desc);
+                const bool packed_stereo_available = mode == 4 &&
+                    !fullscreen_menu &&
+                    g_engine_dual_gameplay_armed.load(std::memory_order_relaxed) &&
+                    g_packed_present_cache_valid &&
+                    g_packed_accepted_pair_id != 0 &&
+                    g_packed_present_cache[0] != nullptr &&
+                    g_packed_present_cache[1] != nullptr;
+                // Preserve the proven bootstrap/tutorial mono presentation
+                // before dual has ever armed.  After stereo activation, mode 4
+                // must never fall back to old per-eye sequential caches: if no
+                // complete packed pair exists, the live backbuffer is copied
+                // to both eyes until a fresh pair is published.
+                const bool sequential_stereo_cache = !fullscreen_menu &&
+                    (mode != 4 ||
+                        (cinema_mode &&
+                            !g_engine_dual_render_active.load(
+                                std::memory_order_relaxed)));
+                const bool stereo_cached = !fullscreen_menu && cache_resources_ready &&
+                    (sequential_stereo_cache || packed_stereo_available);
+                if (current_present % 15 == 0 &&
+                    (g_engine_dual_gameplay_armed.load(std::memory_order_relaxed) ||
+                        cinema_mode)) {
+                    log_line(
+                        "V592 cinema source present=%llu cinema=%d head_locked=%d "
+                        "packed=%d sequential=%d stereo_cached=%d cache_valid=%d "
+                        "pair=%llu dual=%d backbuffer=%p",
+                        static_cast<unsigned long long>(current_present),
+                        cinema_mode ? 1 : 0,
+                        head_locked_quad ? 1 : 0,
+                        packed_stereo_available ? 1 : 0,
+                        sequential_stereo_cache ? 1 : 0,
+                        stereo_cached ? 1 : 0,
+                        g_packed_present_cache_valid ? 1 : 0,
+                        static_cast<unsigned long long>(
+                            g_packed_accepted_pair_id),
+                        g_engine_dual_render_active.load(
+                            std::memory_order_relaxed) ? 1 : 0,
+                        game_backbuffer);
+                }
+
+                if (packed_stereo_available) {
+                    schedule_stereo_luminance_readback(g_xr_command_list);
+                }
+
+                if (stereo_cached && sequential_stereo_cache) {
+                    int tagged_update_eye{-1};
+                    bool copy_loading_mono{};
+                    XrView tagged_render_view{XR_TYPE_VIEW};
+                    bool tagged_render_view_valid{};
+                    if (g_engine_dual_render_active.load()) {
+                        const auto completed_serial = g_engine_completed_serial.load();
+                        const auto completed_generation = g_engine_completed_generation.load();
+                        if (completed_serial != g_engine_completed_consumed_serial &&
+                            completed_generation == g_streamline_capture_generation.load()) {
+                            tagged_update_eye = g_engine_completed_eye.load();
+                            g_engine_completed_consumed_serial = completed_serial;
+                            g_engine_completed_view_mutex.lock();
+                            tagged_render_view = g_engine_completed_view;
+                            tagged_render_view_valid = g_engine_completed_view_valid;
+                            g_engine_completed_view_mutex.unlock();
+                            if (g_config.runtime_diagnostics) {
+                                g_sync_cache_update_count.fetch_add(1);
+                            }
+                        } else if (completed_generation != g_streamline_capture_generation.load()) {
+                            copy_loading_mono = true;
+                        } else {
+                            if (g_config.runtime_diagnostics) {
+                                g_sync_missing_tag_present_count.fetch_add(1);
+                            }
+                        }
+                    } else if (mode == 4 && cinema_mode) {
+                        // A flat movie/tutorial frame is one mono sample, not
+                        // an alternating stereo producer.  Updating the two
+                        // caches on adjacent Presents gives the eyes different
+                        // 30-fps movie timestamps and appears as lateral judder.
+                        // Copy this exact backbuffer into both eyes now.
+                        copy_loading_mono = true;
+                    } else {
+                        tagged_update_eye = static_cast<int>((g_present_count.load() - 1) & 1ull);
+                    }
+                    for (uint32_t eye = 0; eye < 2; ++eye) {
+                        if (!copy_loading_mono &&
+                            (tagged_update_eye < 0 ||
+                                eye != static_cast<uint32_t>(tagged_update_eye))) {
+                            continue;
+                        }
+                        if (g_stereo_eye_cache_initialized[eye]) {
+                            D3D12_RESOURCE_BARRIER cache_to_dest{};
+                            cache_to_dest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                            cache_to_dest.Transition.pResource = g_stereo_eye_cache[eye];
+                            cache_to_dest.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                            cache_to_dest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                            cache_to_dest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                            g_xr_command_list->ResourceBarrier(1, &cache_to_dest);
+                        }
+                        g_xr_command_list->CopyResource(g_stereo_eye_cache[eye], game_backbuffer);
+                        D3D12_RESOURCE_BARRIER cache_to_source{};
+                        cache_to_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                        cache_to_source.Transition.pResource = g_stereo_eye_cache[eye];
+                        cache_to_source.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                        cache_to_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                        cache_to_source.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                        g_xr_command_list->ResourceBarrier(1, &cache_to_source);
+                        g_stereo_eye_cache_initialized[eye] = true;
+                        if (g_config.hmd_freelook && tagged_render_view_valid &&
+                            !copy_loading_mono) {
+                            g_stereo_eye_cache_views[eye] = tagged_render_view;
+                            g_stereo_eye_cache_view_valid[eye] = true;
+                        } else if (g_config.hmd_freelook && eye < g_xr_views.size() &&
+                            g_hmd_pose_valid.load()) {
+                            g_stereo_eye_cache_views[eye] = g_xr_views[eye];
+                            g_stereo_eye_cache_view_valid[eye] = true;
+                        }
+                    }
+                }
+
+                for (uint32_t eye = 0; eye < 2; ++eye) {
+                    const auto current_present = g_present_count.load();
+                    const bool native_projection_ready = g_config.engine_native_projection_shift &&
+                        (!g_engine_dual_render_active.load() ||
+                            current_present > g_dual_render_activation_present.load() + 300);
+                    int eye_shift = calibrated_eye_shifts[eye];
+                    if (head_locked_quad || g_config.hmd_freelook) {
+                        eye_shift = 0;
+                    }
+                    if (native_projection_ready) {
+                        const int residual = std::max(0,
+                            abs(eye_shift) - g_config.engine_native_projection_shift_px);
+                        eye_shift = eye_shift < 0 ? -residual : residual;
+                    }
+                    const UINT shift_magnitude = static_cast<UINT>(std::min(
+                        abs(eye_shift),
+                        static_cast<int>(copy_width > 1 ? copy_width - 1 : 0)));
+                    const UINT shifted_width = copy_width - shift_magnitude;
+                    const UINT dst_x = centered_x + (eye_shift > 0 ? shift_magnitude : 0);
+                    const UINT src_x = eye_shift < 0 ? shift_magnitude : 0;
+
+                    D3D12_TEXTURE_COPY_LOCATION dst{};
+                    dst.pResource = texture;
+                    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    dst.SubresourceIndex = eye;
+
+                    D3D12_TEXTURE_COPY_LOCATION src{};
+                    const uint32_t cache_eye = g_engine_dual_render_active.load() &&
+                            g_config.engine_sync_swap_eyes
+                        ? 1u - eye
+                        : eye;
+                    src.pResource = direct_stereo
+                        ? direct_stereo_sources[cache_eye]
+                        : (mode == 2 &&
+                                mono_captured_sources[eye] != nullptr
+                            ? mono_captured_sources[eye]
+                            : (stereo_cached
+                            ? (mode == 4 && packed_stereo_available
+                                ? g_packed_present_cache[cache_eye]
+                                : g_stereo_eye_cache[cache_eye])
+                            : game_backbuffer));
+                    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    src.SubresourceIndex = 0;
+
+                    D3D12_BOX src_box{};
+                    src_box.left = src_x;
+                    src_box.top = 0;
+                    src_box.front = 0;
+                    src_box.right = src_x + shifted_width;
+                    src_box.bottom = copy_height;
+                    src_box.back = 1;
+
+                    g_xr_command_list->CopyTextureRegion(&dst, dst_x, centered_y, 0, &src, &src_box);
+                }
+
+                if (live_backbuffer_source) {
+                    std::swap(source_to_copy.Transition.StateBefore, source_to_copy.Transition.StateAfter);
+                    g_xr_command_list->ResourceBarrier(1, &source_to_copy);
+                }
+
+                std::swap(to_rtv.Transition.StateBefore, to_rtv.Transition.StateAfter);
+                g_xr_command_list->ResourceBarrier(1, &to_rtv);
+
+                copied_game = true;
+            }
+
+            if (!copied_game) {
+                for (uint32_t eye = 0; eye < 2; ++eye) {
+                    const float left_color[] = {0.02f, 0.15f, 0.85f, 1.0f};
+                    const float right_color[] = {0.85f, 0.12f, 0.04f, 1.0f};
+                    g_xr_command_list->ClearRenderTargetView(swapchain.rtvs[image_index * 2 + eye], eye == 0 ? left_color : right_color, 0, nullptr);
+                }
+
+                std::swap(to_rtv.Transition.StateBefore, to_rtv.Transition.StateAfter);
+                g_xr_command_list->ResourceBarrier(1, &to_rtv);
+            }
+
+            if (game_backbuffer != nullptr) {
+                game_backbuffer->Release();
+            }
+
+            XrView mono_render_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+            bool mono_render_views_valid{};
+            if (mode == 2) {
+                if (mono_capture_slots[0] != nullptr &&
+                    mono_capture_slots[0]->render_view_valid) {
+                    mono_render_views[0] =
+                        mono_capture_slots[0]->render_view;
+                    mono_render_views[1] =
+                        mono_capture_slots[0]->render_view;
+                    mono_render_views_valid = true;
+                } else {
+                    std::scoped_lock view_lock{g_engine_completed_view_mutex};
+                    mono_render_views[0] = g_mono_dlss_render_views[0];
+                    mono_render_views[1] = g_mono_dlss_render_views[1];
+                    mono_render_views_valid = g_mono_dlss_render_views_valid;
+                }
+            }
+            XrPosef mono_cyclopean_pose{};
+            bool mono_cyclopean_pose_valid{};
+            if (mode == 2 && g_xr_views.size() >= 2) {
+                const XrView* mono_pose_views = mono_render_views_valid
+                    ? mono_render_views
+                    : g_xr_views.data();
+                mono_cyclopean_pose.orientation =
+                    mono_pose_views[0].pose.orientation;
+                mono_cyclopean_pose.position = {
+                    (mono_pose_views[0].pose.position.x +
+                        mono_pose_views[1].pose.position.x) * 0.5f,
+                    (mono_pose_views[0].pose.position.y +
+                        mono_pose_views[1].pose.position.y) * 0.5f,
+                    (mono_pose_views[0].pose.position.z +
+                        mono_pose_views[1].pose.position.z) * 0.5f};
+                if (!mono_render_views_valid) {
+                    mono_cyclopean_pose.position.x -=
+                        g_mono_neck_pose_correction.x;
+                    mono_cyclopean_pose.position.y -=
+                        g_mono_neck_pose_correction.y;
+                    mono_cyclopean_pose.position.z -=
+                        g_mono_neck_pose_correction.z;
+                }
+                mono_cyclopean_pose_valid = true;
+            }
+            for (uint32_t eye = 0; eye < 2; ++eye) {
+                const uint32_t render_source_eye = g_engine_dual_render_active.load() &&
+                        g_config.engine_sync_swap_eyes
+                    ? 1u - eye
+                    : eye;
+                const XrView* render_view = &g_xr_views[render_source_eye];
+                if (direct_stereo) {
+                    const auto slot_index = g_streamline_capture_latest_slot[render_source_eye].load();
+                    if (slot_index < kStreamlineCaptureRingSize &&
+                        g_streamline_capture_ring[render_source_eye][slot_index].render_view_valid) {
+                        render_view = &g_streamline_capture_ring[render_source_eye][slot_index].render_view;
+                    }
+                } else if (mode == 4 && g_packed_present_cache_valid &&
+                    g_packed_present_cache_view_valid[render_source_eye]) {
+                    render_view = &g_packed_present_cache_views[render_source_eye];
+                } else if (mode == 3 &&
+                    g_stereo_eye_cache_view_valid[render_source_eye]) {
+                    render_view = &g_stereo_eye_cache_views[render_source_eye];
+                } else if (mode == 2 && mono_render_views_valid) {
+                    render_view = &mono_render_views[eye];
+                }
+                projection_views[eye].pose = mono_cyclopean_pose_valid
+                    ? mono_cyclopean_pose
+                    : render_view->pose;
+                if (g_config.hmd_freelook) {
+                    const auto& runtime_fov = render_view->fov;
+                    const float horizontal_span =
+                        tanf(runtime_fov.angleRight) - tanf(runtime_fov.angleLeft);
+                    const float vertical_span =
+                        tanf(runtime_fov.angleUp) - tanf(runtime_fov.angleDown);
+                    const float horizontal_half = atanf(horizontal_span * 0.5f);
+                    const float vertical_half = atanf(vertical_span * 0.5f);
+                    projection_views[eye].fov = {
+                        -horizontal_half, horizontal_half, vertical_half, -vertical_half};
+                    if (g_hmd_render_fov_valid.load() && !g_hmd_fov_pair_logged.exchange(true)) {
+                        log_line(
+                            "HMD FOV pair render=%.6f,%.6f,%.6f,%.6f submit=%.6f,%.6f,%.6f,%.6f active=%ux%u swapchain=%ux%u",
+                            g_hmd_render_fov_left.load(), g_hmd_render_fov_right.load(),
+                            g_hmd_render_fov_up.load(), g_hmd_render_fov_down.load(),
+                            projection_views[eye].fov.angleLeft,
+                            projection_views[eye].fov.angleRight,
+                            projection_views[eye].fov.angleUp,
+                            projection_views[eye].fov.angleDown,
+                            g_game_render_width, g_game_render_height,
+                            swapchain.width, swapchain.height);
+                    }
+                } else {
+                    projection_views[eye].fov = render_view->fov;
+                }
+                projection_views[eye].subImage.swapchain = swapchain.handle;
+                if (projection_image_rect.extent.width > 0 &&
+                    projection_image_rect.extent.height > 0) {
+                    projection_views[eye].subImage.imageRect = projection_image_rect;
+                } else {
+                    projection_views[eye].subImage.imageRect.offset = {0, 0};
+                    projection_views[eye].subImage.imageRect.extent = {
+                        static_cast<int32_t>(submitted_width),
+                        static_cast<int32_t>(submitted_height)};
+                }
+                projection_views[eye].subImage.imageArrayIndex = eye;
+            }
+        }
+
+        if (command_list_recording) {
+            if (SUCCEEDED(g_xr_command_list->Close())) {
+                ID3D12CommandList* lists[] = {g_xr_command_list};
+                g_command_queue->ExecuteCommandLists(1, lists);
+                if (!signal_xr_allocator_slot(image_index)) {
+                    log_line(
+                        "OpenXR allocator slot signal failed image=%u",
+                        image_index);
+                    wait_for_xr_gpu();
+                    g_xr_allocator_fence_values[image_index] = 0;
+                }
+                log_stereo_luminance_readback();
+            } else {
+                submitted = false;
+                log_line(
+                    "OpenXR command list close failed image=%u",
+                    image_index);
+            }
+        }
+
+        if (acquired) {
+            XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            const auto release_result = pfn_xrReleaseSwapchainImage(swapchain.handle, &release_info);
+            if (XR_FAILED(release_result)) {
+                log_line("OpenXR xrReleaseSwapchainImage stereo-array image=%u result=%s (%d)",
+                    image_index,
+                    xr_result_name(release_result),
+                    release_result);
+            }
+        }
+    }
+
+    XrCompositionLayerProjection projection_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    projection_layer.space = g_xr_space;
+    projection_layer.viewCount = static_cast<uint32_t>(projection_views.size());
+    projection_layer.views = projection_views.data();
+
+    XrCompositionLayerQuad menu_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    menu_layer.space = g_xr_view_space;
+    menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    menu_layer.subImage.swapchain = g_xr_eye_swapchains[0].handle;
+    menu_layer.subImage.imageRect = menu_image_rect;
+    menu_layer.subImage.imageArrayIndex = 0;
+    menu_layer.pose.orientation.w = 1.0f;
+    menu_layer.pose.position.z = -g_config.menu_distance;
+    const float head_locked_scale = cinema_mode && !fullscreen_menu
+        ? g_config.cinema_scale
+        : g_config.menu_scale;
+    menu_layer.size.width = 1.6f * head_locked_scale;
+    // [FIX:CINEMA-5X4 3/3] Give the head-locked cinema quad the same 5:4
+    // aspect used by both engine cameras; otherwise use the native image ratio.
+    const float presented_height_over_width =
+        cinema_mode && !fullscreen_menu && g_config.cinema_5x4
+        ? 4.0f / 5.0f
+        : (menu_image_rect.extent.width > 0
+            ? static_cast<float>(menu_image_rect.extent.height) /
+                static_cast<float>(menu_image_rect.extent.width)
+            : 1.0f);
+    menu_layer.size.height =
+        menu_layer.size.width * presented_height_over_width;
+
+    const XrCompositionLayerBaseHeader* projection_layers[] = {
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection_layer)};
+    const XrCompositionLayerBaseHeader* menu_layers[] = {
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu_layer)};
+    XrCompositionLayerQuad cinema_eye_layers[2] = {menu_layer, menu_layer};
+    cinema_eye_layers[0].eyeVisibility = XR_EYE_VISIBILITY_LEFT;
+    cinema_eye_layers[0].subImage.imageArrayIndex = 0;
+    cinema_eye_layers[1].eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
+    cinema_eye_layers[1].subImage.imageArrayIndex = 1;
+    const XrCompositionLayerBaseHeader* cinema_layers[] = {
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cinema_eye_layers[0]),
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cinema_eye_layers[1])};
+
+    XrFrameEndInfo end_info{XR_TYPE_FRAME_END_INFO};
+    end_info.displayTime = frame_state.predictedDisplayTime;
+    end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    end_info.layerCount = submitted ? 1u : 0u;
+    end_info.layers = submitted
+        ? ((fullscreen_menu || cinema_mode) ? menu_layers : projection_layers)
+        : nullptr;
+    const int submitted_layer_kind = !submitted
+        ? 0
+        : (fullscreen_menu ? 2 : (cinema_mode ? 3 : 1));
+    static int last_submitted_layer_kind{-1};
+    const bool trace_layer_transition =
+        submitted_layer_kind != last_submitted_layer_kind;
+    if (trace_layer_transition) {
+        last_submitted_layer_kind = submitted_layer_kind;
+        const char* layer_name = submitted_layer_kind == 2
+            ? "menu_quad"
+            : (submitted_layer_kind == 3
+                ? "cinema_quad"
+                : (submitted_layer_kind == 1 ? "projection" : "none"));
+        log_line(
+            "OpenXR layer transition layer=%s mode=%d menu=%d cinema=%d submitted=%d should_render=%d views_valid=%d rect=%d,%d %dx%d quad=%.3fx%.3f distance=%.3f scale=%.3f present=%llu",
+            layer_name, g_config.openxr_mode, fullscreen_menu ? 1 : 0,
+            cinema_mode ? 1 : 0, submitted ? 1 : 0,
+            frame_state.shouldRender ? 1 : 0, views_valid ? 1 : 0,
+            menu_image_rect.offset.x, menu_image_rect.offset.y,
+            menu_image_rect.extent.width, menu_image_rect.extent.height,
+            menu_layer.size.width, menu_layer.size.height,
+            g_config.menu_distance, head_locked_scale,
+            static_cast<unsigned long long>(current_present));
+    }
+    result = pfn_xrEndFrame(g_xr_session, &end_info);
+    g_xr_render_frame_prepared.store(false);
+    if (trace_layer_transition) {
+        log_line("OpenXR layer transition xrEndFrame result=%s (%d) present=%llu",
+            xr_result_name(result), result,
+            static_cast<unsigned long long>(current_present));
+    }
+    if (XR_FAILED(result)) {
+        log_line("OpenXR xrEndFrame result=%s (%d)", xr_result_name(result), result);
+    }
+}
+
+HRESULT STDMETHODCALLTYPE hook_resize_buffers(
+    IDXGISwapChain* swapchain,
+    UINT buffer_count,
+    UINT width,
+    UINT height,
+    DXGI_FORMAT format,
+    UINT flags) {
+    const UINT effective_width = g_custom_resolution_active.load() && g_config.render_width > 0
+        ? static_cast<UINT>(g_config.render_width)
+        : width;
+    const UINT effective_height = g_custom_resolution_active.load() && g_config.render_height > 0
+        ? static_cast<UINT>(g_config.render_height)
+        : height;
+    g_game_render_width = effective_width;
+    g_game_render_height = effective_height;
+    log_line("ResizeBuffers requested=%ux%u effective=%ux%u buffers=%u format=%u",
+        width, height, effective_width, effective_height, buffer_count,
+        static_cast<unsigned>(format));
+    return g_resize_buffers(
+        swapchain, buffer_count, effective_width, effective_height, format, flags);
+}
+
+void hook_present(IDXGISwapChain* swapchain) {
+    if (swapchain == nullptr) {
+        return;
+    }
+
+    if (g_present == nullptr) {
+        auto target = method<void*>(swapchain, 8);
+        if (MH_CreateHook(target, reinterpret_cast<void*>(static_cast<PresentFn>(&hook_present)), reinterpret_cast<void**>(&g_present)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Hooked IDXGISwapChain::Present at %p", target);
+        }
+    }
+
+    if (g_resize_buffers == nullptr) {
+        auto target = method<void*>(swapchain, 13);
+        if (MH_CreateHook(target, &hook_resize_buffers,
+                reinterpret_cast<void**>(&g_resize_buffers)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Hooked IDXGISwapChain::ResizeBuffers at %p", target);
+        }
+    }
+
+    IDXGISwapChain1* swapchain1{};
+    if (SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain1))) && swapchain1 != nullptr) {
+        if (g_present1 == nullptr) {
+            auto target = method<void*>(swapchain1, 22);
+            if (MH_CreateHook(target, &hook_present1, reinterpret_cast<void**>(&g_present1)) == MH_OK &&
+                MH_EnableHook(target) == MH_OK) {
+                log_line("Hooked IDXGISwapChain1::Present1 at %p", target);
+            }
+        }
+        swapchain1->Release();
+    }
+}
+
+void try_log_taau_readback() {
+    if (!g_taau_readback_submitted.load() || g_taau_readback_logged.load() ||
+        g_taau_readback_fence == nullptr || g_taau_readback_buffer == nullptr ||
+        g_taau_readback_fence->GetCompletedValue() < 1) {
+        return;
+    }
+    uint8_t* mapped{};
+    const D3D12_RANGE read_range{0, static_cast<SIZE_T>(g_taau_readback_buffer->GetDesc().Width)};
+    if (FAILED(g_taau_readback_buffer->Map(
+            0, &read_range, reinterpret_cast<void**>(&mapped))) || mapped == nullptr) {
+        return;
+    }
+    const UINT width = g_taau_readback_footprint.Footprint.Width;
+    const UINT height = g_taau_readback_footprint.Footprint.Height;
+    const UINT row_pitch = g_taau_readback_footprint.Footprint.RowPitch;
+    auto pixel = [&](UINT x, UINT y) {
+        return reinterpret_cast<const uint16_t*>(
+            mapped + g_taau_readback_footprint.Offset +
+            static_cast<size_t>(y) * row_pitch + static_cast<size_t>(x) * 8);
+    };
+    const auto* first = pixel(0, 0);
+    const auto* center = pixel(width / 2, height / 2);
+    const auto* last = pixel(width - 1, height - 1);
+    const auto half_to_float = [](uint16_t value) {
+        const float sign = (value & 0x8000u) != 0 ? -1.0f : 1.0f;
+        const uint16_t exponent = (value >> 10) & 0x1Fu;
+        const uint16_t mantissa = value & 0x03FFu;
+        if (exponent == 0) {
+            return mantissa == 0 ? sign * 0.0f
+                : sign * ldexpf(static_cast<float>(mantissa) / 1024.0f, -14);
+        }
+        if (exponent == 0x1F) {
+            return mantissa == 0 ? sign * INFINITY : NAN;
+        }
+        return sign * ldexpf(1.0f + static_cast<float>(mantissa) / 1024.0f,
+            static_cast<int>(exponent) - 15);
+    };
+    double sum_abs_x{};
+    double sum_abs_y{};
+    float max_abs_x{};
+    float max_abs_y{};
+    uint32_t valid_samples{};
+    constexpr UINT kGridX = 32;
+    constexpr UINT kGridY = 18;
+    for (UINT grid_y = 0; grid_y < kGridY; ++grid_y) {
+        for (UINT grid_x = 0; grid_x < kGridX; ++grid_x) {
+            const auto* sample = pixel(
+                std::min(width - 1, (grid_x * width + width / 2) / kGridX),
+                std::min(height - 1, (grid_y * height + height / 2) / kGridY));
+            const float x = half_to_float(sample[0]);
+            const float y = half_to_float(sample[1]);
+            if (!std::isfinite(x) || !std::isfinite(y) || x >= 2.0f || y >= 2.0f) {
+                continue;
+            }
+            const float abs_x = fabsf(x);
+            const float abs_y = fabsf(y);
+            sum_abs_x += abs_x;
+            sum_abs_y += abs_y;
+            max_abs_x = std::max(max_abs_x, abs_x);
+            max_abs_y = std::max(max_abs_y, abs_y);
+            ++valid_samples;
+        }
+    }
+    log_line("TAAU readback RGBA16 raw first=%04X,%04X,%04X,%04X center=%04X,%04X,%04X,%04X last=%04X,%04X,%04X,%04X expected_zero=0000",
+        first[0], first[1], first[2], first[3],
+        center[0], center[1], center[2], center[3],
+        last[0], last[1], last[2], last[3]);
+    if (valid_samples != 0) {
+        const double mean_abs_x = sum_abs_x / valid_samples;
+        const double mean_abs_y = sum_abs_y / valid_samples;
+        log_line("TAAU native t7 stats samples=%u mean_abs=%.8f,%.8f max_abs=%.8f,%.8f normalized_as_pixels=%.3f,%.3f max_pixels=%.3f,%.3f",
+            valid_samples, mean_abs_x, mean_abs_y, max_abs_x, max_abs_y,
+            mean_abs_x * width, mean_abs_y * height,
+            max_abs_x * width, max_abs_y * height);
+    }
+    constexpr UINT kProbeColumns = 7;
+    constexpr UINT kProbeRows = 5;
+    for (UINT row = 0; row < kProbeRows; ++row) {
+        float values[kProbeColumns][2]{};
+        for (UINT column = 0; column < kProbeColumns; ++column) {
+            const UINT x = std::min(width - 1,
+                ((2 * column + 1) * width) / (2 * kProbeColumns));
+            const UINT y = std::min(height - 1,
+                ((2 * row + 1) * height) / (2 * kProbeRows));
+            const auto* sample = pixel(x, y);
+            values[column][0] = half_to_float(sample[0]);
+            values[column][1] = half_to_float(sample[1]);
+        }
+        log_line("TAAU native t7 grid row=%u y=%u values=(%.6f,%.6f) (%.6f,%.6f) (%.6f,%.6f) (%.6f,%.6f) (%.6f,%.6f) (%.6f,%.6f) (%.6f,%.6f)",
+            row, ((2 * row + 1) * height) / (2 * kProbeRows),
+            values[0][0], values[0][1], values[1][0], values[1][1],
+            values[2][0], values[2][1], values[3][0], values[3][1],
+            values[4][0], values[4][1], values[5][0], values[5][1],
+            values[6][0], values[6][1]);
+    }
+    const D3D12_RANGE written_range{0, 0};
+    g_taau_readback_buffer->Unmap(0, &written_range);
+    g_taau_readback_logged.store(true);
+}
+
+void try_log_dlss_component_probe() {
+    if (!g_dlss_component_probe_submitted.load() ||
+        g_dlss_component_probe_logged.load() ||
+        g_dlss_component_probe_fence == nullptr ||
+        g_dlss_component_probe_readback == nullptr ||
+        g_dlss_component_probe_fence->GetCompletedValue() < 1) {
+        return;
+    }
+    struct ProbeValue { float x, y, z, w; };
+    ProbeValue* values{};
+    const SIZE_T probe_bytes =
+        static_cast<SIZE_T>(kDlssComponentProbeElements) * sizeof(ProbeValue);
+    const D3D12_RANGE read_range{0, probe_bytes};
+    if (FAILED(g_dlss_component_probe_readback->Map(
+            0, &read_range, reinterpret_cast<void**>(&values))) || values == nullptr) {
+        return;
+    }
+
+    double numerator_x{};
+    double denominator_x{};
+    double numerator_y{};
+    double denominator_y{};
+    std::vector<float> ratios_x{};
+    std::vector<float> ratios_y{};
+    UINT valid{};
+    for (UINT sample = 0;
+        sample < kDlssComponentProbeColumns * kDlssComponentProbeRows; ++sample) {
+        const auto& native_engine = values[sample * 2];
+        const auto& corrected_final = values[sample * 2 + 1];
+        const float components[] = {
+            native_engine.x, native_engine.y, native_engine.z, native_engine.w,
+            corrected_final.x, corrected_final.y, corrected_final.z, corrected_final.w};
+        bool sane = true;
+        for (const float component : components) {
+            sane = sane && std::isfinite(component) && fabsf(component) < 4096.0f;
+        }
+        if (!sane) continue;
+        ++valid;
+        const float target_x = native_engine.x + corrected_final.x;
+        const float target_y = native_engine.y + corrected_final.y;
+        if (fabsf(native_engine.z) > 0.25f && fabsf(target_x) < 1024.0f) {
+            numerator_x += static_cast<double>(native_engine.z) * target_x;
+            denominator_x += static_cast<double>(native_engine.z) * native_engine.z;
+            ratios_x.push_back(target_x / native_engine.z);
+        }
+        if (fabsf(native_engine.w) > 0.25f && fabsf(target_y) < 1024.0f) {
+            numerator_y += static_cast<double>(native_engine.w) * target_y;
+            denominator_y += static_cast<double>(native_engine.w) * native_engine.w;
+            ratios_y.push_back(target_y / native_engine.w);
+        }
+    }
+    const auto median = [](std::vector<float>& ratios) {
+        if (ratios.empty()) return 0.0f;
+        const auto middle = ratios.begin() + ratios.size() / 2;
+        std::nth_element(ratios.begin(), middle, ratios.end());
+        return *middle;
+    };
+    const double fit_x = denominator_x > 1e-9 ? numerator_x / denominator_x : 0.0;
+    const double fit_y = denominator_y > 1e-9 ? numerator_y / denominator_y : 0.0;
+    log_line("DLSS component probe fit valid=%u ratio_samples=%zu,%zu least_squares=%.9f,%.9f median=%.9f,%.9f",
+        valid, ratios_x.size(), ratios_y.size(), fit_x, fit_y,
+        median(ratios_x), median(ratios_y));
+
+    constexpr UINT probe_points[][2] = {
+        {0, 0}, {12, 0}, {23, 0}, {0, 12}, {12, 12},
+        {23, 12}, {0, 23}, {12, 23}, {23, 23}};
+    for (const auto& point : probe_points) {
+        const UINT sample = point[1] * kDlssComponentProbeColumns + point[0];
+        const auto& ne = values[sample * 2];
+        const auto& cf = values[sample * 2 + 1];
+        log_line("DLSS component probe sample=%u,%u native=%.7f,%.7f centered=%.7f,%.7f corrected=%.7f,%.7f final=%.7f,%.7f",
+            point[0], point[1], ne.x, ne.y, ne.z, ne.w,
+            cf.x, cf.y, cf.z, cf.w);
+    }
+    const D3D12_RANGE written_range{0, 0};
+    g_dlss_component_probe_readback->Unmap(0, &written_range);
+    g_dlss_component_probe_logged.store(true);
+}
+
+void try_log_dlss_output_luminance_readback() {
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+        if (!g_dlss_output_luma_submitted[lane].load() ||
+            g_dlss_output_luma_logged[lane].load() ||
+            g_dlss_output_luma_fences[lane] == nullptr ||
+            g_dlss_output_luma_readback[lane] == nullptr ||
+            g_dlss_output_luma_fences[lane]->GetCompletedValue() < 1) {
+            continue;
+        }
+        uint8_t* mapped{};
+        const D3D12_RANGE read_range{0,
+            static_cast<SIZE_T>(g_dlss_output_luma_bytes[lane])};
+        if (FAILED(g_dlss_output_luma_readback[lane]->Map(
+                0, &read_range, reinterpret_cast<void**>(&mapped)))) {
+            continue;
+        }
+        const auto& footprint = g_dlss_output_luma_footprints[lane];
+        const auto half_to_float = [](uint16_t value) {
+            const float sign = (value & 0x8000u) != 0 ? -1.0f : 1.0f;
+            const uint16_t exponent = (value >> 10) & 0x1Fu;
+            const uint16_t mantissa = value & 0x03FFu;
+            if (exponent == 0) {
+                return mantissa == 0 ? sign * 0.0f
+                    : sign * ldexpf(static_cast<float>(mantissa) / 1024.0f, -14);
+            }
+            if (exponent == 0x1F) {
+                return mantissa == 0 ? sign * INFINITY : NAN;
+            }
+            return sign * ldexpf(1.0f + static_cast<float>(mantissa) / 1024.0f,
+                static_cast<int>(exponent) - 15);
+        };
+        double sum_r{}, sum_g{}, sum_b{}, sum_luma{};
+        uint64_t black{}, samples{};
+        const bool half_float =
+            g_dlss_output_luma_formats[lane] == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const size_t pixel_bytes = half_float ? 8u : 4u;
+        constexpr UINT kSampleStride = 4;
+        for (UINT y = 0; y < footprint.Footprint.Height; y += kSampleStride) {
+            const auto* row = mapped + footprint.Offset +
+                static_cast<size_t>(y) * footprint.Footprint.RowPitch;
+            for (UINT x = 0; x < footprint.Footprint.Width; x += kSampleStride) {
+                const auto* pixel = row + static_cast<size_t>(x) * pixel_bytes;
+                double r{};
+                double g{};
+                double b{};
+                if (half_float) {
+                    const auto* half = reinterpret_cast<const uint16_t*>(pixel);
+                    r = half_to_float(half[0]);
+                    g = half_to_float(half[1]);
+                    b = half_to_float(half[2]);
+                    if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) {
+                        continue;
+                    }
+                } else {
+                    r = pixel[0];
+                    g = pixel[1];
+                    b = pixel[2];
+                }
+                sum_r += r;
+                sum_g += g;
+                sum_b += b;
+                sum_luma += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                const double black_threshold = half_float ? 0.0001 : 2.0;
+                black += (r <= black_threshold && g <= black_threshold &&
+                    b <= black_threshold) ? 1u : 0u;
+                ++samples;
+            }
+        }
+        const double denominator = samples != 0 ? static_cast<double>(samples) : 1.0;
+        log_line("DLSS output luminance lane=%u handle=%p format=%u samples=%llu rgb=%.7f,%.7f,%.7f luma=%.7f black=%.4f%%",
+            lane, g_dlss_output_luma_handles[lane],
+            static_cast<unsigned>(g_dlss_output_luma_formats[lane]),
+            static_cast<unsigned long long>(samples),
+            sum_r / denominator, sum_g / denominator, sum_b / denominator,
+            sum_luma / denominator, 100.0 * black / denominator);
+        const D3D12_RANGE written_range{0, 0};
+        g_dlss_output_luma_readback[lane]->Unmap(0, &written_range);
+        g_dlss_output_luma_logged[lane].store(true);
+    }
+}
+
+void try_log_dlss_mvec_readback() {
+    if (!g_dlss_mvec_readback_submitted.load() || g_dlss_mvec_readback_logged.load() ||
+        g_dlss_mvec_readback_fence == nullptr || g_dlss_mvec_readback_buffer == nullptr ||
+        g_dlss_mvec_readback_fence->GetCompletedValue() < 1) {
+        return;
+    }
+    uint8_t* mapped{};
+    const D3D12_RANGE read_range{
+        0, static_cast<SIZE_T>(g_dlss_mvec_readback_buffer->GetDesc().Width)};
+    if (FAILED(g_dlss_mvec_readback_buffer->Map(
+            0, &read_range, reinterpret_cast<void**>(&mapped))) || mapped == nullptr) {
+        return;
+    }
+    const UINT width = g_dlss_mvec_readback_footprint.Footprint.Width;
+    const UINT height = g_dlss_mvec_readback_footprint.Footprint.Height;
+    const UINT row_pitch = g_dlss_mvec_readback_footprint.Footprint.RowPitch;
+    const auto half_to_float = [](uint16_t value) {
+        const float sign = (value & 0x8000u) != 0 ? -1.0f : 1.0f;
+        const uint16_t exponent = (value >> 10) & 0x1Fu;
+        const uint16_t mantissa = value & 0x03FFu;
+        if (exponent == 0) {
+            return mantissa == 0 ? sign * 0.0f
+                : sign * ldexpf(static_cast<float>(mantissa) / 1024.0f, -14);
+        }
+        if (exponent == 0x1F) {
+            return mantissa == 0 ? sign * INFINITY : NAN;
+        }
+        return sign * ldexpf(1.0f + static_cast<float>(mantissa) / 1024.0f,
+            static_cast<int>(exponent) - 15);
+    };
+    auto pixel = [&](UINT x, UINT y) {
+        const auto* raw = reinterpret_cast<const uint16_t*>(
+            mapped + g_dlss_mvec_readback_footprint.Offset +
+            static_cast<size_t>(y) * row_pitch + static_cast<size_t>(x) * 4);
+        return std::array<float, 2>{half_to_float(raw[0]), half_to_float(raw[1])};
+    };
+    const auto first = pixel(0, 0);
+    const auto center = pixel(width / 2, height / 2);
+    const auto last = pixel(width - 1, height - 1);
+    double sum_x{};
+    double sum_y{};
+    float min_x = FLT_MAX;
+    float max_x = -FLT_MAX;
+    float min_y = FLT_MAX;
+    float max_y = -FLT_MAX;
+    uint32_t samples{};
+    constexpr UINT kGridX = 32;
+    constexpr UINT kGridY = 18;
+    for (UINT gy = 0; gy < kGridY; ++gy) {
+        for (UINT gx = 0; gx < kGridX; ++gx) {
+            const auto value = pixel(
+                std::min(width - 1, (gx * width + width / 2) / kGridX),
+                std::min(height - 1, (gy * height + height / 2) / kGridY));
+            if (!std::isfinite(value[0]) || !std::isfinite(value[1])) continue;
+            sum_x += value[0];
+            sum_y += value[1];
+            min_x = std::min(min_x, value[0]);
+            max_x = std::max(max_x, value[0]);
+            min_y = std::min(min_y, value[1]);
+            max_y = std::max(max_y, value[1]);
+            ++samples;
+        }
+    }
+    log_line("DLSS MVec pre-NGX readback samples=%u first=%.7f,%.7f center=%.7f,%.7f last=%.7f,%.7f mean=%.7f,%.7f range_x=%.7f..%.7f range_y=%.7f..%.7f",
+        samples, first[0], first[1], center[0], center[1], last[0], last[1],
+        samples != 0 ? sum_x / samples : 0.0,
+        samples != 0 ? sum_y / samples : 0.0,
+        min_x, max_x, min_y, max_y);
+    const D3D12_RANGE written_range{0, 0};
+    g_dlss_mvec_readback_buffer->Unmap(0, &written_range);
+    g_dlss_mvec_readback_logged.store(true);
+}
+
+HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
+    const bool phase_profile_requested =
+        g_config.logging_enabled && g_config.ngx_trace;
+    const int64_t phase_entry_qpc = phase_profile_requested
+        ? present_phase_qpc_now()
+        : 0;
+    int64_t phase_openxr_begin_qpc{};
+    int64_t phase_openxr_end_qpc{};
+    int64_t phase_prepare_begin_qpc{};
+    int64_t phase_prepare_end_qpc{};
+    if (g_config.logging_enabled && temporal_backend_is_dlss()) {
+        process_dlss_gpu_profile();
+        try_log_dlss_component_probe();
+        try_log_dlss_mvec_readback();
+        try_log_dlss_output_luminance_readback();
+    }
+    if (g_game_swapchain == nullptr && swapchain != nullptr) {
+        g_game_swapchain = swapchain;
+        g_game_swapchain->AddRef();
+
+        ID3D12Resource* backbuffer{};
+        if (reverse_enabled() && SUCCEEDED(swapchain->GetBuffer(0, IID_PPV_ARGS(&backbuffer))) && backbuffer != nullptr) {
+            install_resource_hooks(backbuffer);
+            backbuffer->Release();
+        }
+    }
+
+    const auto frame = ++g_present_count;
+    // Packed/stereo already polls GuiManager from the installed frame-factory
+    // hook.  Mono intentionally has no frame-factory hook, so relying only on
+    // intercepted game calls to IsAnyMenu misses most pause/inventory opens.
+    // Poll the same validated virtual once per mono Present instead.
+    if (g_config.openxr_mode == 2) {
+        poll_engine_menu_state();
+    }
+    if (g_config.logging_enabled && frame % 120 == 0) {
+        static uint64_t previous_draw_count{};
+        static uint64_t previous_indexed_draw_count{};
+        static uint64_t previous_nonindexed_draw_count{};
+        static uint64_t previous_execute_count{};
+        const uint64_t draw_count =
+            g_global_draw_count.load(std::memory_order_relaxed);
+        const uint64_t execute_count =
+            g_execute_count.load(std::memory_order_relaxed);
+        const uint64_t indexed_draw_count =
+            g_fingerprint_indexed_draw_count.load(std::memory_order_relaxed);
+        const uint64_t nonindexed_draw_count =
+            g_fingerprint_nonindexed_draw_count.load(std::memory_order_relaxed);
+        log_line(
+            "Render fingerprint workload present=%llu draws=%llu indexed=%llu "
+            "nonindexed=%llu executes=%llu draw_total=%llu execute_total=%llu",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(draw_count - previous_draw_count),
+            static_cast<unsigned long long>(indexed_draw_count - previous_indexed_draw_count),
+            static_cast<unsigned long long>(nonindexed_draw_count - previous_nonindexed_draw_count),
+            static_cast<unsigned long long>(execute_count - previous_execute_count),
+            static_cast<unsigned long long>(draw_count),
+            static_cast<unsigned long long>(execute_count));
+        previous_draw_count = draw_count;
+        previous_indexed_draw_count = indexed_draw_count;
+        previous_nonindexed_draw_count = nonindexed_draw_count;
+        previous_execute_count = execute_count;
+    }
+    if (g_config.logging_enabled && frame % 120 == 0 &&
+        temporal_backend_is_dlss_packed()) {
+        static std::array<uint64_t, kDlssCpuPhaseCount>
+            previous_phase_calls{};
+        static std::array<uint64_t, kDlssCpuPhaseCount>
+            previous_phase_ticks{};
+        static const int64_t qpc_frequency = [] {
+            LARGE_INTEGER value{};
+            QueryPerformanceFrequency(&value);
+            return value.QuadPart;
+        }();
+        const double tick_to_ms = qpc_frequency > 0
+            ? 1000.0 / static_cast<double>(qpc_frequency)
+            : 0.0;
+        std::array<uint64_t, kDlssCpuPhaseCount> phase_calls{};
+        std::array<double, kDlssCpuPhaseCount> phase_avg_ms{};
+        std::array<double, kDlssCpuPhaseCount> phase_max_ms{};
+        for (size_t phase = 0; phase < kDlssCpuPhaseCount; ++phase) {
+            const uint64_t current_calls =
+                g_dlss_cpu_phase_calls[phase].load(
+                    std::memory_order_relaxed);
+            const uint64_t current_ticks =
+                g_dlss_cpu_phase_ticks[phase].load(
+                    std::memory_order_relaxed);
+            phase_calls[phase] =
+                current_calls - previous_phase_calls[phase];
+            const uint64_t interval_ticks =
+                current_ticks - previous_phase_ticks[phase];
+            phase_avg_ms[phase] = phase_calls[phase] != 0
+                ? static_cast<double>(interval_ticks) * tick_to_ms /
+                    static_cast<double>(phase_calls[phase])
+                : 0.0;
+            phase_max_ms[phase] = static_cast<double>(
+                g_dlss_cpu_phase_max_ticks[phase].exchange(
+                    0, std::memory_order_relaxed)) * tick_to_ms;
+            previous_phase_calls[phase] = current_calls;
+            previous_phase_ticks[phase] = current_ticks;
+        }
+        log_line(
+            "V582 DLSS CPU phases present=%llu format=calls/avg_ms/max_ms ngx_hook=%llu/%.5f/%.5f packed_mutex=%llu/%.5f/%.5f input_copy=%llu/%.5f/%.5f ngx_eval=%llu/%.5f/%.5f recipe_replay=%llu/%.5f/%.5f jitter=%llu/%.5f/%.5f sl_eval=%llu/%.5f/%.5f bridge=%llu/%.5f/%.5f publish=%llu/%.5f/%.5f consumer_sample=%llu/%.5f/%.5f xr_wait=%llu/%.5f/%.5f",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(phase_calls[kDlssCpuNgxHook]),
+            phase_avg_ms[kDlssCpuNgxHook], phase_max_ms[kDlssCpuNgxHook],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuPackedMutexWait]),
+            phase_avg_ms[kDlssCpuPackedMutexWait], phase_max_ms[kDlssCpuPackedMutexWait],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuPackedInputCopy]),
+            phase_avg_ms[kDlssCpuPackedInputCopy], phase_max_ms[kDlssCpuPackedInputCopy],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuNgxEvaluate]),
+            phase_avg_ms[kDlssCpuNgxEvaluate], phase_max_ms[kDlssCpuNgxEvaluate],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuRecipeReplay]),
+            phase_avg_ms[kDlssCpuRecipeReplay], phase_max_ms[kDlssCpuRecipeReplay],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuReplayJitter]),
+            phase_avg_ms[kDlssCpuReplayJitter], phase_max_ms[kDlssCpuReplayJitter],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuSlEvaluateHook]),
+            phase_avg_ms[kDlssCpuSlEvaluateHook], phase_max_ms[kDlssCpuSlEvaluateHook],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuPrivateBridge]),
+            phase_avg_ms[kDlssCpuPrivateBridge], phase_max_ms[kDlssCpuPrivateBridge],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuPublish]),
+            phase_avg_ms[kDlssCpuPublish], phase_max_ms[kDlssCpuPublish],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuConsumerSample]),
+            phase_avg_ms[kDlssCpuConsumerSample], phase_max_ms[kDlssCpuConsumerSample],
+            static_cast<unsigned long long>(phase_calls[kDlssCpuXrGpuWait]),
+            phase_avg_ms[kDlssCpuXrGpuWait], phase_max_ms[kDlssCpuXrGpuWait]);
+    }
+    const bool phase_profile_active = phase_profile_requested &&
+        g_config.openxr_mode == 4 &&
+        g_engine_dual_render_active.load(std::memory_order_relaxed) &&
+        g_packed_accepted_pair_id >= 300;
+    if (!phase_profile_active && phase_profile_requested) {
+        g_present_phase_profile = {};
+    }
+    if (g_config.logging_enabled && g_config.ngx_trace &&
+        frame % 120 == 0) {
+        log_line("DLSS routing totals present=%llu bridge=%llu sl_eval=%llu dispatch=%llu ready_miss=%llu ngx_hook=%llu packed_calls=%llu packed_eval=%llu packed_resets=%llu packed_published=%llu packed_tag_override=%llu prep_publish=%llu prep_wait=%llu prep_hit=%llu prep_timeout=%llu",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(g_streamline_taau_bridge_matches.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_streamline_dlss_evaluate_calls.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_streamline_mvec_dispatch_calls.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_streamline_mvec_ready_misses.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_ngx_dlss_evaluate_calls.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_calls.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_single_evaluations.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_resets.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_outputs_published.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_tags_overridden.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_temporal_preparation_publishes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_temporal_preparation_waits.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_temporal_preparation_hits.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_temporal_preparation_timeouts.load(std::memory_order_relaxed)));
+        log_line("DLSS final-fix totals token_drop=%llu stale_pair_drop=%llu last_published_pair=%llu history_defer=%llu history_commit=%llu",
+            static_cast<unsigned long long>(g_packed_dlss_invalid_token_drops.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_stale_pair_drops.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_last_published_pair.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_camera_history_deferred.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_packed_dlss_camera_history_committed.load(std::memory_order_relaxed)));
+    }
+    const auto bootstrap_until =
+        g_taau_descriptor_bootstrap_until_present.load(std::memory_order_relaxed);
+    if (g_taau_descriptor_bootstrap_active.load(std::memory_order_relaxed) &&
+        bootstrap_until != UINT64_MAX && frame >= bootstrap_until) {
+        g_taau_descriptor_bootstrap_active.store(false, std::memory_order_relaxed);
+    }
+    const bool f8_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    const bool f8_pressed = f8_down &&
+        !g_close_camera_f8_latched.exchange(true, std::memory_order_relaxed);
+    if (!f8_down) {
+        g_close_camera_f8_latched.store(false, std::memory_order_relaxed);
+    }
+    if (f8_pressed) {
+        const int camera_mode =
+            (g_camera_mode.load(std::memory_order_relaxed) + 1) % 3;
+        g_camera_mode.store(camera_mode, std::memory_order_relaxed);
+        const DWORD frequencies[] = {520, 820, 1120};
+        const char* names[] = {"main", "close", "first_person"};
+        Beep(frequencies[camera_mode], 100);
+        log_line("Camera mode toggled mode=%d name=%s close=%.3f first_forward=%.3f first_eye_nudge=%.3f first_up=%.3f present=%llu",
+            camera_mode, names[camera_mode], g_config.engine_close_camera_offset,
+            g_config.engine_first_person_camera_offset,
+            g_config.engine_first_person_camera_eye_nudge,
+            g_config.engine_first_person_camera_up_offset,
+            static_cast<unsigned long long>(frame));
+    }
+    if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
+        const bool forced = !g_force_mono_cinema.load(std::memory_order_relaxed);
+        g_force_mono_cinema.store(forced, std::memory_order_release);
+        if (forced) {
+            g_engine_hmd_forward_valid.store(false, std::memory_order_release);
+            g_auto_recenter_on_packed_lock_armed.store(
+                true, std::memory_order_release);
+        }
+        Beep(forced ? 420 : 900, 100);
+        log_line("F10 force mono cinema active=%d mode=%d present=%llu",
+            forced ? 1 : 0, g_config.openxr_mode,
+            static_cast<unsigned long long>(frame));
+    }
+    update_taau_auto_activation(frame);
+    update_taau_hot_hook_state();
+    log_taau_health(frame);
+    log_packed_hang_diagnostics(frame);
+    if (g_config.runtime_diagnostics) {
+        LARGE_INTEGER present_qpc{};
+        QueryPerformanceCounter(&present_qpc);
+        if (g_present_qpc_frequency == 0) {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            g_present_qpc_frequency = frequency.QuadPart;
+        }
+        if (g_present_last_qpc != 0 && g_present_qpc_frequency > 0) {
+            const double interval_ms = static_cast<double>(present_qpc.QuadPart - g_present_last_qpc) *
+                1000.0 / static_cast<double>(g_present_qpc_frequency);
+            g_present_interval_sum_ms += interval_ms;
+            g_present_interval_min_ms = std::min(g_present_interval_min_ms, interval_ms);
+            g_present_interval_max_ms = std::max(g_present_interval_max_ms, interval_ms);
+            ++g_present_interval_count;
+            if (interval_ms > 12.0) ++g_present_interval_over_12ms;
+            if (interval_ms > 15.0) ++g_present_interval_over_15ms;
+        }
+        g_present_last_qpc = present_qpc.QuadPart;
+    }
+    install_streamline_hook();
+    if (g_config.runtime_diagnostics && (frame == 1 || frame % 300 == 0)) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        swapchain->GetDesc(&desc);
+
+        ID3D12Device* device{};
+        const auto device_hr = swapchain->GetDevice(IID_PPV_ARGS(&device));
+        log_line("Present frame=%llu swapchain=%p size=%ux%u device_hr=0x%08X device=%p",
+            static_cast<unsigned long long>(frame),
+            swapchain,
+            desc.BufferDesc.Width,
+            desc.BufferDesc.Height,
+            static_cast<unsigned>(device_hr),
+            device);
+
+        if (device != nullptr) {
+            device->Release();
+        }
+        if (g_engine_dual_render_active.load()) {
+            log_line("Sync cadence window presents=300 completed_tasks=%llu cache_updates=%llu missing_tag_presents=%llu",
+                static_cast<unsigned long long>(g_sync_completed_task_count.exchange(0)),
+                static_cast<unsigned long long>(g_sync_cache_update_count.exchange(0)),
+                static_cast<unsigned long long>(g_sync_missing_tag_present_count.exchange(0)));
+            const double average_ms = g_present_interval_count > 0
+                ? g_present_interval_sum_ms / g_present_interval_count
+                : 0.0;
+            log_line("Sync Present pacing samples=%u avg_ms=%.4f min_ms=%.4f max_ms=%.4f over12=%u over15=%u",
+                g_present_interval_count, average_ms,
+                g_present_interval_min_ms == DBL_MAX ? 0.0 : g_present_interval_min_ms,
+                g_present_interval_max_ms,
+                g_present_interval_over_12ms, g_present_interval_over_15ms);
+            if (g_config.openxr_mode == 4) {
+                log_line("Packed cadence window left_updates=%llu right_updates=%llu pairs_submitted=%llu versions=%llu/%llu",
+                    static_cast<unsigned long long>(g_packed_left_updates.exchange(0)),
+                    static_cast<unsigned long long>(g_packed_right_updates.exchange(0)),
+                    static_cast<unsigned long long>(g_packed_pairs_submitted.exchange(0)),
+                    static_cast<unsigned long long>(g_packed_eye_version[0]),
+                    static_cast<unsigned long long>(g_packed_eye_version[1]));
+            }
+        }
+        g_present_interval_sum_ms = 0.0;
+        g_present_interval_min_ms = DBL_MAX;
+        g_present_interval_max_ms = 0.0;
+        g_present_interval_count = 0;
+        g_present_interval_over_12ms = 0;
+        g_present_interval_over_15ms = 0;
+    }
+
+    scan_mapped_resources_periodically(frame);
+    if (phase_profile_active) {
+        phase_openxr_begin_qpc = present_phase_qpc_now();
+    }
+    if (g_config.openxr_mode == 4) {
+        if (g_packed_present_cache_valid &&
+            g_packed_last_accepted_present != UINT64_MAX &&
+            frame > g_packed_last_accepted_present + 8) {
+            const bool retain_last_complete_packed_pair =
+                g_engine_dual_render_active.load(std::memory_order_relaxed) &&
+                g_engine_dual_gameplay_armed.load(std::memory_order_relaxed) &&
+                !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+                !g_force_mono_cinema.load(std::memory_order_relaxed);
+            if (retain_last_complete_packed_pair) {
+                static std::atomic<uint32_t> packed_cache_retention_logs{};
+                if (frame == g_packed_last_accepted_present + 9 &&
+                    packed_cache_retention_logs.fetch_add(
+                        1, std::memory_order_relaxed) < 8) {
+                    log_line("V573 retained last complete packed pair=%llu age=%llu present=%llu",
+                        static_cast<unsigned long long>(g_packed_accepted_pair_id),
+                        static_cast<unsigned long long>(
+                            frame - g_packed_last_accepted_present),
+                        static_cast<unsigned long long>(frame));
+                }
+            } else {
+                g_packed_present_cache_valid = false;
+                g_packed_runtime_ready.store(false, std::memory_order_relaxed);
+                g_packed_present_cache_view_valid[0] = false;
+                g_packed_present_cache_view_valid[1] = false;
+                static std::atomic<uint32_t> packed_cache_expiry_logs{};
+                if (packed_cache_expiry_logs.fetch_add(
+                        1, std::memory_order_relaxed) < 4) {
+                    log_line("Packed cache expired to live mono pair=%llu age=%llu present=%llu",
+                        static_cast<unsigned long long>(g_packed_accepted_pair_id),
+                        static_cast<unsigned long long>(
+                            frame - g_packed_last_accepted_present),
+                        static_cast<unsigned long long>(frame));
+                }
+            }
+        }
+        const bool accepted_new_pair = update_packed_eye_cache();
+        constexpr uint64_t kCinemaDetectorWakeupAge = 12;
+        const uint64_t last_hmd_camera =
+            g_engine_hmd_camera_last_present.load(std::memory_order_relaxed);
+        const bool cinema_detector_due =
+            !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+            last_hmd_camera != UINT64_MAX &&
+            frame > last_hmd_camera &&
+            frame - last_hmd_camera > kCinemaDetectorWakeupAge;
+        if (accepted_new_pair &&
+            g_auto_recenter_on_packed_lock_armed.exchange(
+                false, std::memory_order_acq_rel)) {
+            // Reuse the exact F9 recenter path on the next located HMD pose.
+            // Trigger only after OpenXR has accepted the first real packed
+            // pair, so tutorial/camera state cannot center us prematurely.
+            g_hmd_center_valid.store(false, std::memory_order_release);
+            log_line("HMD auto-recenter armed by first packed pair=%llu present=%llu",
+                static_cast<unsigned long long>(g_packed_accepted_pair_id),
+                static_cast<unsigned long long>(frame));
+        }
+        if (g_force_mono_cinema.load(std::memory_order_relaxed) ||
+            g_cinema_mode_active.load(std::memory_order_relaxed) ||
+            cinema_detector_due ||
+            accepted_new_pair || !g_packed_present_cache_valid) {
+            if (cinema_detector_due) {
+                log_line(
+                    "V593 cinema detector wakeup present=%llu last_hmd=%llu age=%llu",
+                    static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(last_hmd_camera),
+                    static_cast<unsigned long long>(
+                        frame - last_hmd_camera));
+            }
+            render_openxr_test_frame();
+        } else {
+            static std::atomic<uint32_t> packed_duplicate_skip_logs{};
+            if (packed_duplicate_skip_logs.load(std::memory_order_relaxed) < 8 &&
+                packed_duplicate_skip_logs.fetch_add(
+                    1, std::memory_order_relaxed) < 8) {
+                log_line("Packed OpenXR duplicate skipped pair=%llu present=%llu",
+                    static_cast<unsigned long long>(g_packed_accepted_pair_id),
+                    static_cast<unsigned long long>(frame));
+            }
+        }
+        if (accepted_new_pair) {
+            g_packed_submitted_version[0] = g_packed_eye_version[0];
+            g_packed_submitted_version[1] = g_packed_eye_version[1];
+            if (g_config.runtime_diagnostics) {
+                g_packed_pairs_submitted.fetch_add(1);
+            }
+        }
+    } else {
+        render_openxr_test_frame();
+    }
+    if (phase_profile_active) {
+        phase_openxr_end_qpc = present_phase_qpc_now();
+    }
+
+    const int requested_mode = g_engine_dual_render_requested.exchange(-1);
+    if (requested_mode >= 0) {
+        apply_engine_dual_render_transition(requested_mode != 0, "request");
+    }
+    if (g_config.pipeline_frame_wait && g_config.hmd_freelook &&
+        !g_xr_render_frame_prepared.load()) {
+        // Prepare the next XR frame at the application frame boundary. Camera
+        // construction then consumes this pose without blocking REDengine's
+        // internal render scheduler on xrWaitFrame.
+        if (phase_profile_active) {
+            phase_prepare_begin_qpc = present_phase_qpc_now();
+        }
+        prepare_openxr_render_frame();
+        if (phase_profile_active) {
+            phase_prepare_end_qpc = present_phase_qpc_now();
+        }
+    }
+
+    const UINT effective_sync_interval = g_config.openxr_enabled &&
+            g_config.disable_desktop_vsync && g_xr_session_running
+        ? 0u
+        : sync_interval;
+    const int64_t phase_present_begin_qpc = phase_profile_active
+        ? present_phase_qpc_now()
+        : 0;
+    const HRESULT present_result =
+        g_present(swapchain, effective_sync_interval, flags);
+    const int64_t phase_present_end_qpc = phase_profile_active
+        ? present_phase_qpc_now()
+        : 0;
+    if (phase_profile_active) {
+        auto& profile = g_present_phase_profile;
+        if (profile.previous_return_qpc != 0) {
+            const double outside_ms = present_phase_qpc_ms(
+                profile.previous_return_qpc, phase_entry_qpc);
+            const double hook_ms = present_phase_qpc_ms(
+                phase_entry_qpc, phase_present_end_qpc);
+            const double openxr_ms = present_phase_qpc_ms(
+                phase_openxr_begin_qpc, phase_openxr_end_qpc);
+            const double prepare_ms = present_phase_qpc_ms(
+                phase_prepare_begin_qpc, phase_prepare_end_qpc);
+            const double present_ms = present_phase_qpc_ms(
+                phase_present_begin_qpc, phase_present_end_qpc);
+            profile.outside_sum_ms += outside_ms;
+            profile.hook_sum_ms += hook_ms;
+            profile.openxr_sum_ms += openxr_ms;
+            profile.prepare_sum_ms += prepare_ms;
+            profile.present_sum_ms += present_ms;
+            profile.outside_max_ms = std::max(
+                profile.outside_max_ms, outside_ms);
+            profile.hook_max_ms = std::max(profile.hook_max_ms, hook_ms);
+            profile.openxr_max_ms = std::max(
+                profile.openxr_max_ms, openxr_ms);
+            profile.prepare_max_ms = std::max(
+                profile.prepare_max_ms, prepare_ms);
+            profile.present_max_ms = std::max(
+                profile.present_max_ms, present_ms);
+            ++profile.samples;
+            if (profile.samples == 1200) {
+                const double sample_count =
+                    static_cast<double>(profile.samples);
+                const double average_cycle_ms =
+                    (profile.outside_sum_ms + profile.hook_sum_ms) /
+                    sample_count;
+                const double pair_fps = average_cycle_ms > 0.0
+                    ? 500.0 / average_cycle_ms
+                    : 0.0;
+                const double other_hook_ms = std::max(
+                    0.0, profile.hook_sum_ms - profile.openxr_sum_ms -
+                        profile.prepare_sum_ms - profile.present_sum_ms) /
+                    sample_count;
+                constexpr uintptr_t kFrameLimitValueRva = 0x031BCB80;
+                const auto* game_module = reinterpret_cast<const uint8_t*>(
+                    GetModuleHandleW(nullptr));
+                const int engine_limit = game_module != nullptr
+                    ? *reinterpret_cast<const int*>(
+                          game_module + kFrameLimitValueRva)
+                    : -1;
+                log_line(
+                    "Present phase profile samples=%llu pair=%llu fps=%.2f engine_limit=%d outside=%.4fms hook=%.4fms other=%.4fms openxr=%.4fms prepare=%.4fms dxgi=%.4fms max_outside=%.4fms max_hook=%.4fms max_openxr=%.4fms max_prepare=%.4fms max_dxgi=%.4fms",
+                    static_cast<unsigned long long>(profile.samples),
+                    static_cast<unsigned long long>(
+                        g_packed_accepted_pair_id),
+                    pair_fps, engine_limit,
+                    profile.outside_sum_ms / sample_count,
+                    profile.hook_sum_ms / sample_count,
+                    other_hook_ms,
+                    profile.openxr_sum_ms / sample_count,
+                    profile.prepare_sum_ms / sample_count,
+                    profile.present_sum_ms / sample_count,
+                    profile.outside_max_ms, profile.hook_max_ms,
+                    profile.openxr_max_ms, profile.prepare_max_ms,
+                    profile.present_max_ms);
+                const int64_t previous_return_qpc = phase_present_end_qpc;
+                profile = {};
+                profile.previous_return_qpc = previous_return_qpc;
+            }
+        }
+        profile.previous_return_qpc = phase_present_end_qpc;
+    }
+    return present_result;
+}
+
+HRESULT STDMETHODCALLTYPE hook_present1(
+    IDXGISwapChain1* swapchain,
+    UINT sync_interval,
+    UINT flags,
+    const DXGI_PRESENT_PARAMETERS* params) {
+    const auto frame = ++g_present_count;
+    if (g_config.runtime_diagnostics && (frame == 1 || frame % 300 == 0)) {
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        swapchain->GetDesc1(&desc);
+        log_line("Present1 frame=%llu swapchain=%p size=%ux%u format=%u",
+            static_cast<unsigned long long>(frame),
+            swapchain,
+            desc.Width,
+            desc.Height,
+            static_cast<unsigned>(desc.Format));
+    }
+
+    return g_present1(swapchain, sync_interval, flags, params);
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_swapchain_for_hwnd(
+    IDXGIFactory2* factory,
+    IUnknown* device,
+    HWND hwnd,
+    const DXGI_SWAP_CHAIN_DESC1* desc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen_desc,
+    IDXGIOutput* restrict_to_output,
+    IDXGISwapChain1** swapchain) {
+    log_line("CreateSwapChainForHwnd device=%p hwnd=%p size=%ux%u format=%u",
+        device,
+        hwnd,
+        desc != nullptr ? desc->Width : 0,
+        desc != nullptr ? desc->Height : 0,
+        desc != nullptr ? static_cast<unsigned>(desc->Format) : 0);
+
+    capture_d3d12_objects(device);
+    g_game_hwnd = hwnd;
+    DXGI_SWAP_CHAIN_DESC1 forced_desc{};
+    const DXGI_SWAP_CHAIN_DESC1* effective_desc = desc;
+    if (desc != nullptr) {
+        forced_desc = *desc;
+        if (g_config.render_width > 0 && g_config.render_height > 0) {
+            forced_desc.Width = static_cast<UINT>(g_config.render_width);
+            forced_desc.Height = static_cast<UINT>(g_config.render_height);
+            g_custom_resolution_active.store(true);
+        }
+        effective_desc = &forced_desc;
+        g_game_render_width = g_config.render_width > 0
+            ? static_cast<UINT>(g_config.render_width) : forced_desc.Width;
+        g_game_render_height = g_config.render_height > 0
+            ? static_cast<UINT>(g_config.render_height) : forced_desc.Height;
+        log_line("DXGI effective render size=%ux%u requested=%ux%u",
+            g_game_render_width, g_game_render_height, desc->Width, desc->Height);
+    }
+
+    const auto hr = g_create_swapchain_for_hwnd(
+        factory, device, hwnd, effective_desc, fullscreen_desc, restrict_to_output, swapchain);
+
+    if (SUCCEEDED(hr) && swapchain != nullptr && *swapchain != nullptr) {
+        hook_present(*swapchain);
+        initialize_openxr_probe();
+    }
+
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE hook_create_swapchain(
+    IDXGIFactory* factory,
+    IUnknown* device,
+    DXGI_SWAP_CHAIN_DESC* desc,
+    IDXGISwapChain** swapchain) {
+    log_line("CreateSwapChain device=%p size=%ux%u format=%u",
+        device,
+        desc != nullptr ? desc->BufferDesc.Width : 0,
+        desc != nullptr ? desc->BufferDesc.Height : 0,
+        desc != nullptr ? static_cast<unsigned>(desc->BufferDesc.Format) : 0);
+
+    DXGI_SWAP_CHAIN_DESC forced_desc{};
+    auto* effective_desc = desc;
+    if (desc != nullptr) {
+        forced_desc = *desc;
+        if (g_config.render_width > 0 && g_config.render_height > 0) {
+            forced_desc.BufferDesc.Width = static_cast<UINT>(g_config.render_width);
+            forced_desc.BufferDesc.Height = static_cast<UINT>(g_config.render_height);
+            g_custom_resolution_active.store(true);
+        }
+        effective_desc = &forced_desc;
+        g_game_render_width = g_config.render_width > 0
+            ? static_cast<UINT>(g_config.render_width) : forced_desc.BufferDesc.Width;
+        g_game_render_height = g_config.render_height > 0
+            ? static_cast<UINT>(g_config.render_height) : forced_desc.BufferDesc.Height;
+    }
+
+    const auto hr = g_create_swapchain(factory, device, effective_desc, swapchain);
+
+    if (SUCCEEDED(hr) && swapchain != nullptr && *swapchain != nullptr) {
+        hook_present(*swapchain);
+        initialize_openxr_probe();
+    }
+
+    return hr;
+}
+
+void hook_factory(void* factory) {
+    ensure_initialized();
+
+    if (factory == nullptr) {
+        return;
+    }
+
+    IDXGIFactory* base_factory{};
+    auto* factory_unknown = static_cast<IUnknown*>(factory);
+    if (false && SUCCEEDED(factory_unknown->QueryInterface(IID_PPV_ARGS(&base_factory))) &&
+        base_factory != nullptr) {
+        for (UINT adapter_index = 0;; ++adapter_index) {
+            IDXGIAdapter* adapter{};
+            if (base_factory->EnumAdapters(adapter_index, &adapter) == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (adapter == nullptr) {
+                continue;
+            }
+            for (UINT output_index = 0;; ++output_index) {
+                IDXGIOutput* output{};
+                if (adapter->EnumOutputs(output_index, &output) == DXGI_ERROR_NOT_FOUND) {
+                    break;
+                }
+                if (output == nullptr) {
+                    continue;
+                }
+                if (g_get_display_mode_list == nullptr) {
+                    auto target = method<void*>(output, 7);
+                    if (MH_CreateHook(target, &hook_get_display_mode_list,
+                            reinterpret_cast<void**>(&g_get_display_mode_list)) == MH_OK &&
+                        MH_EnableHook(target) == MH_OK) {
+                        log_line("Hooked IDXGIOutput::GetDisplayModeList at %p", target);
+                    }
+                }
+                IDXGIOutput1* output1{};
+                if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output1))) && output1 != nullptr) {
+                    if (g_get_display_mode_list1 == nullptr) {
+                        auto target = method<void*>(output1, 19);
+                        if (MH_CreateHook(target, &hook_get_display_mode_list1,
+                                reinterpret_cast<void**>(&g_get_display_mode_list1)) == MH_OK &&
+                            MH_EnableHook(target) == MH_OK) {
+                            log_line("Hooked IDXGIOutput1::GetDisplayModeList1 at %p", target);
+                        }
+                    }
+                    output1->Release();
+                }
+                output->Release();
+            }
+            adapter->Release();
+        }
+        base_factory->Release();
+    }
+
+    if (g_create_swapchain == nullptr) {
+        auto target = method<void*>(factory, 10);
+        if (MH_CreateHook(target, &hook_create_swapchain, reinterpret_cast<void**>(&g_create_swapchain)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line("Hooked IDXGIFactory::CreateSwapChain at %p", target);
+        }
+    }
+
+    IDXGIFactory2* factory2{};
+    auto unknown = static_cast<IUnknown*>(factory);
+    if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&factory2))) && factory2 != nullptr) {
+        if (g_create_swapchain_for_hwnd == nullptr) {
+            auto target = method<void*>(factory2, 15);
+            if (MH_CreateHook(target, &hook_create_swapchain_for_hwnd, reinterpret_cast<void**>(&g_create_swapchain_for_hwnd)) == MH_OK &&
+                MH_EnableHook(target) == MH_OK) {
+                log_line("Hooked IDXGIFactory2::CreateSwapChainForHwnd at %p", target);
+            }
+        }
+        factory2->Release();
+    }
+}
+
+} // namespace
+
+extern "C" HRESULT WINAPI CreateDXGIFactory(REFIID riid, void** factory) {
+    ensure_initialized();
+    auto fn = reinterpret_cast<CreateDXGIFactoryFn>(real_proc("CreateDXGIFactory"));
+    const auto hr = fn != nullptr ? fn(riid, factory) : E_FAIL;
+    if (SUCCEEDED(hr) && factory != nullptr) {
+        if (g_config.runtime_diagnostics) {
+            log_line("CreateDXGIFactory riid ok factory=%p", *factory);
+        }
+        hook_factory(*factory);
+    }
+    return hr;
+}
+
+extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void** factory) {
+    ensure_initialized();
+    auto fn = reinterpret_cast<CreateDXGIFactory1Fn>(real_proc("CreateDXGIFactory1"));
+    const auto hr = fn != nullptr ? fn(riid, factory) : E_FAIL;
+    if (SUCCEEDED(hr) && factory != nullptr) {
+        if (g_config.runtime_diagnostics) {
+            log_line("CreateDXGIFactory1 riid ok factory=%p", *factory);
+        }
+        hook_factory(*factory);
+    }
+    return hr;
+}
+
+extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void** factory) {
+    ensure_initialized();
+    auto fn = reinterpret_cast<CreateDXGIFactory2Fn>(real_proc("CreateDXGIFactory2"));
+    const auto hr = fn != nullptr ? fn(flags, riid, factory) : E_FAIL;
+    if (SUCCEEDED(hr) && factory != nullptr) {
+        if (g_config.runtime_diagnostics) {
+            log_line("CreateDXGIFactory2 flags=%u factory=%p", flags, *factory);
+        }
+        hook_factory(*factory);
+    }
+    return hr;
+}
+
+extern "C" HRESULT WINAPI DXGIDeclareAdapterRemovalSupport() {
+    ensure_initialized();
+    auto fn = reinterpret_cast<DXGIDeclareAdapterRemovalSupportFn>(real_proc("DXGIDeclareAdapterRemovalSupport"));
+    return fn != nullptr ? fn() : E_FAIL;
+}
+
+extern "C" HRESULT WINAPI DXGIGetDebugInterface1(UINT flags, REFIID riid, void** debug) {
+    ensure_initialized();
+    auto fn = reinterpret_cast<DXGIGetDebugInterface1Fn>(real_proc("DXGIGetDebugInterface1"));
+    return fn != nullptr ? fn(flags, riid, debug) : E_FAIL;
+}
+
+extern "C" HRESULT WINAPI DXGIDisableVBlankVirtualization() {
+    ensure_initialized();
+    auto fn = reinterpret_cast<DXGIDisableVBlankVirtualizationFn>(real_proc("DXGIDisableVBlankVirtualization"));
+    return fn != nullptr ? fn() : E_FAIL;
+}
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void*) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(module);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        if (g_xr_session != XR_NULL_HANDLE && pfn_xrDestroySession != nullptr) {
+            pfn_xrDestroySession(g_xr_session);
+        }
+        if (g_xr_instance != XR_NULL_HANDLE && pfn_xrDestroyInstance != nullptr) {
+            pfn_xrDestroyInstance(g_xr_instance);
+        }
+        if (g_dlss_gpu_profile_readback != nullptr) {
+            if (g_dlss_gpu_profile_mapped != nullptr) {
+                g_dlss_gpu_profile_readback->Unmap(0, nullptr);
+                g_dlss_gpu_profile_mapped = nullptr;
+            }
+            g_dlss_gpu_profile_readback->Release();
+            g_dlss_gpu_profile_readback = nullptr;
+        }
+        if (g_dlss_gpu_profile_query_heap != nullptr) {
+            g_dlss_gpu_profile_query_heap->Release();
+            g_dlss_gpu_profile_query_heap = nullptr;
+        }
+        if (g_dlss_gpu_profile_fence != nullptr) {
+            g_dlss_gpu_profile_fence->Release();
+            g_dlss_gpu_profile_fence = nullptr;
+        }
+        if (g_d3d12_device != nullptr) {
+            g_d3d12_device->Release();
+            g_d3d12_device = nullptr;
+        }
+        if (g_command_queue != nullptr) {
+            g_command_queue->Release();
+            g_command_queue = nullptr;
+        }
+        if (g_game_swapchain != nullptr) {
+            g_game_swapchain->Release();
+            g_game_swapchain = nullptr;
+        }
+        MH_Uninitialize();
+    }
+
+    return TRUE;
+}
