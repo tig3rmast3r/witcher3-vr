@@ -14,6 +14,7 @@ add_executable(Witcher3VRLauncher WIN32
     main.cpp
     launcher.rc
     resources.h
+    witcher3vr.default.ini
     vr_dx12user.settings
 )
 target_compile_definitions(Witcher3VRLauncher PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)

@@ -108,6 +108,10 @@ Older game versions and rollback branches are not supported.
 4. Select the rendering mode and resolution.
 5. Launch the game through the launcher.
 
+If `witcher3vr.ini` does not exist, the launcher creates it automatically. The
+first-run selection is **Stereo TAAU** at the **Ultra 2688 × 2784** preset;
+nothing overwrites an existing INI.
+
 The launcher includes three resolution presets intended for Quest 3 with
 Virtual Desktop. If you use a different headset or runtime, select **Custom**
 and enter the recommended per-eye resolution reported by your OpenXR or
@@ -208,7 +212,7 @@ To create a diagnostic log:
 1. Enable **Diagnostic Logging** in the launcher.
 2. Reproduce the problem.
 3. Close the game normally.
-4. Attach the generated `witcher3vr-vxxx.log` file to the issue.
+4. Attach the generated `witcher3vr.log` file to the issue.
 
 Please do not open feature requests for motion-controller support. The request
 is understood, but motion controls are not currently part of the development

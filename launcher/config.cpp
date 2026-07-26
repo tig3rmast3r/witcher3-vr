@@ -21,7 +21,7 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {2, false, "dlss", 6, true},
     {4, true, "none", 0, false},
     {4, true, "taau", 3, false},
-    {4, true, "dlss_packed", 6, true},
+    {3, true, "dlss", 6, true},
 }};
 
 std::string Trim(std::string value) {
@@ -123,10 +123,10 @@ std::optional<RenderMode> ExactMode(int xr_mode, bool dual_probe,
 }
 
 RenderMode BestEffortMode(int xr_mode, const std::string& backend) {
-    const bool stereo = xr_mode == 4;
+    const bool stereo = xr_mode == 3 || xr_mode == 4;
     if (backend == "taau") return stereo ? RenderMode::StereoTaau : RenderMode::MonoTaau;
-    if (backend == "dlss_packed") return RenderMode::StereoDlssPacked;
-    if (backend == "dlss") return stereo ? RenderMode::StereoDlssPacked : RenderMode::MonoDlss;
+    if (backend == "dlss_packed") return RenderMode::StereoDlssSequential;
+    if (backend == "dlss") return stereo ? RenderMode::StereoDlssSequential : RenderMode::MonoDlss;
     return stereo ? RenderMode::StereoNone : RenderMode::MonoNone;
 }
 
@@ -269,12 +269,14 @@ const ModeSettings& SettingsForMode(RenderMode mode) {
 const wchar_t* ModeDisplayName(RenderMode mode) {
     constexpr const wchar_t* names[]{
         L"Mono - No AA / FXAA", L"Mono - TAAU", L"Mono - DLSS",
-        L"Stereo - No AA / FXAA", L"Stereo - TAAU", L"Stereo - DLSS Packed"};
+        L"Stereo - No AA / FXAA", L"Stereo - TAAU",
+        L"Stereo - DLSS Sequential (Mode 3)"};
     return names[static_cast<size_t>(mode)];
 }
 
 bool ModeUsesDlss(RenderMode mode) {
-    return mode == RenderMode::MonoDlss || mode == RenderMode::StereoDlssPacked;
+    return mode == RenderMode::MonoDlss ||
+        mode == RenderMode::StereoDlssSequential;
 }
 
 ConfigPaths DiscoverPaths() {
@@ -298,6 +300,27 @@ ConfigPaths DiscoverPaths() {
         documents / L"The Witcher 3" / L"dx12user.settings",
         directory / L"witcher3.exe",
     };
+}
+
+bool EnsureVrConfiguration(const ConfigPaths& paths,
+    const std::string& template_contents, bool& created, std::wstring& error) {
+    created = false;
+    const DWORD attributes = GetFileAttributesW(paths.vr_ini.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        return true;
+    }
+    const DWORD lookup_error = GetLastError();
+    if (lookup_error != ERROR_FILE_NOT_FOUND &&
+        lookup_error != ERROR_PATH_NOT_FOUND) {
+        SetLastError(lookup_error);
+        error = LastErrorMessage(L"Checking configuration", paths.vr_ini);
+        return false;
+    }
+    if (!AtomicWriteWithBackup(paths.vr_ini, template_contents, error)) {
+        return false;
+    }
+    created = true;
+    return true;
 }
 
 LoadResult LoadConfiguration(const ConfigPaths& paths) {

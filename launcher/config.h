@@ -13,7 +13,7 @@ enum class RenderMode {
     MonoDlss,
     StereoNone,
     StereoTaau,
-    StereoDlssPacked,
+    StereoDlssSequential,
 };
 
 struct ModeSettings {
@@ -25,7 +25,7 @@ struct ModeSettings {
 };
 
 struct LauncherState {
-    RenderMode mode{RenderMode::StereoNone};
+    RenderMode mode{RenderMode::StereoTaau};
     int width{2688};
     int height{2784};
     int dlss_quality{3};
@@ -81,6 +81,8 @@ const wchar_t* ModeDisplayName(RenderMode mode);
 bool ModeUsesDlss(RenderMode mode);
 
 ConfigPaths DiscoverPaths();
+bool EnsureVrConfiguration(const ConfigPaths& paths,
+    const std::string& template_contents, bool& created, std::wstring& error);
 LoadResult LoadConfiguration(const ConfigPaths& paths);
 bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     IniDocument& vr_ini, IniDocument& game_settings, std::wstring& error);

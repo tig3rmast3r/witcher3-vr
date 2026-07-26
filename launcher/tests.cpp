@@ -242,8 +242,40 @@ void TestInconsistentWarning(const w3vr::ConfigPaths& paths) {
     Write(paths.game_settings, game->Serialize());
     const auto loaded = w3vr::LoadConfiguration(paths);
     Require(!loaded.warning.empty(), "inconsistent settings should warn");
-    Require(loaded.state.mode == w3vr::RenderMode::StereoDlssPacked,
+    Require(loaded.state.mode == w3vr::RenderMode::StereoDlssSequential,
         "best-effort mode should follow VR backend");
+}
+
+void TestFirstRunConfiguration(const fs::path& root) {
+    const auto paths = MakePaths(root / "first-run");
+    fs::create_directories(paths.launcher_directory);
+    bool created{};
+    std::wstring error;
+    const std::string defaults =
+        "[openxr]\r\n"
+        "mode=4\r\n"
+        "render_width=2688\r\n"
+        "render_height=2784\r\n"
+        "[engine]\r\n"
+        "temporal_backend=taau\r\n"
+        "dual_render_probe=1\r\n"
+        "dual_render_start=1\r\n"
+        "[debug]\r\n"
+        "logging_enabled=0\r\n"
+        "runtime_diagnostics=0\r\n";
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "first-run INI creation failed");
+    Require(created, "first-run INI was not reported as created");
+    Require(Read(paths.vr_ini) == defaults,
+        "first-run INI does not match embedded defaults");
+
+    Write(paths.vr_ini, "[openxr]\r\nmode=3\r\n");
+    created = true;
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "existing INI check failed");
+    Require(!created, "existing INI must not be replaced");
+    Require(Read(paths.vr_ini) == "[openxr]\r\nmode=3\r\n",
+        "existing INI was overwritten");
 }
 
 void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {
@@ -309,6 +341,7 @@ int main() {
         TestDlssLabelsAndLegacyAuto(paths);
         TestFallbackAndAtomicSave(paths);
         TestInconsistentWarning(paths);
+        TestFirstRunConfiguration(temporary.path);
         TestVrBaselineAndRestore(paths);
         TestFailurePaths(temporary.path);
         std::cout << "All launcher configuration tests passed.\n";

@@ -248,10 +248,10 @@ bool LaunchGame(std::wstring& error) {
     return true;
 }
 
-std::optional<std::string> LoadVrSettingsTemplate() {
+std::optional<std::string> LoadTextResource(int resource_id) {
     HMODULE module = GetModuleHandleW(nullptr);
     HRSRC resource = FindResourceW(
-        module, MAKEINTRESOURCEW(IDR_VR_SETTINGS), RT_RCDATA);
+        module, MAKEINTRESOURCEW(resource_id), RT_RCDATA);
     if (!resource) return std::nullopt;
     HGLOBAL loaded = LoadResource(module, resource);
     if (!loaded) return std::nullopt;
@@ -259,6 +259,10 @@ std::optional<std::string> LoadVrSettingsTemplate() {
     const DWORD size = SizeofResource(module, resource);
     if (!data || size == 0) return std::nullopt;
     return std::string(static_cast<const char*>(data), size);
+}
+
+std::optional<std::string> LoadVrSettingsTemplate() {
+    return LoadTextResource(IDR_VR_SETTINGS);
 }
 
 void ConfigureSettingsForVr() {
@@ -494,7 +498,7 @@ void CreateInterface(HWND window) {
 
     AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
         20, 722, 680, 74);
-    AddLabel(L"F8  Switch View        F9  Recenter View        F10  Force Mono Cinema",
+    AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person",
         38, 752, 640, 24);
 
     AddLabel(L"", 20, 812, 680, 38, IdStatus, SS_LEFT);
@@ -556,6 +560,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
     g_app.paths = w3vr::DiscoverPaths();
+    const auto default_ini = LoadTextResource(IDR_VR_INI);
+    if (!default_ini) {
+        MessageBoxW(nullptr, L"The embedded witcher3vr.ini template is missing.",
+            L"Witcher 3 VR Launcher", MB_OK | MB_ICONERROR);
+        return 3;
+    }
+    bool created_ini{};
+    std::wstring configuration_error;
+    if (!w3vr::EnsureVrConfiguration(
+            g_app.paths, *default_ini, created_ini, configuration_error)) {
+        MessageBoxW(nullptr, configuration_error.c_str(),
+            L"Witcher 3 VR Launcher", MB_OK | MB_ICONERROR);
+        return 4;
+    }
 
     WNDCLASSEXW window_class{sizeof(window_class)};
     window_class.lpfnWndProc = WindowProcedure;

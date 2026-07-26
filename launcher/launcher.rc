@@ -1,3 +1,4 @@
 #include "resources.h"
 
 IDR_VR_SETTINGS RCDATA "vr_dx12user.settings"
+IDR_VR_INI RCDATA "witcher3vr.default.ini"
