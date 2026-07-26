@@ -70,6 +70,8 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
         "close_camera_offset=0.750\r\n"
+        "first_person_snap_turn=0\r\n"
+        "first_person_hmd_body_follow=0\r\n"
         "unrelated_engine=42\r\n"
         "\r\n"
         "[debug]\r\n"
@@ -108,6 +110,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.near_view = 1.25f;
         state.vertical_pitch_enabled = true;
         state.cinema_5x4 = true;
+        state.first_person_gamepad_head_follow = true;
         state.diagnostic_logging = true;
 
         w3vr::IniDocument vr;
@@ -154,6 +157,10 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "cinema scale missing");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
             "extended cinema framing flag missing");
+        Require(vr.Get("engine", "first_person_snap_turn") == "1",
+            "first-person snap-turn flag missing");
+        Require(vr.Get("engine", "first_person_hmd_body_follow") == "1",
+            "first-person HMD body-follow flag missing");
         Require(vr.Get("debug", "logging_enabled") == "1",
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
@@ -182,6 +189,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         }
         Require(loaded.state.cinema_5x4,
             "round-trip extended cinema framing mismatch");
+        Require(loaded.state.first_person_gamepad_head_follow,
+            "round-trip first-person gamepad head-follow mismatch");
         Require(loaded.state.diagnostic_logging,
             "round-trip diagnostic logging mismatch");
     }

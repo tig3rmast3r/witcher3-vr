@@ -38,6 +38,7 @@ struct LauncherState {
     float near_view{0.75f};
     bool vertical_pitch_enabled{};
     bool cinema_5x4{};
+    bool first_person_gamepad_head_follow{};
     bool diagnostic_logging{};
 };
 

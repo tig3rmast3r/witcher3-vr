@@ -382,6 +382,9 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         *vr, "openxr", "vertical_pitch_enabled", false);
     result.state.cinema_5x4 = ReadBool(
         *vr, "openxr", "cinema_5x4", false);
+    result.state.first_person_gamepad_head_follow =
+        ReadBool(*vr, "engine", "first_person_snap_turn", false) &&
+        ReadBool(*vr, "engine", "first_person_hmd_body_follow", false);
     result.state.diagnostic_logging =
         ReadBool(*vr, "debug", "logging_enabled", false) &&
         ReadBool(*vr, "debug", "runtime_diagnostics", false);
@@ -415,6 +418,13 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("engine", "dual_render_probe", mode.dual_render ? "1" : "0");
     vr_ini.Set("engine", "dual_render_start", mode.dual_render ? "1" : "0");
     vr_ini.Set("engine", "temporal_backend", mode.temporal_backend);
+    // One experimental launcher option owns both cooperating F11 controls.
+    // Keeping them equal avoids a persistent snap preview without its
+    // continuous native-camera follower, or the inverse partial state.
+    vr_ini.Set("engine", "first_person_snap_turn",
+        state.first_person_gamepad_head_follow ? "1" : "0");
+    vr_ini.Set("engine", "first_person_hmd_body_follow",
+        state.first_person_gamepad_head_follow ? "1" : "0");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
     vr_ini.Set("engine", "dlss_dlaa", dlss_dlaa ? "1" : "0");
     // [DEBUG 1/2] One launcher switch owns both the log writer and the

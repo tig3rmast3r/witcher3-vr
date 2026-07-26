@@ -20,7 +20,7 @@ using w3vr::RenderMode;
 
 constexpr wchar_t kWindowClass[] = L"Witcher3VRLauncherWindow";
 constexpr int kClientWidth = 720;
-constexpr int kClientHeight = 982;
+constexpr int kClientHeight = 1020;
 
 enum ControlId {
     IdMode = 100,
@@ -43,6 +43,7 @@ enum ControlId {
     IdNearView,
     IdNearViewValue,
     IdVerticalPitch,
+    IdFirstPersonGamepadHeadFollow,
     IdCinema5x4,
     IdDiagnosticLogging,
     IdStatus,
@@ -204,6 +205,8 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdNearView), TBM_GETPOS, 0, 0)) / 100.0f;
     state.vertical_pitch_enabled = SendMessageW(
         Item(IdVerticalPitch), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.first_person_gamepad_head_follow = SendMessageW(
+        Item(IdFirstPersonGamepadHeadFollow), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_5x4 = SendMessageW(
         Item(IdCinema5x4), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.diagnostic_logging = SendMessageW(
@@ -337,6 +340,9 @@ void RestoreLauncherDefaults() {
     SendMessageW(Item(IdNearView), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(defaults.near_view * 100.0f)));
     SendMessageW(Item(IdVerticalPitch), BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonGamepadHeadFollow), BM_SETCHECK,
+        defaults.first_person_gamepad_head_follow
+            ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinema5x4), BM_SETCHECK, BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK, BST_UNCHECKED, 0);
     UpdateModeControls();
@@ -419,6 +425,9 @@ void PopulateControls() {
         static_cast<int>(std::lround(loaded.state.near_view * 100.0f)));
     SendMessageW(Item(IdVerticalPitch), BM_SETCHECK,
         loaded.state.vertical_pitch_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonGamepadHeadFollow), BM_SETCHECK,
+        loaded.state.first_person_gamepad_head_follow
+            ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinema5x4), BM_SETCHECK,
         loaded.state.cinema_5x4 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK,
@@ -483,35 +492,40 @@ void CreateInterface(HWND window) {
     AddTrack(205, 458, 405, IdNearView, -200, 300);
     AddLabel(L"0.75", 625, 464, 54, 22, IdNearViewValue, SS_RIGHT);
 
-    AddControl(L"BUTTON", L"Enable vertical mouse/pad pitch (experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 520, 410, 28, IdVerticalPitch);
-
     AddControl(L"BUTTON", L"Extended Cinema Framing (5:4)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 558, 410, 26, IdCinema5x4);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 520, 410, 26, IdCinema5x4);
     AddLabel(L"Shows more of the scene during cinematics. HUD elements may appear slightly smaller.",
-        58, 584, 610, 34);
+        58, 546, 610, 34);
 
     AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 624, 410, 26, IdDiagnosticLogging);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 586, 410, 26, IdDiagnosticLogging);
     AddLabel(L"Saves witcher3vr.log in the game folder for debugging. May affect performance.",
-        58, 650, 610, 34);
+        58, 612, 610, 34);
+
+    AddControl(L"BUTTON", L"Enable vertical mouse/pad pitch (Experimental)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 658, 410, 28, IdVerticalPitch);
+
+    AddControl(L"BUTTON",
+        L"Gamepad Snap Turn + Head Follow (First Person Only, Experimental)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 692, 630, 28,
+        IdFirstPersonGamepadHeadFollow);
 
     AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
-        20, 722, 680, 74);
-    AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person",
-        38, 752, 640, 24);
+        20, 760, 680, 74);
+    AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
+        38, 790, 650, 24);
 
-    AddLabel(L"", 20, 812, 680, 38, IdStatus, SS_LEFT);
+    AddLabel(L"", 20, 850, 680, 38, IdStatus, SS_LEFT);
     AddControl(L"BUTTON", L"Configure Settings for VR", BS_PUSHBUTTON | WS_TABSTOP,
-        20, 864, 220, 36, IdConfigureVr);
+        20, 902, 220, 36, IdConfigureVr);
     AddControl(L"BUTTON", L"Restore Original Settings", BS_PUSHBUTTON | WS_TABSTOP,
-        252, 864, 220, 36, IdRestoreOriginal);
+        252, 902, 220, 36, IdRestoreOriginal);
     AddControl(L"BUTTON", L"Restore Defaults", BS_PUSHBUTTON | WS_TABSTOP,
-        484, 864, 216, 36, IdRestoreDefaults);
+        484, 902, 216, 36, IdRestoreDefaults);
     AddControl(L"BUTTON", L"Save Only", BS_PUSHBUTTON | WS_TABSTOP,
-        406, 930, 130, 36, IdSave);
+        406, 968, 130, 36, IdSave);
     AddControl(L"BUTTON", L"Save && Launch", BS_DEFPUSHBUTTON | WS_TABSTOP,
-        550, 930, 150, 36, IdSaveLaunch);
+        550, 968, 150, 36, IdSaveLaunch);
 
     PopulateControls();
 }

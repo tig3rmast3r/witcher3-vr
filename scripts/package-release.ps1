@@ -24,6 +24,9 @@ $exampleIni = Join-Path $repositoryRoot 'config/witcher3vr.example.ini'
 $readme = Join-Path $repositoryRoot 'README.md'
 $license = Join-Path $repositoryRoot 'LICENSE'
 $thirdPartyNotices = Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md'
+$stateBridgeRoot = Join-Path $repositoryRoot 'support/modWitcher3VRStateBridge'
+$stateBridgeScript = Join-Path $stateBridgeRoot `
+    'content/scripts/local/witcher3vr/first_person_state_bridge.ws'
 
 foreach ($requiredFile in @(
         $releaseDll,
@@ -31,7 +34,8 @@ foreach ($requiredFile in @(
         $exampleIni,
         $readme,
         $license,
-        $thirdPartyNotices)) {
+        $thirdPartyNotices,
+        $stateBridgeScript)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Missing release input: $requiredFile"
     }
@@ -59,6 +63,10 @@ try {
     Copy-Item -LiteralPath $readme -Destination $releaseStage
     Copy-Item -LiteralPath $license -Destination $releaseStage
     Copy-Item -LiteralPath $thirdPartyNotices -Destination $releaseStage
+    $modsStage = Join-Path $releaseStage 'mods'
+    New-Item -ItemType Directory -Path $modsStage | Out-Null
+    Copy-Item -LiteralPath $stateBridgeRoot `
+        -Destination (Join-Path $modsStage 'modWitcher3VRStateBridge') -Recurse
     Set-Content -LiteralPath (Join-Path $releaseStage 'BUILD.txt') `
         -Value @(
             $normalizedVersion,

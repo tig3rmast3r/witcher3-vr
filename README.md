@@ -36,7 +36,7 @@ as a runtime dependency.
 | Resizable HUD and menus | Working |
 | Adjustable in-headset render window | Working |
 | Near-camera view | Working |
-| Experimental first-person view | Available through `F11` |
+| Experimental first-person view | Available through `F11`, with adaptive on-foot and horse placement |
 | Optional 5:4 cinema framing | Working |
 | HMD-aware render-budget region | Implemented |
 | 2D Overlay and world-space icons | Corrected for VR |
@@ -108,6 +108,10 @@ Older game versions and rollback branches are not supported.
 4. Select the rendering mode and resolution.
 5. Launch the game through the launcher.
 
+The package also installs the bundled `modWitcher3VRStateBridge` script under
+the game's `mods` directory. It supplies the instantaneous locomotion state
+used by the experimental First-Person view and is part of Witcher 3 VR.
+
 If `witcher3vr.ini` does not exist, the launcher creates it automatically. The
 first-run selection is **Stereo TAAU** at the **Ultra 2688 × 2784** preset;
 nothing overwrites an existing INI.
@@ -176,12 +180,17 @@ Suggested values:
 | `F8` | Toggle between Standard and Near views |
 | `F9` | Recenter the VR view |
 | `F10` | Toggle 2D Cinema Mode |
-| `F11` | Toggle the experimental First-Person view |
+| `F11` | Toggle First Person (Experimental) |
 
-The First-Person view is experimental and uses a fixed camera placement rather
-than a fully animation-driven body anchor. It is positioned far enough forward
-to keep Geralt's head out of view during normal movement, but its placement may
-not be ideal for every animation, contextual action, or horse-riding state.
+The First-Person view is experimental. It uses DLL-controlled placement
+profiles for idle movement, walking, sprinting, and horse states rather than a
+fully animation-driven body anchor. Its placement may not be ideal for every
+animation or contextual action.
+
+The launcher option **Gamepad Snap Turn + Head Follow (First Person Only,
+Experimental)** enables both 30-degree gamepad snap turning and continuous
+HMD-directed native-camera following while `F11` First Person is active. It is
+disabled by default and does not affect Standard, Near, or Cinema views.
 
 Cinema Mode can also be used as a temporary workaround for sections that do
 not render correctly or are difficult to play in VR.

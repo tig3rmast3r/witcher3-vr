@@ -5,6 +5,7 @@
 #include <dxcapi.h>
 #include <nvsdk_ngx.h>
 #include <MinHook.h>
+#include <Xinput.h>
 #include <intrin.h>
 
 #define XR_USE_PLATFORM_WIN32
@@ -168,6 +169,33 @@ struct Config {
     float engine_first_person_camera_horizontal_forward_offset{0.75f};
     float engine_first_person_camera_world_z_offset{0.65f};
     bool engine_first_person_dynamic_anchor{false};
+    // [FIX:FIRST-PERSON-STATE-BRIDGE 1/5] State-specific final placement.
+    // WitcherScript publishes only the enum; every offset remains DLL-owned.
+    bool engine_first_person_state_offsets{true};
+    float engine_first_person_idle_forward_offset{0.10f};
+    float engine_first_person_slow_walk_forward_offset{0.65f};
+    float engine_first_person_walk_forward_offset{0.65f};
+    float engine_first_person_sprint_forward_offset{1.05f};
+    float engine_first_person_sprint_right_offset{0.22f};
+    float engine_first_person_sprint_world_z_offset{0.45f};
+    float engine_first_person_horse_idle_forward_offset{0.75f};
+    float engine_first_person_horse_walk_forward_offset{0.85f};
+    float engine_first_person_horse_trot_forward_offset{0.95f};
+    float engine_first_person_horse_gallop_forward_offset{1.05f};
+    float engine_first_person_state_transition_seconds{0.08f};
+    float engine_first_person_stop_hold_seconds{0.50f};
+    bool engine_first_person_lock_game_pitch{true};
+    float engine_first_person_low_position_pitch_reference{-38.0f};
+    float engine_first_person_pitch_vertical_compensation{0.0010f};
+    // [FEATURE:FIRST-PERSON-SNAP-TURN 1/5] F11-only gamepad yaw. A high
+    // threshold triggers one fixed turn and a lower threshold rearms it.
+    bool engine_first_person_snap_turn{false};
+    float engine_first_person_snap_turn_degrees{30.0f};
+    float engine_first_person_snap_turn_activation{0.55f};
+    float engine_first_person_snap_turn_release{0.20f};
+    // [FEATURE:FIRST-PERSON-HMD-BODY-FOLLOW 1/5] Keep HMD freelook as the
+    // visible authority while a persistent native XInput servo follows yaw.
+    bool engine_first_person_hmd_body_follow{false};
     bool streamline_force_reset{false};
     bool streamline_split_viewports{false};
     float streamline_right_temporal_offset{0.0f};
@@ -184,6 +212,10 @@ struct Config {
     bool ngx_trace{false};
     bool dlss_dlaa{false};
     bool world_marker_diagnostics{false};
+    // [DEBUG:FIRST-PERSON-LOCOMOTION 1/3] Optional bounded camera-state probe.
+    // It is additionally gated by the general logging switch and does not
+    // enable the expensive renderer diagnostics.
+    bool first_person_state_diagnostics{false};
     // [DEBUG] Both switches are launcher-controlled. When disabled, the same
     // optimized DLL follows the normal low-overhead gaming path.
     bool logging_enabled{false};
@@ -1881,6 +1913,60 @@ std::atomic<bool> g_taau_force_matrix_fallback{};
 std::atomic<bool> g_close_camera_f8_latched{};
 std::atomic<bool> g_first_person_f11_latched{};
 std::atomic<int> g_camera_mode{};
+using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+XInputGetStateFn g_xinput_get_state{};
+std::atomic<DWORD> g_first_person_snap_controller{XUSER_MAX_COUNT};
+std::atomic<bool> g_first_person_snap_stick_latched{true};
+std::atomic<bool> g_first_person_snap_native_drive_active{};
+std::atomic<int> g_first_person_snap_native_drive_direction{};
+std::atomic<float> g_first_person_snap_native_drive_scale{1.0f};
+std::atomic<uint64_t> g_first_person_snap_native_drive_start_present{
+    UINT64_MAX};
+std::atomic<float> g_first_person_snap_latest_native_yaw{};
+std::atomic<bool> g_first_person_snap_latest_native_yaw_valid{};
+std::atomic<float> g_first_person_snap_preview_yaw{};
+std::atomic<bool> g_first_person_snap_preview_valid{};
+std::atomic<float> g_first_person_head_follow_base_yaw{};
+std::atomic<bool> g_first_person_head_follow_base_valid{};
+std::mutex g_first_person_snap_native_mutex{};
+uint64_t g_first_person_snap_native_last_measure_present{UINT64_MAX};
+float g_first_person_snap_native_start_yaw{};
+float g_first_person_snap_native_target_yaw{};
+uint32_t g_first_person_snap_native_aligned_samples{};
+std::atomic<uint32_t> g_first_person_snap_diag_transaction{};
+uint32_t g_first_person_snap_diag_sample_count{};
+uint32_t g_first_person_snap_diag_post_samples_remaining{};
+std::atomic<uint64_t> g_first_person_state_last_sample_present{UINT64_MAX};
+std::mutex g_first_person_state_mutex{};
+bool g_first_person_state_previous_valid{};
+LARGE_INTEGER g_first_person_state_previous_qpc{};
+std::array<float, 3> g_first_person_state_previous_center{};
+enum class FirstPersonBridgeState : int {
+    Missing = 0,
+    FootIdle = 1,
+    FootSlowWalk = 2,
+    FootWalk = 3,
+    FootSprint = 4,
+    HorseIdle = 5,
+    HorseWalk = 6,
+    HorseTrot = 7,
+    HorseGallop = 8
+};
+std::atomic<int> g_first_person_bridge_state{};
+std::atomic<uint64_t> g_first_person_bridge_last_present{UINT64_MAX};
+std::atomic<uint32_t> g_first_person_bridge_decode_count{};
+std::mutex g_first_person_bridge_offset_mutex{};
+uint64_t g_first_person_bridge_offset_last_present{UINT64_MAX};
+LARGE_INTEGER g_first_person_bridge_offset_last_qpc{};
+float g_first_person_bridge_smoothed_forward{0.75f};
+float g_first_person_bridge_smoothed_right{};
+float g_first_person_bridge_smoothed_world_z{0.65f};
+std::atomic<float> g_first_person_bridge_output_forward{0.75f};
+std::atomic<float> g_first_person_bridge_output_right{};
+std::atomic<float> g_first_person_bridge_output_world_z{0.65f};
+FirstPersonBridgeState g_first_person_bridge_last_foot_motion_state{
+    FirstPersonBridgeState::FootIdle};
+LARGE_INTEGER g_first_person_bridge_foot_idle_since_qpc{};
 std::atomic<uint64_t> g_taau_native_last_seen_present{UINT64_MAX};
 std::atomic<uint64_t> g_taau_auto_candidate_start_present{UINT64_MAX};
 std::atomic<bool> g_taau_auto_activated{};
@@ -2678,6 +2764,20 @@ void log_runtime_stereo_startup(const char* fmt, ...) {
     va_end(args);
 }
 
+// [DEBUG:FIRST-PERSON-LOCOMOTION 2/3] The dedicated INI gate is subordinate to
+// the general log-writer switch, so stale private settings cannot produce a log
+// during a normal gaming run.
+void log_first_person_state(const char* fmt, ...) {
+    if (!g_config.logging_enabled ||
+        !g_config.first_person_state_diagnostics) {
+        return;
+    }
+    va_list args{};
+    va_start(args, fmt);
+    write_log_line_v(fmt, args);
+    va_end(args);
+}
+
 void diagnose_final_present_resource_identity(
     ID3D12GraphicsCommandList* command_list,
     ID3D12Resource* resource,
@@ -3278,6 +3378,86 @@ void load_config() {
         // DLL-owned pivot, enabled by the false default below.
         g_config.engine_first_person_dynamic_anchor = read_ini_bool(
             "engine", "first_person_dynamic_anchor", false);
+        g_config.engine_first_person_state_offsets = read_ini_bool(
+            "engine", "first_person_state_offsets", true);
+        g_config.engine_first_person_idle_forward_offset = std::clamp(
+            read_ini_float("engine", "first_person_idle_forward_offset", 0.10f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_slow_walk_forward_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_slow_walk_forward_offset", 0.65f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_walk_forward_offset = std::clamp(
+            read_ini_float("engine", "first_person_walk_forward_offset", 0.65f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_sprint_forward_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_sprint_forward_offset", 1.05f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_sprint_right_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_sprint_right_offset", 0.22f),
+            -0.75f, 0.75f);
+        g_config.engine_first_person_sprint_world_z_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_sprint_world_z_offset", 0.45f),
+            -2.0f, 2.0f);
+        g_config.engine_first_person_horse_idle_forward_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_horse_idle_forward_offset", 0.75f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_horse_walk_forward_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_horse_walk_forward_offset", 0.85f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_horse_trot_forward_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_horse_trot_forward_offset", 0.95f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_horse_gallop_forward_offset = std::clamp(
+            read_ini_float(
+                "engine", "first_person_horse_gallop_forward_offset", 1.05f),
+            -1.50f, 1.50f);
+        g_config.engine_first_person_state_transition_seconds = std::clamp(
+            read_ini_float(
+                "engine", "first_person_state_transition_seconds", 0.08f),
+            0.0f, 0.50f);
+        g_config.engine_first_person_stop_hold_seconds = std::clamp(
+            read_ini_float(
+                "engine", "first_person_stop_hold_seconds", 0.50f),
+            0.0f, 2.0f);
+        // [FIX:FIRST-PERSON-INPUT-LOCK 1/3] F11 uses the native low-pitch
+        // position only as the anchor's Z reference. View orientation keeps
+        // the existing horizon lock; HMD pitch remains fully live.
+        g_config.engine_first_person_lock_game_pitch = read_ini_bool(
+            "engine", "first_person_lock_game_pitch", true);
+        g_config.engine_first_person_low_position_pitch_reference =
+            std::clamp(read_ini_float(
+                "engine",
+                "first_person_low_position_pitch_reference", -38.0f),
+                -60.0f, 20.0f);
+        g_config.engine_first_person_pitch_vertical_compensation =
+            std::clamp(read_ini_float(
+                "engine",
+                "first_person_pitch_vertical_compensation", 0.0010f),
+                -0.01f, 0.01f);
+        g_config.engine_first_person_snap_turn = read_ini_bool(
+            "engine", "first_person_snap_turn", false);
+        g_config.engine_first_person_snap_turn_degrees = std::clamp(
+            read_ini_float(
+                "engine", "first_person_snap_turn_degrees", 30.0f),
+            5.0f, 90.0f);
+        g_config.engine_first_person_snap_turn_activation = std::clamp(
+            read_ini_float(
+                "engine", "first_person_snap_turn_activation", 0.55f),
+            0.20f, 0.95f);
+        g_config.engine_first_person_snap_turn_release = std::clamp(
+            read_ini_float(
+                "engine", "first_person_snap_turn_release", 0.20f),
+            0.0f,
+            g_config.engine_first_person_snap_turn_activation - 0.05f);
+        g_config.engine_first_person_hmd_body_follow = read_ini_bool(
+            "engine", "first_person_hmd_body_follow", false);
         g_camera_mode.store(g_config.engine_camera_mode, std::memory_order_relaxed);
         g_config.streamline_force_reset = read_ini_bool("engine", "streamline_force_reset", false);
         g_config.streamline_split_viewports = read_ini_bool("engine", "streamline_split_viewports", false);
@@ -3303,6 +3483,8 @@ void load_config() {
         g_config.dlss_dlaa = read_ini_bool("engine", "dlss_dlaa", false);
         g_config.world_marker_diagnostics = read_ini_bool(
             "debug", "world_marker_diagnostics", false);
+        g_config.first_person_state_diagnostics = read_ini_bool(
+            "debug", "first_person_state_diagnostics", false);
         // [DEBUG 2/2] One binary supports normal and diagnostic runs; the
         // launcher enables both file output and the detailed probes together.
         g_config.logging_enabled = read_ini_bool(
@@ -13294,12 +13476,610 @@ bool load_world_marker_projection(
     return false;
 }
 
+const char* first_person_bridge_state_name(FirstPersonBridgeState state) {
+    switch (state) {
+    case FirstPersonBridgeState::FootIdle:
+        return "foot_idle";
+    case FirstPersonBridgeState::FootSlowWalk:
+        return "foot_slow_walk";
+    case FirstPersonBridgeState::FootWalk:
+        return "foot_walk";
+    case FirstPersonBridgeState::FootSprint:
+        return "foot_sprint";
+    case FirstPersonBridgeState::HorseIdle:
+        return "horse_idle";
+    case FirstPersonBridgeState::HorseWalk:
+        return "horse_walk";
+    case FirstPersonBridgeState::HorseTrot:
+        return "horse_trot";
+    case FirstPersonBridgeState::HorseGallop:
+        return "horse_gallop";
+    default:
+        return "missing";
+    }
+}
+
+// [FIX:FIRST-PERSON-STATE-BRIDGE 2/5] Decode and remove the reversible script
+// FOV tag before any projection classification or REDengine view rebuild.
+void decode_first_person_bridge_state(float* view, uint64_t present) {
+    if (view == nullptr) {
+        return;
+    }
+
+    constexpr float kMarkerBase = 4096.0f;
+    constexpr float kStateStride = 128.0f;
+    const float tagged_fov = view[7];
+    if (tagged_fov < kMarkerBase + kStateStride ||
+        tagged_fov >= kMarkerBase + 9.0f * kStateStride) {
+        return;
+    }
+
+    const float payload = tagged_fov - kMarkerBase;
+    const int state_code =
+        static_cast<int>(floorf(payload / kStateStride));
+    const float native_fov =
+        payload - static_cast<float>(state_code) * kStateStride;
+    if (state_code < static_cast<int>(FirstPersonBridgeState::FootIdle) ||
+        state_code > static_cast<int>(FirstPersonBridgeState::HorseGallop) ||
+        native_fov <= 1.0f || native_fov >= 128.0f) {
+        return;
+    }
+
+    view[7] = native_fov;
+    const int previous =
+        g_first_person_bridge_state.exchange(
+            state_code, std::memory_order_relaxed);
+    g_first_person_bridge_last_present.store(
+        present, std::memory_order_release);
+    const uint32_t decode_count =
+        g_first_person_bridge_decode_count.fetch_add(
+            1, std::memory_order_relaxed);
+    if (previous != state_code || decode_count < 16) {
+        log_first_person_state(
+            "FPBRIDGE decoded present=%llu state=%d:%s native_fov=%.4f "
+            "tagged_fov=%.4f",
+            static_cast<unsigned long long>(present),
+            state_code,
+            first_person_bridge_state_name(
+                static_cast<FirstPersonBridgeState>(state_code)),
+            native_fov,
+            tagged_fov);
+    }
+}
+
+void reset_first_person_bridge_offsets() {
+    std::scoped_lock lock{g_first_person_bridge_offset_mutex};
+    g_first_person_bridge_offset_last_present = UINT64_MAX;
+    g_first_person_bridge_offset_last_qpc = {};
+    g_first_person_bridge_smoothed_forward =
+        g_config.engine_first_person_camera_horizontal_forward_offset;
+    g_first_person_bridge_smoothed_right = 0.0f;
+    g_first_person_bridge_smoothed_world_z =
+        g_config.engine_first_person_camera_world_z_offset;
+    g_first_person_bridge_last_foot_motion_state =
+        FirstPersonBridgeState::FootIdle;
+    g_first_person_bridge_foot_idle_since_qpc = {};
+    g_first_person_bridge_output_forward.store(
+        g_first_person_bridge_smoothed_forward, std::memory_order_relaxed);
+    g_first_person_bridge_output_right.store(
+        0.0f, std::memory_order_relaxed);
+    g_first_person_bridge_output_world_z.store(
+        g_first_person_bridge_smoothed_world_z, std::memory_order_relaxed);
+}
+
+// [FEATURE:FIRST-PERSON-SNAP-TURN 2/5] Reset controller hysteresis and the
+// synthetic native-stick transaction whenever F11 changes mode. Entering F11
+// starts latched, so a stick already held sideways must return near center.
+void reset_first_person_snap_turn(bool require_recenter) {
+    g_first_person_snap_controller.store(
+        XUSER_MAX_COUNT, std::memory_order_relaxed);
+    g_first_person_snap_stick_latched.store(
+        require_recenter, std::memory_order_relaxed);
+    g_first_person_snap_native_drive_active.store(
+        false, std::memory_order_release);
+    g_first_person_snap_native_drive_direction.store(
+        0, std::memory_order_relaxed);
+    g_first_person_snap_native_drive_scale.store(
+        1.0f, std::memory_order_relaxed);
+    g_first_person_snap_native_drive_start_present.store(
+        UINT64_MAX, std::memory_order_relaxed);
+    g_first_person_snap_latest_native_yaw_valid.store(
+        false, std::memory_order_release);
+    g_first_person_snap_preview_valid.store(
+        false, std::memory_order_release);
+    g_first_person_snap_preview_yaw.store(
+        0.0f, std::memory_order_relaxed);
+    g_first_person_head_follow_base_valid.store(
+        false, std::memory_order_release);
+    g_first_person_head_follow_base_yaw.store(
+        0.0f, std::memory_order_relaxed);
+    std::scoped_lock lock{g_first_person_snap_native_mutex};
+    g_first_person_snap_native_last_measure_present = UINT64_MAX;
+    g_first_person_snap_native_start_yaw = 0.0f;
+    g_first_person_snap_native_target_yaw = 0.0f;
+    g_first_person_snap_native_aligned_samples = 0;
+    g_first_person_snap_diag_sample_count = 0;
+    g_first_person_snap_diag_post_samples_remaining = 0;
+}
+
+float shortest_yaw_delta(float current, float previous) {
+    float delta = fmodf(current - previous + 180.0f, 360.0f);
+    if (delta < 0.0f) {
+        delta += 360.0f;
+    }
+    return delta - 180.0f;
+}
+
+float normalize_yaw_degrees(float yaw) {
+    yaw = fmodf(yaw + 180.0f, 360.0f);
+    if (yaw < 0.0f) {
+        yaw += 360.0f;
+    }
+    return yaw - 180.0f;
+}
+
+// [FEATURE:FIRST-PERSON-SNAP-TURN 3/5] Observe REDengine's unmodified yaw and
+// close the loop on an exact target. The preview jumps immediately; synthetic
+// XInput can reverse if it overshoots and stops only after native convergence.
+void update_first_person_native_snap_turn(
+    float native_yaw, uint64_t present, const float* view) {
+    g_first_person_snap_latest_native_yaw.store(
+        native_yaw, std::memory_order_relaxed);
+    g_first_person_snap_latest_native_yaw_valid.store(
+        true, std::memory_order_release);
+    std::scoped_lock lock{g_first_person_snap_native_mutex};
+    const bool continuous_head_follow =
+        g_config.engine_first_person_hmd_body_follow &&
+        g_camera_mode.load(std::memory_order_relaxed) == 2;
+    if (continuous_head_follow) {
+        // [FEATURE:FIRST-PERSON-HMD-BODY-FOLLOW 2/5] The pre-HMD visual base
+        // never hands back to native yaw. Native yaw instead chases the final
+        // world heading produced by that base plus the live HMD yaw.
+        if (!g_first_person_head_follow_base_valid.load(
+                std::memory_order_acquire)) {
+            g_first_person_head_follow_base_yaw.store(
+                native_yaw, std::memory_order_relaxed);
+            g_first_person_head_follow_base_valid.store(
+                true, std::memory_order_release);
+            g_first_person_snap_native_start_yaw = native_yaw;
+            g_first_person_snap_native_target_yaw = normalize_yaw_degrees(
+                native_yaw +
+                g_hmd_yaw_degrees * g_config.hmd_yaw_scale);
+            g_first_person_snap_native_aligned_samples = 0;
+            g_first_person_snap_diag_sample_count = 0;
+            g_first_person_snap_diag_post_samples_remaining = 0;
+            g_first_person_snap_native_drive_start_present.store(
+                present, std::memory_order_relaxed);
+            const uint32_t transaction =
+                g_first_person_snap_diag_transaction.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+            log_first_person_state(
+                "FPFOLLOW start tx=%u present=%llu native=%.4f base=%.4f "
+                "hmd=%.4f target=%.4f",
+                transaction,
+                static_cast<unsigned long long>(present),
+                native_yaw, native_yaw,
+                g_hmd_yaw_degrees * g_config.hmd_yaw_scale,
+                g_first_person_snap_native_target_yaw);
+        } else {
+            const float target = normalize_yaw_degrees(
+                g_first_person_head_follow_base_yaw.load(
+                    std::memory_order_relaxed) +
+                g_hmd_yaw_degrees * g_config.hmd_yaw_scale);
+            if (fabsf(shortest_yaw_delta(
+                    target, g_first_person_snap_native_target_yaw)) > 0.01f) {
+                g_first_person_snap_native_aligned_samples = 0;
+            }
+            g_first_person_snap_native_target_yaw = target;
+        }
+        // The controller stays armed for the whole F11 session. Reaching the
+        // target sets its synthetic stick to zero; new head motion immediately
+        // creates another error without requiring a new transaction.
+        g_first_person_snap_native_drive_active.store(
+            true, std::memory_order_release);
+    }
+    const bool drive_active =
+        g_first_person_snap_native_drive_active.load(
+            std::memory_order_relaxed);
+    if (!drive_active) {
+        if (g_first_person_snap_diag_post_samples_remaining > 0 &&
+            g_first_person_snap_native_last_measure_present != present) {
+            g_first_person_snap_native_last_measure_present = present;
+            --g_first_person_snap_diag_post_samples_remaining;
+            log_first_person_state(
+                "FPSNAP post tx=%u present=%llu eye=%d view=%p native=%.4f "
+                "target=%.4f error=%.4f remaining=%u",
+                g_first_person_snap_diag_transaction.load(
+                    std::memory_order_relaxed),
+                static_cast<unsigned long long>(present),
+                g_engine_factory_eye, view, native_yaw,
+                g_first_person_snap_native_target_yaw,
+                shortest_yaw_delta(
+                    g_first_person_snap_native_target_yaw, native_yaw),
+                g_first_person_snap_diag_post_samples_remaining);
+        }
+        return;
+    }
+    if (g_first_person_snap_native_last_measure_present == present) {
+        return;
+    }
+    g_first_person_snap_native_last_measure_present = present;
+
+    const float error = shortest_yaw_delta(
+        g_first_person_snap_native_target_yaw, native_yaw);
+    const float absolute_error = fabsf(error);
+    if (g_first_person_snap_diag_sample_count < 64) {
+        ++g_first_person_snap_diag_sample_count;
+        log_first_person_state(
+            "FPSNAP sample tx=%u n=%u present=%llu eye=%d view=%p "
+            "native=%.4f start=%.4f target=%.4f error=%.4f "
+            "aligned=%u drive_dir=%d drive_scale=%.4f",
+            g_first_person_snap_diag_transaction.load(
+                std::memory_order_relaxed),
+            g_first_person_snap_diag_sample_count,
+            static_cast<unsigned long long>(present),
+            g_engine_factory_eye, view, native_yaw,
+            g_first_person_snap_native_start_yaw,
+            g_first_person_snap_native_target_yaw,
+            error, g_first_person_snap_native_aligned_samples,
+            g_first_person_snap_native_drive_direction.load(
+                std::memory_order_relaxed),
+            g_first_person_snap_native_drive_scale.load(
+                std::memory_order_relaxed));
+    }
+    if (absolute_error <= 0.75f) {
+        if (g_first_person_snap_native_aligned_samples < 2) {
+            ++g_first_person_snap_native_aligned_samples;
+        }
+        g_first_person_snap_native_drive_direction.store(
+            0, std::memory_order_relaxed);
+        g_first_person_snap_native_drive_scale.store(
+            0.0f, std::memory_order_relaxed);
+        if (continuous_head_follow) {
+            return;
+        }
+        if (g_first_person_snap_native_aligned_samples < 2) {
+            // Require another primary-eye sample before handoff. Pause the
+            // synthetic stick so one contaminated descriptor cannot advance
+            // or complete the transaction.
+            return;
+        }
+        g_first_person_snap_native_drive_active.store(
+            false, std::memory_order_release);
+        g_first_person_snap_preview_valid.store(
+            false, std::memory_order_release);
+        g_first_person_snap_native_drive_direction.store(
+            0, std::memory_order_relaxed);
+        g_first_person_snap_native_drive_scale.store(
+            0.0f, std::memory_order_relaxed);
+        g_first_person_snap_native_drive_start_present.store(
+            UINT64_MAX, std::memory_order_relaxed);
+        g_first_person_snap_diag_post_samples_remaining = 8;
+        log_first_person_state(
+            "FPSNAP handoff tx=%u present=%llu eye=%d native=%.4f "
+            "target=%.4f error=%.4f samples=%u",
+            g_first_person_snap_diag_transaction.load(
+                std::memory_order_relaxed),
+            static_cast<unsigned long long>(present),
+            g_engine_factory_eye, native_yaw,
+            g_first_person_snap_native_target_yaw, error,
+            g_first_person_snap_diag_sample_count);
+        return;
+    }
+    g_first_person_snap_native_aligned_samples = 0;
+
+    // REDengine yaw moves opposite to XInput right-stick X. Use progressively
+    // smaller real stick values near the target; if native yaw crosses it,
+    // error changes sign and the next poll automatically corrects backwards.
+    g_first_person_snap_native_drive_direction.store(
+        error < 0.0f ? 1 : -1, std::memory_order_relaxed);
+    const float scale = absolute_error > 12.0f
+        ? 1.0f
+        : absolute_error > 4.0f
+            ? 0.60f
+            : absolute_error > 1.5f
+                ? 0.38f
+                : 0.27f;
+    g_first_person_snap_native_drive_scale.store(
+        scale, std::memory_order_relaxed);
+}
+
+// [FIX:FIRST-PERSON-STATE-BRIDGE 3/5] Resolve the enum to DLL-owned offsets.
+// The small blend removes a one-frame camera step without waiting for measured
+// world velocity, so the correction starts with the animation state itself.
+void update_first_person_bridge_offsets(uint64_t present) {
+    if (g_engine_factory_eye == 1) {
+        return;
+    }
+
+    std::scoped_lock lock{g_first_person_bridge_offset_mutex};
+    if (g_first_person_bridge_offset_last_present == present) {
+        return;
+    }
+    g_first_person_bridge_offset_last_present = present;
+
+    const uint64_t state_present =
+        g_first_person_bridge_last_present.load(std::memory_order_acquire);
+    const bool state_fresh =
+        state_present != UINT64_MAX &&
+        present >= state_present &&
+        present - state_present <= 5;
+    const auto state = state_fresh
+        ? static_cast<FirstPersonBridgeState>(
+            g_first_person_bridge_state.load(std::memory_order_relaxed))
+        : FirstPersonBridgeState::Missing;
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    static const int64_t qpc_frequency = [] {
+        LARGE_INTEGER value{};
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart;
+    }();
+
+    // [FIX:FIRST-PERSON-FOOT-MOTION 1/2] Both partial-stick walking and full
+    // running are instantaneous movement states. On the first idle frame,
+    // retain the last moving placement briefly so Geralt's head cannot flash
+    // back into view while the stop animation is still settling.
+    auto effective_state = state;
+    const bool foot_moving =
+        state == FirstPersonBridgeState::FootSlowWalk ||
+        state == FirstPersonBridgeState::FootWalk ||
+        state == FirstPersonBridgeState::FootSprint;
+    if (foot_moving) {
+        g_first_person_bridge_last_foot_motion_state = state;
+        g_first_person_bridge_foot_idle_since_qpc = {};
+    } else if (state == FirstPersonBridgeState::FootIdle &&
+        g_first_person_bridge_last_foot_motion_state !=
+            FirstPersonBridgeState::FootIdle &&
+        qpc_frequency > 0) {
+        if (g_first_person_bridge_foot_idle_since_qpc.QuadPart == 0) {
+            g_first_person_bridge_foot_idle_since_qpc = now;
+        }
+        const double idle_seconds = static_cast<double>(
+            now.QuadPart -
+            g_first_person_bridge_foot_idle_since_qpc.QuadPart) /
+            static_cast<double>(qpc_frequency);
+        if (idle_seconds <
+            g_config.engine_first_person_stop_hold_seconds) {
+            effective_state =
+                g_first_person_bridge_last_foot_motion_state;
+        } else {
+            g_first_person_bridge_last_foot_motion_state =
+                FirstPersonBridgeState::FootIdle;
+        }
+    } else {
+        g_first_person_bridge_last_foot_motion_state =
+            FirstPersonBridgeState::FootIdle;
+        g_first_person_bridge_foot_idle_since_qpc = {};
+    }
+
+    float target_forward =
+        g_config.engine_first_person_camera_horizontal_forward_offset;
+    float target_right{};
+    float target_world_z =
+        g_config.engine_first_person_camera_world_z_offset;
+
+    if (g_config.engine_first_person_state_offsets && state_fresh) {
+        switch (effective_state) {
+        case FirstPersonBridgeState::FootIdle:
+            target_forward =
+                g_config.engine_first_person_idle_forward_offset;
+            break;
+        case FirstPersonBridgeState::FootSlowWalk:
+            // [FIX:FIRST-PERSON-FOOT-MOTION 2/2] Partial analog movement uses
+            // the same safe head-clearing placement as normal movement.
+            target_forward =
+                g_config.engine_first_person_slow_walk_forward_offset;
+            break;
+        case FirstPersonBridgeState::FootWalk:
+            target_forward =
+                g_config.engine_first_person_walk_forward_offset;
+            break;
+        case FirstPersonBridgeState::FootSprint:
+            target_forward =
+                g_config.engine_first_person_sprint_forward_offset;
+            target_right =
+                g_config.engine_first_person_sprint_right_offset;
+            target_world_z =
+                g_config.engine_first_person_sprint_world_z_offset;
+            break;
+        case FirstPersonBridgeState::HorseIdle:
+            target_forward =
+                g_config.engine_first_person_horse_idle_forward_offset;
+            break;
+        case FirstPersonBridgeState::HorseWalk:
+            target_forward =
+                g_config.engine_first_person_horse_walk_forward_offset;
+            break;
+        case FirstPersonBridgeState::HorseTrot:
+            target_forward =
+                g_config.engine_first_person_horse_trot_forward_offset;
+            break;
+        case FirstPersonBridgeState::HorseGallop:
+            target_forward =
+                g_config.engine_first_person_horse_gallop_forward_offset;
+            break;
+        default:
+            break;
+        }
+    }
+
+    double dt_seconds{};
+    if (g_first_person_bridge_offset_last_qpc.QuadPart != 0 &&
+        qpc_frequency > 0 &&
+        now.QuadPart > g_first_person_bridge_offset_last_qpc.QuadPart) {
+        dt_seconds = static_cast<double>(
+            now.QuadPart -
+            g_first_person_bridge_offset_last_qpc.QuadPart) /
+            static_cast<double>(qpc_frequency);
+    }
+    g_first_person_bridge_offset_last_qpc = now;
+
+    float blend = 1.0f;
+    if (dt_seconds > 0.0 && dt_seconds < 0.5 &&
+        g_config.engine_first_person_state_transition_seconds > 0.0f) {
+        blend = 1.0f - expf(
+            -static_cast<float>(dt_seconds) /
+            g_config.engine_first_person_state_transition_seconds);
+    }
+    g_first_person_bridge_smoothed_forward +=
+        (target_forward - g_first_person_bridge_smoothed_forward) * blend;
+    g_first_person_bridge_smoothed_right +=
+        (target_right - g_first_person_bridge_smoothed_right) * blend;
+    g_first_person_bridge_smoothed_world_z +=
+        (target_world_z - g_first_person_bridge_smoothed_world_z) * blend;
+
+    g_first_person_bridge_output_forward.store(
+        g_first_person_bridge_smoothed_forward, std::memory_order_release);
+    g_first_person_bridge_output_right.store(
+        g_first_person_bridge_smoothed_right, std::memory_order_release);
+    g_first_person_bridge_output_world_z.store(
+        g_first_person_bridge_smoothed_world_z, std::memory_order_release);
+}
+
+// [DEBUG:FIRST-PERSON-LOCOMOTION 3/3] Sample the REDengine camera before the
+// first-person placement is applied. The orbit-cancelled point approximates the
+// actor pivot, while executable stack RVAs distinguish upstream call paths.
+void diagnose_first_person_locomotion_state(
+    float* view,
+    uintptr_t module,
+    uint64_t present) {
+    if (!g_config.logging_enabled ||
+        !g_config.first_person_state_diagnostics ||
+        g_camera_mode.load(std::memory_order_relaxed) != 2 ||
+        view == nullptr ||
+        g_engine_factory_eye != 0) {
+        return;
+    }
+
+    constexpr uint64_t kSampleIntervalPresents = 9;
+    uint64_t last_present =
+        g_first_person_state_last_sample_present.load(std::memory_order_relaxed);
+    if (last_present != UINT64_MAX &&
+        present < last_present + kSampleIntervalPresents) {
+        return;
+    }
+    if (!g_first_person_state_last_sample_present.compare_exchange_strong(
+            last_present, present, std::memory_order_relaxed)) {
+        return;
+    }
+
+    const float right_offset =
+            g_config.engine_first_person_camera_right_offset;
+        const float forward_offset =
+            g_config.engine_first_person_camera_offset +
+            g_config.engine_first_person_camera_eye_nudge;
+        const float up_offset =
+            g_config.engine_first_person_camera_up_offset;
+        const std::array<float, 3> center{
+            view[0] + view[0xA0] * right_offset +
+                view[0xA4] * forward_offset + view[0xA8] * up_offset,
+            view[1] + view[0xA1] * right_offset +
+                view[0xA5] * forward_offset + view[0xA9] * up_offset,
+            view[2] + view[0xA2] * right_offset +
+                view[0xA6] * forward_offset + view[0xAA] * up_offset};
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        static const int64_t qpc_frequency = [] {
+            LARGE_INTEGER value{};
+            QueryPerformanceFrequency(&value);
+            return value.QuadPart;
+        }();
+
+        double dt_seconds{};
+        float delta_x{};
+        float delta_y{};
+        float delta_z{};
+        float horizontal_speed{};
+        {
+            std::scoped_lock lock{g_first_person_state_mutex};
+            if (g_first_person_state_previous_valid &&
+                qpc_frequency > 0 &&
+                now.QuadPart > g_first_person_state_previous_qpc.QuadPart) {
+                dt_seconds = static_cast<double>(
+                    now.QuadPart -
+                    g_first_person_state_previous_qpc.QuadPart) /
+                    static_cast<double>(qpc_frequency);
+                delta_x =
+                    center[0] - g_first_person_state_previous_center[0];
+                delta_y =
+                    center[1] - g_first_person_state_previous_center[1];
+                delta_z =
+                    center[2] - g_first_person_state_previous_center[2];
+                if (dt_seconds > 0.0001 && dt_seconds < 1.0) {
+                    horizontal_speed = sqrtf(
+                        delta_x * delta_x + delta_y * delta_y) /
+                        static_cast<float>(dt_seconds);
+                }
+            }
+            g_first_person_state_previous_center = center;
+            g_first_person_state_previous_qpc = now;
+            g_first_person_state_previous_valid = true;
+        }
+
+        char executable_stack[512]{"none"};
+        void* frames[32]{};
+        const USHORT frame_count =
+            CaptureStackBackTrace(0, static_cast<DWORD>(std::size(frames)),
+                frames, nullptr);
+        const auto* dos =
+            reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+            module + static_cast<uintptr_t>(dos->e_lfanew));
+        const uintptr_t module_end =
+            module + static_cast<uintptr_t>(nt->OptionalHeader.SizeOfImage);
+        size_t stack_offset{};
+        for (USHORT index = 0; index < frame_count; ++index) {
+            const uintptr_t address =
+                reinterpret_cast<uintptr_t>(frames[index]);
+            if (address < module || address >= module_end) {
+                continue;
+            }
+            const int written = _snprintf_s(
+                executable_stack + stack_offset,
+                sizeof(executable_stack) - stack_offset,
+                _TRUNCATE,
+                "%s%llX",
+                stack_offset == 0 ? "" : ",",
+                static_cast<unsigned long long>(address - module));
+            if (written <= 0) {
+                break;
+            }
+            stack_offset += static_cast<size_t>(written);
+            if (stack_offset + 24 >= sizeof(executable_stack)) {
+                break;
+            }
+        }
+
+    log_first_person_state(
+            "FPSTATE present=%llu eye=%d dt=%.4f speed_xy=%.4f "
+            "raw=%.4f,%.4f,%.4f center=%.4f,%.4f,%.4f "
+            "delta=%.4f,%.4f,%.4f euler=%.4f,%.4f,%.4f "
+            "basis_r=%.4f,%.4f,%.4f basis_f=%.4f,%.4f,%.4f "
+            "basis_u=%.4f,%.4f,%.4f fov=%.4f aspect=%.6f stack=%s",
+            static_cast<unsigned long long>(present),
+            g_engine_factory_eye,
+            dt_seconds,
+            horizontal_speed,
+            view[0], view[1], view[2],
+            center[0], center[1], center[2],
+            delta_x, delta_y, delta_z,
+            view[4], view[5], view[6],
+            view[0xA0], view[0xA1], view[0xA2],
+            view[0xA4], view[0xA5], view[0xA6],
+            view[0xA8], view[0xA9], view[0xAA],
+            view[7], view[10], executable_stack);
+}
+
 void __fastcall hook_engine_view_rebuild(float* view) {
     constexpr uintptr_t kViewFactoryReturnRva = 0x0162196D;
     constexpr float kCinemaProjectionAspect = 5.0f / 4.0f;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const auto present = g_present_count.load();
+    decode_first_person_bridge_state(view, present);
     const auto world_pipeline_present = g_gameplay_world_pipeline_present.load(
         std::memory_order_relaxed);
     const bool gameplay_pipeline_ready = world_pipeline_present != UINT64_MAX &&
@@ -13441,6 +14221,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     if (world_camera && !force_2d_camera &&
         g_engine_menu_state.load() == 0) {
         const int camera_mode = g_camera_mode.load(std::memory_order_relaxed);
+        diagnose_first_person_locomotion_state(view, module, present);
+        if (camera_mode == 2) {
+            update_first_person_bridge_offsets(present);
+        }
         float right_offset{};
         float forward_offset{};
         float up_offset{};
@@ -13467,19 +14251,73 @@ void __fastcall hook_engine_view_rebuild(float* view) {
         view[2] += view[0xA2] * right_offset +
             view[0xA6] * forward_offset + view[0xAA] * up_offset;
         if (camera_mode == 2) {
-            // [FIX:FIRST-PERSON-EYE-LEVEL 2/2] Raise the centered pivot on
-            // world Z and add the requested ten-centimetre nudge along the
-            // normalized horizontal camera heading. Neither term inherits
-            // mouse/HMD pitch, so the eliminated orbit ellipse stays gone.
+            // [FIX:FIRST-PERSON-STATE-BRIDGE 4/5] Apply the selected final
+            // forward/right/height placement after the common stable pivot.
             const float horizontal_forward_length = sqrtf(
                 view[0xA4] * view[0xA4] + view[0xA5] * view[0xA5]);
+            const float state_forward =
+                g_first_person_bridge_output_forward.load(
+                    std::memory_order_acquire);
             if (horizontal_forward_length > 0.0001f) {
                 view[0] += view[0xA4] / horizontal_forward_length *
-                    g_config.engine_first_person_camera_horizontal_forward_offset;
+                    state_forward;
                 view[1] += view[0xA5] / horizontal_forward_length *
-                    g_config.engine_first_person_camera_horizontal_forward_offset;
+                    state_forward;
             }
-            view[2] += g_config.engine_first_person_camera_world_z_offset;
+            const float horizontal_right_length = sqrtf(
+                view[0xA0] * view[0xA0] + view[0xA1] * view[0xA1]);
+            const float state_right =
+                g_first_person_bridge_output_right.load(
+                    std::memory_order_acquire);
+            if (horizontal_right_length > 0.0001f) {
+                view[0] += view[0xA0] / horizontal_right_length * state_right;
+                view[1] += view[0xA1] / horizontal_right_length * state_right;
+            }
+            view[2] += g_first_person_bridge_output_world_z.load(
+                std::memory_order_acquire);
+            if (g_config.engine_first_person_lock_game_pitch) {
+                // [FIX:FIRST-PERSON-INPUT-LOCK 2/3] The orbit cancellation
+                // already removes nearly all pitch-driven movement. Cancel
+                // only its measured millimetric Z residue relative to the
+                // lowest native pitch; terrain and locomotion Z remain live.
+                float pitch_delta = fmodf(
+                    view[5] -
+                    g_config.engine_first_person_low_position_pitch_reference +
+                    180.0f,
+                    360.0f);
+                if (pitch_delta < 0.0f) {
+                    pitch_delta += 360.0f;
+                }
+                pitch_delta -= 180.0f;
+                view[2] -= pitch_delta *
+                    g_config.engine_first_person_pitch_vertical_compensation;
+            }
+            if (g_config.engine_first_person_snap_turn ||
+                g_config.engine_first_person_hmd_body_follow) {
+                // [FEATURE:FIRST-PERSON-SNAP-TURN 4/5] Show the exact target
+                // immediately while the native XInput servo converges behind
+                // it, then hand off without changing the displayed yaw.
+                // Only eye 0 (or the mono/unknown-eye fallback) may update the
+                // native measurement. Eye 1 can share a descriptor already
+                // carrying the preview and must never validate convergence.
+                if (g_engine_factory_eye != 1) {
+                    update_first_person_native_snap_turn(
+                        view[6], present, view);
+                }
+                if (g_config.engine_first_person_hmd_body_follow &&
+                    g_first_person_head_follow_base_valid.load(
+                        std::memory_order_acquire)) {
+                    // [FEATURE:FIRST-PERSON-HMD-BODY-FOLLOW 3/5] Native yaw is
+                    // deliberately hidden. The persistent base is rendered
+                    // here and live HMD yaw is still added one-to-one below.
+                    view[6] = g_first_person_head_follow_base_yaw.load(
+                        std::memory_order_relaxed);
+                } else if (g_first_person_snap_preview_valid.load(
+                        std::memory_order_acquire)) {
+                    view[6] = g_first_person_snap_preview_yaw.load(
+                        std::memory_order_relaxed);
+                }
+            }
         }
     }
     // Build the same game/FOV/camera-mode view without HMD pose. Its vertical
@@ -13552,6 +14390,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                     g_hmd_game_pitch_lock,
                     static_cast<unsigned long long>(present));
             }
+            // [FIX:FIRST-PERSON-INPUT-LOCK 3/3] Keep horizon authority:
+            // the low-pitch reference affects position only, never the viewing
+            // angle. Mouse/pad pitch remains locked by the existing game-pitch
+            // lock, then physical HMD pitch is added below one-to-one.
             const float game_pitch = g_config.hmd_lock_game_pitch &&
                     g_hmd_game_pitch_lock_valid
                 ? g_hmd_game_pitch_lock
@@ -17308,11 +18150,219 @@ void install_d3d12_create_device_hook() {
     }
 }
 
+// [FEATURE:FIRST-PERSON-SNAP-TURN 5/5] Read the physical right-stick X, turn
+// its threshold crossing into one synthetic native stick transaction, then
+// release it when the measured REDengine yaw reaches the configured angle.
+// Mouse, right-stick Y, locomotion and every other camera mode are untouched.
+DWORD WINAPI hook_xinput_get_state(
+    DWORD user_index, XINPUT_STATE* state) {
+    if (g_xinput_get_state == nullptr) {
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+
+    const DWORD result = g_xinput_get_state(user_index, state);
+    if (result != ERROR_SUCCESS || state == nullptr) {
+        DWORD selected = user_index;
+        g_first_person_snap_controller.compare_exchange_strong(
+            selected, XUSER_MAX_COUNT, std::memory_order_relaxed);
+        return result;
+    }
+
+    const bool snap_turn_enabled =
+        g_config.engine_first_person_snap_turn;
+    const bool head_follow_enabled =
+        g_config.engine_first_person_hmd_body_follow;
+    if ((!snap_turn_enabled && !head_follow_enabled) ||
+        g_camera_mode.load(std::memory_order_relaxed) != 2) {
+        return result;
+    }
+
+    const SHORT raw_thumb_x = state->Gamepad.sThumbRX;
+    state->Gamepad.sThumbRX = 0;
+
+    DWORD selected =
+        g_first_person_snap_controller.load(std::memory_order_relaxed);
+    if (selected == XUSER_MAX_COUNT) {
+        DWORD expected = XUSER_MAX_COUNT;
+        g_first_person_snap_controller.compare_exchange_strong(
+            expected, user_index, std::memory_order_relaxed);
+        selected =
+            g_first_person_snap_controller.load(std::memory_order_relaxed);
+    }
+    if (selected != user_index) {
+        return result;
+    }
+
+    if (snap_turn_enabled) {
+        const int magnitude = raw_thumb_x < 0
+            ? -static_cast<int>(raw_thumb_x)
+            : static_cast<int>(raw_thumb_x);
+        const int activation = static_cast<int>(
+            g_config.engine_first_person_snap_turn_activation * 32767.0f);
+        const int release = static_cast<int>(
+            g_config.engine_first_person_snap_turn_release * 32767.0f);
+        if (g_first_person_snap_stick_latched.load(
+                std::memory_order_relaxed)) {
+            if (magnitude <= release) {
+                g_first_person_snap_stick_latched.store(
+                    false, std::memory_order_relaxed);
+            }
+        } else if (magnitude >= activation) {
+            g_first_person_snap_stick_latched.store(
+                true, std::memory_order_release);
+            if (g_first_person_snap_latest_native_yaw_valid.load(
+                    std::memory_order_acquire)) {
+                std::scoped_lock lock{g_first_person_snap_native_mutex};
+                const bool was_active =
+                    g_first_person_snap_native_drive_active.load(
+                        std::memory_order_relaxed);
+                const float native_yaw =
+                    g_first_person_snap_latest_native_yaw.load(
+                        std::memory_order_relaxed);
+                g_first_person_snap_native_start_yaw =
+                    native_yaw;
+                const int direction = raw_thumb_x > 0 ? 1 : -1;
+                const float base_target = head_follow_enabled
+                    ? (g_first_person_head_follow_base_valid.load(
+                            std::memory_order_acquire)
+                        ? g_first_person_head_follow_base_yaw.load(
+                            std::memory_order_relaxed)
+                        : native_yaw)
+                    : (was_active
+                        ? g_first_person_snap_native_target_yaw
+                        : native_yaw);
+                const float visual_base = normalize_yaw_degrees(
+                    base_target -
+                    static_cast<float>(direction) *
+                        g_config.engine_first_person_snap_turn_degrees);
+                if (head_follow_enabled) {
+                    // [FEATURE:FIRST-PERSON-HMD-BODY-FOLLOW 4/5] Snap changes
+                    // the persistent freelook base. The continuous target then
+                    // remains that snapped base plus current physical HMD yaw.
+                    g_first_person_head_follow_base_yaw.store(
+                        visual_base, std::memory_order_relaxed);
+                    g_first_person_head_follow_base_valid.store(
+                        true, std::memory_order_release);
+                    g_first_person_snap_preview_valid.store(
+                        false, std::memory_order_release);
+                    g_first_person_snap_native_target_yaw =
+                        normalize_yaw_degrees(
+                            visual_base +
+                            g_hmd_yaw_degrees * g_config.hmd_yaw_scale);
+                } else {
+                    g_first_person_snap_native_target_yaw = visual_base;
+                    g_first_person_snap_preview_yaw.store(
+                        visual_base, std::memory_order_relaxed);
+                    g_first_person_snap_preview_valid.store(
+                        true, std::memory_order_release);
+                }
+                g_first_person_snap_native_aligned_samples = 0;
+                g_first_person_snap_diag_sample_count = 0;
+                g_first_person_snap_diag_post_samples_remaining = 0;
+                const uint32_t transaction =
+                    g_first_person_snap_diag_transaction.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                g_first_person_snap_native_last_measure_present = UINT64_MAX;
+                const float error = shortest_yaw_delta(
+                    g_first_person_snap_native_target_yaw, native_yaw);
+                const bool already_aligned = fabsf(error) <= 0.75f;
+                g_first_person_snap_native_drive_scale.store(
+                    already_aligned ? 0.0f : 1.0f,
+                    std::memory_order_relaxed);
+                const uint64_t trigger_present =
+                    g_present_count.load(std::memory_order_relaxed);
+                g_first_person_snap_native_drive_start_present.store(
+                    trigger_present,
+                    std::memory_order_relaxed);
+                g_first_person_snap_native_drive_direction.store(
+                    already_aligned ? 0 : (error < 0.0f ? 1 : -1),
+                    std::memory_order_relaxed);
+                g_first_person_snap_native_drive_active.store(
+                    true, std::memory_order_release);
+                log_first_person_state(
+                    "FPSNAP start tx=%u present=%llu user=%lu raw=%d dir=%d "
+                    "accumulated=%u follow=%u native=%.4f base=%.4f "
+                    "target=%.4f error=%.4f angle=%.4f",
+                    transaction,
+                    static_cast<unsigned long long>(trigger_present),
+                    static_cast<unsigned long>(user_index),
+                    static_cast<int>(raw_thumb_x), direction,
+                    was_active ? 1u : 0u,
+                    head_follow_enabled ? 1u : 0u,
+                    native_yaw, visual_base,
+                    g_first_person_snap_native_target_yaw,
+                    error,
+                    g_config.engine_first_person_snap_turn_degrees);
+            }
+        }
+    }
+
+    const uint64_t drive_start =
+        g_first_person_snap_native_drive_start_present.load(
+            std::memory_order_relaxed);
+    const uint64_t current_present =
+        g_present_count.load(std::memory_order_relaxed);
+    if (!head_follow_enabled &&
+        g_first_person_snap_native_drive_active.load(
+            std::memory_order_acquire) &&
+        drive_start != UINT64_MAX &&
+        current_present > drive_start + 360) {
+        g_first_person_snap_native_drive_active.store(
+            false, std::memory_order_release);
+        g_first_person_snap_preview_valid.store(
+            false, std::memory_order_release);
+    }
+    if (g_first_person_snap_native_drive_active.load(
+            std::memory_order_acquire)) {
+        const int direction =
+            g_first_person_snap_native_drive_direction.load(
+                std::memory_order_relaxed);
+        const float scale =
+            g_first_person_snap_native_drive_scale.load(
+                std::memory_order_relaxed);
+        const float synthetic = static_cast<float>(direction) *
+            std::clamp(scale, 0.0f, 1.0f) * 32767.0f;
+        state->Gamepad.sThumbRX = static_cast<SHORT>(std::clamp(
+            synthetic, -32768.0f, 32767.0f));
+    }
+    return result;
+}
+
+void install_xinput_snap_turn_hook() {
+    if ((!g_config.engine_first_person_snap_turn &&
+            !g_config.engine_first_person_hmd_body_follow) ||
+        g_xinput_get_state != nullptr) {
+        return;
+    }
+
+    HMODULE module = GetModuleHandleW(L"XINPUT9_1_0.dll");
+    if (module == nullptr) {
+        module = LoadLibraryW(L"XINPUT9_1_0.dll");
+    }
+    auto* target = module != nullptr
+        ? GetProcAddress(module, "XInputGetState")
+        : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(
+            target,
+            reinterpret_cast<void*>(&hook_xinput_get_state),
+            reinterpret_cast<void**>(&g_xinput_get_state)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("First-person XInput snap-turn hook installed target=%p",
+            target);
+    } else {
+        g_xinput_get_state = nullptr;
+        log_line("First-person XInput snap-turn hook failed target=%p",
+            target);
+    }
+}
+
 void ensure_initialized() {
     std::call_once(g_init_once, []() {
         real_proc("CreateDXGIFactory");
         MH_Initialize();
         load_config();
+        install_xinput_snap_turn_hook();
         install_ngx_dlaa_loader_hooks();
         initialize_performance_cpu_sets();
         install_engine_scene_culling_probe();
@@ -19024,9 +20074,11 @@ void render_openxr_test_frame() {
     // A valid gameplay camera refreshes much more frequently than this.  The
     // former 120-present guard left a locked cinematic camera running through
     // the packed/HMD route for roughly one second before selecting the quad.
-    // Twelve presents still absorb a short callback gap while making the
+    // Sixteen presents still absorb a short callback gap while making the
     // gameplay-to-cinema handoff effectively immediate.
-    constexpr uint64_t kCinemaEnterCameraAge = 12;
+    // [FIX:CINEMA-ENTRY-DEBOUNCE 1/1] Four additional missing-camera presents
+    // reject the observed one-frame false positive without delaying F10.
+    constexpr uint64_t kCinemaEnterCameraAge = 16;
     const bool previous_cinema = g_cinema_mode_active.load(std::memory_order_relaxed);
     bool cinema_mode = previous_cinema;
     if (g_force_mono_cinema.load(std::memory_order_relaxed)) {
@@ -20455,6 +21507,9 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             g_camera_mode.load(std::memory_order_relaxed);
         const int camera_mode = current_mode == 0 ? 1 : 0;
         g_camera_mode.store(camera_mode, std::memory_order_relaxed);
+        if (current_mode == 2) {
+            reset_first_person_snap_turn(false);
+        }
         announce_camera_mode(camera_mode, "F8");
     }
     const bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
@@ -20468,6 +21523,8 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             g_camera_mode.load(std::memory_order_relaxed);
         const int camera_mode = current_mode == 2 ? 0 : 2;
         g_camera_mode.store(camera_mode, std::memory_order_relaxed);
+        reset_first_person_bridge_offsets();
+        reset_first_person_snap_turn(camera_mode == 2);
         announce_camera_mode(camera_mode, "F11");
     }
     if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
