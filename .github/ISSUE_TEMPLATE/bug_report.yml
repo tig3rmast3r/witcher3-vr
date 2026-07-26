@@ -1,0 +1,111 @@
+name: Bug report
+description: Report a reproducible problem with Witcher 3 VR
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Witcher 3 VR. Please complete every relevant field.
+        For renderer problems, enable Diagnostic Logging in the launcher, reproduce the issue once, and close the game normally.
+        Only the latest official PC version of The Witcher 3 is supported.
+        Third-party mods are currently unsupported. Disable them and reproduce the problem before opening an issue.
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      placeholder: "Example: RTX 4080, driver xxx.xx"
+    validations:
+      required: true
+
+  - type: input
+    id: headset
+    attributes:
+      label: Headset and connection
+      placeholder: "Example: Quest 3 via Virtual Desktop, Pimax via DisplayPort"
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: OpenXR runtime
+      placeholder: "Example: VDXR, SteamVR, Meta OpenXR"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: render_mode
+    attributes:
+      label: Rendering mode
+      options:
+        - Mono
+        - Stereo
+        - Cinema Mode
+        - Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: antialiasing
+    attributes:
+      label: Anti-aliasing backend
+      options:
+        - No AA / FXAA
+        - TAAU
+        - DLSS
+        - DLAA
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem description
+      description: Explain what happened and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Load the attached save
+        2. Travel to...
+        3. Look toward...
+    validations:
+      required: true
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Diagnostic files
+      description: |
+        Attach witcher3vr.ini and the generated witcher3vr-vxxx.log.
+        Add a save file if the problem is scene-specific. Review logs for personal paths before uploading.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add screenshots, video, frametime data, or other useful details.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I reproduced the problem on the latest official PC version of The Witcher 3.
+          required: true
+        - label: I reproduced the problem with all third-party mods disabled.
+          required: true
+        - label: I am not requesting motion-controller support.
+          required: true

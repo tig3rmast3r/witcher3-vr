@@ -21,8 +21,17 @@ $normalizedVersion = $Version.ToUpperInvariant()
 $releaseDll = Join-Path $repositoryRoot 'build/release/Release/dxgi.dll'
 $launcher = Join-Path $repositoryRoot 'build/release/launcher/Release/Witcher3VRLauncher.exe'
 $exampleIni = Join-Path $repositoryRoot 'config/witcher3vr.example.ini'
+$readme = Join-Path $repositoryRoot 'README.md'
+$license = Join-Path $repositoryRoot 'LICENSE'
+$thirdPartyNotices = Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md'
 
-foreach ($requiredFile in @($releaseDll, $launcher, $exampleIni)) {
+foreach ($requiredFile in @(
+        $releaseDll,
+        $launcher,
+        $exampleIni,
+        $readme,
+        $license,
+        $thirdPartyNotices)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Missing release input: $requiredFile"
     }
@@ -47,6 +56,9 @@ try {
     Copy-Item -LiteralPath $releaseDll -Destination (Join-Path $releaseStage 'dxgi.dll')
     Copy-Item -LiteralPath $launcher -Destination $releaseStage
     Copy-Item -LiteralPath $exampleIni -Destination (Join-Path $releaseStage 'witcher3vr.example.ini')
+    Copy-Item -LiteralPath $readme -Destination $releaseStage
+    Copy-Item -LiteralPath $license -Destination $releaseStage
+    Copy-Item -LiteralPath $thirdPartyNotices -Destination $releaseStage
     Set-Content -LiteralPath (Join-Path $releaseStage 'BUILD.txt') `
         -Value @(
             $normalizedVersion,
