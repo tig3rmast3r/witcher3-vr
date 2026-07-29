@@ -60,6 +60,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "hud_vertical_scale=0.500\r\n"
         "menu_scale=0.900\r\n"
         "cinema_5x4=0\r\n"
+        "steady_icons=0\r\n"
         "vertical_pitch_enabled=0\r\n"
         "hmd_position_scale=0.375\r\n"
         "untouched_openxr=alpha\r\n"
@@ -72,6 +73,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "close_camera_offset=0.750\r\n"
         "first_person_snap_turn=0\r\n"
         "first_person_hmd_body_follow=0\r\n"
+        "first_person_combat_exit=0\r\n"
         "unrelated_engine=42\r\n"
         "\r\n"
         "[debug]\r\n"
@@ -110,7 +112,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.near_view = 1.25f;
         state.vertical_pitch_enabled = true;
         state.cinema_5x4 = true;
+        state.steady_icons = true;
         state.first_person_gamepad_head_follow = true;
+        state.first_person_combat_exit = true;
         state.diagnostic_logging = true;
 
         w3vr::IniDocument vr;
@@ -157,10 +161,14 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "cinema scale missing");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
             "extended cinema framing flag missing");
+        Require(vr.Get("openxr", "steady_icons") == "1",
+            "steady-icons latency flag missing");
         Require(vr.Get("engine", "first_person_snap_turn") == "1",
             "first-person snap-turn flag missing");
         Require(vr.Get("engine", "first_person_hmd_body_follow") == "1",
             "first-person HMD body-follow flag missing");
+        Require(vr.Get("engine", "first_person_combat_exit") == "1",
+            "first-person combat-exit flag missing");
         Require(vr.Get("debug", "logging_enabled") == "1",
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
@@ -189,8 +197,12 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         }
         Require(loaded.state.cinema_5x4,
             "round-trip extended cinema framing mismatch");
+        Require(loaded.state.steady_icons,
+            "round-trip steady-icons latency mismatch");
         Require(loaded.state.first_person_gamepad_head_follow,
             "round-trip first-person gamepad head-follow mismatch");
+        Require(loaded.state.first_person_combat_exit,
+            "round-trip first-person combat-exit mismatch");
         Require(loaded.state.diagnostic_logging,
             "round-trip diagnostic logging mismatch");
     }
@@ -201,6 +213,18 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
         L"Mono - No AA / FXAA", "mono No AA / FXAA label mismatch");
     Require(std::wstring(w3vr::ModeDisplayName(w3vr::RenderMode::StereoNone)) ==
         L"Stereo - No AA / FXAA", "stereo No AA / FXAA label mismatch");
+    Require(std::wstring(w3vr::ModeDisplayName(
+        w3vr::RenderMode::StereoDlssSequential)) ==
+        L"Stereo - DLSS Sequential", "stereo DLSS label mismatch");
+    Require(w3vr::SettingsForMode(w3vr::RenderMode::StereoNone).openxr_mode == 3 &&
+        w3vr::SettingsForMode(w3vr::RenderMode::StereoTaau).openxr_mode == 3 &&
+        w3vr::SettingsForMode(
+            w3vr::RenderMode::StereoDlssSequential).openxr_mode == 3,
+        "all stereo modes must use OpenXR Mode 3");
+    Require(w3vr::SettingsForMode(w3vr::RenderMode::MonoNone).openxr_mode == 2 &&
+        w3vr::SettingsForMode(w3vr::RenderMode::MonoTaau).openxr_mode == 2 &&
+        w3vr::SettingsForMode(w3vr::RenderMode::MonoDlss).openxr_mode == 2,
+        "all mono modes must use OpenXR Mode 2");
 
     WriteBaseFixtures(paths);
     std::wstring error;
@@ -262,11 +286,12 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[openxr]\r\n"
-        "mode=4\r\n"
+        "mode=3\r\n"
         "render_width=2688\r\n"
         "render_height=2784\r\n"
+        "cinema_5x4=1\r\n"
         "[engine]\r\n"
-        "temporal_backend=taau\r\n"
+        "temporal_backend=none\r\n"
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
         "[debug]\r\n"
@@ -285,6 +310,112 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "existing INI must not be replaced");
     Require(Read(paths.vr_ini) == "[openxr]\r\nmode=3\r\n",
         "existing INI was overwritten");
+
+    const auto verify_inheritance = [&](const char* name, int aa_mode,
+                                        bool allow_dlss,
+                                        const char* expected_backend) {
+        const auto inherited = MakePaths(root / name);
+        fs::create_directories(inherited.launcher_directory);
+        Write(inherited.game_settings,
+            "[PostProcess]\r\nAAMode=" + std::to_string(aa_mode) +
+            "\r\n[Rendering]\r\nAllowDLSS=" +
+            std::string(allow_dlss ? "true" : "false") + "\r\n");
+        bool inherited_created{};
+        std::wstring inherited_error;
+        Require(w3vr::EnsureVrConfiguration(inherited, defaults,
+            inherited_created, inherited_error),
+            "inherited first-run INI creation failed");
+        Require(inherited_created,
+            "inherited first-run INI was not reported as created");
+        auto inherited_ini =
+            w3vr::IniDocument::Load(inherited.vr_ini, inherited_error);
+        Require(inherited_ini.has_value(),
+            "inherited first-run INI could not be loaded");
+        Require(inherited_ini->Get("engine", "temporal_backend") ==
+            expected_backend, "first-run AA backend inheritance mismatch");
+        Require(inherited_ini->Get("openxr", "mode") == "3",
+            "first-run inherited mode must remain stereo Mode 3");
+    };
+    verify_inheritance("first-run-taau", 3, false, "taau");
+    verify_inheritance("first-run-dlss", 6, true, "dlss");
+    verify_inheritance("first-run-no-aa", 0, false, "none");
+    verify_inheritance("first-run-unsupported", 5, false, "none");
+}
+
+void TestApprovedLauncherDefaults() {
+    const w3vr::LauncherState defaults;
+    Require(defaults.mode == w3vr::RenderMode::StereoNone,
+        "fallback launcher mode must be Stereo No AA");
+    Require(defaults.width == 2688 && defaults.height == 2784,
+        "default resolution must be Ultra 2688x2784");
+    Require(defaults.dlss_quality == 1,
+        "default DLSS preset must be Quality");
+    Require(defaults.hud_convergence_delta == -20,
+        "default HUD convergence must be -20");
+    Require(defaults.hud_vertical_scale == 0.85f,
+        "default HUD Y zoom must be 0.85");
+    Require(defaults.cinema_5x4,
+        "Extended Cinema 5:4 must default on");
+    Require(!defaults.steady_icons && !defaults.vertical_pitch_enabled &&
+        !defaults.first_person_gamepad_head_follow &&
+        !defaults.first_person_combat_exit &&
+        !defaults.diagnostic_logging,
+        "optional and experimental features must default off");
+}
+
+void TestMissingKeyFallbacks(const fs::path& root) {
+    const auto paths = MakePaths(root / "missing-key-fallbacks");
+    fs::create_directories(paths.launcher_directory);
+    Write(paths.vr_ini,
+        "[openxr]\r\n"
+        "mode=3\r\n"
+        "[engine]\r\n"
+        "temporal_backend=none\r\n"
+        "dual_render_probe=1\r\n"
+        "dual_render_start=1\r\n");
+    Write(paths.game_settings,
+        "[PostProcess]\r\n"
+        "AAMode=0\r\n"
+        "[Rendering]\r\n"
+        "AllowDLSS=false\r\n");
+
+    const auto loaded = w3vr::LoadConfiguration(paths);
+    Require(loaded.state.mode == w3vr::RenderMode::StereoNone,
+        "partial legacy INI must keep the Stereo No AA fallback");
+    Require(loaded.state.dlss_quality == 1,
+        "missing DLSS preset must fall back to Quality");
+    Require(loaded.state.hud_convergence_delta == -20,
+        "missing HUD convergence must fall back to -20");
+    Require(loaded.state.hud_vertical_scale == 0.85f,
+        "missing HUD Y zoom must fall back to 0.85");
+    Require(loaded.state.cinema_5x4,
+        "missing Extended Cinema key must fall back to On");
+}
+
+void TestCompatibilityWarnings(const fs::path& root) {
+    const auto paths = MakePaths(root / "compatibility-warnings");
+    fs::create_directories(paths.launcher_directory);
+    Write(paths.game_settings,
+        "[Rendering/RT]\r\n"
+        "EnableRT=true\r\n"
+        "[Rendering]\r\n"
+        "SSREnabled=true\r\n");
+    auto warnings = w3vr::InspectCompatibilitySettings(paths);
+    Require(warnings.ray_tracing_enabled,
+        "enabled Ray Tracing warning was not detected");
+    Require(warnings.ssr_high,
+        "SSR High warning was not detected");
+
+    Write(paths.game_settings,
+        "[Rendering/RT]\r\n"
+        "EnableRT=false\r\n"
+        "[Rendering]\r\n"
+        "SSREnabled=false\r\n");
+    warnings = w3vr::InspectCompatibilitySettings(paths);
+    Require(!warnings.ray_tracing_enabled,
+        "disabled Ray Tracing produced a warning");
+    Require(!warnings.ssr_high,
+        "SSR Low/Off produced a warning");
 }
 
 void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {
@@ -351,6 +482,9 @@ int main() {
         TestFallbackAndAtomicSave(paths);
         TestInconsistentWarning(paths);
         TestFirstRunConfiguration(temporary.path);
+        TestApprovedLauncherDefaults();
+        TestMissingKeyFallbacks(temporary.path);
+        TestCompatibilityWarnings(temporary.path);
         TestVrBaselineAndRestore(paths);
         TestFailurePaths(temporary.path);
         std::cout << "All launcher configuration tests passed.\n";

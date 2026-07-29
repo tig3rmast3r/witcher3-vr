@@ -29,6 +29,13 @@ The following components are incorporated or adapted under the MIT License:
   - Copyright 2017-2026 The Khronos Group Inc.
   - Header SPDX license: `Apache-2.0 OR MIT`
   - Witcher 3 VR relies on the MIT option for the generated OpenXR headers.
+- **Khronos OpenXR Loader 1.0.22**
+  - Project: https://github.com/KhronosGroup/OpenXR-SDK
+  - Pinned revision: `458984d7f59d1ae6dc1b597d94b02e4f7132eaba`
+  - Copyright 2017-2020 The Khronos Group Inc.
+  - Loader SPDX license: `Apache-2.0 OR MIT`
+  - The release package includes the 64-bit loader built from this revision
+    under the MIT option.
 
 The MIT License text applying to the components above is reproduced here:
 

@@ -25,21 +25,28 @@ struct ModeSettings {
 };
 
 struct LauncherState {
-    RenderMode mode{RenderMode::StereoTaau};
+    RenderMode mode{RenderMode::StereoNone};
     int width{2688};
     int height{2784};
-    int dlss_quality{3};
-    int hud_convergence_delta{};
+    int dlss_quality{1};
+    int hud_convergence_delta{-20};
     float presentation_scale{1.0f};
     float hud_horizontal_scale{0.5f};
-    float hud_vertical_scale{0.5f};
+    float hud_vertical_scale{0.85f};
     float menu_scale{0.85f};
     float cinema_scale{0.9f};
     float near_view{0.75f};
     bool vertical_pitch_enabled{};
-    bool cinema_5x4{};
+    bool cinema_5x4{true};
+    bool steady_icons{};
     bool first_person_gamepad_head_follow{};
+    bool first_person_combat_exit{};
     bool diagnostic_logging{};
+};
+
+struct CompatibilityWarnings {
+    bool ray_tracing_enabled{};
+    bool ssr_high{};
 };
 
 struct ConfigPaths {
@@ -85,6 +92,7 @@ ConfigPaths DiscoverPaths();
 bool EnsureVrConfiguration(const ConfigPaths& paths,
     const std::string& template_contents, bool& created, std::wstring& error);
 LoadResult LoadConfiguration(const ConfigPaths& paths);
+CompatibilityWarnings InspectCompatibilitySettings(const ConfigPaths& paths);
 bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     IniDocument& vr_ini, IniDocument& game_settings, std::wstring& error);
 bool SaveConfiguration(const ConfigPaths& paths, const LauncherState& state,

@@ -44,7 +44,9 @@ enum ControlId {
     IdNearViewValue,
     IdVerticalPitch,
     IdFirstPersonGamepadHeadFollow,
+    IdFirstPersonCombatExit,
     IdCinema5x4,
+    IdSteadyIcons,
     IdDiagnosticLogging,
     IdStatus,
     IdConfigureVr,
@@ -207,8 +209,12 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdVerticalPitch), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.first_person_gamepad_head_follow = SendMessageW(
         Item(IdFirstPersonGamepadHeadFollow), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.first_person_combat_exit = SendMessageW(
+        Item(IdFirstPersonCombatExit), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_5x4 = SendMessageW(
         Item(IdCinema5x4), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.steady_icons = SendMessageW(
+        Item(IdSteadyIcons), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.diagnostic_logging = SendMessageW(
         Item(IdDiagnosticLogging), BM_GETCHECK, 0, 0) == BST_CHECKED;
     return true;
@@ -315,6 +321,28 @@ void RestoreOriginalSettings() {
     SetStatus(L"Original dx12user.settings restored.");
 }
 
+void ShowCompatibilityWarnings() {
+    const auto warnings = w3vr::InspectCompatibilitySettings(g_app.paths);
+    if (warnings.ray_tracing_enabled) {
+        MessageBoxW(g_app.window,
+            L"Ray Tracing is enabled.\n\n"
+            L"Ray Tracing has not been fixed for VR and may cause incorrect "
+            L"rendering or unstable headset motion. Disable Ray Tracing in "
+            L"the game's graphics options before launching.",
+            L"Unsupported VR setting: Ray Tracing",
+            MB_OK | MB_ICONWARNING);
+    }
+    if (warnings.ssr_high) {
+        MessageBoxW(g_app.window,
+            L"Screen Space Reflections are set to High.\n\n"
+            L"SSR High has not been fixed for VR. Set Screen Space "
+            L"Reflections to Low or Off in the game's graphics options "
+            L"before launching.",
+            L"Unsupported VR setting: SSR High",
+            MB_OK | MB_ICONWARNING);
+    }
+}
+
 void RestoreLauncherDefaults() {
     LauncherState defaults;
     SendMessageW(Item(IdMode), CB_SETCURSEL,
@@ -343,7 +371,12 @@ void RestoreLauncherDefaults() {
     SendMessageW(Item(IdFirstPersonGamepadHeadFollow), BM_SETCHECK,
         defaults.first_person_gamepad_head_follow
             ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(Item(IdCinema5x4), BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
+        defaults.first_person_combat_exit ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdCinema5x4), BM_SETCHECK,
+        defaults.cinema_5x4 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
+        defaults.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK, BST_UNCHECKED, 0);
     UpdateModeControls();
     UpdateTrackLabels();
@@ -428,8 +461,13 @@ void PopulateControls() {
     SendMessageW(Item(IdFirstPersonGamepadHeadFollow), BM_SETCHECK,
         loaded.state.first_person_gamepad_head_follow
             ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
+        loaded.state.first_person_combat_exit
+            ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinema5x4), BM_SETCHECK,
         loaded.state.cinema_5x4 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
+        loaded.state.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK,
         loaded.state.diagnostic_logging ? BST_CHECKED : BST_UNCHECKED, 0);
     UpdateModeControls();
@@ -463,7 +501,7 @@ void CreateInterface(HWND window) {
         589, 76, 82, 25, IdHeight, WS_EX_CLIENTEDGE);
 
     AddControl(L"BUTTON", L"Comfort and interface", BS_GROUPBOX,
-        20, 138, 680, 568);
+        20, 138, 680, 650);
     AddLabel(L"Presentation size", 38, 166, 170, 22);
     AddTrack(205, 160, 405, IdPresentationScale, 50, 100);
     AddLabel(L"1.00", 625, 166, 54, 22, IdPresentationScaleValue, SS_RIGHT);
@@ -497,35 +535,43 @@ void CreateInterface(HWND window) {
     AddLabel(L"Shows more of the scene during cinematics. HUD elements may appear slightly smaller.",
         58, 546, 610, 34);
 
-    AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 586, 410, 26, IdDiagnosticLogging);
-    AddLabel(L"Saves witcher3vr.log in the game folder for debugging. May affect performance.",
-        58, 612, 610, 34);
+    AddControl(L"BUTTON", L"Steady Icons (adds 1 frame latency)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 586, 410, 26, IdSteadyIcons);
 
     AddControl(L"BUTTON", L"Enable vertical mouse/pad pitch (Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 658, 410, 28, IdVerticalPitch);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 622, 410, 28, IdVerticalPitch);
 
     AddControl(L"BUTTON",
         L"Gamepad Snap Turn + Head Follow (First Person Only, Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 692, 630, 28,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 656, 630, 28,
         IdFirstPersonGamepadHeadFollow);
 
-    AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
-        20, 760, 680, 74);
-    AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
-        38, 790, 650, 24);
+    AddControl(L"BUTTON",
+        L"Auto switch to third person during combats (First Person Only, experimental)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 690, 630, 28,
+        IdFirstPersonCombatExit);
 
-    AddLabel(L"", 20, 850, 680, 38, IdStatus, SS_LEFT);
+    AddControl(L"BUTTON", L"Diagnostic Logging",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 726, 410, 26, IdDiagnosticLogging);
+    AddLabel(L"Saves witcher3vr.log in the game folder for debugging. May affect performance.",
+        58, 752, 610, 34);
+
+    AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
+        20, 796, 680, 74);
+    AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
+        38, 826, 650, 24);
+
+    AddLabel(L"", 20, 880, 680, 38, IdStatus, SS_LEFT);
     AddControl(L"BUTTON", L"Configure Settings for VR", BS_PUSHBUTTON | WS_TABSTOP,
-        20, 902, 220, 36, IdConfigureVr);
+        20, 922, 220, 36, IdConfigureVr);
     AddControl(L"BUTTON", L"Restore Original Settings", BS_PUSHBUTTON | WS_TABSTOP,
-        252, 902, 220, 36, IdRestoreOriginal);
+        252, 922, 220, 36, IdRestoreOriginal);
     AddControl(L"BUTTON", L"Restore Defaults", BS_PUSHBUTTON | WS_TABSTOP,
-        484, 902, 216, 36, IdRestoreDefaults);
+        484, 922, 216, 36, IdRestoreDefaults);
     AddControl(L"BUTTON", L"Save Only", BS_PUSHBUTTON | WS_TABSTOP,
-        406, 968, 130, 36, IdSave);
+        406, 972, 130, 36, IdSave);
     AddControl(L"BUTTON", L"Save && Launch", BS_DEFPUSHBUTTON | WS_TABSTOP,
-        550, 968, 150, 36, IdSaveLaunch);
+        550, 972, 150, 36, IdSaveLaunch);
 
     PopulateControls();
 }
@@ -608,6 +654,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (!window) return 2;
     ShowWindow(window, show);
     UpdateWindow(window);
+    ShowCompatibilityWarnings();
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

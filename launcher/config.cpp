@@ -19,8 +19,8 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {2, false, "none", 0, false},
     {2, false, "taau", 3, false},
     {2, false, "dlss", 6, true},
-    {4, true, "none", 0, false},
-    {4, true, "taau", 3, false},
+    {3, true, "none", 0, false},
+    {3, true, "taau", 3, false},
     {3, true, "dlss", 6, true},
 }};
 
@@ -270,7 +270,7 @@ const wchar_t* ModeDisplayName(RenderMode mode) {
     constexpr const wchar_t* names[]{
         L"Mono - No AA / FXAA", L"Mono - TAAU", L"Mono - DLSS",
         L"Stereo - No AA / FXAA", L"Stereo - TAAU",
-        L"Stereo - DLSS Sequential (Mode 3)"};
+        L"Stereo - DLSS Sequential"};
     return names[static_cast<size_t>(mode)];
 }
 
@@ -316,7 +316,29 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         error = LastErrorMessage(L"Checking configuration", paths.vr_ini);
         return false;
     }
-    if (!AtomicWriteWithBackup(paths.vr_ini, template_contents, error)) {
+
+    // First-run AA inheritance: keep the user's supported native AA choice,
+    // but always initialize its stereo Mode 3 route. Unknown/unsupported AA
+    // values deliberately fall back to the safest release default, No AA.
+    auto first_run = IniDocument::FromText(template_contents);
+    std::wstring game_error;
+    if (const auto game = IniDocument::Load(paths.game_settings, game_error)) {
+        const int aa_mode = ReadInt(*game, "PostProcess", "AAMode", 0);
+        const bool allow_dlss =
+            ReadBool(*game, "Rendering", "AllowDLSS", false);
+        const char* backend = "none";
+        if (aa_mode == 3) {
+            backend = "taau";
+        } else if (aa_mode == 6 && allow_dlss) {
+            backend = "dlss";
+        }
+        first_run.Set("openxr", "mode", "3");
+        first_run.Set("engine", "dual_render_probe", "1");
+        first_run.Set("engine", "dual_render_start", "1");
+        first_run.Set("engine", "temporal_backend", backend);
+    }
+    if (!AtomicWriteWithBackup(
+            paths.vr_ini, first_run.Serialize(), error)) {
         return false;
     }
     created = true;
@@ -337,7 +359,7 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         return result;
     }
 
-    const int xr_mode = ReadInt(*vr, "openxr", "mode", 4);
+    const int xr_mode = ReadInt(*vr, "openxr", "mode", 3);
     const bool dual_probe = ReadBool(*vr, "engine", "dual_render_probe", true);
     const bool dual_start = ReadBool(*vr, "engine", "dual_render_start", true);
     const auto backend = ReadString(*vr, "engine", "temporal_backend", "none");
@@ -356,7 +378,7 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     result.state.width = ReadInt(*vr, "openxr", "render_width", 2688);
     result.state.height = ReadInt(*vr, "openxr", "render_height", 2784);
     const int saved_dlss_quality = std::clamp(
-        ReadInt(*game, "PostProcess", "DLSSQuality", 3), 0, 4);
+        ReadInt(*game, "PostProcess", "DLSSQuality", 1), 0, 4);
     // Combo index 0 is the launcher-owned DLAA mode. NGX still receives the
     // supported Quality preset (1) as bootstrap; dlss_dlaa owns the distinction.
     result.state.dlss_quality =
@@ -364,13 +386,13 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         ? 0
         : std::clamp(saved_dlss_quality, 1, 4);
     result.state.hud_convergence_delta = std::clamp(
-        ReadInt(*vr, "openxr", "hud_stereo_shift_px", -16) + 16, -64, 64);
+        ReadInt(*vr, "openxr", "hud_stereo_shift_px", -36) + 16, -64, 64);
     result.state.presentation_scale = std::clamp(
         ReadFloat(*vr, "openxr", "presentation_scale", 1.0f), 0.5f, 1.0f);
     result.state.hud_horizontal_scale = std::clamp(
         ReadFloat(*vr, "openxr", "hud_horizontal_scale", 0.5f), 0.25f, 1.0f);
     result.state.hud_vertical_scale = std::clamp(
-        ReadFloat(*vr, "openxr", "hud_vertical_scale", 0.5f), 0.25f, 1.0f);
+        ReadFloat(*vr, "openxr", "hud_vertical_scale", 0.85f), 0.25f, 1.0f);
     result.state.menu_scale = std::clamp(
         ReadFloat(*vr, "openxr", "menu_scale", 0.85f), 0.3f, 1.5f);
     result.state.cinema_scale = std::clamp(
@@ -381,14 +403,34 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     result.state.vertical_pitch_enabled = ReadBool(
         *vr, "openxr", "vertical_pitch_enabled", false);
     result.state.cinema_5x4 = ReadBool(
-        *vr, "openxr", "cinema_5x4", false);
+        *vr, "openxr", "cinema_5x4", true);
+    result.state.steady_icons = ReadBool(
+        *vr, "openxr", "steady_icons", false);
     result.state.first_person_gamepad_head_follow =
         ReadBool(*vr, "engine", "first_person_snap_turn", false) &&
         ReadBool(*vr, "engine", "first_person_hmd_body_follow", false);
+    result.state.first_person_combat_exit = ReadBool(
+        *vr, "engine", "first_person_combat_exit", false);
     result.state.diagnostic_logging =
         ReadBool(*vr, "debug", "logging_enabled", false) &&
         ReadBool(*vr, "debug", "runtime_diagnostics", false);
     return result;
+}
+
+CompatibilityWarnings InspectCompatibilitySettings(const ConfigPaths& paths) {
+    CompatibilityWarnings warnings;
+    std::wstring error;
+    const auto game = IniDocument::Load(paths.game_settings, error);
+    if (!game) {
+        return warnings;
+    }
+    warnings.ray_tracing_enabled =
+        ReadBool(*game, "Rendering/RT", "EnableRT", false);
+    // In the DX12 settings file SSREnabled is the High-quality switch. False
+    // covers the supported Low/Off choices.
+    warnings.ssr_high =
+        ReadBool(*game, "Rendering", "SSREnabled", false);
+    return warnings;
 }
 
 bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
@@ -414,6 +456,7 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "vertical_pitch_enabled",
         state.vertical_pitch_enabled ? "1" : "0");
     vr_ini.Set("openxr", "cinema_5x4", state.cinema_5x4 ? "1" : "0");
+    vr_ini.Set("openxr", "steady_icons", state.steady_icons ? "1" : "0");
     vr_ini.Set("engine", "close_camera_offset", FloatString(state.near_view));
     vr_ini.Set("engine", "dual_render_probe", mode.dual_render ? "1" : "0");
     vr_ini.Set("engine", "dual_render_start", mode.dual_render ? "1" : "0");
@@ -425,6 +468,8 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         state.first_person_gamepad_head_follow ? "1" : "0");
     vr_ini.Set("engine", "first_person_hmd_body_follow",
         state.first_person_gamepad_head_follow ? "1" : "0");
+    vr_ini.Set("engine", "first_person_combat_exit",
+        state.first_person_combat_exit ? "1" : "0");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
     vr_ini.Set("engine", "dlss_dlaa", dlss_dlaa ? "1" : "0");
     // [DEBUG 1/2] One launcher switch owns both the log writer and the

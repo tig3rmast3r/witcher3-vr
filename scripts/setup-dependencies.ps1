@@ -41,6 +41,10 @@ Sync-Dependency -Name 'openxr-sdk' `
     -Url 'https://github.com/KhronosGroup/OpenXR-SDK.git' `
     -Commit '5267613edf3d937e3d77556a106a65c2f82b25c6' `
     -SparsePaths @('include')
+Sync-Dependency -Name 'openxr-loader' `
+    -Url 'https://github.com/KhronosGroup/OpenXR-SDK.git' `
+    -Commit '458984d7f59d1ae6dc1b597d94b02e4f7132eaba' `
+    -SparsePaths @('include', 'src')
 Sync-Dependency -Name 'directx-headers' `
     -Url 'https://github.com/microsoft/DirectX-Headers.git' `
     -Commit '2c305c16da8a4450db8d7f1e7d8d014c8bc665ee' `
