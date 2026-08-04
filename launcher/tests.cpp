@@ -63,6 +63,8 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "steady_icons=0\r\n"
         "vertical_pitch_enabled=0\r\n"
         "hmd_position_scale=0.375\r\n"
+        "snap_turn_enabled=1\r\n"
+        "snap_turn_angle=30\r\n"
         "untouched_openxr=alpha\r\n"
         "\r\n"
         "[engine]\r\n"
@@ -72,9 +74,14 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "dual_render_start=1\r\n"
         "close_camera_offset=0.750\r\n"
         "first_person_snap_turn=0\r\n"
+        "first_person_snap_turn_degrees=45\r\n"
         "first_person_hmd_body_follow=0\r\n"
         "first_person_combat_exit=0\r\n"
         "unrelated_engine=42\r\n"
+        "\r\n"
+        "[reverse]\r\n"
+        "enabled=1\r\n"
+        "scan_periodic=0\r\n"
         "\r\n"
         "[debug]\r\n"
         "logging_enabled=0\r\n"
@@ -91,6 +98,9 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "[Rendering]\r\n"
         "AllowDLSS=true\r\n"
         "TextureQuality=Ultra\r\n"
+        "[Localization]\r\n"
+        "SpeechLanguage=DE\r\n"
+        "TextLanguage=DE\r\n"
         "[Galaxy]\r\n"
         "tokenRefA=user-secret\r\n");
 }
@@ -114,6 +124,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.cinema_5x4 = true;
         state.steady_icons = true;
         state.first_person_gamepad_head_follow = true;
+        state.first_person_snap_turn_degrees = 60;
         state.first_person_combat_exit = true;
         state.diagnostic_logging = true;
 
@@ -157,6 +168,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "obsolete HUD size should remain untouched");
         Require(vr.Get("openxr", "hmd_position_scale") == "0.375",
             "launcher must not modify unmanaged HMD position scale");
+        Require(!vr.Get("openxr", "snap_turn_enabled").has_value() &&
+            !vr.Get("openxr", "snap_turn_angle").has_value(),
+            "legacy OpenXR snap-turn keys were not removed");
         Require(vr.Get("openxr", "cinema_scale") == "1.100",
             "cinema scale missing");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
@@ -167,12 +181,18 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "first-person snap-turn flag missing");
         Require(vr.Get("engine", "first_person_hmd_body_follow") == "1",
             "first-person HMD body-follow flag missing");
+        Require(vr.Get("engine", "first_person_snap_turn_degrees") == "60",
+            "first-person snap-turn angle missing");
         Require(vr.Get("engine", "first_person_combat_exit") == "1",
             "first-person combat-exit flag missing");
         Require(vr.Get("debug", "logging_enabled") == "1",
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
             "runtime diagnostics flag missing");
+        Require(vr.Get("reverse", "enabled") == "0",
+            "launcher must clear the obsolete reverse master workaround");
+        Require(vr.Get("reverse", "scan_periodic") == "0",
+            "launcher must preserve individual reverse probe settings");
         Require(vr.Get("debug", "unrelated_debug") == "keep",
             "unrelated debug setting not preserved");
         Require(vr.Get("engine", "close_camera_offset") == "1.250",
@@ -201,6 +221,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "round-trip steady-icons latency mismatch");
         Require(loaded.state.first_person_gamepad_head_follow,
             "round-trip first-person gamepad head-follow mismatch");
+        Require(loaded.state.first_person_snap_turn_degrees == 60,
+            "round-trip first-person snap-turn angle mismatch");
         Require(loaded.state.first_person_combat_exit,
             "round-trip first-person combat-exit mismatch");
         Require(loaded.state.diagnostic_logging,
@@ -240,9 +262,13 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     Require(vr.has_value(), "partial diagnostics fixture load failed");
     vr->Set("debug", "logging_enabled", "1");
     vr->Set("debug", "runtime_diagnostics", "0");
+    vr->Set("engine", "first_person_snap_turn_degrees", "90");
     Write(paths.vr_ini, vr->Serialize());
-    Require(!w3vr::LoadConfiguration(paths).state.diagnostic_logging,
+    const auto partial = w3vr::LoadConfiguration(paths);
+    Require(!partial.state.diagnostic_logging,
         "partial manual diagnostics must not display as a full diagnostic run");
+    Require(partial.state.first_person_snap_turn_degrees == 45,
+        "unsupported snap-turn angles must fall back to 45 degrees");
 }
 
 void TestFallbackAndAtomicSave(const w3vr::ConfigPaths& paths) {
@@ -422,6 +448,9 @@ void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {
     WriteBaseFixtures(paths);
     const std::string original = Read(paths.game_settings);
     const std::string profile =
+        "[Localization]\r\n"
+        "SpeechLanguage=EN\r\n"
+        "TextLanguage=IT\r\n"
         "[Viewport]\r\n"
         "Resolution=\"2688x2784\"\r\n"
         "[Rendering]\r\n"
@@ -441,6 +470,9 @@ void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {
         "complete VR profile was not installed");
     Require(configured->Get("Galaxy", "tokenRefA") == "user-secret",
         "target account data was not preserved");
+    Require(configured->Get("Localization", "SpeechLanguage") == "DE" &&
+        configured->Get("Localization", "TextLanguage") == "DE",
+        "target language settings were not preserved");
 
     Require(w3vr::ConfigureGameSettingsForVr(paths, profile, error),
         "repeated VR baseline install failed");

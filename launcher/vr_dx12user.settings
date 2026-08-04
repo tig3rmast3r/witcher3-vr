@@ -11,11 +11,6 @@ uiVerticalFrameScale=0.85
 uiHorizontalFrameScale=0.5
 [RTXGI/GlobalGrid]
 ProbeMaxRayDist=128
-[Localization]
-RequestedSpeechLanguage=
-SpeechLanguage=EN
-RequestedTextLanguage=
-TextLanguage=IT
 [Viewport]
 VSync=false
 Resolution="2688x2784"

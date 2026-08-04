@@ -44,6 +44,7 @@ enum ControlId {
     IdNearViewValue,
     IdVerticalPitch,
     IdFirstPersonGamepadHeadFollow,
+    IdFirstPersonSnapTurnDegrees,
     IdFirstPersonCombatExit,
     IdCinema5x4,
     IdSteadyIcons,
@@ -141,6 +142,25 @@ void UpdateModeControls() {
     EnableWindow(Item(IdDlssQuality), dlss);
 }
 
+void UpdateFirstPersonControls() {
+    const bool enabled = SendMessageW(Item(IdFirstPersonGamepadHeadFollow),
+        BM_GETCHECK, 0, 0) == BST_CHECKED;
+    EnableWindow(Item(IdFirstPersonSnapTurnDegrees), enabled);
+}
+
+int SnapTurnIndexFor(int degrees) {
+    if (degrees == 30) return 0;
+    if (degrees == 60) return 2;
+    return 1;
+}
+
+int SnapTurnDegreesFor(int index) {
+    constexpr std::array<int, 3> degrees{{30, 45, 60}};
+    return index >= 0 && index < static_cast<int>(degrees.size())
+        ? degrees[static_cast<size_t>(index)]
+        : 45;
+}
+
 void SetEditInteger(HWND edit, int value) {
     SetWindowTextW(edit, std::to_wstring(value).c_str());
 }
@@ -209,6 +229,9 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdVerticalPitch), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.first_person_gamepad_head_follow = SendMessageW(
         Item(IdFirstPersonGamepadHeadFollow), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.first_person_snap_turn_degrees = SnapTurnDegreesFor(
+        static_cast<int>(SendMessageW(
+            Item(IdFirstPersonSnapTurnDegrees), CB_GETCURSEL, 0, 0)));
     state.first_person_combat_exit = SendMessageW(
         Item(IdFirstPersonCombatExit), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_5x4 = SendMessageW(
@@ -371,6 +394,8 @@ void RestoreLauncherDefaults() {
     SendMessageW(Item(IdFirstPersonGamepadHeadFollow), BM_SETCHECK,
         defaults.first_person_gamepad_head_follow
             ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonSnapTurnDegrees), CB_SETCURSEL,
+        SnapTurnIndexFor(defaults.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         defaults.first_person_combat_exit ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinema5x4), BM_SETCHECK,
@@ -379,6 +404,7 @@ void RestoreLauncherDefaults() {
         defaults.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK, BST_UNCHECKED, 0);
     UpdateModeControls();
+    UpdateFirstPersonControls();
     UpdateTrackLabels();
     SetStatus(L"Launcher defaults loaded. Press Save to apply them.");
 }
@@ -432,6 +458,11 @@ void PopulateControls() {
     ComboAdd(quality, L"Performance");
     ComboAdd(quality, L"Ultra Performance");
 
+    HWND snap_turn_degrees = Item(IdFirstPersonSnapTurnDegrees);
+    ComboAdd(snap_turn_degrees, L"30 degrees");
+    ComboAdd(snap_turn_degrees, L"45 degrees");
+    ComboAdd(snap_turn_degrees, L"60 degrees");
+
     const auto loaded = w3vr::LoadConfiguration(g_app.paths);
     g_app.loaded = loaded.state;
     SendMessageW(mode, CB_SETCURSEL, static_cast<int>(loaded.state.mode), 0);
@@ -461,6 +492,8 @@ void PopulateControls() {
     SendMessageW(Item(IdFirstPersonGamepadHeadFollow), BM_SETCHECK,
         loaded.state.first_person_gamepad_head_follow
             ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(snap_turn_degrees, CB_SETCURSEL,
+        SnapTurnIndexFor(loaded.state.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         loaded.state.first_person_combat_exit
             ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -471,6 +504,7 @@ void PopulateControls() {
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK,
         loaded.state.diagnostic_logging ? BST_CHECKED : BST_UNCHECKED, 0);
     UpdateModeControls();
+    UpdateFirstPersonControls();
     UpdateTrackLabels();
     EnableWindow(Item(IdRestoreOriginal),
         w3vr::HasOriginalSettingsBackup(g_app.paths));
@@ -542,9 +576,11 @@ void CreateInterface(HWND window) {
         BS_AUTOCHECKBOX | WS_TABSTOP, 38, 622, 410, 28, IdVerticalPitch);
 
     AddControl(L"BUTTON",
-        L"Gamepad Snap Turn + Head Follow (First Person Only, Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 656, 630, 28,
+        L"Gamepad Snap Turn + Head Follow (First Person, Experimental)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 656, 455, 28,
         IdFirstPersonGamepadHeadFollow);
+    AddLabel(L"Angle", 500, 660, 50, 22);
+    AddCombo(550, 652, 125, IdFirstPersonSnapTurnDegrees);
 
     AddControl(L"BUTTON",
         L"Auto switch to third person during combats (First Person Only, experimental)",
@@ -585,6 +621,9 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
         const int id = LOWORD(wparam);
         const int notification = HIWORD(wparam);
         if (id == IdMode && notification == CBN_SELCHANGE) UpdateModeControls();
+        if (id == IdFirstPersonGamepadHeadFollow && notification == BN_CLICKED) {
+            UpdateFirstPersonControls();
+        }
         if (id == IdResolution && notification == CBN_SELCHANGE) {
             ApplyResolutionPreset(static_cast<int>(SendMessageW(
                 Item(IdResolution), CB_GETCURSEL, 0, 0)));

@@ -256,6 +256,31 @@ void IniDocument::Set(const std::string& wanted_section,
         {wanted_key + "=" + value, default_newline_});
 }
 
+void IniDocument::Remove(const std::string& wanted_section,
+    const std::string& wanted_key) {
+    const std::string section_key = Lower(wanted_section);
+    const std::string key = Lower(wanted_key);
+    std::string section;
+    for (auto line = lines_.begin(); line != lines_.end();) {
+        const std::string trimmed = Trim(line->text);
+        if (trimmed.size() >= 2 && trimmed.front() == '[' &&
+            trimmed.back() == ']') {
+            section = Lower(Trim(trimmed.substr(1, trimmed.size() - 2)));
+            ++line;
+            continue;
+        }
+        const size_t equals = line->text.find('=');
+        if (section == section_key && !trimmed.empty() &&
+            trimmed.front() != ';' && trimmed.front() != '#' &&
+            equals != std::string::npos &&
+            Lower(Trim(line->text.substr(0, equals))) == key) {
+            line = lines_.erase(line);
+        } else {
+            ++line;
+        }
+    }
+}
+
 std::string IniDocument::Serialize() const {
     std::string result;
     for (const auto& line : lines_) result += line.text + line.newline;
@@ -409,6 +434,12 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     result.state.first_person_gamepad_head_follow =
         ReadBool(*vr, "engine", "first_person_snap_turn", false) &&
         ReadBool(*vr, "engine", "first_person_hmd_body_follow", false);
+    const int snap_turn_degrees = ReadInt(
+        *vr, "engine", "first_person_snap_turn_degrees", 45);
+    result.state.first_person_snap_turn_degrees =
+        snap_turn_degrees == 30 || snap_turn_degrees == 60
+        ? snap_turn_degrees
+        : 45;
     result.state.first_person_combat_exit = ReadBool(
         *vr, "engine", "first_person_combat_exit", false);
     result.state.diagnostic_logging =
@@ -468,6 +499,13 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         state.first_person_gamepad_head_follow ? "1" : "0");
     vr_ini.Set("engine", "first_person_hmd_body_follow",
         state.first_person_gamepad_head_follow ? "1" : "0");
+    const int snap_turn_degrees =
+        state.first_person_snap_turn_degrees == 30 ||
+        state.first_person_snap_turn_degrees == 60
+        ? state.first_person_snap_turn_degrees
+        : 45;
+    vr_ini.Set("engine", "first_person_snap_turn_degrees",
+        std::to_string(snap_turn_degrees));
     vr_ini.Set("engine", "first_person_combat_exit",
         state.first_person_combat_exit ? "1" : "0");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
@@ -478,6 +516,15 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         state.diagnostic_logging ? "1" : "0");
     vr_ini.Set("debug", "runtime_diagnostics",
         state.diagnostic_logging ? "1" : "0");
+    // [FIX:FUNCTIONAL-REVERSE-ROUTE 2/2] Functional renderer hooks no longer
+    // depend on the historical reverse master. Clear manual release-era
+    // workarounds on every launcher save while preserving individual probes.
+    vr_ini.Set("reverse", "enabled", "0");
+    // Remove the two pre-release compositor snap-turn keys. V831/V838 use the
+    // first-person native-camera controls in [engine]; retaining these ignored
+    // aliases makes migrated user INIs misleading.
+    vr_ini.Remove("openxr", "snap_turn_enabled");
+    vr_ini.Remove("openxr", "snap_turn_angle");
 
     game_settings.Set("Viewport", "Resolution", "\"" +
         std::to_string(state.width) + "x" + std::to_string(state.height) + "\"");
@@ -559,6 +606,11 @@ bool ConfigureGameSettingsForVr(const ConfigPaths& paths,
     // user out or copies the developer's account data to another installation.
     for (const auto& [key, value] : current->Entries("Galaxy")) {
         configured.Set("Galaxy", key, value);
+    }
+    // Graphics configuration must never select the user's spoken or text
+    // language. Preserve the complete existing localization section instead.
+    for (const auto& [key, value] : current->Entries("Localization")) {
+        configured.Set("Localization", key, value);
     }
 
     const auto backup = OriginalSettingsBackupPath(paths);

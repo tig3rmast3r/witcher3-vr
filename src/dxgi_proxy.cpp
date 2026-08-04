@@ -192,7 +192,7 @@ struct Config {
     // [FEATURE:FIRST-PERSON-SNAP-TURN 1/5] F11-only gamepad yaw. A high
     // threshold triggers one fixed turn and a lower threshold rearms it.
     bool engine_first_person_snap_turn{false};
-    float engine_first_person_snap_turn_degrees{30.0f};
+    float engine_first_person_snap_turn_degrees{45.0f};
     float engine_first_person_snap_turn_activation{0.55f};
     float engine_first_person_snap_turn_release{0.20f};
     // [FEATURE:FIRST-PERSON-HMD-BODY-FOLLOW 1/5] Keep HMD freelook as the
@@ -273,7 +273,8 @@ bool taau_drop_diagnostics_active() {
 }
 
 bool reverse_diagnostic_hooks_requested() {
-    return g_config.runtime_diagnostics ||
+    return g_config.reverse_enabled ||
+        g_config.runtime_diagnostics ||
         g_config.reverse_scan_periodic ||
         g_config.reverse_scan_unmap ||
         g_config.reverse_cbv_probe ||
@@ -3852,7 +3853,7 @@ void load_config() {
             "engine", "first_person_snap_turn", false);
         g_config.engine_first_person_snap_turn_degrees = std::clamp(
             read_ini_float(
-                "engine", "first_person_snap_turn_degrees", 30.0f),
+                "engine", "first_person_snap_turn_degrees", 45.0f),
             5.0f, 90.0f);
         g_config.engine_first_person_snap_turn_activation = std::clamp(
             read_ini_float(
@@ -3982,7 +3983,13 @@ void load_config() {
 }
 
 bool reverse_enabled() {
-    return g_config.reverse_enabled;
+    // [FIX:FUNCTIONAL-REVERSE-ROUTE 1/2] The historical INI switch now owns
+    // optional reverse-engineering diagnostics only. Functional descriptor,
+    // resource and command-list metadata hooks are selected automatically by
+    // the active renderer route, so stereo TAAU no longer depends on users
+    // setting [reverse] enabled=1. Mode 3 keeps its shared transport metadata
+    // for No AA and Sequential DLSS as required by the released contract.
+    return taau_metadata_hooks_needed();
 }
 
 const char* classify_matrix(const float* m) {

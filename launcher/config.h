@@ -40,6 +40,7 @@ struct LauncherState {
     bool cinema_5x4{true};
     bool steady_icons{};
     bool first_person_gamepad_head_follow{};
+    int first_person_snap_turn_degrees{45};
     bool first_person_combat_exit{};
     bool diagnostic_logging{};
 };
@@ -73,6 +74,7 @@ public:
         const std::string& section) const;
     void Set(const std::string& section, const std::string& key,
         const std::string& value);
+    void Remove(const std::string& section, const std::string& key);
     std::string Serialize() const;
 
 private:
