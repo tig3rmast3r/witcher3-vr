@@ -38,11 +38,15 @@ as a runtime dependency.
 | Adjustable in-headset render window | Working |
 | Near-camera view | Working |
 | Experimental first-person exploration view | Available through `F11`, with adaptive on-foot and horse placement |
-| First-person snap turn and headset-based movement | Optional 30-degree gamepad snap turn with continuous HMD-directed movement |
+| First-person snap turn and headset-based movement | Optional 30/45/60-degree gamepad snap turn with continuous HMD-directed movement |
 | First-person combat handoff | Optional automatic switch to third person in combat |
-| Optional 5:4 cinema framing | Working |
+| 5:4 cinema framing | Enabled |
 | HMD-aware render-budget region | Implemented |
 | 2D overlays and world-space icons | Corrected for VR; optional "Steady Icons" mode |
+| Cinema Mode and cutscenes | Mono or stereoscopic, according to the selected rendering mode |
+| Optional automatic cutscenes in Full VR | Available; manual `F10` Cinema Mode remains independent |
+| World-locked menus, inventory, and Cinema Mode | Free HMD rotation while the screen remains stationary |
+| First-person aiming handoff | Temporarily switches to third person while aiming |
 
 The ForceDLAA parameter-query and resolution-override approach is adapted from
 [DLSSTweaks](https://github.com/emoose/DLSSTweaks) by emoose.
@@ -52,6 +56,7 @@ The ForceDLAA parameter-query and resolution-override approach is adapted from
 - Ray tracing
 - Screen Space Reflections (High)
 - Native support for canted displays
+- Far/Distante game camera modes for exploration, combat, and horse riding; only close/near cameras are currently corrected
 
 Headsets with canted displays currently require the manufacturer's
 **Parallel Projection** mode.
@@ -82,6 +87,8 @@ a restriction on using mods.
 
 - Some rare shadows may flicker in stereo.
 - Loading screens may change size, appear blank, or display duplicated images.
+- Black borders may be visible at the sides; depending on the headset, they may
+  also appear at the top or bottom of the image.
 
 ## Requirements
 
@@ -124,9 +131,11 @@ Witcher 3 VR.
 If `witcher3vr.ini` does not exist, the launcher creates it automatically. The
 first run inherits the game's current supported AA choice as **Stereo No AA /
 FXAA**, **Stereo TAAU**, or **Stereo DLSS**. An unknown AA mode falls back to
-**Stereo No AA / FXAA**. Resolution defaults to **Ultra 2688 × 2784** and
-Extended Cinema Framing (5:4) defaults to On. Nothing overwrites an existing
-INI.
+**Stereo No AA / FXAA**. Resolution defaults to **Ultra 2688 × 2784** and 5:4
+Cinema framing is enabled. Older INIs receive a one-time configuration update
+that preserves the selected rendering mode, resolution, Full VR cutscene
+choice, and unrelated custom settings. Later manual tuning is not overwritten
+at launcher startup.
 
 The launcher includes three resolution presets intended for Quest 3 with
 Virtual Desktop. If you use a different headset or runtime, select **Custom**
@@ -195,7 +204,7 @@ Suggested values:
 |---|---|
 | `F8` | Toggle between Standard and Near views |
 | `F9` | Recenter the VR view |
-| `F10` | Toggle 2D Cinema Mode |
+| `F10` | Toggle Cinema Mode; mono in Mono modes, stereoscopic in Stereo modes |
 | `F11` | Toggle First Person (Experimental) |
 
 The First-Person view is experimental and intended for exploration only. It
@@ -205,8 +214,9 @@ placement may not be ideal for every animation or contextual action; Standard
 third-person view is recommended for combat.
 
 The launcher option **Gamepad Snap Turn + Head Follow (First Person Only,
-Experimental)** enables both 30-degree gamepad snap turning and continuous
-headset-based movement direction while `F11` First Person is active. It is
+Experimental)** enables both gamepad snap turning and continuous headset-based
+movement direction while `F11` First Person is active. The snap-turn angle is
+selectable as 30, 45, or 60 degrees and defaults to 45 degrees. The option is
 disabled by default and does not affect Standard, Near, or Cinema views.
 
 The launcher option **Auto switch to third person during combats (First Person
@@ -214,6 +224,20 @@ Only, experimental)** automatically switches from First Person to Standard
 third-person view when combat begins. After combat has remained inactive for
 10 seconds, it returns to First Person. Manual view changes cancel the pending
 automatic return. This option is also disabled by default.
+
+While First Person is active, aiming temporarily uses the Standard third-person
+camera so the weapon trajectory remains aligned with the crosshair. The view
+returns to First Person when aiming ends.
+
+Menus, inventory screens, and Cinema Mode remain stationary in the virtual
+world, allowing free headset rotation instead of moving with the headset.
+Cinema Mode follows the selected rendering mode: Mono modes produce a mono
+screen, while Stereo modes produce a stereoscopic screen.
+
+The launcher option **Show Automatic Cutscenes in Full VR (Experimental)**
+keeps automatic cutscenes in the normal VR camera instead of switching them to
+Cinema Mode. It does not change manual `F10` Cinema Mode. Both routes follow the
+selected Mono or Stereo rendering mode.
 
 Cinema Mode can also be used as a temporary workaround for sections that do
 not render correctly or are difficult to play in VR.

@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -20,7 +21,9 @@ using w3vr::RenderMode;
 
 constexpr wchar_t kWindowClass[] = L"Witcher3VRLauncherWindow";
 constexpr int kClientWidth = 720;
-constexpr int kClientHeight = 1020;
+constexpr int kClientHeight = 1056;
+constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
+    WS_MINIMIZEBOX;
 
 enum ControlId {
     IdMode = 100,
@@ -46,7 +49,7 @@ enum ControlId {
     IdFirstPersonGamepadHeadFollow,
     IdFirstPersonSnapTurnDegrees,
     IdFirstPersonCombatExit,
-    IdCinema5x4,
+    IdCinemaFullVr,
     IdSteadyIcons,
     IdDiagnosticLogging,
     IdStatus,
@@ -57,11 +60,17 @@ enum ControlId {
     IdSaveLaunch,
 };
 
+struct ControlLayout {
+    HWND window{};
+    RECT design{};
+};
+
 struct App {
     HWND window{};
     HFONT font{};
     w3vr::ConfigPaths paths;
     LauncherState loaded;
+    std::vector<ControlLayout> controls;
 };
 
 App g_app;
@@ -81,7 +90,67 @@ HWND AddControl(const wchar_t* class_name, const wchar_t* text, DWORD style,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
         GetModuleHandleW(nullptr), nullptr);
     ApplyFont(control);
+    if (control != nullptr) {
+        g_app.controls.push_back(
+            ControlLayout{control, RECT{x, y, x + width, y + height}});
+    }
     return control;
+}
+
+void LayoutInterface() {
+    if (g_app.window == nullptr || g_app.controls.empty()) return;
+
+    RECT client{};
+    GetClientRect(g_app.window, &client);
+    const int client_width = std::max(client.right - client.left, 1L);
+    const int client_height = std::max(client.bottom - client.top, 1L);
+    const int layout_width = std::min(client_width, kClientWidth);
+    const int layout_height = std::min(client_height, kClientHeight);
+
+    HDWP positions = BeginDeferWindowPos(
+        static_cast<int>(g_app.controls.size()));
+    for (const auto& control : g_app.controls) {
+        const int x = MulDiv(control.design.left, layout_width, kClientWidth);
+        const int y = MulDiv(control.design.top, layout_height, kClientHeight);
+        const int width = std::max(1, MulDiv(
+            control.design.right - control.design.left,
+            layout_width, kClientWidth));
+        const int height = std::max(1, MulDiv(
+            control.design.bottom - control.design.top,
+            layout_height, kClientHeight));
+        if (positions != nullptr) {
+            positions = DeferWindowPos(
+                positions, control.window, nullptr,
+                x, y, width, height,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+        } else {
+            SetWindowPos(
+                control.window, nullptr, x, y, width, height,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+        }
+    }
+    if (positions != nullptr) EndDeferWindowPos(positions);
+    RedrawWindow(g_app.window, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+RECT FitWindowToWorkArea(RECT window_rect) {
+    const HMONITOR monitor = MonitorFromRect(
+        &window_rect, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO info{sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info)) return window_rect;
+
+    const int work_width = info.rcWork.right - info.rcWork.left;
+    const int work_height = info.rcWork.bottom - info.rcWork.top;
+    const int requested_width = static_cast<int>(
+        window_rect.right - window_rect.left);
+    const int requested_height = static_cast<int>(
+        window_rect.bottom - window_rect.top);
+    const int width = std::min(requested_width, work_width);
+    const int height = std::min(requested_height, work_height);
+    const int x = info.rcWork.left + std::max(0, (work_width - width) / 2);
+    const int y = info.rcWork.top + std::max(0, (work_height - height) / 2);
+    return RECT{x, y, x + width, y + height};
 }
 
 HWND AddLabel(const wchar_t* text, int x, int y, int width, int height,
@@ -107,9 +176,8 @@ void ComboAdd(HWND combo, const wchar_t* text) {
     SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text));
 }
 
-void SetStatus(const std::wstring& text, bool error = false) {
+void SetStatus(const std::wstring& text) {
     SetWindowTextW(Item(IdStatus), text.c_str());
-    if (error) MessageBeep(MB_ICONWARNING);
 }
 
 std::wstring FormatFloat(float value) {
@@ -234,8 +302,8 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
             Item(IdFirstPersonSnapTurnDegrees), CB_GETCURSEL, 0, 0)));
     state.first_person_combat_exit = SendMessageW(
         Item(IdFirstPersonCombatExit), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    state.cinema_5x4 = SendMessageW(
-        Item(IdCinema5x4), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.cinema_full_vr = SendMessageW(
+        Item(IdCinemaFullVr), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.steady_icons = SendMessageW(
         Item(IdSteadyIcons), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.diagnostic_logging = SendMessageW(
@@ -398,8 +466,8 @@ void RestoreLauncherDefaults() {
         SnapTurnIndexFor(defaults.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         defaults.first_person_combat_exit ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(Item(IdCinema5x4), BM_SETCHECK,
-        defaults.cinema_5x4 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
+        defaults.cinema_full_vr ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
         defaults.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK, BST_UNCHECKED, 0);
@@ -497,8 +565,8 @@ void PopulateControls() {
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         loaded.state.first_person_combat_exit
             ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(Item(IdCinema5x4), BM_SETCHECK,
-        loaded.state.cinema_5x4 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
+        loaded.state.cinema_full_vr ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
         loaded.state.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK,
@@ -509,11 +577,12 @@ void PopulateControls() {
     EnableWindow(Item(IdRestoreOriginal),
         w3vr::HasOriginalSettingsBackup(g_app.paths));
     SetStatus(loaded.warning.empty() ? L"Ready. Changes apply on the next game launch."
-                                     : loaded.warning, !loaded.warning.empty());
+                                     : loaded.warning);
 }
 
 void CreateInterface(HWND window) {
     g_app.window = window;
+    g_app.controls.clear();
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
     wcscpy_s(metrics.lfMessageFont.lfFaceName, L"Segoe UI");
@@ -535,7 +604,7 @@ void CreateInterface(HWND window) {
         589, 76, 82, 25, IdHeight, WS_EX_CLIENTEDGE);
 
     AddControl(L"BUTTON", L"Comfort and interface", BS_GROUPBOX,
-        20, 138, 680, 650);
+        20, 138, 680, 686);
     AddLabel(L"Presentation size", 38, 166, 170, 22);
     AddTrack(205, 160, 405, IdPresentationScale, 50, 100);
     AddLabel(L"1.00", 625, 166, 54, 22, IdPresentationScaleValue, SS_RIGHT);
@@ -564,52 +633,53 @@ void CreateInterface(HWND window) {
     AddTrack(205, 458, 405, IdNearView, -200, 300);
     AddLabel(L"0.75", 625, 464, 54, 22, IdNearViewValue, SS_RIGHT);
 
-    AddControl(L"BUTTON", L"Extended Cinema Framing (5:4)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 520, 410, 26, IdCinema5x4);
-    AddLabel(L"Shows more of the scene during cinematics. HUD elements may appear slightly smaller.",
-        58, 546, 610, 34);
+    AddControl(L"BUTTON",
+        L"Show Automatic Cutscenes in Full VR (Experimental)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 520, 560, 26,
+        IdCinemaFullVr);
 
     AddControl(L"BUTTON", L"Steady Icons (adds 1 frame latency)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 586, 410, 26, IdSteadyIcons);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 556, 410, 26, IdSteadyIcons);
 
     AddControl(L"BUTTON", L"Enable vertical mouse/pad pitch (Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 622, 410, 28, IdVerticalPitch);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 592, 410, 28, IdVerticalPitch);
 
     AddControl(L"BUTTON",
         L"Gamepad Snap Turn + Head Follow (First Person, Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 656, 455, 28,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 626, 455, 28,
         IdFirstPersonGamepadHeadFollow);
-    AddLabel(L"Angle", 500, 660, 50, 22);
-    AddCombo(550, 652, 125, IdFirstPersonSnapTurnDegrees);
+    AddLabel(L"Angle", 500, 630, 50, 22);
+    AddCombo(550, 622, 125, IdFirstPersonSnapTurnDegrees);
 
     AddControl(L"BUTTON",
         L"Auto switch to third person during combats (First Person Only, experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 690, 630, 28,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 660, 630, 28,
         IdFirstPersonCombatExit);
 
     AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 726, 410, 26, IdDiagnosticLogging);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 696, 410, 26, IdDiagnosticLogging);
     AddLabel(L"Saves witcher3vr.log in the game folder for debugging. May affect performance.",
-        58, 752, 610, 34);
+        58, 722, 610, 34);
 
     AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
-        20, 796, 680, 74);
+        20, 832, 680, 74);
     AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
-        38, 826, 650, 24);
+        38, 862, 650, 24);
 
-    AddLabel(L"", 20, 880, 680, 38, IdStatus, SS_LEFT);
+    AddLabel(L"", 20, 916, 680, 38, IdStatus, SS_LEFT);
     AddControl(L"BUTTON", L"Configure Settings for VR", BS_PUSHBUTTON | WS_TABSTOP,
-        20, 922, 220, 36, IdConfigureVr);
+        20, 958, 220, 36, IdConfigureVr);
     AddControl(L"BUTTON", L"Restore Original Settings", BS_PUSHBUTTON | WS_TABSTOP,
-        252, 922, 220, 36, IdRestoreOriginal);
+        252, 958, 220, 36, IdRestoreOriginal);
     AddControl(L"BUTTON", L"Restore Defaults", BS_PUSHBUTTON | WS_TABSTOP,
-        484, 922, 216, 36, IdRestoreDefaults);
+        484, 958, 216, 36, IdRestoreDefaults);
     AddControl(L"BUTTON", L"Save Only", BS_PUSHBUTTON | WS_TABSTOP,
-        406, 972, 130, 36, IdSave);
+        406, 1008, 130, 36, IdSave);
     AddControl(L"BUTTON", L"Save && Launch", BS_DEFPUSHBUTTON | WS_TABSTOP,
-        550, 972, 150, 36, IdSaveLaunch);
+        550, 1008, 150, 36, IdSaveLaunch);
 
     PopulateControls();
+    LayoutInterface();
 }
 
 LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -617,6 +687,21 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
     case WM_CREATE:
         CreateInterface(window);
         return 0;
+    case WM_SIZE:
+        LayoutInterface();
+        return 0;
+    case WM_DPICHANGED: {
+        const auto suggested = reinterpret_cast<const RECT*>(lparam);
+        if (suggested != nullptr) {
+            const RECT fitted = FitWindowToWorkArea(*suggested);
+            SetWindowPos(window, nullptr,
+                fitted.left, fitted.top,
+                fitted.right - fitted.left,
+                fitted.bottom - fitted.top,
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+        }
+        return 0;
+    }
     case WM_COMMAND: {
         const int id = LOWORD(wparam);
         const int notification = HIWORD(wparam);
@@ -684,11 +769,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (!RegisterClassExW(&window_class)) return 1;
 
     RECT bounds{0, 0, kClientWidth, kClientHeight};
-    AdjustWindowRectEx(&bounds, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
-        WS_MINIMIZEBOX, FALSE, 0);
+    if (!AdjustWindowRectExForDpi(
+            &bounds, kWindowStyle, FALSE, 0, GetDpiForSystem())) {
+        AdjustWindowRectEx(&bounds, kWindowStyle, FALSE, 0);
+    }
+    bounds = FitWindowToWorkArea(bounds);
     HWND window = CreateWindowExW(0, kWindowClass, L"Witcher 3 VR Launcher",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, bounds.right - bounds.left,
+        kWindowStyle,
+        bounds.left, bounds.top, bounds.right - bounds.left,
         bounds.bottom - bounds.top, nullptr, nullptr, instance, nullptr);
     if (!window) return 2;
     ShowWindow(window, show);

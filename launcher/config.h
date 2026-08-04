@@ -37,7 +37,7 @@ struct LauncherState {
     float cinema_scale{0.9f};
     float near_view{0.75f};
     bool vertical_pitch_enabled{};
-    bool cinema_5x4{true};
+    bool cinema_full_vr{};
     bool steady_icons{};
     bool first_person_gamepad_head_follow{};
     int first_person_snap_turn_degrees{45};

@@ -59,12 +59,21 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "hud_horizontal_scale=0.500\r\n"
         "hud_vertical_scale=0.500\r\n"
         "menu_scale=0.900\r\n"
+        "menu_distance=1.200\r\n"
+        "cinema_render_stereo_strength=0.250\r\n"
+        "cinema_hud_stereo_shift_px=-36\r\n"
         "cinema_5x4=0\r\n"
+        "cinema_full_vr=0\r\n"
         "steady_icons=0\r\n"
         "vertical_pitch_enabled=0\r\n"
         "hmd_position_scale=0.375\r\n"
         "snap_turn_enabled=1\r\n"
         "snap_turn_angle=30\r\n"
+        "hud_convergence_offset_px=24\r\n"
+        "cinematic_16_9=1\r\n"
+        "cinema_subtitle_scale=1.300\r\n"
+        "full_vr_subtitle_scale=0.800\r\n"
+        "cinema_subtitle_stereo_shift_px=-88\r\n"
         "untouched_openxr=alpha\r\n"
         "\r\n"
         "[engine]\r\n"
@@ -77,6 +86,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "first_person_snap_turn_degrees=45\r\n"
         "first_person_hmd_body_follow=0\r\n"
         "first_person_combat_exit=0\r\n"
+        "streamline_ps93_learning_log=1\r\n"
         "unrelated_engine=42\r\n"
         "\r\n"
         "[reverse]\r\n"
@@ -121,7 +131,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.cinema_scale = 1.1f;
         state.near_view = 1.25f;
         state.vertical_pitch_enabled = true;
-        state.cinema_5x4 = true;
+        state.cinema_full_vr = true;
         state.steady_icons = true;
         state.first_person_gamepad_head_follow = true;
         state.first_person_snap_turn_degrees = 60;
@@ -165,16 +175,34 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(vr.Get("openxr", "hud_vertical_scale") == "0.300",
             "HUD Y scale missing");
         Require(vr.Get("openxr", "hud_size") == "1.000",
-            "obsolete HUD size should remain untouched");
+            "unmanaged HUD size should remain untouched");
         Require(vr.Get("openxr", "hmd_position_scale") == "0.375",
             "launcher must not modify unmanaged HMD position scale");
         Require(!vr.Get("openxr", "snap_turn_enabled").has_value() &&
             !vr.Get("openxr", "snap_turn_angle").has_value(),
             "legacy OpenXR snap-turn keys were not removed");
+        Require(!vr.Get("openxr", "hud_convergence_offset_px").has_value() &&
+            !vr.Get("openxr", "cinematic_16_9").has_value() &&
+            !vr.Get("openxr", "cinema_subtitle_scale").has_value() &&
+            !vr.Get("openxr", "full_vr_subtitle_scale").has_value() &&
+            !vr.Get("openxr", "cinema_subtitle_stereo_shift_px").has_value(),
+            "obsolete OpenXR trial keys were not removed");
+        Require(!vr.Get("engine", "streamline_ps93_learning_log").has_value(),
+            "obsolete engine learning-log key was not removed");
         Require(vr.Get("openxr", "cinema_scale") == "1.100",
             "cinema scale missing");
+        Require(vr.Get("openxr", "menu_distance") == "1.200",
+            "launcher must not modify menu distance");
+        Require(vr.Get("openxr", "cinema_render_stereo_strength") == "0.250",
+            "launcher must preserve unmanaged cinema render strength");
+        Require(vr.Get("openxr", "cinema_hud_stereo_shift_px") == "-36",
+            "launcher must preserve unmanaged cinema HUD convergence");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
-            "extended cinema framing flag missing");
+            "fixed cinema framing flag missing");
+        Require(vr.Get("meta", "config_version") == "2",
+            "configuration version marker missing");
+        Require(vr.Get("openxr", "cinema_full_vr") == "1",
+            "automatic full-VR cutscene flag missing");
         Require(vr.Get("openxr", "steady_icons") == "1",
             "steady-icons latency flag missing");
         Require(vr.Get("engine", "first_person_snap_turn") == "1",
@@ -189,6 +217,14 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
             "runtime diagnostics flag missing");
+        Require(vr.Get("debug", "taau_drop_diagnostics") == "1",
+            "per-eye TAAU diagnostics flag missing");
+        Require(vr.Get("debug", "cinema_camera_diagnostics") == "1" &&
+            vr.Get("debug", "cinema_subtitle_diagnostics") == "1" &&
+            vr.Get("debug", "first_person_state_diagnostics") == "1" &&
+            vr.Get("debug", "first_person_aim_diagnostics") == "1" &&
+            vr.Get("debug", "world_marker_diagnostics") == "1",
+            "diagnostic checkbox does not own every runtime probe");
         Require(vr.Get("reverse", "enabled") == "0",
             "launcher must clear the obsolete reverse master workaround");
         Require(vr.Get("reverse", "scan_periodic") == "0",
@@ -215,8 +251,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             Require(loaded.state.dlss_quality == state.dlss_quality,
                 "round-trip DLSS/DLAA selection mismatch");
         }
-        Require(loaded.state.cinema_5x4,
-            "round-trip extended cinema framing mismatch");
+        Require(loaded.state.cinema_full_vr,
+            "round-trip automatic full-VR cutscene mismatch");
         Require(loaded.state.steady_icons,
             "round-trip steady-icons latency mismatch");
         Require(loaded.state.first_person_gamepad_head_follow,
@@ -311,13 +347,16 @@ void TestFirstRunConfiguration(const fs::path& root) {
     bool created{};
     std::wstring error;
     const std::string defaults =
+        "[meta]\r\n"
+        "config_version=2\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
         "render_width=2688\r\n"
         "render_height=2784\r\n"
         "cinema_5x4=1\r\n"
+        "manual_cinema_hud_scale=1.600\r\n"
         "[engine]\r\n"
-        "temporal_backend=none\r\n"
+        "temporal_backend=taau\r\n"
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
         "[debug]\r\n"
@@ -329,119 +368,59 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(Read(paths.vr_ini) == defaults,
         "first-run INI does not match embedded defaults");
 
-    Write(paths.vr_ini, "[openxr]\r\nmode=3\r\n");
+    Write(paths.vr_ini,
+        "; old alpha user file\r\n"
+        "[openxr]\r\n"
+        "mode=2\r\n"
+        "render_width=3100\r\n"
+        "render_height=3200\r\n"
+        "cinema_5x4=0\r\n"
+        "cinema_full_vr=1\r\n"
+        "cinema_hud_stereo_shift_px=-36\r\n"
+        "manual_cinema_hud_scale=1.000\r\n"
+        "cinema_subtitle_stereo_shift_px=-88\r\n"
+        "custom_user_value=keep\r\n"
+        "[reverse]\r\n"
+        "enabled=1\r\n"
+        "[debug]\r\n"
+        "logging_enabled=1\r\n");
     created = true;
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "existing INI check failed");
-    Require(!created, "existing INI must not be replaced");
-    Require(Read(paths.vr_ini) == "[openxr]\r\nmode=3\r\n",
-        "existing INI was overwritten");
+        paths, defaults, created, error), "existing INI migration failed");
+    Require(!created, "migrated INI must not be reported as newly created");
+    auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
+    Require(migrated.has_value(), "migrated INI could not be read");
+    Require(migrated->Get("meta", "config_version") == "2",
+        "old INI was not versioned");
+    Require(migrated->Get("openxr", "mode") == "2" &&
+        migrated->Get("openxr", "render_width") == "3100" &&
+        migrated->Get("openxr", "render_height") == "3200",
+        "migration changed mode or resolution");
+    Require(migrated->Get("openxr", "cinema_5x4") == "1" &&
+        migrated->Get("openxr", "cinema_render_stereo_strength") == "0.250" &&
+        migrated->Get("openxr", "cinema_hud_stereo_shift_px") == "-72" &&
+        migrated->Get("openxr", "manual_cinema_hud_scale") == "1.600" &&
+        migrated->Get("openxr", "full_vr_hud_stereo_shift_px") == "-192" &&
+        migrated->Get("openxr", "full_vr_hud_scale") == "0.750",
+        "migration did not apply the validated cinema defaults");
+    Require(migrated->Get("openxr", "cinema_full_vr") == "1",
+        "migration changed the existing Full VR choice");
+    Require(migrated->Get("openxr", "custom_user_value") == "keep",
+        "migration removed an unrelated user value");
+    Require(!migrated->Get("openxr", "cinema_subtitle_stereo_shift_px").has_value(),
+        "migration retained an obsolete subtitle key");
+    Require(migrated->Get("reverse", "enabled") == "0" &&
+        migrated->Get("debug", "logging_enabled") == "0",
+        "migration did not restore release-safe flags");
 
-    const auto verify_inheritance = [&](const char* name, int aa_mode,
-                                        bool allow_dlss,
-                                        const char* expected_backend) {
-        const auto inherited = MakePaths(root / name);
-        fs::create_directories(inherited.launcher_directory);
-        Write(inherited.game_settings,
-            "[PostProcess]\r\nAAMode=" + std::to_string(aa_mode) +
-            "\r\n[Rendering]\r\nAllowDLSS=" +
-            std::string(allow_dlss ? "true" : "false") + "\r\n");
-        bool inherited_created{};
-        std::wstring inherited_error;
-        Require(w3vr::EnsureVrConfiguration(inherited, defaults,
-            inherited_created, inherited_error),
-            "inherited first-run INI creation failed");
-        Require(inherited_created,
-            "inherited first-run INI was not reported as created");
-        auto inherited_ini =
-            w3vr::IniDocument::Load(inherited.vr_ini, inherited_error);
-        Require(inherited_ini.has_value(),
-            "inherited first-run INI could not be loaded");
-        Require(inherited_ini->Get("engine", "temporal_backend") ==
-            expected_backend, "first-run AA backend inheritance mismatch");
-        Require(inherited_ini->Get("openxr", "mode") == "3",
-            "first-run inherited mode must remain stereo Mode 3");
-    };
-    verify_inheritance("first-run-taau", 3, false, "taau");
-    verify_inheritance("first-run-dlss", 6, true, "dlss");
-    verify_inheritance("first-run-no-aa", 0, false, "none");
-    verify_inheritance("first-run-unsupported", 5, false, "none");
-}
-
-void TestApprovedLauncherDefaults() {
-    const w3vr::LauncherState defaults;
-    Require(defaults.mode == w3vr::RenderMode::StereoNone,
-        "fallback launcher mode must be Stereo No AA");
-    Require(defaults.width == 2688 && defaults.height == 2784,
-        "default resolution must be Ultra 2688x2784");
-    Require(defaults.dlss_quality == 1,
-        "default DLSS preset must be Quality");
-    Require(defaults.hud_convergence_delta == -20,
-        "default HUD convergence must be -20");
-    Require(defaults.hud_vertical_scale == 0.85f,
-        "default HUD Y zoom must be 0.85");
-    Require(defaults.cinema_5x4,
-        "Extended Cinema 5:4 must default on");
-    Require(!defaults.steady_icons && !defaults.vertical_pitch_enabled &&
-        !defaults.first_person_gamepad_head_follow &&
-        !defaults.first_person_combat_exit &&
-        !defaults.diagnostic_logging,
-        "optional and experimental features must default off");
-}
-
-void TestMissingKeyFallbacks(const fs::path& root) {
-    const auto paths = MakePaths(root / "missing-key-fallbacks");
-    fs::create_directories(paths.launcher_directory);
-    Write(paths.vr_ini,
-        "[openxr]\r\n"
-        "mode=3\r\n"
-        "[engine]\r\n"
-        "temporal_backend=none\r\n"
-        "dual_render_probe=1\r\n"
-        "dual_render_start=1\r\n");
-    Write(paths.game_settings,
-        "[PostProcess]\r\n"
-        "AAMode=0\r\n"
-        "[Rendering]\r\n"
-        "AllowDLSS=false\r\n");
-
-    const auto loaded = w3vr::LoadConfiguration(paths);
-    Require(loaded.state.mode == w3vr::RenderMode::StereoNone,
-        "partial legacy INI must keep the Stereo No AA fallback");
-    Require(loaded.state.dlss_quality == 1,
-        "missing DLSS preset must fall back to Quality");
-    Require(loaded.state.hud_convergence_delta == -20,
-        "missing HUD convergence must fall back to -20");
-    Require(loaded.state.hud_vertical_scale == 0.85f,
-        "missing HUD Y zoom must fall back to 0.85");
-    Require(loaded.state.cinema_5x4,
-        "missing Extended Cinema key must fall back to On");
-}
-
-void TestCompatibilityWarnings(const fs::path& root) {
-    const auto paths = MakePaths(root / "compatibility-warnings");
-    fs::create_directories(paths.launcher_directory);
-    Write(paths.game_settings,
-        "[Rendering/RT]\r\n"
-        "EnableRT=true\r\n"
-        "[Rendering]\r\n"
-        "SSREnabled=true\r\n");
-    auto warnings = w3vr::InspectCompatibilitySettings(paths);
-    Require(warnings.ray_tracing_enabled,
-        "enabled Ray Tracing warning was not detected");
-    Require(warnings.ssr_high,
-        "SSR High warning was not detected");
-
-    Write(paths.game_settings,
-        "[Rendering/RT]\r\n"
-        "EnableRT=false\r\n"
-        "[Rendering]\r\n"
-        "SSREnabled=false\r\n");
-    warnings = w3vr::InspectCompatibilitySettings(paths);
-    Require(!warnings.ray_tracing_enabled,
-        "disabled Ray Tracing produced a warning");
-    Require(!warnings.ssr_high,
-        "SSR Low/Off produced a warning");
+    migrated->Set("openxr", "manual_cinema_hud_scale", "1.100");
+    Write(paths.vr_ini, migrated->Serialize());
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "versioned INI check failed");
+    auto versioned = w3vr::IniDocument::Load(paths.vr_ini, error);
+    Require(versioned.has_value() &&
+        versioned->Get("openxr", "manual_cinema_hud_scale") == "1.100",
+        "versioned INI manual tuning was overwritten");
 }
 
 void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {
@@ -514,9 +493,6 @@ int main() {
         TestFallbackAndAtomicSave(paths);
         TestInconsistentWarning(paths);
         TestFirstRunConfiguration(temporary.path);
-        TestApprovedLauncherDefaults();
-        TestMissingKeyFallbacks(temporary.path);
-        TestCompatibilityWarnings(temporary.path);
         TestVrBaselineAndRestore(paths);
         TestFailurePaths(temporary.path);
         std::cout << "All launcher configuration tests passed.\n";

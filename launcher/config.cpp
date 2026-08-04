@@ -24,6 +24,46 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {3, true, "dlss", 6, true},
 }};
 
+constexpr int kCurrentConfigVersion = 2;
+
+void RemoveObsoleteSettings(IniDocument& ini) {
+    ini.Remove("openxr", "snap_turn_enabled");
+    ini.Remove("openxr", "snap_turn_angle");
+    ini.Remove("openxr", "hud_convergence_offset_px");
+    ini.Remove("openxr", "cinematic_16_9");
+    ini.Remove("openxr", "cinema_subtitle_scale");
+    ini.Remove("openxr", "full_vr_subtitle_scale");
+    ini.Remove("openxr", "cinema_subtitle_stereo_shift_px");
+    ini.Remove("engine", "streamline_ps93_learning_log");
+}
+
+void MigrateConfigurationToV2(IniDocument& ini) {
+    // These are the validated 0.9.1 defaults. Apply them once to INIs from the
+    // first alpha, while leaving render mode, resolution and user-owned values
+    // untouched. The version marker prevents later launcher starts from
+    // overwriting manual tuning.
+    ini.Set("openxr", "cinema_render_stereo_strength", "0.250");
+    ini.Set("openxr", "cinema_hud_stereo_shift_px", "-72");
+    ini.Set("openxr", "manual_cinema_hud_scale", "1.600");
+    ini.Set("openxr", "full_vr_hud_stereo_shift_px", "-192");
+    ini.Set("openxr", "full_vr_hud_scale", "0.750");
+    ini.Set("openxr", "cinema_5x4", "1");
+    if (!ini.Get("openxr", "cinema_full_vr").has_value()) {
+        ini.Set("openxr", "cinema_full_vr", "0");
+    }
+    ini.Set("reverse", "enabled", "0");
+    ini.Set("debug", "logging_enabled", "0");
+    ini.Set("debug", "runtime_diagnostics", "0");
+    ini.Set("debug", "taau_drop_diagnostics", "0");
+    ini.Set("debug", "cinema_camera_diagnostics", "0");
+    ini.Set("debug", "cinema_subtitle_diagnostics", "0");
+    ini.Set("debug", "first_person_state_diagnostics", "0");
+    ini.Set("debug", "first_person_aim_diagnostics", "0");
+    ini.Set("debug", "world_marker_diagnostics", "0");
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
+}
+
 std::string Trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -332,7 +372,15 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
     created = false;
     const DWORD attributes = GetFileAttributesW(paths.vr_ini.c_str());
     if (attributes != INVALID_FILE_ATTRIBUTES) {
-        return true;
+        const auto existing = IniDocument::Load(paths.vr_ini, error);
+        if (!existing) return false;
+        if (ReadInt(*existing, "meta", "config_version", 0) >=
+            kCurrentConfigVersion) {
+            return true;
+        }
+        auto migrated = *existing;
+        MigrateConfigurationToV2(migrated);
+        return AtomicWriteWithBackup(paths.vr_ini, migrated.Serialize(), error);
     }
     const DWORD lookup_error = GetLastError();
     if (lookup_error != ERROR_FILE_NOT_FOUND &&
@@ -341,7 +389,6 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         error = LastErrorMessage(L"Checking configuration", paths.vr_ini);
         return false;
     }
-
     // First-run AA inheritance: keep the user's supported native AA choice,
     // but always initialize its stereo Mode 3 route. Unknown/unsupported AA
     // values deliberately fall back to the safest release default, No AA.
@@ -427,8 +474,8 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         ReadFloat(*vr, "engine", "close_camera_offset", 0.75f), -2.0f, 3.0f);
     result.state.vertical_pitch_enabled = ReadBool(
         *vr, "openxr", "vertical_pitch_enabled", false);
-    result.state.cinema_5x4 = ReadBool(
-        *vr, "openxr", "cinema_5x4", true);
+    result.state.cinema_full_vr = ReadBool(
+        *vr, "openxr", "cinema_full_vr", false);
     result.state.steady_icons = ReadBool(
         *vr, "openxr", "steady_icons", false);
     result.state.first_person_gamepad_head_follow =
@@ -452,9 +499,7 @@ CompatibilityWarnings InspectCompatibilitySettings(const ConfigPaths& paths) {
     CompatibilityWarnings warnings;
     std::wstring error;
     const auto game = IniDocument::Load(paths.game_settings, error);
-    if (!game) {
-        return warnings;
-    }
+    if (!game) return warnings;
     warnings.ray_tracing_enabled =
         ReadBool(*game, "Rendering/RT", "EnableRT", false);
     // In the DX12 settings file SSREnabled is the High-quality switch. False
@@ -486,7 +531,11 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "cinema_scale", FloatString(state.cinema_scale));
     vr_ini.Set("openxr", "vertical_pitch_enabled",
         state.vertical_pitch_enabled ? "1" : "0");
-    vr_ini.Set("openxr", "cinema_5x4", state.cinema_5x4 ? "1" : "0");
+    // Cinema framing is intentionally fixed in the launcher. Keep the INI key
+    // because the renderer still consumes it and advanced users can inspect it.
+    vr_ini.Set("openxr", "cinema_5x4", "1");
+    vr_ini.Set("openxr", "cinema_full_vr",
+        state.cinema_full_vr ? "1" : "0");
     vr_ini.Set("openxr", "steady_icons", state.steady_icons ? "1" : "0");
     vr_ini.Set("engine", "close_camera_offset", FloatString(state.near_view));
     vr_ini.Set("engine", "dual_render_probe", mode.dual_render ? "1" : "0");
@@ -510,11 +559,23 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         state.first_person_combat_exit ? "1" : "0");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
     vr_ini.Set("engine", "dlss_dlaa", dlss_dlaa ? "1" : "0");
-    // [DEBUG 1/2] One launcher switch owns both the log writer and the
-    // higher-detail runtime probes, so release and diagnostic runs use one DLL.
+    // [DEBUG 1/2] One launcher switch owns the log writer and every bounded
+    // runtime probe, so release and diagnostic runs use one DLL.
     vr_ini.Set("debug", "logging_enabled",
         state.diagnostic_logging ? "1" : "0");
     vr_ini.Set("debug", "runtime_diagnostics",
+        state.diagnostic_logging ? "1" : "0");
+    vr_ini.Set("debug", "taau_drop_diagnostics",
+        state.diagnostic_logging ? "1" : "0");
+    vr_ini.Set("debug", "cinema_camera_diagnostics",
+        state.diagnostic_logging ? "1" : "0");
+    vr_ini.Set("debug", "cinema_subtitle_diagnostics",
+        state.diagnostic_logging ? "1" : "0");
+    vr_ini.Set("debug", "first_person_state_diagnostics",
+        state.diagnostic_logging ? "1" : "0");
+    vr_ini.Set("debug", "first_person_aim_diagnostics",
+        state.diagnostic_logging ? "1" : "0");
+    vr_ini.Set("debug", "world_marker_diagnostics",
         state.diagnostic_logging ? "1" : "0");
     // [FIX:FUNCTIONAL-REVERSE-ROUTE 2/2] Functional renderer hooks no longer
     // depend on the historical reverse master. Clear manual release-era
@@ -523,8 +584,10 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     // Remove the two pre-release compositor snap-turn keys. V831/V838 use the
     // first-person native-camera controls in [engine]; retaining these ignored
     // aliases makes migrated user INIs misleading.
-    vr_ini.Remove("openxr", "snap_turn_enabled");
-    vr_ini.Remove("openxr", "snap_turn_angle");
+    // Remove distributed trial keys that no longer have a runtime consumer.
+    // Keep all other unmanaged renderer values intact.
+    RemoveObsoleteSettings(vr_ini);
+    vr_ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 
     game_settings.Set("Viewport", "Resolution", "\"" +
         std::to_string(state.width) + "x" + std::to_string(state.height) + "\"");
