@@ -344,6 +344,24 @@ bool ModeUsesDlss(RenderMode mode) {
         mode == RenderMode::StereoDlssSequential;
 }
 
+std::optional<int> DlssNearSquareCompatibleWidth(const LauncherState& state) {
+    constexpr int kResolutionAdjustment = 48;
+    constexpr int kMinimumResolution = 640;
+    constexpr int kMaximumResolution = 8192;
+    if (!ModeUsesDlss(state.mode) || state.dlss_quality == 0 ||
+        std::abs(state.width - state.height) >= kResolutionAdjustment) {
+        return std::nullopt;
+    }
+    const int adjusted_width = state.width <= state.height
+        ? state.width - kResolutionAdjustment
+        : state.width + kResolutionAdjustment;
+    if (adjusted_width >= kMinimumResolution &&
+        adjusted_width <= kMaximumResolution) {
+        return adjusted_width;
+    }
+    return std::nullopt;
+}
+
 ConfigPaths DiscoverPaths() {
     std::array<wchar_t, 32768> buffer{};
     const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
@@ -489,6 +507,8 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         : 45;
     result.state.first_person_combat_exit = ReadBool(
         *vr, "engine", "first_person_combat_exit", false);
+    result.state.fast_movement_transitions = ReadBool(
+        *game, "DLC", "DlcEnabled_movementinputfix", true);
     result.state.diagnostic_logging =
         ReadBool(*vr, "debug", "logging_enabled", false) &&
         ReadBool(*vr, "debug", "runtime_diagnostics", false);
@@ -598,6 +618,10 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
             : std::clamp(state.dlss_quality, 1, 4)));
     game_settings.Set("Rendering", "AllowDLSS",
         mode.allow_dlss ? "true" : "false");
+    // The DLC remains installed; REDengine's native DLC switch keeps its
+    // animation-behavior mounter dormant when the launcher option is disabled.
+    game_settings.Set("DLC", "DlcEnabled_movementinputfix",
+        state.fast_movement_transitions ? "1" : "0");
     return true;
 }
 

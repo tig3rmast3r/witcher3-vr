@@ -31,6 +31,9 @@ $thirdPartyNotices = Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md'
 $stateBridgeRoot = Join-Path $repositoryRoot 'support/modWitcher3VRStateBridge'
 $stateBridgeScript = Join-Path $stateBridgeRoot `
     'content/scripts/local/witcher3vr/first_person_state_bridge.ws'
+$movementDlcRoot = Join-Path $repositoryRoot 'support/dlcmovementinputfix'
+$movementDlcBundle = Join-Path $movementDlcRoot 'content/blob0.bundle'
+$movementDlcMetadata = Join-Path $movementDlcRoot 'content/metadata.store'
 
 if (-not (Test-Path -LiteralPath (Join-Path $openXrLoaderSource 'CMakeLists.txt') `
         -PathType Leaf)) {
@@ -56,7 +59,9 @@ foreach ($requiredFile in @(
         $readme,
         $license,
         $thirdPartyNotices,
-        $stateBridgeScript)) {
+        $stateBridgeScript,
+        $movementDlcBundle,
+        $movementDlcMetadata)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Missing release input: $requiredFile"
     }
@@ -100,6 +105,11 @@ try {
     Copy-Item -LiteralPath $stateBridgeRoot `
         -Destination (Join-Path $modsStage 'modWitcher3VRStateBridge') -Recurse
 
+    $dlcStage = Join-Path $releaseStage 'dlc'
+    New-Item -ItemType Directory -Path $dlcStage | Out-Null
+    Copy-Item -LiteralPath $movementDlcRoot `
+        -Destination (Join-Path $dlcStage 'dlcmovementinputfix') -Recurse
+
     $documentationStage = Join-Path $releaseStage 'Witcher3VR'
     $configStage = Join-Path $documentationStage 'config'
     New-Item -ItemType Directory -Path $configStage -Force | Out-Null
@@ -125,10 +135,16 @@ try {
     $launcherHash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash
     $openXrLoaderHash =
         (Get-FileHash -LiteralPath $openXrLoader -Algorithm SHA256).Hash
+    $movementDlcBundleHash =
+        (Get-FileHash -LiteralPath $movementDlcBundle -Algorithm SHA256).Hash
+    $movementDlcMetadataHash =
+        (Get-FileHash -LiteralPath $movementDlcMetadata -Algorithm SHA256).Hash
     $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
     $manifestLines += "dll.sha256=$dllHash"
     $manifestLines += "launcher.sha256=$launcherHash"
     $manifestLines += "openxr_loader.sha256=$openXrLoaderHash"
+    $manifestLines += "movement_dlc_bundle.sha256=$movementDlcBundleHash"
+    $manifestLines += "movement_dlc_metadata.sha256=$movementDlcMetadataHash"
     $manifestLines += "archive.sha256=$archiveHash"
 
     $manifestPath = Join-Path $OutputDirectory "Witcher3VR-$normalizedVersion-SHA256.txt"

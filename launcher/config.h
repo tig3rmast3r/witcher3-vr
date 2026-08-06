@@ -42,6 +42,7 @@ struct LauncherState {
     bool first_person_gamepad_head_follow{};
     int first_person_snap_turn_degrees{45};
     bool first_person_combat_exit{};
+    bool fast_movement_transitions{true};
     bool diagnostic_logging{};
 };
 
@@ -89,6 +90,7 @@ private:
 const ModeSettings& SettingsForMode(RenderMode mode);
 const wchar_t* ModeDisplayName(RenderMode mode);
 bool ModeUsesDlss(RenderMode mode);
+std::optional<int> DlssNearSquareCompatibleWidth(const LauncherState& state);
 
 ConfigPaths DiscoverPaths();
 bool EnsureVrConfiguration(const ConfigPaths& paths,

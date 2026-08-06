@@ -37,9 +37,10 @@ as a runtime dependency.
 | Resizable HUD and menus | Working |
 | Adjustable in-headset render window | Working |
 | Near-camera view | Working |
-| Experimental first-person exploration view | Available through `F11`, with adaptive on-foot and horse placement |
+| Experimental first-person exploration view | Available through `F11`, with adaptive on-foot and horse placement plus stationary view-following body rotation |
 | First-person snap turn and headset-based movement | Optional 30/45/60-degree gamepad snap turn with continuous HMD-directed movement |
 | First-person combat handoff | Optional automatic switch to third person in combat |
+| Faster movement transitions | Optional and enabled by default in both third and first person |
 | 5:4 cinema framing | Enabled |
 | HMD-aware render-budget region | Implemented |
 | 2D overlays and world-space icons | Corrected for VR; optional "Steady Icons" mode |
@@ -117,7 +118,7 @@ only the hooks required for the selected mode.
    The Witcher 3\
    ```
 
-   The archive already contains the correct `bin\x64_dx12`, `mods`, and
+   The archive already contains the correct `bin\x64_dx12`, `mods`, `dlc`, and
    `Witcher3VR` folders, including the required OpenXR loader.
 3. Run `bin\x64_dx12\Witcher3VRLauncher.exe`.
 4. Select the rendering mode and resolution.
@@ -127,6 +128,11 @@ The package also installs the bundled `modWitcher3VRStateBridge` script under
 the game's `mods` directory. It supplies the instantaneous locomotion and
 combat state used by the experimental First-Person view and is part of
 Witcher 3 VR.
+
+The bundled Fast Transitions DLC remains installed, while the launcher option
+**Faster Movement Transitions (Recommended)** controls REDengine's native DLC
+enable flag. It is enabled by default and can be disabled without removing or
+renaming any files; the change applies on the next game launch.
 
 If `witcher3vr.ini` does not exist, the launcher creates it automatically. The
 first run inherits the game's current supported AA choice as **Stereo No AA /
@@ -219,6 +225,12 @@ movement direction while `F11` First Person is active. The snap-turn angle is
 selectable as 30, 45, or 60 degrees and defaults to 45 degrees. The option is
 disabled by default and does not affect Standard, Near, or Cinema views.
 
+When First Person is stationary on foot, Geralt follows the viewing direction
+so targets can be acquired without first starting a movement animation. The
+view remains detached from the body turn, and normal free look resumes as soon
+as locomotion begins. Combat, horse riding, swimming, diving, menus, Cinema
+Mode, and cutscenes are excluded from this behavior.
+
 The launcher option **Auto switch to third person during combats (First Person
 Only, experimental)** automatically switches from First Person to Standard
 third-person view when combat begins. After combat has remained inactive for
@@ -294,6 +306,8 @@ top of the repository.
   implementation reference
 - [emoose / DLSSTweaks](https://github.com/emoose/DLSSTweaks) — ForceDLAA
   parameter-query and resolution-override approach
+- [Next Gen Movement Input Lag Fix — Fumio Edition](https://www.nexusmods.com/witcher3/mods/7586)
+  — behavior-graph foundation for the optional Fast Transitions DLC
 - [MinHook](https://github.com/TsudaKageyu/minhook) — Windows API hooking
   library
 - [Khronos OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK)

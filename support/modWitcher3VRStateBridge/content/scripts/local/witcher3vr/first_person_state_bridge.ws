@@ -16,6 +16,7 @@
 //   7 horse trot
 //   8 horse gallop/canter
 //   9 foot indoor walk (running is disabled by the interior)
+//  10 unsupported first-person locomotion (swimming/diving)
 //   0 combat (locomotion is irrelevant after the DLL leaves first person)
 
 @addField(CR4Player)
@@ -39,7 +40,9 @@ function W3VR_RestoreStateBridgeFov(camera: CCustomCamera) {
   }
 
   // Marker base 4096, state stride 128, native FOV retained in the remainder.
-  if (camera.fov >= 5248.0f && camera.fov < 5376.0f) {
+  if (camera.fov >= 5376.0f && camera.fov < 5504.0f) {
+    camera.fov -= 5376.0f;
+  } else if (camera.fov >= 5248.0f && camera.fov < 5376.0f) {
     camera.fov -= 5248.0f;
   } else if (camera.fov >= 5120.0f && camera.fov < 5248.0f) {
     camera.fov -= 5120.0f;
@@ -67,14 +70,14 @@ function W3VR_PublishStateBridgeFov(
   stateCode: int,
   inCombat: bool
 ) {
-  if (!camera || stateCode < 1 || stateCode > 9) {
+  if (!camera || stateCode < 1 || stateCode > 10) {
     return;
   }
 
   W3VR_RestoreStateBridgeFov(camera);
   if (inCombat) {
-    // Keep the complete bridge inside the original V705 marker range, plus
-    // state 9 for walk-only interiors.
+    // Keep the original V705 marker layout; states 9 and 10 extend it for
+    // walk-only interiors and unsupported first-person locomotion.
     camera.fov += 4096.0f;
   } else if (stateCode == 1) {
     camera.fov += 4224.0f;
@@ -92,8 +95,10 @@ function W3VR_PublishStateBridgeFov(
     camera.fov += 4992.0f;
   } else if (stateCode == 8) {
     camera.fov += 5120.0f;
-  } else {
+  } else if (stateCode == 9) {
     camera.fov += 5248.0f;
+  } else {
+    camera.fov += 5376.0f;
   }
 }
 
@@ -120,7 +125,7 @@ function W3VR_PublishStateBridgeChange(
 ) {
   var camera: CCustomCamera;
 
-  if (!player || stateCode < 1 || stateCode > 9) {
+  if (!player || stateCode < 1 || stateCode > 10) {
     return;
   }
   if (
@@ -144,6 +149,11 @@ function W3VR_PublishStateBridgeChange(
 }
 
 function W3VR_GetFootState(player: CR4Player): int {
+  // Do not let swimming/diving inherit the retained ordinary foot-idle state.
+  // The DLL uses this dedicated edge only to suppress the snap-turn basis fix.
+  if (player.IsSwimming() || player.OnCheckDiving()) {
+    return 10;
+  }
   if (player.GetIsSprinting()) {
     return 4;
   }

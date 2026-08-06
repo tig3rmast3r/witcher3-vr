@@ -173,8 +173,14 @@ game and compatible NVIDIA driver.
 ## CD PROJEKT RED fan content
 
 Witcher 3 VR is an unofficial fan work and is not approved or endorsed by
-CD PROJEKT RED. It does not distribute game assets and requires a legally
-obtained copy of The Witcher 3: Wild Hunt.
+CD PROJEKT RED and requires a legally obtained copy of The Witcher 3: Wild
+Hunt.
+
+The optional Fast Transitions DLC contains a modified Geralt behavior graph.
+Its foundation is the **Next Gen Movement Input Lag Fix — Fumio Edition**
+(Nexus Mods project 7586); Witcher 3 VR adds narrowly scoped transition changes
+for direct run starts and quick reversals. This component and the underlying
+REDengine game data are not relicensed under Witcher 3 VR's MIT License.
 
 Fan Content Guidelines:
 https://www.cdprojektred.com/en/fan-content

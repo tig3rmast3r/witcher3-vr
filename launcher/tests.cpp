@@ -108,6 +108,9 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "[Rendering]\r\n"
         "AllowDLSS=true\r\n"
         "TextureQuality=Ultra\r\n"
+        "[DLC]\r\n"
+        "DlcEnabled_movementinputfix=0\r\n"
+        "DlcEnabled_unrelated=0\r\n"
         "[Localization]\r\n"
         "SpeechLanguage=DE\r\n"
         "TextLanguage=DE\r\n"
@@ -136,6 +139,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.first_person_gamepad_head_follow = true;
         state.first_person_snap_turn_degrees = 60;
         state.first_person_combat_exit = true;
+        state.fast_movement_transitions = index % 2 == 0;
         state.diagnostic_logging = true;
 
         w3vr::IniDocument vr;
@@ -166,6 +170,11 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(game.Get("Viewport", "Resolution") == "\"" +
             std::to_string(state.width) + "x" + std::to_string(state.height) + "\"",
             "wrong game resolution");
+        Require(game.Get("DLC", "DlcEnabled_movementinputfix") ==
+            std::string(state.fast_movement_transitions ? "1" : "0"),
+            "wrong faster-transitions DLC flag");
+        Require(game.Get("DLC", "DlcEnabled_unrelated") == "0",
+            "unrelated DLC flag not preserved");
         Require(vr.Get("openxr", "hud_stereo_shift_px") == "-9",
             "wrong zero-relative convergence conversion");
         Require(vr.Get("openxr", "presentation_scale") == "0.850",
@@ -261,9 +270,63 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "round-trip first-person snap-turn angle mismatch");
         Require(loaded.state.first_person_combat_exit,
             "round-trip first-person combat-exit mismatch");
+        Require(loaded.state.fast_movement_transitions ==
+            state.fast_movement_transitions,
+            "round-trip faster-transitions DLC mismatch");
         Require(loaded.state.diagnostic_logging,
             "round-trip diagnostic logging mismatch");
     }
+}
+
+void TestDlssNearSquareResolutionCompatibility() {
+    w3vr::LauncherState state;
+    state.width = 2560;
+    state.height = 2560;
+    state.mode = w3vr::RenderMode::StereoDlssSequential;
+    state.dlss_quality = 3;
+    Require(w3vr::DlssNearSquareCompatibleWidth(state) == 2512,
+        "stereo scaled DLSS square resolution was not adjusted by 48 pixels");
+
+    state.width = 2880;
+    state.height = 2880;
+    state.mode = w3vr::RenderMode::MonoDlss;
+    state.dlss_quality = 1;
+    Require(w3vr::DlssNearSquareCompatibleWidth(state) == 2832,
+        "mono scaled DLSS square resolution was not adjusted by 48 pixels");
+
+    state.width = 2160;
+    state.height = 2193;
+    Require(w3vr::DlssNearSquareCompatibleWidth(state) == 2112,
+        "portrait near-square DLSS resolution was not moved away from square");
+
+    state.width = 2193;
+    state.height = 2160;
+    Require(w3vr::DlssNearSquareCompatibleWidth(state) == 2241,
+        "landscape near-square DLSS resolution was not moved away from square");
+
+    state.dlss_quality = 0;
+    Require(!w3vr::DlssNearSquareCompatibleWidth(state).has_value(),
+        "DLAA square resolution must remain unchanged");
+
+    state.dlss_quality = 4;
+    state.mode = w3vr::RenderMode::StereoTaau;
+    Require(!w3vr::DlssNearSquareCompatibleWidth(state).has_value(),
+        "non-DLSS square resolution must remain unchanged");
+
+    state.mode = w3vr::RenderMode::StereoDlssSequential;
+    state.width = 2832;
+    state.height = 2880;
+    Require(!w3vr::DlssNearSquareCompatibleWidth(state).has_value(),
+        "already corrected DLSS resolution must not be adjusted twice");
+
+    state.width = 2833;
+    state.height = 2880;
+    Require(w3vr::DlssNearSquareCompatibleWidth(state) == 2785,
+        "47-pixel DLSS difference must still be adjusted");
+
+    state.width = 2832;
+    Require(!w3vr::DlssNearSquareCompatibleWidth(state).has_value(),
+        "48-pixel DLSS difference must be accepted");
 }
 
 void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
@@ -305,6 +368,12 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
         "partial manual diagnostics must not display as a full diagnostic run");
     Require(partial.state.first_person_snap_turn_degrees == 45,
         "unsupported snap-turn angles must fall back to 45 degrees");
+
+    game->Remove("DLC", "DlcEnabled_movementinputfix");
+    Write(paths.game_settings, game->Serialize());
+    const auto missing_dlc_flag = w3vr::LoadConfiguration(paths);
+    Require(missing_dlc_flag.state.fast_movement_transitions,
+        "missing faster-transitions DLC flag must default to enabled");
 }
 
 void TestFallbackAndAtomicSave(const w3vr::ConfigPaths& paths) {
@@ -488,6 +557,7 @@ int main() {
     try {
         TempDirectory temporary;
         const auto paths = MakePaths(temporary.path);
+        TestDlssNearSquareResolutionCompatibility();
         TestAllModes(paths);
         TestDlssLabelsAndLegacyAuto(paths);
         TestFallbackAndAtomicSave(paths);

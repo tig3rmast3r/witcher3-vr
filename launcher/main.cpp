@@ -49,6 +49,7 @@ enum ControlId {
     IdFirstPersonGamepadHeadFollow,
     IdFirstPersonSnapTurnDegrees,
     IdFirstPersonCombatExit,
+    IdFastMovementTransitions,
     IdCinemaFullVr,
     IdSteadyIcons,
     IdDiagnosticLogging,
@@ -302,6 +303,8 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
             Item(IdFirstPersonSnapTurnDegrees), CB_GETCURSEL, 0, 0)));
     state.first_person_combat_exit = SendMessageW(
         Item(IdFirstPersonCombatExit), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.fast_movement_transitions = SendMessageW(
+        Item(IdFastMovementTransitions), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_full_vr = SendMessageW(
         Item(IdCinemaFullVr), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.steady_icons = SendMessageW(
@@ -466,6 +469,8 @@ void RestoreLauncherDefaults() {
         SnapTurnIndexFor(defaults.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         defaults.first_person_combat_exit ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
+        defaults.fast_movement_transitions ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
         defaults.cinema_full_vr ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
@@ -489,6 +494,27 @@ void Save(bool launch) {
     if (!CaptureState(state, error)) {
         MessageBoxW(g_app.window, error.c_str(), L"Invalid settings",
             MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (const auto compatible_width =
+            w3vr::DlssNearSquareCompatibleWidth(state)) {
+        const std::wstring adjusted_resolution =
+            std::to_wstring(*compatible_width) + L" x " +
+            std::to_wstring(state.height);
+        const std::wstring message =
+            L"A REDengine bug prevents DLSS from working correctly with "
+            L"square and near-square resolutions.\n\nThe resolution will be adjusted to " +
+            adjusted_resolution +
+            L".\n\nNo settings will be saved and the game will not launch yet. "
+            L"Press Save or Save & Launch again to continue.";
+        MessageBoxW(g_app.window, message.c_str(),
+            L"DLSS resolution compatibility", MB_OK | MB_ICONINFORMATION);
+        SendMessageW(Item(IdResolution), CB_SETCURSEL, 3, 0);
+        SetEditInteger(Item(IdWidth), *compatible_width);
+        SetEditInteger(Item(IdHeight), state.height);
+        EnableWindow(Item(IdWidth), TRUE);
+        EnableWindow(Item(IdHeight), TRUE);
+        SetStatus(L"DLSS resolution adjusted. Nothing was saved; press Save again.");
         return;
     }
     if (!w3vr::SaveConfiguration(g_app.paths, state, error)) {
@@ -564,6 +590,9 @@ void PopulateControls() {
         SnapTurnIndexFor(loaded.state.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         loaded.state.first_person_combat_exit
+            ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
+        loaded.state.fast_movement_transitions
             ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
         loaded.state.cinema_full_vr ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -656,10 +685,15 @@ void CreateInterface(HWND window) {
         BS_AUTOCHECKBOX | WS_TABSTOP, 38, 660, 630, 28,
         IdFirstPersonCombatExit);
 
+    AddControl(L"BUTTON",
+        L"Faster Movement Transitions (Recommended)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 696, 520, 26,
+        IdFastMovementTransitions);
+
     AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 696, 410, 26, IdDiagnosticLogging);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 732, 410, 26, IdDiagnosticLogging);
     AddLabel(L"Saves witcher3vr.log in the game folder for debugging. May affect performance.",
-        58, 722, 610, 34);
+        58, 758, 610, 34);
 
     AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
         20, 832, 680, 74);
