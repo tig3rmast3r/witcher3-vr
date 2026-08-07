@@ -31,17 +31,20 @@ struct LauncherState {
     int dlss_quality{1};
     int hud_convergence_delta{-20};
     float presentation_scale{1.0f};
-    float hud_horizontal_scale{0.5f};
-    float hud_vertical_scale{0.85f};
     float menu_scale{0.85f};
     float cinema_scale{0.9f};
+    float cinema_hud_scale{1.30f};
+    int cinema_hud_convergence_offset{};
+    float full_vr_hud_scale{1.00f};
+    int full_vr_hud_convergence_offset{};
     float near_view{0.75f};
     bool vertical_pitch_enabled{};
-    bool cinema_full_vr{};
+    bool cinema_full_vr{true};
     bool steady_icons{};
     bool first_person_gamepad_head_follow{};
     int first_person_snap_turn_degrees{45};
-    bool first_person_combat_exit{};
+    bool first_person_combat_exit{true};
+    bool first_person_stationary_turn{};
     bool fast_movement_transitions{true};
     bool diagnostic_logging{};
 };
@@ -91,10 +94,13 @@ const ModeSettings& SettingsForMode(RenderMode mode);
 const wchar_t* ModeDisplayName(RenderMode mode);
 bool ModeUsesDlss(RenderMode mode);
 std::optional<int> DlssNearSquareCompatibleWidth(const LauncherState& state);
+int CinemaHudConvergenceShift(float hud_scale, int offset);
+int FullVrHudConvergenceShift(float hud_scale, int offset);
 
 ConfigPaths DiscoverPaths();
 bool EnsureVrConfiguration(const ConfigPaths& paths,
     const std::string& template_contents, bool& created, std::wstring& error);
+bool EnsureHudEditorSetup(const ConfigPaths& paths, std::wstring& error);
 LoadResult LoadConfiguration(const ConfigPaths& paths);
 CompatibilityWarnings InspectCompatibilitySettings(const ConfigPaths& paths);
 bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,

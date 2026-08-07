@@ -24,7 +24,51 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {3, true, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 2;
+constexpr int kCurrentConfigVersion = 5;
+constexpr float kCinemaHudReferenceScale = 1.30f;
+constexpr int kCinemaHudReferenceShift = -72;
+constexpr float kFullVrHudReferenceScale = 1.00f;
+// The V1022 physical HUD plane makes shift * size the inverse-depth authority.
+// Full VR now defaults directly to gameplay's validated -36 at size 1.0:
+// about one metre on the Quest 3 reference instead of the old ~25 cm plane.
+constexpr int kFullVrHudReferenceShift = -36;
+
+int ProportionalHudConvergenceShift(
+    float hud_scale,
+    float reference_scale,
+    int reference_shift,
+    int offset) {
+    // Convergence is authored in source HUD pixels. Scale its validated base
+    // by the selected HUD-size ratio first; the user-facing slider is then a
+    // small correction around that automatic value, never the whole value.
+    const float safe_scale = std::clamp(hud_scale, 0.5f, 1.5f);
+    const int automatic_shift = static_cast<int>(std::lround(
+        static_cast<float>(reference_shift) * safe_scale /
+        reference_scale));
+    return std::clamp(automatic_shift + std::clamp(offset, -64, 64),
+        -512, 512);
+}
+
+int PhysicalPlaneHudConvergenceShift(
+    float hud_scale,
+    float reference_scale,
+    int reference_shift,
+    int offset) {
+    // A physical plane derives inverse distance from source shift * HUD size.
+    // Vary shift inversely with size so the size control does not also move
+    // the plane toward or away from the viewer.
+    const float safe_scale = std::clamp(hud_scale, 0.5f, 1.5f);
+    const int automatic_shift = static_cast<int>(std::lround(
+        static_cast<float>(reference_shift) * reference_scale /
+        safe_scale));
+    return std::clamp(automatic_shift + std::clamp(offset, -64, 64),
+        -512, 512);
+}
+
+int ReadInt(const IniDocument& doc, const char* section, const char* key,
+    int fallback);
+float ReadFloat(const IniDocument& doc, const char* section, const char* key,
+    float fallback);
 
 void RemoveObsoleteSettings(IniDocument& ini) {
     ini.Remove("openxr", "snap_turn_enabled");
@@ -49,7 +93,7 @@ void MigrateConfigurationToV2(IniDocument& ini) {
     ini.Set("openxr", "full_vr_hud_scale", "0.750");
     ini.Set("openxr", "cinema_5x4", "1");
     if (!ini.Get("openxr", "cinema_full_vr").has_value()) {
-        ini.Set("openxr", "cinema_full_vr", "0");
+        ini.Set("openxr", "cinema_full_vr", "1");
     }
     ini.Set("reverse", "enabled", "0");
     ini.Set("debug", "logging_enabled", "0");
@@ -60,6 +104,52 @@ void MigrateConfigurationToV2(IniDocument& ini) {
     ini.Set("debug", "first_person_state_diagnostics", "0");
     ini.Set("debug", "first_person_aim_diagnostics", "0");
     ini.Set("debug", "world_marker_diagnostics", "0");
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "2");
+}
+
+void MigrateConfigurationToV3(IniDocument& ini) {
+    // V3 exposes the automatic Cinema3D HUD scale and makes the stationary
+    // first-person body turn optional. Seed only absent values so a V2 user's
+    // advanced INI tuning remains authoritative.
+    if (!ini.Get("openxr", "cinema_hud_scale").has_value()) {
+        ini.Set("openxr", "cinema_hud_scale", "1.300");
+    }
+    if (!ini.Get("engine", "first_person_stationary_turn").has_value()) {
+        ini.Set("engine", "first_person_stationary_turn", "0");
+    }
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "3");
+}
+
+void MigrateConfigurationToV4(IniDocument& ini) {
+    // The independent X/Y HUD zoom controls were removed from the supported
+    // launcher surface in V978. Normalize values inherited from older INIs
+    // once so the compositor starts from an undistorted 1:1 HUD again.
+    ini.Set("openxr", "hud_horizontal_scale", "1.000");
+    ini.Set("openxr", "hud_vertical_scale", "1.000");
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "4");
+}
+
+void MigrateConfigurationToV5(IniDocument& ini) {
+    // Preserve the user's old slider offset while moving Full VR onto the
+    // physical-plane depth contract. V4 stored a proportional -192/0.75 base;
+    // V5 stores an inverse-size -36/1.0 base at gameplay-HUD depth.
+    const float previous_hud_scale = std::clamp(
+        ReadFloat(ini, "openxr", "full_vr_hud_scale", 0.75f),
+        0.5f, 1.5f);
+    const int stored_shift = ReadInt(
+        ini, "openxr", "full_vr_hud_stereo_shift_px", -192);
+    const int old_automatic_shift = static_cast<int>(std::lround(
+        -192.0f * previous_hud_scale / 0.75f));
+    const int preserved_offset = std::clamp(
+        stored_shift - old_automatic_shift, -64, 64);
+    ini.Set("openxr", "full_vr_hud_scale", "1.000");
+    ini.Set("openxr", "full_vr_hud_stereo_shift_px", std::to_string(
+        PhysicalPlaneHudConvergenceShift(
+            1.0f, kFullVrHudReferenceScale,
+            kFullVrHudReferenceShift, preserved_offset)));
     RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
@@ -168,6 +258,184 @@ RenderMode BestEffortMode(int xr_mode, const std::string& backend) {
     if (backend == "dlss_packed") return RenderMode::StereoDlssSequential;
     if (backend == "dlss") return stereo ? RenderMode::StereoDlssSequential : RenderMode::MonoDlss;
     return stereo ? RenderMode::StereoNone : RenderMode::MonoNone;
+}
+
+struct EditableTextLine {
+    std::string text;
+    std::string newline;
+};
+
+std::vector<EditableTextLine> ParseEditableText(const std::string& text) {
+    std::vector<EditableTextLine> lines;
+    size_t cursor{};
+    while (cursor < text.size()) {
+        const size_t end = text.find_first_of("\r\n", cursor);
+        if (end == std::string::npos) {
+            lines.push_back({text.substr(cursor), {}});
+            break;
+        }
+        size_t next = end + 1;
+        std::string newline(1, text[end]);
+        if (text[end] == '\r' && next < text.size() && text[next] == '\n') {
+            newline = "\r\n";
+            ++next;
+        }
+        lines.push_back({text.substr(cursor, end - cursor), newline});
+        cursor = next;
+    }
+    return lines;
+}
+
+std::string SerializeEditableText(
+    const std::vector<EditableTextLine>& lines) {
+    std::string result;
+    for (const auto& line : lines) result += line.text + line.newline;
+    return result;
+}
+
+std::string PreferredNewline(const std::vector<EditableTextLine>& lines) {
+    for (const auto& line : lines) {
+        if (!line.newline.empty()) return line.newline;
+    }
+    return "\r\n";
+}
+
+bool SectionBounds(const std::vector<EditableTextLine>& lines,
+    const std::string& wanted_section, size_t& header, size_t& end) {
+    const std::string wanted = Lower(wanted_section);
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string trimmed = Trim(lines[i].text);
+        if (trimmed.size() < 2 || trimmed.front() != '[' ||
+            trimmed.back() != ']') {
+            continue;
+        }
+        if (Lower(Trim(trimmed.substr(1, trimmed.size() - 2))) != wanted) {
+            continue;
+        }
+        header = i;
+        end = lines.size();
+        for (size_t j = i + 1; j < lines.size(); ++j) {
+            const std::string candidate = Trim(lines[j].text);
+            if (candidate.size() >= 2 && candidate.front() == '[' &&
+                candidate.back() == ']') {
+                end = j;
+                break;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool SectionHasAction(const std::vector<EditableTextLine>& lines,
+    const std::string& section, const std::string& action) {
+    size_t header{};
+    size_t end{};
+    if (!SectionBounds(lines, section, header, end)) return false;
+    const std::string token = "Action=" + action;
+    for (size_t i = header + 1; i < end; ++i) {
+        if (lines[i].text.find(token) != std::string::npos) return true;
+    }
+    return false;
+}
+
+void EnsureSectionAction(std::vector<EditableTextLine>& lines,
+    const std::string& section, const std::string& action,
+    const std::string& default_binding, const std::string& newline) {
+    if (SectionHasAction(lines, section, action)) return;
+
+    size_t header{};
+    size_t end{};
+    if (!SectionBounds(lines, section, header, end)) {
+        if (!lines.empty() && lines.back().newline.empty()) {
+            lines.back().newline = newline;
+        }
+        if (!lines.empty() && !lines.back().text.empty()) {
+            lines.push_back({{}, newline});
+        }
+        lines.push_back({"[" + section + "]", newline});
+        lines.push_back({default_binding, newline});
+        return;
+    }
+
+    size_t insertion = end;
+    while (insertion > header + 1 && lines[insertion - 1].text.empty()) {
+        --insertion;
+    }
+    lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insertion),
+        {default_binding, newline});
+}
+
+void RemoveLegacyHudEditorBindings(std::vector<EditableTextLine>& lines) {
+    size_t header{};
+    size_t end{};
+    if (!SectionBounds(lines, "W3VRHudEditor", header, end)) return;
+
+    const bool legacy_arrows =
+        !SectionHasAction(lines, "W3VRHudEditor", "W3VRHudEditorMoveLeft") &&
+        !SectionHasAction(lines, "W3VRHudEditor", "W3VRHudEditorMoveRight") &&
+        std::any_of(lines.begin() + static_cast<std::ptrdiff_t>(header + 1),
+            lines.begin() + static_cast<std::ptrdiff_t>(end),
+            [](const EditableTextLine& line) {
+                return Trim(line.text) ==
+                    "IK_Left=(Action=W3VRHudEditorPrevious)";
+            }) &&
+        std::any_of(lines.begin() + static_cast<std::ptrdiff_t>(header + 1),
+            lines.begin() + static_cast<std::ptrdiff_t>(end),
+            [](const EditableTextLine& line) {
+                return Trim(line.text) ==
+                    "IK_Right=(Action=W3VRHudEditorNext)";
+            });
+
+    for (size_t i = end; i-- > header + 1;) {
+        const std::string line = Trim(lines[i].text);
+        const bool obsolete =
+            line.find("Action=W3VRHudEditorMoveX") != std::string::npos ||
+            line.find("Action=W3VRHudEditorMoveY") != std::string::npos ||
+            line.find("Action=W3VRHudEditorDrag") != std::string::npos ||
+            line == "IK_MouseX=(Action=GI_MouseDampX)" ||
+            line == "IK_MouseY=(Action=GI_MouseDampY)" ||
+            (legacy_arrows &&
+                (line == "IK_Left=(Action=W3VRHudEditorPrevious)" ||
+                 line == "IK_Right=(Action=W3VRHudEditorNext)"));
+        if (obsolete) {
+            lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(i));
+        }
+    }
+}
+
+std::string MergeHudEditorBindings(const std::string& original) {
+    auto lines = ParseEditableText(original);
+    const std::string newline = PreferredNewline(lines);
+    RemoveLegacyHudEditorBindings(lines);
+
+    constexpr std::array<const char*, 12> toggle_contexts{
+        "Boat", "BoatPassenger", "Combat", "Combat_Replacer_Ciri",
+        "Diving", "Exploration", "Exploration_Replacer_Ciri", "Horse",
+        "Horse_Replacer_Ciri", "JumpClimb", "Scene", "Swimming"};
+    for (const char* context : toggle_contexts) {
+        EnsureSectionAction(lines, context, "W3VRHudEditorToggle",
+            "IK_Insert=(Action=W3VRHudEditorToggle)", newline);
+    }
+
+    constexpr std::array<std::pair<const char*, const char*>, 12> editor_actions{{
+        {"W3VRHudEditorToggle", "IK_Insert=(Action=W3VRHudEditorToggle)"},
+        {"W3VRHudEditorExit", "IK_Escape=(Action=W3VRHudEditorExit)"},
+        {"W3VRHudEditorPrevious", "IK_Q=(Action=W3VRHudEditorPrevious)"},
+        {"W3VRHudEditorNext", "IK_E=(Action=W3VRHudEditorNext)"},
+        {"W3VRHudEditorMoveLeft", "IK_Left=(Action=W3VRHudEditorMoveLeft)"},
+        {"W3VRHudEditorMoveRight", "IK_Right=(Action=W3VRHudEditorMoveRight)"},
+        {"W3VRHudEditorMoveUp", "IK_Up=(Action=W3VRHudEditorMoveUp)"},
+        {"W3VRHudEditorMoveDown", "IK_Down=(Action=W3VRHudEditorMoveDown)"},
+        {"W3VRHudEditorScale", "IK_MouseZ=(Action=W3VRHudEditorScale)"},
+        {"W3VRHudEditorResetCurrent", "IK_R=(Action=W3VRHudEditorResetCurrent)"},
+        {"W3VRHudEditorResetProfile", "IK_X=(Action=W3VRHudEditorResetProfile)"},
+        {"W3VRHudEditorProfile", "IK_Tab=(Action=W3VRHudEditorProfile)"},
+    }};
+    for (const auto& [action, binding] : editor_actions) {
+        EnsureSectionAction(lines, "W3VRHudEditor", action, binding, newline);
+    }
+    return SerializeEditableText(lines);
 }
 
 } // namespace
@@ -344,6 +612,18 @@ bool ModeUsesDlss(RenderMode mode) {
         mode == RenderMode::StereoDlssSequential;
 }
 
+int CinemaHudConvergenceShift(float hud_scale, int offset) {
+    return ProportionalHudConvergenceShift(
+        hud_scale, kCinemaHudReferenceScale,
+        kCinemaHudReferenceShift, offset);
+}
+
+int FullVrHudConvergenceShift(float hud_scale, int offset) {
+    return PhysicalPlaneHudConvergenceShift(
+        hud_scale, kFullVrHudReferenceScale,
+        kFullVrHudReferenceShift, offset);
+}
+
 std::optional<int> DlssNearSquareCompatibleWidth(const LauncherState& state) {
     constexpr int kResolutionAdjustment = 48;
     constexpr int kMinimumResolution = 640;
@@ -392,12 +672,24 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
     if (attributes != INVALID_FILE_ATTRIBUTES) {
         const auto existing = IniDocument::Load(paths.vr_ini, error);
         if (!existing) return false;
-        if (ReadInt(*existing, "meta", "config_version", 0) >=
-            kCurrentConfigVersion) {
+        const int existing_version = ReadInt(
+            *existing, "meta", "config_version", 0);
+        if (existing_version >= kCurrentConfigVersion) {
             return true;
         }
         auto migrated = *existing;
-        MigrateConfigurationToV2(migrated);
+        if (existing_version < 2) {
+            MigrateConfigurationToV2(migrated);
+        }
+        if (existing_version < 3) {
+            MigrateConfigurationToV3(migrated);
+        }
+        if (existing_version < 4) {
+            MigrateConfigurationToV4(migrated);
+        }
+        if (existing_version < 5) {
+            MigrateConfigurationToV5(migrated);
+        }
         return AtomicWriteWithBackup(paths.vr_ini, migrated.Serialize(), error);
     }
     const DWORD lookup_error = GetLastError();
@@ -432,6 +724,74 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         return false;
     }
     created = true;
+    return true;
+}
+
+bool EnsureHudEditorSetup(const ConfigPaths& paths, std::wstring& error) {
+    const auto bin_directory = paths.launcher_directory.parent_path();
+    const auto game_root = bin_directory.parent_path();
+    const auto script = game_root / L"mods" / L"modWitcher3VRHUDEditor" /
+        L"content" / L"scripts" / L"local" /
+        L"witcher3vr_hud_editor" / L"hud_editor.ws";
+    const auto config_directory = bin_directory / L"config" / L"r4game" /
+        L"user_config_matrix" / L"pc";
+    const auto xml = config_directory / L"modWitcher3VRHUDEditor.xml";
+    const auto filelist = config_directory / L"dx12filelist.txt";
+    const auto input_settings =
+        paths.game_settings.parent_path() / L"input.settings";
+
+    for (const auto& required : {script, xml, filelist, input_settings}) {
+        const DWORD attributes = GetFileAttributesW(required.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            error = L"HUD editor setup file was not found:\n" +
+                required.wstring();
+            return false;
+        }
+    }
+
+    const auto read_text = [&error](const std::filesystem::path& path)
+        -> std::optional<std::string> {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) {
+            error = L"Could not open HUD setup file:\n" + path.wstring();
+            return std::nullopt;
+        }
+        std::string contents((std::istreambuf_iterator<char>(stream)), {});
+        if (!stream.good() && !stream.eof()) {
+            error = L"Could not read HUD setup file:\n" + path.wstring();
+            return std::nullopt;
+        }
+        return contents;
+    };
+
+    const auto original_filelist = read_text(filelist);
+    if (!original_filelist) return false;
+    auto filelist_lines = ParseEditableText(*original_filelist);
+    const bool registered = std::any_of(filelist_lines.begin(),
+        filelist_lines.end(), [](const EditableTextLine& line) {
+            return Trim(line.text) == "modWitcher3VRHUDEditor.xml;";
+        });
+    if (!registered) {
+        const std::string newline = PreferredNewline(filelist_lines);
+        if (!filelist_lines.empty() && filelist_lines.back().newline.empty()) {
+            filelist_lines.back().newline = newline;
+        }
+        filelist_lines.push_back(
+            {"modWitcher3VRHUDEditor.xml;", newline});
+        if (!AtomicWriteWithBackup(
+                filelist, SerializeEditableText(filelist_lines), error)) {
+            return false;
+        }
+    }
+
+    const auto original_input = read_text(input_settings);
+    if (!original_input) return false;
+    const std::string merged_input = MergeHudEditorBindings(*original_input);
+    if (merged_input != *original_input &&
+        !AtomicWriteWithBackup(input_settings, merged_input, error)) {
+        return false;
+    }
     return true;
 }
 
@@ -479,21 +839,29 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         ReadInt(*vr, "openxr", "hud_stereo_shift_px", -36) + 16, -64, 64);
     result.state.presentation_scale = std::clamp(
         ReadFloat(*vr, "openxr", "presentation_scale", 1.0f), 0.5f, 1.0f);
-    result.state.hud_horizontal_scale = std::clamp(
-        ReadFloat(*vr, "openxr", "hud_horizontal_scale", 0.5f), 0.25f, 1.0f);
-    result.state.hud_vertical_scale = std::clamp(
-        ReadFloat(*vr, "openxr", "hud_vertical_scale", 0.85f), 0.25f, 1.0f);
     result.state.menu_scale = std::clamp(
         ReadFloat(*vr, "openxr", "menu_scale", 0.85f), 0.3f, 1.5f);
     result.state.cinema_scale = std::clamp(
         ReadFloat(*vr, "openxr", "cinema_scale", result.state.menu_scale),
         0.3f, 1.5f);
+    result.state.cinema_hud_scale = std::clamp(
+        ReadFloat(*vr, "openxr", "cinema_hud_scale", 1.30f), 0.5f, 1.5f);
+    result.state.cinema_hud_convergence_offset = std::clamp(
+        ReadInt(*vr, "openxr", "cinema_hud_stereo_shift_px", -72) -
+            CinemaHudConvergenceShift(result.state.cinema_hud_scale, 0),
+        -64, 64);
+    result.state.full_vr_hud_scale = std::clamp(
+        ReadFloat(*vr, "openxr", "full_vr_hud_scale", 1.00f), 0.5f, 1.5f);
+    result.state.full_vr_hud_convergence_offset = std::clamp(
+        ReadInt(*vr, "openxr", "full_vr_hud_stereo_shift_px", -36) -
+            FullVrHudConvergenceShift(result.state.full_vr_hud_scale, 0),
+        -64, 64);
     result.state.near_view = std::clamp(
         ReadFloat(*vr, "engine", "close_camera_offset", 0.75f), -2.0f, 3.0f);
     result.state.vertical_pitch_enabled = ReadBool(
         *vr, "openxr", "vertical_pitch_enabled", false);
     result.state.cinema_full_vr = ReadBool(
-        *vr, "openxr", "cinema_full_vr", false);
+        *vr, "openxr", "cinema_full_vr", true);
     result.state.steady_icons = ReadBool(
         *vr, "openxr", "steady_icons", false);
     result.state.first_person_gamepad_head_follow =
@@ -506,7 +874,9 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         ? snap_turn_degrees
         : 45;
     result.state.first_person_combat_exit = ReadBool(
-        *vr, "engine", "first_person_combat_exit", false);
+        *vr, "engine", "first_person_combat_exit", true);
+    result.state.first_person_stationary_turn = ReadBool(
+        *vr, "engine", "first_person_stationary_turn", false);
     result.state.fast_movement_transitions = ReadBool(
         *game, "DLC", "DlcEnabled_movementinputfix", true);
     result.state.diagnostic_logging =
@@ -545,10 +915,20 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "hud_stereo_shift_px",
         std::to_string(std::clamp(state.hud_convergence_delta - 16, -256, 256)));
     vr_ini.Set("openxr", "presentation_scale", FloatString(state.presentation_scale));
-    vr_ini.Set("openxr", "hud_horizontal_scale", FloatString(state.hud_horizontal_scale));
-    vr_ini.Set("openxr", "hud_vertical_scale", FloatString(state.hud_vertical_scale));
     vr_ini.Set("openxr", "menu_scale", FloatString(state.menu_scale));
     vr_ini.Set("openxr", "cinema_scale", FloatString(state.cinema_scale));
+    vr_ini.Set("openxr", "cinema_hud_scale",
+        FloatString(state.cinema_hud_scale));
+    vr_ini.Set("openxr", "cinema_hud_stereo_shift_px",
+        std::to_string(CinemaHudConvergenceShift(
+            state.cinema_hud_scale,
+            state.cinema_hud_convergence_offset)));
+    vr_ini.Set("openxr", "full_vr_hud_scale",
+        FloatString(state.full_vr_hud_scale));
+    vr_ini.Set("openxr", "full_vr_hud_stereo_shift_px",
+        std::to_string(FullVrHudConvergenceShift(
+            state.full_vr_hud_scale,
+            state.full_vr_hud_convergence_offset)));
     vr_ini.Set("openxr", "vertical_pitch_enabled",
         state.vertical_pitch_enabled ? "1" : "0");
     // Cinema framing is intentionally fixed in the launcher. Keep the INI key
@@ -577,6 +957,8 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         std::to_string(snap_turn_degrees));
     vr_ini.Set("engine", "first_person_combat_exit",
         state.first_person_combat_exit ? "1" : "0");
+    vr_ini.Set("engine", "first_person_stationary_turn",
+        state.first_person_stationary_turn ? "1" : "0");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
     vr_ini.Set("engine", "dlss_dlaa", dlss_dlaa ? "1" : "0");
     // [DEBUG 1/2] One launcher switch owns the log writer and every bounded

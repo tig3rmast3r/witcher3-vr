@@ -35,20 +35,25 @@ enum ControlId {
     IdConvergenceValue,
     IdPresentationScale,
     IdPresentationScaleValue,
-    IdHudHorizontalScale,
-    IdHudHorizontalScaleValue,
-    IdHudVerticalScale,
-    IdHudVerticalScaleValue,
     IdMenuScale,
     IdMenuScaleValue,
     IdCinemaScale,
     IdCinemaScaleValue,
+    IdCinemaHudScale,
+    IdCinemaHudScaleValue,
+    IdCinemaHudConvergenceOffset,
+    IdCinemaHudConvergenceOffsetValue,
+    IdFullVrHudScale,
+    IdFullVrHudScaleValue,
+    IdFullVrHudConvergenceOffset,
+    IdFullVrHudConvergenceOffsetValue,
     IdNearView,
     IdNearViewValue,
     IdVerticalPitch,
     IdFirstPersonGamepadHeadFollow,
     IdFirstPersonSnapTurnDegrees,
     IdFirstPersonCombatExit,
+    IdFirstPersonStationaryTurn,
     IdFastMovementTransitions,
     IdCinemaFullVr,
     IdSteadyIcons,
@@ -187,20 +192,42 @@ std::wstring FormatFloat(float value) {
     return text;
 }
 
+std::wstring FormatConvergenceOffset(int offset, int effective_shift) {
+    wchar_t text[40]{};
+    swprintf_s(text, L"%+d / %d", offset, effective_shift);
+    return text;
+}
+
 void UpdateTrackLabels() {
     SetWindowTextW(Item(IdConvergenceValue),
         std::to_wstring(static_cast<int>(SendMessageW(
             Item(IdConvergence), TBM_GETPOS, 0, 0))).c_str());
     SetWindowTextW(Item(IdPresentationScaleValue), FormatFloat(
         static_cast<float>(SendMessageW(Item(IdPresentationScale), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
-    SetWindowTextW(Item(IdHudHorizontalScaleValue), FormatFloat(
-        static_cast<float>(SendMessageW(Item(IdHudHorizontalScale), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
-    SetWindowTextW(Item(IdHudVerticalScaleValue), FormatFloat(
-        static_cast<float>(SendMessageW(Item(IdHudVerticalScale), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
     SetWindowTextW(Item(IdMenuScaleValue), FormatFloat(
         static_cast<float>(SendMessageW(Item(IdMenuScale), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
     SetWindowTextW(Item(IdCinemaScaleValue), FormatFloat(
         static_cast<float>(SendMessageW(Item(IdCinemaScale), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
+    const float cinema_hud_scale = static_cast<float>(SendMessageW(
+        Item(IdCinemaHudScale), TBM_GETPOS, 0, 0)) / 100.0f;
+    const int cinema_offset = static_cast<int>(SendMessageW(
+        Item(IdCinemaHudConvergenceOffset), TBM_GETPOS, 0, 0));
+    SetWindowTextW(Item(IdCinemaHudScaleValue),
+        FormatFloat(cinema_hud_scale).c_str());
+    SetWindowTextW(Item(IdCinemaHudConvergenceOffsetValue),
+        FormatConvergenceOffset(cinema_offset,
+            w3vr::CinemaHudConvergenceShift(
+                cinema_hud_scale, cinema_offset)).c_str());
+    const float full_vr_hud_scale = static_cast<float>(SendMessageW(
+        Item(IdFullVrHudScale), TBM_GETPOS, 0, 0)) / 100.0f;
+    const int full_vr_offset = static_cast<int>(SendMessageW(
+        Item(IdFullVrHudConvergenceOffset), TBM_GETPOS, 0, 0));
+    SetWindowTextW(Item(IdFullVrHudScaleValue),
+        FormatFloat(full_vr_hud_scale).c_str());
+    SetWindowTextW(Item(IdFullVrHudConvergenceOffsetValue),
+        FormatConvergenceOffset(full_vr_offset,
+            w3vr::FullVrHudConvergenceShift(
+                full_vr_hud_scale, full_vr_offset)).c_str());
     SetWindowTextW(Item(IdNearViewValue), FormatFloat(
         static_cast<float>(SendMessageW(Item(IdNearView), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
 }
@@ -284,14 +311,18 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdConvergence), TBM_GETPOS, 0, 0));
     state.presentation_scale = static_cast<float>(SendMessageW(
         Item(IdPresentationScale), TBM_GETPOS, 0, 0)) / 100.0f;
-    state.hud_horizontal_scale = static_cast<float>(SendMessageW(
-        Item(IdHudHorizontalScale), TBM_GETPOS, 0, 0)) / 100.0f;
-    state.hud_vertical_scale = static_cast<float>(SendMessageW(
-        Item(IdHudVerticalScale), TBM_GETPOS, 0, 0)) / 100.0f;
     state.menu_scale = static_cast<float>(SendMessageW(
         Item(IdMenuScale), TBM_GETPOS, 0, 0)) / 100.0f;
     state.cinema_scale = static_cast<float>(SendMessageW(
         Item(IdCinemaScale), TBM_GETPOS, 0, 0)) / 100.0f;
+    state.cinema_hud_scale = static_cast<float>(SendMessageW(
+        Item(IdCinemaHudScale), TBM_GETPOS, 0, 0)) / 100.0f;
+    state.cinema_hud_convergence_offset = static_cast<int>(SendMessageW(
+        Item(IdCinemaHudConvergenceOffset), TBM_GETPOS, 0, 0));
+    state.full_vr_hud_scale = static_cast<float>(SendMessageW(
+        Item(IdFullVrHudScale), TBM_GETPOS, 0, 0)) / 100.0f;
+    state.full_vr_hud_convergence_offset = static_cast<int>(SendMessageW(
+        Item(IdFullVrHudConvergenceOffset), TBM_GETPOS, 0, 0));
     state.near_view = static_cast<float>(SendMessageW(
         Item(IdNearView), TBM_GETPOS, 0, 0)) / 100.0f;
     state.vertical_pitch_enabled = SendMessageW(
@@ -303,6 +334,8 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
             Item(IdFirstPersonSnapTurnDegrees), CB_GETCURSEL, 0, 0)));
     state.first_person_combat_exit = SendMessageW(
         Item(IdFirstPersonCombatExit), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.first_person_stationary_turn = SendMessageW(
+        Item(IdFirstPersonStationaryTurn), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.fast_movement_transitions = SendMessageW(
         Item(IdFastMovementTransitions), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_full_vr = SendMessageW(
@@ -331,6 +364,58 @@ bool IsGameRunning() {
     return found;
 }
 
+struct GameWindowSearch {
+    DWORD process_id{};
+    HWND window{};
+};
+
+BOOL CALLBACK FindGameWindowCallback(HWND window, LPARAM parameter) {
+    auto* search = reinterpret_cast<GameWindowSearch*>(parameter);
+    DWORD process_id{};
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id != search->process_id || !IsWindowVisible(window) ||
+        GetWindow(window, GW_OWNER) != nullptr ||
+        (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
+        return TRUE;
+    }
+    search->window = window;
+    return FALSE;
+}
+
+HWND FindGameWindow(DWORD process_id) {
+    GameWindowSearch search{process_id, nullptr};
+    EnumWindows(&FindGameWindowCallback,
+        reinterpret_cast<LPARAM>(&search));
+    return search.window;
+}
+
+void FocusLaunchedGame(HANDLE process, DWORD process_id) {
+    // The launcher owns foreground activation at this point, so explicitly
+    // grant the child permission before its window exists. Steam/VR overlays
+    // can otherwise leave the new Witcher window behind another application.
+    AllowSetForegroundWindow(process_id);
+    WaitForInputIdle(process, 15000);
+
+    constexpr ULONGLONG kWindowWaitMilliseconds = 45000;
+    const ULONGLONG deadline = GetTickCount64() + kWindowWaitMilliseconds;
+    while (GetTickCount64() < deadline &&
+        WaitForSingleObject(process, 0) != WAIT_OBJECT_0) {
+        HWND window = FindGameWindow(process_id);
+        if (window == nullptr) {
+            Sleep(100);
+            continue;
+        }
+        if (IsIconic(window)) {
+            ShowWindowAsync(window, SW_RESTORE);
+        }
+        BringWindowToTop(window);
+        SetWindowPos(window, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+        SetForegroundWindow(window);
+        return;
+    }
+}
+
 bool LaunchGame(std::wstring& error) {
     if (GetFileAttributesW(g_app.paths.game_executable.c_str()) == INVALID_FILE_ATTRIBUTES) {
         error = L"witcher3.exe was not found next to the launcher.";
@@ -347,6 +432,7 @@ bool LaunchGame(std::wstring& error) {
         return false;
     }
     CloseHandle(process.hThread);
+    FocusLaunchedGame(process.hProcess, process.dwProcessId);
     CloseHandle(process.hProcess);
     return true;
 }
@@ -451,14 +537,18 @@ void RestoreLauncherDefaults() {
         defaults.hud_convergence_delta);
     SendMessageW(Item(IdPresentationScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(defaults.presentation_scale * 100.0f)));
-    SendMessageW(Item(IdHudHorizontalScale), TBM_SETPOS, TRUE,
-        static_cast<int>(std::lround(defaults.hud_horizontal_scale * 100.0f)));
-    SendMessageW(Item(IdHudVerticalScale), TBM_SETPOS, TRUE,
-        static_cast<int>(std::lround(defaults.hud_vertical_scale * 100.0f)));
     SendMessageW(Item(IdMenuScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(defaults.menu_scale * 100.0f)));
     SendMessageW(Item(IdCinemaScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(defaults.cinema_scale * 100.0f)));
+    SendMessageW(Item(IdCinemaHudScale), TBM_SETPOS, TRUE,
+        static_cast<int>(std::lround(defaults.cinema_hud_scale * 100.0f)));
+    SendMessageW(Item(IdCinemaHudConvergenceOffset), TBM_SETPOS, TRUE,
+        defaults.cinema_hud_convergence_offset);
+    SendMessageW(Item(IdFullVrHudScale), TBM_SETPOS, TRUE,
+        static_cast<int>(std::lround(defaults.full_vr_hud_scale * 100.0f)));
+    SendMessageW(Item(IdFullVrHudConvergenceOffset), TBM_SETPOS, TRUE,
+        defaults.full_vr_hud_convergence_offset);
     SendMessageW(Item(IdNearView), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(defaults.near_view * 100.0f)));
     SendMessageW(Item(IdVerticalPitch), BM_SETCHECK, BST_UNCHECKED, 0);
@@ -469,6 +559,8 @@ void RestoreLauncherDefaults() {
         SnapTurnIndexFor(defaults.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         defaults.first_person_combat_exit ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonStationaryTurn), BM_SETCHECK,
+        defaults.first_person_stationary_turn ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         defaults.fast_movement_transitions ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
@@ -571,14 +663,18 @@ void PopulateControls() {
         loaded.state.hud_convergence_delta);
     SendMessageW(Item(IdPresentationScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(loaded.state.presentation_scale * 100.0f)));
-    SendMessageW(Item(IdHudHorizontalScale), TBM_SETPOS, TRUE,
-        static_cast<int>(std::lround(loaded.state.hud_horizontal_scale * 100.0f)));
-    SendMessageW(Item(IdHudVerticalScale), TBM_SETPOS, TRUE,
-        static_cast<int>(std::lround(loaded.state.hud_vertical_scale * 100.0f)));
     SendMessageW(Item(IdMenuScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(loaded.state.menu_scale * 100.0f)));
     SendMessageW(Item(IdCinemaScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(loaded.state.cinema_scale * 100.0f)));
+    SendMessageW(Item(IdCinemaHudScale), TBM_SETPOS, TRUE,
+        static_cast<int>(std::lround(loaded.state.cinema_hud_scale * 100.0f)));
+    SendMessageW(Item(IdCinemaHudConvergenceOffset), TBM_SETPOS, TRUE,
+        loaded.state.cinema_hud_convergence_offset);
+    SendMessageW(Item(IdFullVrHudScale), TBM_SETPOS, TRUE,
+        static_cast<int>(std::lround(loaded.state.full_vr_hud_scale * 100.0f)));
+    SendMessageW(Item(IdFullVrHudConvergenceOffset), TBM_SETPOS, TRUE,
+        loaded.state.full_vr_hud_convergence_offset);
     SendMessageW(Item(IdNearView), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(loaded.state.near_view * 100.0f)));
     SendMessageW(Item(IdVerticalPitch), BM_SETCHECK,
@@ -590,6 +686,9 @@ void PopulateControls() {
         SnapTurnIndexFor(loaded.state.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         loaded.state.first_person_combat_exit
+            ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonStationaryTurn), BM_SETCHECK,
+        loaded.state.first_person_stationary_turn
             ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         loaded.state.fast_movement_transitions
@@ -633,7 +732,7 @@ void CreateInterface(HWND window) {
         589, 76, 82, 25, IdHeight, WS_EX_CLIENTEDGE);
 
     AddControl(L"BUTTON", L"Comfort and interface", BS_GROUPBOX,
-        20, 138, 680, 686);
+        20, 138, 680, 658);
     AddLabel(L"Presentation size", 38, 166, 170, 22);
     AddTrack(205, 160, 405, IdPresentationScale, 50, 100);
     AddLabel(L"1.00", 625, 166, 54, 22, IdPresentationScaleValue, SS_RIGHT);
@@ -642,65 +741,82 @@ void CreateInterface(HWND window) {
     AddTrack(205, 208, 405, IdConvergence, -64, 64);
     AddLabel(L"0", 625, 214, 54, 22, IdConvergenceValue, SS_RIGHT);
 
-    AddLabel(L"HUD X zoom", 38, 264, 170, 22);
-    AddTrack(205, 258, 405, IdHudHorizontalScale, 25, 100);
-    AddLabel(L"0.50", 625, 264, 54, 22, IdHudHorizontalScaleValue, SS_RIGHT);
+    AddLabel(L"Menu window size", 38, 264, 170, 22);
+    AddTrack(205, 258, 405, IdMenuScale, 30, 150);
+    AddLabel(L"0.85", 625, 264, 54, 22, IdMenuScaleValue, SS_RIGHT);
 
-    AddLabel(L"HUD Y zoom", 38, 314, 170, 22);
-    AddTrack(205, 308, 405, IdHudVerticalScale, 25, 100);
-    AddLabel(L"0.50", 625, 314, 54, 22, IdHudVerticalScaleValue, SS_RIGHT);
+    AddLabel(L"Cinema screen size", 38, 314, 170, 22);
+    AddTrack(205, 308, 405, IdCinemaScale, 30, 150);
+    AddLabel(L"0.90", 625, 314, 54, 22, IdCinemaScaleValue, SS_RIGHT);
 
-    AddLabel(L"Menu window size", 38, 364, 170, 22);
-    AddTrack(205, 358, 405, IdMenuScale, 30, 150);
-    AddLabel(L"0.90", 625, 364, 54, 22, IdMenuScaleValue, SS_RIGHT);
+    AddLabel(L"Near View", 38, 364, 170, 22);
+    AddTrack(205, 358, 405, IdNearView, -200, 300);
+    AddLabel(L"0.75", 625, 364, 54, 22, IdNearViewValue, SS_RIGHT);
 
-    AddLabel(L"Cinema size", 38, 414, 170, 22);
-    AddTrack(205, 408, 405, IdCinemaScale, 30, 150);
-    AddLabel(L"0.90", 625, 414, 54, 22, IdCinemaScaleValue, SS_RIGHT);
+    AddLabel(L"Cinema3D HUD/text size", 38, 414, 150, 22);
+    AddTrack(188, 408, 112, IdCinemaHudScale, 50, 150);
+    AddLabel(L"1.30", 302, 414, 46, 22, IdCinemaHudScaleValue, SS_RIGHT);
+    AddLabel(L"Full VR HUD/text size", 365, 414, 145, 22);
+    AddTrack(510, 408, 112, IdFullVrHudScale, 50, 150);
+    AddLabel(L"0.75", 624, 414, 55, 22, IdFullVrHudScaleValue, SS_RIGHT);
 
-    AddLabel(L"Near View", 38, 464, 170, 22);
-    AddTrack(205, 458, 405, IdNearView, -200, 300);
-    AddLabel(L"0.75", 625, 464, 54, 22, IdNearViewValue, SS_RIGHT);
+    AddLabel(L"Cinema3D conv. offset", 38, 458, 150, 22);
+    AddTrack(188, 452, 100, IdCinemaHudConvergenceOffset, -64, 64);
+    AddLabel(L"+0 / -72", 292, 458, 62, 22,
+        IdCinemaHudConvergenceOffsetValue, SS_RIGHT);
+    AddLabel(L"Full VR conv. offset", 365, 458, 145, 22);
+    AddTrack(510, 452, 100, IdFullVrHudConvergenceOffset, -64, 64);
+    AddLabel(L"+0 / -36", 612, 458, 67, 22,
+        IdFullVrHudConvergenceOffsetValue, SS_RIGHT);
 
     AddControl(L"BUTTON",
-        L"Show Automatic Cutscenes in Full VR (Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 520, 560, 26,
+        L"Show Automatic Cutscenes in Full VR",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 494, 560, 26,
         IdCinemaFullVr);
 
     AddControl(L"BUTTON", L"Steady Icons (adds 1 frame latency)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 556, 410, 26, IdSteadyIcons);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 526, 410, 26, IdSteadyIcons);
 
     AddControl(L"BUTTON", L"Enable vertical mouse/pad pitch (Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 592, 410, 28, IdVerticalPitch);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 558, 410, 28, IdVerticalPitch);
 
     AddControl(L"BUTTON",
         L"Gamepad Snap Turn + Head Follow (First Person, Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 626, 455, 28,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 590, 455, 28,
         IdFirstPersonGamepadHeadFollow);
-    AddLabel(L"Angle", 500, 630, 50, 22);
-    AddCombo(550, 622, 125, IdFirstPersonSnapTurnDegrees);
+    AddLabel(L"Angle", 500, 594, 50, 22);
+    AddCombo(550, 586, 125, IdFirstPersonSnapTurnDegrees);
 
     AddControl(L"BUTTON",
-        L"Auto switch to third person during combats (First Person Only, experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 660, 630, 28,
+        L"Auto switch to third person during combats (First Person Only)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 624, 630, 28,
         IdFirstPersonCombatExit);
 
     AddControl(L"BUTTON",
-        L"Faster Movement Transitions (Recommended)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 696, 520, 26,
+        L"Turn body while stationary in First Person (Experimental)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 656, 590, 26,
+        IdFirstPersonStationaryTurn);
+
+    AddControl(L"BUTTON",
+        L"Faster Movement Transitions",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 688, 520, 26,
         IdFastMovementTransitions);
 
     AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 732, 410, 26, IdDiagnosticLogging);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 720, 410, 26, IdDiagnosticLogging);
     AddLabel(L"Saves witcher3vr.log in the game folder for debugging. May affect performance.",
-        58, 758, 610, 34);
+        58, 746, 610, 34);
 
     AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
-        20, 832, 680, 74);
+        20, 804, 680, 112);
     AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
-        38, 862, 650, 24);
+        38, 830, 650, 24);
+    AddLabel(L"HUD editor: Insert open/close    Q/E select panel    Arrow keys move    Wheel scales",
+        38, 854, 650, 24);
+    AddLabel(L"Esc save/close    R reset panel    X reset profile    Tab switch VR / Cinema3D",
+        38, 878, 650, 24);
 
-    AddLabel(L"", 20, 916, 680, 38, IdStatus, SS_LEFT);
+    AddLabel(L"", 20, 924, 680, 30, IdStatus, SS_LEFT);
     AddControl(L"BUTTON", L"Configure Settings for VR", BS_PUSHBUTTON | WS_TABSTOP,
         20, 958, 220, 36, IdConfigureVr);
     AddControl(L"BUTTON", L"Restore Original Settings", BS_PUSHBUTTON | WS_TABSTOP,
@@ -791,6 +907,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         MessageBoxW(nullptr, configuration_error.c_str(),
             L"Witcher 3 VR Launcher", MB_OK | MB_ICONERROR);
         return 4;
+    }
+
+    std::wstring hud_setup_error;
+    if (!w3vr::EnsureHudEditorSetup(g_app.paths, hud_setup_error)) {
+        MessageBoxW(nullptr, hud_setup_error.c_str(),
+            L"Witcher 3 VR HUD Editor setup", MB_OK | MB_ICONWARNING);
     }
 
     WNDCLASSEXW window_class{sizeof(window_class)};

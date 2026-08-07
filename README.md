@@ -43,6 +43,8 @@ as a runtime dependency.
 | Faster movement transitions | Optional and enabled by default in both third and first person |
 | 5:4 cinema framing | Enabled |
 | HMD-aware render-budget region | Implemented |
+| Native canted-display support | Uses each OpenXR eye pose directly; no parallel-projection workaround required |
+| Headset-aware HUD convergence | Derived automatically from OpenXR eye geometry for parallel and canted displays |
 | 2D overlays and world-space icons | Corrected for VR; optional "Steady Icons" mode |
 | Cinema Mode and cutscenes | Mono or stereoscopic, according to the selected rendering mode |
 | Optional automatic cutscenes in Full VR | Available; manual `F10` Cinema Mode remains independent |
@@ -56,18 +58,14 @@ The ForceDLAA parameter-query and resolution-override approach is adapted from
 
 - Ray tracing
 - Screen Space Reflections (High)
-- Native support for canted displays
 - Far/Distante game camera modes for exploration, combat, and horse riding; only close/near cameras are currently corrected
-
-Headsets with canted displays currently require the manufacturer's
-**Parallel Projection** mode.
 
 ### Tested configurations
 
 | Headset | OpenXR path | Notes |
 |---|---|---|
 | Meta Quest 3 | Virtual Desktop | Primary development configuration |
-| Pimax 5K | OpenXR via SteamVR | Parallel Projection must be enabled |
+| Pimax 5K | OpenXR via SteamVR | Native canted views validated with Parallel Projection disabled |
 
 ### Not supported or not fully tested
 
@@ -87,9 +85,6 @@ a restriction on using mods.
 ## Known issues
 
 - Some rare shadows may flicker in stereo.
-- Loading screens may change size, appear blank, or display duplicated images.
-- Black borders may be visible at the sides; depending on the headset, they may
-  also appear at the top or bottom of the image.
 
 ## Requirements
 
@@ -130,7 +125,7 @@ combat state used by the experimental First-Person view and is part of
 Witcher 3 VR.
 
 The bundled Fast Transitions DLC remains installed, while the launcher option
-**Faster Movement Transitions (Recommended)** controls REDengine's native DLC
+**Faster Movement Transitions** controls REDengine's native DLC
 enable flag. It is enabled by default and can be disabled without removing or
 renaming any files; the change applies on the next game launch.
 
@@ -151,6 +146,15 @@ SteamVR runtime.
 For the current release, preserve the recommended aspect ratio. A different
 resolution with the same ratio can be used to trade image quality for
 performance; an incorrect ratio may distort screen-space elements or the HUD.
+
+The **Presentation Size** slider provides another image-quality tradeoff.
+`1.00` fills the usable headset view. Lower values present the same rendered
+resolution over a smaller angular area, increasing visible pixel density while
+zooming the scene out; horizontal and vertical black bands gradually become
+visible. This adjustment has no additional CPU cost. Choose the lowest value
+whose borders are still invisible or acceptable for your headset and fit. On
+Quest 3, `0.85` is a good starting point: unless the headset is worn extremely
+close to the lenses, the borders are practically invisible.
 
 ## Recommended game settings
 
@@ -213,6 +217,26 @@ Suggested values:
 | `F10` | Toggle Cinema Mode; mono in Mono modes, stereoscopic in Stereo modes |
 | `F11` | Toggle First Person (Experimental) |
 
+The launcher installs the bundled HUD editor bindings idempotently, registers
+its configuration XML in the DX12 user-config filelist, and preserves unrelated
+bindings and filelist entries. The initial VR bank contains the validated Quest
+3 layout; the Cinema3D bank remains neutral. Existing saved HUD layouts are not
+overwritten.
+
+| HUD editor control | Action |
+|---|---|
+| `Insert` | Open or close the editor |
+| `Q` / `E` | Select previous or next panel |
+| Arrow keys | Move the selected panel |
+| Mouse wheel | Scale the selected panel |
+| `R` | Reset the selected panel to neutral position and scale |
+| `X` | Reset the active profile to `X=0`, `Y=0`, scale `1.0` |
+| `Tab` | Manually switch between VR and Cinema3D banks |
+| `Esc` | Save and close |
+
+Profile selection remains manual; the renderer does not switch the HUD bank
+automatically.
+
 The First-Person view is experimental and intended for exploration only. It
 uses DLL-controlled placement profiles for idle movement, walking, sprinting,
 and horse states rather than a fully animation-driven body anchor. Its
@@ -231,11 +255,16 @@ view remains detached from the body turn, and normal free look resumes as soon
 as locomotion begins. Combat, horse riding, swimming, diving, menus, Cinema
 Mode, and cutscenes are excluded from this behavior.
 
+**Turn body while stationary in First Person (Experimental)** controls this
+behavior independently and is disabled by default. Enable it when stationary
+body following suits the controller, animation mod, and locomotion setup;
+native first-person yaw remains in control while it is disabled.
+
 The launcher option **Auto switch to third person during combats (First Person
-Only, experimental)** automatically switches from First Person to Standard
+Only)** automatically switches from First Person to Standard
 third-person view when combat begins. After combat has remained inactive for
 10 seconds, it returns to First Person. Manual view changes cancel the pending
-automatic return. This option is also disabled by default.
+automatic return. This option is enabled by default.
 
 While First Person is active, aiming temporarily uses the Standard third-person
 camera so the weapon trajectory remains aligned with the crosshair. The view
@@ -246,10 +275,17 @@ world, allowing free headset rotation instead of moving with the headset.
 Cinema Mode follows the selected rendering mode: Mono modes produce a mono
 screen, while Stereo modes produce a stereoscopic screen.
 
-The launcher option **Show Automatic Cutscenes in Full VR (Experimental)**
+The launcher option **Show Automatic Cutscenes in Full VR**
 keeps automatic cutscenes in the normal VR camera instead of switching them to
-Cinema Mode. It does not change manual `F10` Cinema Mode. Both routes follow the
-selected Mono or Stereo rendering mode.
+Cinema Mode. It is enabled by default and does not change manual `F10` Cinema
+Mode. Both routes follow the selected Mono or Stereo rendering mode.
+
+Separate **Cinema3D** and **Full VR** HUD/text-size controls tune automatic
+cutscenes. Their convergence sliders are small offsets around an automatic base:
+Cinema3D follows its authored scale, while Full VR preserves the same physical
+text depth as its size changes. Full VR defaults to size `1.00`. The displayed
+value shows `offset / final convergence`. Manual `F10` Cinema keeps its
+independent advanced HUD-size setting.
 
 Cinema Mode can also be used as a temporary workaround for sections that do
 not render correctly or are difficult to play in VR.
@@ -330,7 +366,8 @@ ctest --preset release
 
 The optimized Release build produces one `dxgi.dll`. The launcher's
 **Diagnostic Logging** checkbox enables logging and detailed runtime probes in
-that same DLL; no separate diagnostic binary is required.
+that same DLL; it is disabled by default and no separate diagnostic binary is
+required.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before proposing a code change.
 

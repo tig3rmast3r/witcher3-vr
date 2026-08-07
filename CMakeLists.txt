@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.939.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1027.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -41,6 +41,7 @@ target_include_directories(minhook PUBLIC
 add_library(witcher3vr_dxgi SHARED
     src/dxgi_proxy.cpp
     src/dxgi_proxy.def
+    src/openxr_eye_geometry.cpp
 )
 target_compile_definitions(witcher3vr_dxgi PRIVATE
     WIN32_LEAN_AND_MEAN
@@ -58,6 +59,18 @@ target_link_libraries(witcher3vr_dxgi PRIVATE
 )
 set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
+
+if(BUILD_TESTING)
+    add_executable(w3vr_openxr_eye_geometry_tests
+        tests/openxr_eye_geometry_tests.cpp
+        src/openxr_eye_geometry.cpp
+    )
+    target_include_directories(w3vr_openxr_eye_geometry_tests PRIVATE
+        src
+        "${W3VR_OPENXR_DIR}/include"
+    )
+    add_test(NAME renderer_eye_geometry COMMAND w3vr_openxr_eye_geometry_tests)
+endif()
 
 option(W3VR_BUILD_LAUNCHER "Build the Witcher 3 VR launcher" ON)
 if(W3VR_BUILD_LAUNCHER)

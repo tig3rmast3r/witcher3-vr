@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<UserConfig>
+  <Group id="W3VRHudEditorSettings" displayName="Witcher3VR HUD Editor data">
+    <PresetsArray>
+      <Preset id="0" displayName="Defaults">
+        <Entry varId="SchemaVersion" value="1"/>
+      </Preset>
+    </PresetsArray>
+    <VisibleVars>
+      <Var id="SchemaVersion" displayName="Schema" displayType="SLIDER;1;10;9" visibilityCondition="hideAlways"/>
+    </VisibleVars>
+  </Group>
+
+  <Group id="W3VRHudEditorVR" displayName="Witcher3VR HUD Editor VR data">
+    <PresetsArray>
+      <Preset id="0" displayName="Defaults">
+        <Entry varId="ControlsFeedbackX" value="-297.901"/><Entry varId="ControlsFeedbackY" value="0"/><Entry varId="ControlsFeedbackScale" value="1"/>
+        <Entry varId="HorseStaminaX" value="0"/><Entry varId="HorseStaminaY" value="25.625"/><Entry varId="HorseStaminaScale" value="1"/>
+        <Entry varId="HorsePanicX" value="0"/><Entry varId="HorsePanicY" value="25.1562"/><Entry varId="HorsePanicScale" value="1"/>
+        <Entry varId="MessageX" value="-13.75"/><Entry varId="MessageY" value="122.032"/><Entry varId="MessageScale" value="1"/>
+        <Entry varId="QuestsX" value="-768.539"/><Entry varId="QuestsY" value="-50.5025"/><Entry varId="QuestsScale" value="0.9"/>
+        <Entry varId="BuffsX" value="414.049"/><Entry varId="BuffsY" value="92.3438"/><Entry varId="BuffsScale" value="1"/>
+        <Entry varId="WolfHeadX" value="613.34"/><Entry varId="WolfHeadY" value="129.633"/><Entry varId="WolfHeadScale" value="0.8"/>
+        <Entry varId="ItemInfoX" value="376.094"/><Entry varId="ItemInfoY" value="0"/><Entry varId="ItemInfoScale" value="1"/>
+        <Entry varId="OxygenX" value="0"/><Entry varId="OxygenY" value="52.6562"/><Entry varId="OxygenScale" value="1"/>
+        <Entry varId="BossFocusX" value="0"/><Entry varId="BossFocusY" value="94.1406"/><Entry varId="BossFocusScale" value="1"/>
+        <Entry varId="BoatHealthX" value="416.051"/><Entry varId="BoatHealthY" value="37.055"/><Entry varId="BoatHealthScale" value="1"/>
+        <Entry varId="ConsoleX" value="369.404"/><Entry varId="ConsoleY" value="34.7112"/><Entry varId="ConsoleScale" value="1"/>
+        <Entry varId="JournalUpdateX" value="452.085"/><Entry varId="JournalUpdateY" value="0"/><Entry varId="JournalUpdateScale" value="1"/>
+        <Entry varId="AreaInfoX" value="0"/><Entry varId="AreaInfoY" value="0"/><Entry varId="AreaInfoScale" value="1"/>
+        <Entry varId="MinimapX" value="-499.206"/><Entry varId="MinimapY" value="126.743"/><Entry varId="MinimapScale" value="1"/>
+        <Entry varId="CompanionX" value="600.03"/><Entry varId="CompanionY" value="-35.0575"/><Entry varId="CompanionScale" value="0.7"/>
+        <Entry varId="DamagedItemsX" value="805.064"/><Entry varId="DamagedItemsY" value="-233.526"/><Entry varId="DamagedItemsScale" value="0.5"/>
+        <Entry varId="TimeLapseX" value="-408.704"/><Entry varId="TimeLapseY" value="0"/><Entry varId="TimeLapseScale" value="1"/>
+        <Entry varId="TimeLeftX" value="25.625"/><Entry varId="TimeLeftY" value="276.336"/><Entry varId="TimeLeftScale" value="0.8"/>
+        <Entry varId="TutorialX" value="563.94"/><Entry varId="TutorialY" value="363.736"/><Entry varId="TutorialScale" value="1"/>
+      </Preset>
+    </PresetsArray>
+    <VisibleVars>
+      <Var id="ControlsFeedbackX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="ControlsFeedbackY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="ControlsFeedbackScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="HorseStaminaX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="HorseStaminaY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="HorseStaminaScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="HorsePanicX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="HorsePanicY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="HorsePanicScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="MessageX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="MessageY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="MessageScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="QuestsX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="QuestsY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="QuestsScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="BuffsX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="BuffsY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="BuffsScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="WolfHeadX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="WolfHeadY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="WolfHeadScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="ItemInfoX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="ItemInfoY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="ItemInfoScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="OxygenX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="OxygenY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="OxygenScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="BossFocusX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="BossFocusY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="BossFocusScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="BoatHealthX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="BoatHealthY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="BoatHealthScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="ConsoleX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="ConsoleY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="ConsoleScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="JournalUpdateX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="JournalUpdateY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="JournalUpdateScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="AreaInfoX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="AreaInfoY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="AreaInfoScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="MinimapX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="MinimapY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="MinimapScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="CompanionX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="CompanionY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="CompanionScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="DamagedItemsX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="DamagedItemsY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="DamagedItemsScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="TimeLapseX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLapseY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLapseScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="TimeLeftX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLeftY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLeftScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="TutorialX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TutorialY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TutorialScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+    </VisibleVars>
+  </Group>
+
+  <Group id="W3VRHudEditorCinema3D" displayName="Witcher3VR HUD Editor Cinema3D data">
+    <PresetsArray>
+      <Preset id="0" displayName="Defaults">
+        <Entry varId="ControlsFeedbackX" value="0"/><Entry varId="ControlsFeedbackY" value="0"/><Entry varId="ControlsFeedbackScale" value="1"/>
+        <Entry varId="HorseStaminaX" value="0"/><Entry varId="HorseStaminaY" value="0"/><Entry varId="HorseStaminaScale" value="1"/>
+        <Entry varId="HorsePanicX" value="0"/><Entry varId="HorsePanicY" value="0"/><Entry varId="HorsePanicScale" value="1"/>
+        <Entry varId="MessageX" value="0"/><Entry varId="MessageY" value="0"/><Entry varId="MessageScale" value="1"/>
+        <Entry varId="QuestsX" value="0"/><Entry varId="QuestsY" value="0"/><Entry varId="QuestsScale" value="1"/>
+        <Entry varId="BuffsX" value="0"/><Entry varId="BuffsY" value="0"/><Entry varId="BuffsScale" value="1"/>
+        <Entry varId="WolfHeadX" value="0"/><Entry varId="WolfHeadY" value="0"/><Entry varId="WolfHeadScale" value="1"/>
+        <Entry varId="ItemInfoX" value="0"/><Entry varId="ItemInfoY" value="0"/><Entry varId="ItemInfoScale" value="1"/>
+        <Entry varId="OxygenX" value="0"/><Entry varId="OxygenY" value="0"/><Entry varId="OxygenScale" value="1"/>
+        <Entry varId="BossFocusX" value="0"/><Entry varId="BossFocusY" value="0"/><Entry varId="BossFocusScale" value="1"/>
+        <Entry varId="BoatHealthX" value="0"/><Entry varId="BoatHealthY" value="0"/><Entry varId="BoatHealthScale" value="1"/>
+        <Entry varId="ConsoleX" value="0"/><Entry varId="ConsoleY" value="0"/><Entry varId="ConsoleScale" value="1"/>
+        <Entry varId="JournalUpdateX" value="0"/><Entry varId="JournalUpdateY" value="0"/><Entry varId="JournalUpdateScale" value="1"/>
+        <Entry varId="AreaInfoX" value="0"/><Entry varId="AreaInfoY" value="0"/><Entry varId="AreaInfoScale" value="1"/>
+        <Entry varId="MinimapX" value="0"/><Entry varId="MinimapY" value="0"/><Entry varId="MinimapScale" value="1"/>
+        <Entry varId="CompanionX" value="0"/><Entry varId="CompanionY" value="0"/><Entry varId="CompanionScale" value="1"/>
+        <Entry varId="DamagedItemsX" value="0"/><Entry varId="DamagedItemsY" value="0"/><Entry varId="DamagedItemsScale" value="1"/>
+        <Entry varId="TimeLapseX" value="0"/><Entry varId="TimeLapseY" value="0"/><Entry varId="TimeLapseScale" value="1"/>
+        <Entry varId="TimeLeftX" value="0"/><Entry varId="TimeLeftY" value="0"/><Entry varId="TimeLeftScale" value="1"/>
+        <Entry varId="TutorialX" value="0"/><Entry varId="TutorialY" value="0"/><Entry varId="TutorialScale" value="1"/>
+      </Preset>
+    </PresetsArray>
+    <VisibleVars>
+      <Var id="ControlsFeedbackX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="ControlsFeedbackY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="ControlsFeedbackScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="HorseStaminaX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="HorseStaminaY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="HorseStaminaScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="HorsePanicX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="HorsePanicY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="HorsePanicScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="MessageX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="MessageY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="MessageScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="QuestsX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="QuestsY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="QuestsScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="BuffsX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="BuffsY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="BuffsScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="WolfHeadX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="WolfHeadY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="WolfHeadScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="ItemInfoX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="ItemInfoY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="ItemInfoScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="OxygenX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="OxygenY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="OxygenScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="BossFocusX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="BossFocusY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="BossFocusScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="BoatHealthX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="BoatHealthY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="BoatHealthScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="ConsoleX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="ConsoleY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="ConsoleScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="JournalUpdateX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="JournalUpdateY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="JournalUpdateScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="AreaInfoX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="AreaInfoY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="AreaInfoScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="MinimapX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="MinimapY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="MinimapScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="CompanionX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="CompanionY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="CompanionScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="DamagedItemsX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="DamagedItemsY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="DamagedItemsScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="TimeLapseX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLapseY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLapseScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="TimeLeftX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLeftY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLeftScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="TutorialX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TutorialY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TutorialScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+    </VisibleVars>
+  </Group>
+  <Group id="W3VRHudEditorDebug" displayName="Witcher3VR HUD Editor diagnostics">
+    <PresetsArray>
+      <Preset id="0" displayName="Defaults">
+        <Entry varId="InputSeq" value="-1"/>
+        <Entry varId="MoveSeq" value="-1"/>
+        <Entry varId="SnapMissSeq" value="-1"/>
+        <Entry varId="WrapperInSeq" value="-1"/>
+        <Entry varId="WrapperOutSeq" value="-1"/>
+        <Entry varId="LastSequence" value="-1"/>
+        <Entry varId="ValueA" value="0"/>
+        <Entry varId="ValueB" value="0"/>
+        <Entry varId="ValueC" value="0"/>
+        <Entry varId="ValueD" value="0"/>
+      </Preset>
+    </PresetsArray>
+    <VisibleVars>
+      <Var id="InputSeq" displayName="Input" displayType="SLIDER;-1;1000000;1000001" visibilityCondition="hideAlways"/>
+      <Var id="MoveSeq" displayName="Move" displayType="SLIDER;-1;1000000;1000001" visibilityCondition="hideAlways"/>
+      <Var id="SnapMissSeq" displayName="Snap" displayType="SLIDER;-1;1000000;1000001" visibilityCondition="hideAlways"/>
+      <Var id="WrapperInSeq" displayName="Wrapper in" displayType="SLIDER;-1;1000000;1000001" visibilityCondition="hideAlways"/>
+      <Var id="WrapperOutSeq" displayName="Wrapper out" displayType="SLIDER;-1;1000000;1000001" visibilityCondition="hideAlways"/>
+      <Var id="LastSequence" displayName="Last sequence" displayType="SLIDER;-1;1000000;1000001" visibilityCondition="hideAlways"/>
+      <Var id="ValueA" displayName="A" displayType="SLIDER;-100000;100000;200000" visibilityCondition="hideAlways"/>
+      <Var id="ValueB" displayName="B" displayType="SLIDER;-100000;100000;200000" visibilityCondition="hideAlways"/>
+      <Var id="ValueC" displayName="C" displayType="SLIDER;-100000;100000;200000" visibilityCondition="hideAlways"/>
+      <Var id="ValueD" displayName="D" displayType="SLIDER;-100000;100000;200000" visibilityCondition="hideAlways"/>
+    </VisibleVars>
+  </Group>
+</UserConfig>

@@ -17,6 +17,7 @@
 //   8 horse gallop/canter
 //   9 foot indoor walk (running is disabled by the interior)
 //  10 unsupported first-person locomotion (swimming/diving)
+//  11 boat authority (Sailing/SailingPassive and mount transitions)
 //   0 combat (locomotion is irrelevant after the DLL leaves first person)
 
 @addField(CR4Player)
@@ -40,7 +41,9 @@ function W3VR_RestoreStateBridgeFov(camera: CCustomCamera) {
   }
 
   // Marker base 4096, state stride 128, native FOV retained in the remainder.
-  if (camera.fov >= 5376.0f && camera.fov < 5504.0f) {
+  if (camera.fov >= 5504.0f && camera.fov < 5632.0f) {
+    camera.fov -= 5504.0f;
+  } else if (camera.fov >= 5376.0f && camera.fov < 5504.0f) {
     camera.fov -= 5376.0f;
   } else if (camera.fov >= 5248.0f && camera.fov < 5376.0f) {
     camera.fov -= 5248.0f;
@@ -70,7 +73,7 @@ function W3VR_PublishStateBridgeFov(
   stateCode: int,
   inCombat: bool
 ) {
-  if (!camera || stateCode < 1 || stateCode > 10) {
+  if (!camera || stateCode < 1 || stateCode > 11) {
     return;
   }
 
@@ -97,8 +100,10 @@ function W3VR_PublishStateBridgeFov(
     camera.fov += 5120.0f;
   } else if (stateCode == 9) {
     camera.fov += 5248.0f;
-  } else {
+  } else if (stateCode == 10) {
     camera.fov += 5376.0f;
+  } else {
+    camera.fov += 5504.0f;
   }
 }
 
@@ -125,7 +130,7 @@ function W3VR_PublishStateBridgeChange(
 ) {
   var camera: CCustomCamera;
 
-  if (!player || stateCode < 1 || stateCode > 10) {
+  if (!player || stateCode < 1 || stateCode > 11) {
     return;
   }
   if (
@@ -149,6 +154,14 @@ function W3VR_PublishStateBridgeChange(
 }
 
 function W3VR_GetFootState(player: CR4Player): int {
+  // Sailing and SailingPassive both retain CR4Player camera ticks, but their
+  // player root is attached to the boat. Publish a dedicated authority edge
+  // before any ordinary foot-idle classification. IsUsingBoat covers the two
+  // sailing states; IsOnBoat also keeps mount/dismount transitions excluded.
+  if (player.IsUsingBoat() || player.IsOnBoat()) {
+    return 11;
+  }
+
   // Do not let swimming/diving inherit the retained ordinary foot-idle state.
   // The DLL uses this dedicated edge only to suppress the snap-turn basis fix.
   if (player.IsSwimming() || player.OnCheckDiving()) {
@@ -245,5 +258,34 @@ function OnGameCameraPostTick(
     W3VR_GetHorseState(horse),
     parent.IsInCombat()
   );
+  return result;
+}
+
+// Sailing and SailingPassive override the ordinary CR4Player camera tick, so
+// neither can rely on W3VR_GetFootState() to replace a retained FootIdle edge.
+// Publish boat authority directly from both native camera-state owners.
+@wrapMethod(Sailing)
+function OnGameCameraPostTick(
+  out moveData: SCameraMovementData,
+  dt: float
+) {
+  var result: bool;
+
+  W3VR_RestorePendingStateBridgeFov(parent);
+  result = wrappedMethod(moveData, dt);
+  W3VR_PublishStateBridgeChange(parent, 11, parent.IsInCombat());
+  return result;
+}
+
+@wrapMethod(SailingPassive)
+function OnGameCameraPostTick(
+  out moveData: SCameraMovementData,
+  dt: float
+) {
+  var result: bool;
+
+  W3VR_RestorePendingStateBridgeFov(parent);
+  result = wrappedMethod(moveData, dt);
+  W3VR_PublishStateBridgeChange(parent, 11, parent.IsInCombat());
   return result;
 }

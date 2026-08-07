@@ -31,6 +31,11 @@ $thirdPartyNotices = Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md'
 $stateBridgeRoot = Join-Path $repositoryRoot 'support/modWitcher3VRStateBridge'
 $stateBridgeScript = Join-Path $stateBridgeRoot `
     'content/scripts/local/witcher3vr/first_person_state_bridge.ws'
+$hudEditorRoot = Join-Path $repositoryRoot 'support/modWitcher3VRHUDEditor'
+$hudEditorScript = Join-Path $hudEditorRoot `
+    'content/scripts/local/witcher3vr_hud_editor/hud_editor.ws'
+$hudEditorXml = Join-Path $repositoryRoot `
+    'support/modWitcher3VRHUDEditor.xml'
 $movementDlcRoot = Join-Path $repositoryRoot 'support/dlcmovementinputfix'
 $movementDlcBundle = Join-Path $movementDlcRoot 'content/blob0.bundle'
 $movementDlcMetadata = Join-Path $movementDlcRoot 'content/metadata.store'
@@ -60,6 +65,8 @@ foreach ($requiredFile in @(
         $license,
         $thirdPartyNotices,
         $stateBridgeScript,
+        $hudEditorScript,
+        $hudEditorXml,
         $movementDlcBundle,
         $movementDlcMetadata)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
@@ -104,6 +111,13 @@ try {
     New-Item -ItemType Directory -Path $modsStage | Out-Null
     Copy-Item -LiteralPath $stateBridgeRoot `
         -Destination (Join-Path $modsStage 'modWitcher3VRStateBridge') -Recurse
+    Copy-Item -LiteralPath $hudEditorRoot `
+        -Destination (Join-Path $modsStage 'modWitcher3VRHUDEditor') -Recurse
+
+    $configMatrixStage = Join-Path $releaseStage `
+        'bin/config/r4game/user_config_matrix/pc'
+    New-Item -ItemType Directory -Path $configMatrixStage -Force | Out-Null
+    Copy-Item -LiteralPath $hudEditorXml -Destination $configMatrixStage
 
     $dlcStage = Join-Path $releaseStage 'dlc'
     New-Item -ItemType Directory -Path $dlcStage | Out-Null
@@ -139,12 +153,18 @@ try {
         (Get-FileHash -LiteralPath $movementDlcBundle -Algorithm SHA256).Hash
     $movementDlcMetadataHash =
         (Get-FileHash -LiteralPath $movementDlcMetadata -Algorithm SHA256).Hash
+    $hudEditorScriptHash =
+        (Get-FileHash -LiteralPath $hudEditorScript -Algorithm SHA256).Hash
+    $hudEditorXmlHash =
+        (Get-FileHash -LiteralPath $hudEditorXml -Algorithm SHA256).Hash
     $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
     $manifestLines += "dll.sha256=$dllHash"
     $manifestLines += "launcher.sha256=$launcherHash"
     $manifestLines += "openxr_loader.sha256=$openXrLoaderHash"
     $manifestLines += "movement_dlc_bundle.sha256=$movementDlcBundleHash"
     $manifestLines += "movement_dlc_metadata.sha256=$movementDlcMetadataHash"
+    $manifestLines += "hud_editor_script.sha256=$hudEditorScriptHash"
+    $manifestLines += "hud_editor_xml.sha256=$hudEditorXmlHash"
     $manifestLines += "archive.sha256=$archiveHash"
 
     $manifestPath = Join-Path $OutputDirectory "Witcher3VR-$normalizedVersion-SHA256.txt"

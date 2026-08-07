@@ -27,6 +27,16 @@ std::string Read(const fs::path& path) {
     return {(std::istreambuf_iterator<char>(stream)), {}};
 }
 
+size_t CountOccurrences(const std::string& text, const std::string& token) {
+    size_t count{};
+    size_t position{};
+    while ((position = text.find(token, position)) != std::string::npos) {
+        ++count;
+        position += token.size();
+    }
+    return count;
+}
+
 struct TempDirectory {
     fs::path path;
     TempDirectory() {
@@ -62,6 +72,10 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "menu_distance=1.200\r\n"
         "cinema_render_stereo_strength=0.250\r\n"
         "cinema_hud_stereo_shift_px=-36\r\n"
+        "cinema_hud_scale=1.300\r\n"
+        "manual_cinema_hud_scale=1.600\r\n"
+        "full_vr_hud_stereo_shift_px=-192\r\n"
+        "full_vr_hud_scale=0.750\r\n"
         "cinema_5x4=0\r\n"
         "cinema_full_vr=0\r\n"
         "steady_icons=0\r\n"
@@ -86,6 +100,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "first_person_snap_turn_degrees=45\r\n"
         "first_person_hmd_body_follow=0\r\n"
         "first_person_combat_exit=0\r\n"
+        "first_person_stationary_turn=1\r\n"
         "streamline_ps93_learning_log=1\r\n"
         "unrelated_engine=42\r\n"
         "\r\n"
@@ -128,10 +143,12 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.dlss_quality = index % 5;
         state.hud_convergence_delta = 7;
         state.presentation_scale = 0.85f;
-        state.hud_horizontal_scale = 0.25f;
-        state.hud_vertical_scale = 0.30f;
         state.menu_scale = 0.75f;
         state.cinema_scale = 1.1f;
+        state.cinema_hud_scale = 1.5f;
+        state.cinema_hud_convergence_offset = 7;
+        state.full_vr_hud_scale = 1.25f;
+        state.full_vr_hud_convergence_offset = -9;
         state.near_view = 1.25f;
         state.vertical_pitch_enabled = true;
         state.cinema_full_vr = true;
@@ -139,6 +156,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.first_person_gamepad_head_follow = true;
         state.first_person_snap_turn_degrees = 60;
         state.first_person_combat_exit = true;
+        state.first_person_stationary_turn = index % 2 != 0;
         state.fast_movement_transitions = index % 2 == 0;
         state.diagnostic_logging = true;
 
@@ -179,10 +197,10 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "wrong zero-relative convergence conversion");
         Require(vr.Get("openxr", "presentation_scale") == "0.850",
             "presentation scale missing");
-        Require(vr.Get("openxr", "hud_horizontal_scale") == "0.250",
-            "HUD X scale missing");
-        Require(vr.Get("openxr", "hud_vertical_scale") == "0.300",
-            "HUD Y scale missing");
+        Require(vr.Get("openxr", "hud_horizontal_scale") == "0.500",
+            "removed HUD X control must preserve the existing INI value");
+        Require(vr.Get("openxr", "hud_vertical_scale") == "0.500",
+            "removed HUD Y control must preserve the existing INI value");
         Require(vr.Get("openxr", "hud_size") == "1.000",
             "unmanaged HUD size should remain untouched");
         Require(vr.Get("openxr", "hmd_position_scale") == "0.375",
@@ -204,11 +222,17 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "launcher must not modify menu distance");
         Require(vr.Get("openxr", "cinema_render_stereo_strength") == "0.250",
             "launcher must preserve unmanaged cinema render strength");
-        Require(vr.Get("openxr", "cinema_hud_stereo_shift_px") == "-36",
-            "launcher must preserve unmanaged cinema HUD convergence");
+        Require(vr.Get("openxr", "cinema_hud_scale") == "1.500" &&
+            vr.Get("openxr", "cinema_hud_stereo_shift_px") == "-76",
+            "Cinema3D HUD scale/automatic convergence mismatch");
+        Require(vr.Get("openxr", "full_vr_hud_scale") == "1.250" &&
+            vr.Get("openxr", "full_vr_hud_stereo_shift_px") == "-38",
+            "Full VR HUD scale/automatic convergence mismatch");
+        Require(vr.Get("openxr", "manual_cinema_hud_scale") == "1.600",
+            "manual F10 HUD scale must remain independently tuned");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
             "fixed cinema framing flag missing");
-        Require(vr.Get("meta", "config_version") == "2",
+        Require(vr.Get("meta", "config_version") == "5",
             "configuration version marker missing");
         Require(vr.Get("openxr", "cinema_full_vr") == "1",
             "automatic full-VR cutscene flag missing");
@@ -222,6 +246,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "first-person snap-turn angle missing");
         Require(vr.Get("engine", "first_person_combat_exit") == "1",
             "first-person combat-exit flag missing");
+        Require(vr.Get("engine", "first_person_stationary_turn") ==
+            std::string(state.first_person_stationary_turn ? "1" : "0"),
+            "first-person stationary-turn flag missing");
         Require(vr.Get("debug", "logging_enabled") == "1",
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
@@ -270,12 +297,138 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "round-trip first-person snap-turn angle mismatch");
         Require(loaded.state.first_person_combat_exit,
             "round-trip first-person combat-exit mismatch");
+        Require(loaded.state.first_person_stationary_turn ==
+            state.first_person_stationary_turn,
+            "round-trip first-person stationary-turn mismatch");
+        Require(loaded.state.cinema_hud_scale == state.cinema_hud_scale &&
+            loaded.state.cinema_hud_convergence_offset ==
+                state.cinema_hud_convergence_offset,
+            "round-trip Cinema3D HUD tuning mismatch");
+        Require(loaded.state.full_vr_hud_scale == state.full_vr_hud_scale &&
+            loaded.state.full_vr_hud_convergence_offset ==
+                state.full_vr_hud_convergence_offset,
+            "round-trip Full VR HUD tuning mismatch");
         Require(loaded.state.fast_movement_transitions ==
             state.fast_movement_transitions,
             "round-trip faster-transitions DLC mismatch");
         Require(loaded.state.diagnostic_logging,
             "round-trip diagnostic logging mismatch");
     }
+}
+
+void TestProportionalCutsceneConvergence() {
+    Require(w3vr::CinemaHudConvergenceShift(1.30f, 0) == -72,
+        "Cinema3D reference convergence changed");
+    Require(w3vr::CinemaHudConvergenceShift(0.65f, 0) == -36,
+        "Cinema3D convergence does not follow HUD scale");
+    Require(w3vr::CinemaHudConvergenceShift(1.30f, 10) == -62,
+        "Cinema3D manual offset was not added after the automatic base");
+    Require(w3vr::FullVrHudConvergenceShift(1.00f, 0) == -36,
+        "Full VR reference convergence changed");
+    Require(w3vr::FullVrHudConvergenceShift(1.50f, 0) == -24,
+        "Full VR physical depth changed with HUD scale");
+    Require(w3vr::FullVrHudConvergenceShift(1.00f, 100) == 28,
+        "cutscene convergence offset must remain bounded");
+}
+
+void TestReleaseDefaults() {
+    const w3vr::LauncherState defaults;
+    Require(defaults.full_vr_hud_scale == 1.0f &&
+        w3vr::FullVrHudConvergenceShift(
+            defaults.full_vr_hud_scale,
+            defaults.full_vr_hud_convergence_offset) == -36,
+        "Full VR cutscene HUD must default to size 1.0 at gameplay depth");
+    Require(defaults.cinema_full_vr,
+        "automatic Full VR cutscenes must default to enabled");
+    Require(!defaults.steady_icons,
+        "steady icons must default to disabled");
+    Require(!defaults.vertical_pitch_enabled,
+        "vertical mouse/pad pitch must default to disabled");
+    Require(defaults.first_person_combat_exit,
+        "automatic combat camera switch must default to enabled");
+    Require(!defaults.first_person_stationary_turn,
+        "stationary first-person body turn must default to disabled");
+    Require(defaults.fast_movement_transitions,
+        "faster movement transitions must default to enabled");
+    Require(!defaults.diagnostic_logging,
+        "diagnostic logging must default to disabled");
+}
+
+void TestHudEditorSetup(const fs::path& root) {
+    const fs::path game = root / "hud-setup" / "game";
+    const fs::path launcher_directory = game / "bin" / "x64_dx12";
+    const fs::path documents = root / "hud-setup" / "Documents" /
+        "The Witcher 3";
+    const w3vr::ConfigPaths paths{
+        launcher_directory,
+        launcher_directory / "witcher3vr.ini",
+        documents / "dx12user.settings",
+        launcher_directory / "witcher3.exe"};
+    const fs::path script = game / "mods" / "modWitcher3VRHUDEditor" /
+        "content" / "scripts" / "local" / "witcher3vr_hud_editor" /
+        "hud_editor.ws";
+    const fs::path config_directory = game / "bin" / "config" / "r4game" /
+        "user_config_matrix" / "pc";
+    const fs::path xml = config_directory / "modWitcher3VRHUDEditor.xml";
+    const fs::path filelist = config_directory / "dx12filelist.txt";
+    const fs::path input = documents / "input.settings";
+
+    Write(script, "// fixture\n");
+    Write(xml, "<UserConfig/>\n");
+    Write(filelist, "audio.xml;\ninput.xml;\n");
+    Write(input,
+        "[Exploration]\r\n"
+        "IK_F12=(Action=UnrelatedAction)\r\n"
+        "\r\n"
+        "[W3VRHudEditor]\r\n"
+        "IK_Left=(Action=W3VRHudEditorPrevious)\r\n"
+        "IK_Right=(Action=W3VRHudEditorNext)\r\n"
+        "IK_A=(Action=W3VRHudEditorMoveX,State=Axis,Value=-1)\r\n"
+        "IK_LeftMouse=(Action=W3VRHudEditorDrag)\r\n"
+        "CustomBinding=keep\r\n"
+        "\r\n"
+        "[Unrelated]\r\n"
+        "Value=preserve\r\n");
+
+    std::wstring error;
+    Require(w3vr::EnsureHudEditorSetup(paths, error),
+        "HUD editor setup failed");
+    const std::string first_filelist = Read(filelist);
+    const std::string first_input = Read(input);
+    Require(CountOccurrences(first_filelist,
+        "modWitcher3VRHUDEditor.xml;") == 1,
+        "HUD config XML was not registered exactly once");
+    Require(CountOccurrences(first_input,
+        "Action=W3VRHudEditorToggle") == 13,
+        "HUD editor toggle was not installed in every supported context");
+    Require(first_input.find("IK_Q=(Action=W3VRHudEditorPrevious)") !=
+            std::string::npos &&
+        first_input.find("IK_E=(Action=W3VRHudEditorNext)") !=
+            std::string::npos &&
+        first_input.find("IK_Left=(Action=W3VRHudEditorMoveLeft)") !=
+            std::string::npos &&
+        first_input.find("IK_Right=(Action=W3VRHudEditorMoveRight)") !=
+            std::string::npos &&
+        first_input.find("IK_Tab=(Action=W3VRHudEditorProfile)") !=
+            std::string::npos,
+        "validated HUD editor controls were not installed");
+    Require(first_input.find("W3VRHudEditorMoveX") == std::string::npos &&
+        first_input.find("W3VRHudEditorDrag") == std::string::npos,
+        "obsolete HUD editor bindings were retained");
+    Require(first_input.find("IK_F12=(Action=UnrelatedAction)") !=
+            std::string::npos &&
+        first_input.find("CustomBinding=keep") != std::string::npos &&
+        first_input.find("Value=preserve") != std::string::npos,
+        "HUD setup changed unrelated input settings");
+    Require(fs::exists(filelist.wstring() + L".w3vr.bak") &&
+        fs::exists(input.wstring() + L".w3vr.bak"),
+        "HUD setup did not preserve backups");
+
+    error.clear();
+    Require(w3vr::EnsureHudEditorSetup(paths, error),
+        "idempotent HUD editor setup failed");
+    Require(Read(filelist) == first_filelist && Read(input) == first_input,
+        "repeated HUD editor setup changed already-correct files");
 }
 
 void TestDlssNearSquareResolutionCompatibility() {
@@ -369,11 +522,31 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     Require(partial.state.first_person_snap_turn_degrees == 45,
         "unsupported snap-turn angles must fall back to 45 degrees");
 
+    vr->Remove("openxr", "cinema_full_vr");
+    vr->Remove("openxr", "steady_icons");
+    vr->Remove("openxr", "vertical_pitch_enabled");
+    vr->Remove("engine", "first_person_combat_exit");
+    vr->Remove("engine", "first_person_stationary_turn");
+    vr->Remove("debug", "logging_enabled");
+    vr->Remove("debug", "runtime_diagnostics");
+    Write(paths.vr_ini, vr->Serialize());
     game->Remove("DLC", "DlcEnabled_movementinputfix");
     Write(paths.game_settings, game->Serialize());
-    const auto missing_dlc_flag = w3vr::LoadConfiguration(paths);
-    Require(missing_dlc_flag.state.fast_movement_transitions,
+    const auto missing_flags = w3vr::LoadConfiguration(paths);
+    Require(missing_flags.state.cinema_full_vr,
+        "missing automatic-cutscene flag must default to enabled");
+    Require(!missing_flags.state.steady_icons,
+        "missing steady-icons flag must default to disabled");
+    Require(!missing_flags.state.vertical_pitch_enabled,
+        "missing vertical-pitch flag must default to disabled");
+    Require(missing_flags.state.first_person_combat_exit,
+        "missing combat-switch flag must default to enabled");
+    Require(!missing_flags.state.first_person_stationary_turn,
+        "missing stationary-turn flag must default to disabled");
+    Require(missing_flags.state.fast_movement_transitions,
         "missing faster-transitions DLC flag must default to enabled");
+    Require(!missing_flags.state.diagnostic_logging,
+        "missing diagnostic flags must default to disabled");
 }
 
 void TestFallbackAndAtomicSave(const w3vr::ConfigPaths& paths) {
@@ -417,17 +590,23 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[meta]\r\n"
-        "config_version=2\r\n"
+        "config_version=5\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
         "render_width=2688\r\n"
         "render_height=2784\r\n"
+        "hud_horizontal_scale=1.000\r\n"
+        "hud_vertical_scale=1.000\r\n"
         "cinema_5x4=1\r\n"
+        "cinema_hud_scale=1.300\r\n"
         "manual_cinema_hud_scale=1.600\r\n"
+        "cinema_full_vr=1\r\n"
         "[engine]\r\n"
         "temporal_backend=taau\r\n"
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
+        "first_person_combat_exit=1\r\n"
+        "first_person_stationary_turn=0\r\n"
         "[debug]\r\n"
         "logging_enabled=0\r\n"
         "runtime_diagnostics=0\r\n";
@@ -459,7 +638,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "migrated INI must not be reported as newly created");
     auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated.has_value(), "migrated INI could not be read");
-    Require(migrated->Get("meta", "config_version") == "2",
+    Require(migrated->Get("meta", "config_version") == "5",
         "old INI was not versioned");
     Require(migrated->Get("openxr", "mode") == "2" &&
         migrated->Get("openxr", "render_width") == "3100" &&
@@ -469,9 +648,13 @@ void TestFirstRunConfiguration(const fs::path& root) {
         migrated->Get("openxr", "cinema_render_stereo_strength") == "0.250" &&
         migrated->Get("openxr", "cinema_hud_stereo_shift_px") == "-72" &&
         migrated->Get("openxr", "manual_cinema_hud_scale") == "1.600" &&
-        migrated->Get("openxr", "full_vr_hud_stereo_shift_px") == "-192" &&
-        migrated->Get("openxr", "full_vr_hud_scale") == "0.750",
-        "migration did not apply the validated cinema defaults");
+        migrated->Get("openxr", "full_vr_hud_stereo_shift_px") == "-36" &&
+        migrated->Get("openxr", "full_vr_hud_scale") == "1.000" &&
+        migrated->Get("openxr", "cinema_hud_scale") == "1.300" &&
+        migrated->Get("openxr", "hud_horizontal_scale") == "1.000" &&
+        migrated->Get("openxr", "hud_vertical_scale") == "1.000" &&
+        migrated->Get("engine", "first_person_stationary_turn") == "0",
+        "migration did not apply the validated release defaults");
     Require(migrated->Get("openxr", "cinema_full_vr") == "1",
         "migration changed the existing Full VR choice");
     Require(migrated->Get("openxr", "custom_user_value") == "keep",
@@ -483,13 +666,60 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "migration did not restore release-safe flags");
 
     migrated->Set("openxr", "manual_cinema_hud_scale", "1.100");
+    migrated->Set("openxr", "hud_horizontal_scale", "0.900");
+    migrated->Set("openxr", "hud_vertical_scale", "0.950");
     Write(paths.vr_ini, migrated->Serialize());
     Require(w3vr::EnsureVrConfiguration(
         paths, defaults, created, error), "versioned INI check failed");
     auto versioned = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(versioned.has_value() &&
-        versioned->Get("openxr", "manual_cinema_hud_scale") == "1.100",
-        "versioned INI manual tuning was overwritten");
+        versioned->Get("openxr", "manual_cinema_hud_scale") == "1.100" &&
+        versioned->Get("openxr", "hud_horizontal_scale") == "0.900" &&
+        versioned->Get("openxr", "hud_vertical_scale") == "0.950",
+        "current-version INI manual tuning was overwritten");
+
+    Write(paths.vr_ini,
+        "[meta]\r\n"
+        "config_version=2\r\n"
+        "[openxr]\r\n"
+        "cinema_hud_stereo_shift_px=-91\r\n"
+        "cinema_hud_scale=1.100\r\n"
+        "full_vr_hud_stereo_shift_px=-220\r\n"
+        "full_vr_hud_scale=0.900\r\n"
+        "hud_horizontal_scale=0.400\r\n"
+        "hud_vertical_scale=0.700\r\n"
+        "[engine]\r\n"
+        "first_person_stationary_turn=0\r\n");
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "V2-to-V5 migration failed");
+    auto migrated_v4 = w3vr::IniDocument::Load(paths.vr_ini, error);
+    Require(migrated_v4.has_value() &&
+        migrated_v4->Get("meta", "config_version") == "5" &&
+        migrated_v4->Get("openxr", "cinema_hud_stereo_shift_px") == "-91" &&
+        migrated_v4->Get("openxr", "cinema_hud_scale") == "1.100" &&
+        migrated_v4->Get("openxr", "full_vr_hud_stereo_shift_px") == "-26" &&
+        migrated_v4->Get("openxr", "full_vr_hud_scale") == "1.000" &&
+        migrated_v4->Get("openxr", "hud_horizontal_scale") == "1.000" &&
+        migrated_v4->Get("openxr", "hud_vertical_scale") == "1.000" &&
+        migrated_v4->Get("engine", "first_person_stationary_turn") == "0",
+        "V5 migration changed the Full VR offset or missed HUD normalization");
+
+    Write(paths.vr_ini,
+        "[meta]\r\n"
+        "config_version=3\r\n"
+        "[openxr]\r\n"
+        "hud_horizontal_scale=0.620\r\n"
+        "hud_vertical_scale=0.780\r\n"
+        "custom_user_value=keep\r\n");
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "V3-to-V5 migration failed");
+    auto migrated_from_v3 = w3vr::IniDocument::Load(paths.vr_ini, error);
+    Require(migrated_from_v3.has_value() &&
+        migrated_from_v3->Get("meta", "config_version") == "5" &&
+        migrated_from_v3->Get("openxr", "hud_horizontal_scale") == "1.000" &&
+        migrated_from_v3->Get("openxr", "hud_vertical_scale") == "1.000" &&
+        migrated_from_v3->Get("openxr", "custom_user_value") == "keep",
+        "V3-to-V5 HUD migration damaged unrelated settings");
 }
 
 void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {
@@ -558,6 +788,9 @@ int main() {
         TempDirectory temporary;
         const auto paths = MakePaths(temporary.path);
         TestDlssNearSquareResolutionCompatibility();
+        TestProportionalCutsceneConvergence();
+        TestReleaseDefaults();
+        TestHudEditorSetup(temporary.path);
         TestAllModes(paths);
         TestDlssLabelsAndLegacyAuto(paths);
         TestFallbackAndAtomicSave(paths);
