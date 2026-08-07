@@ -690,6 +690,71 @@ struct PresentationProjectionScales {
     float vertical{1.0f};
 };
 
+struct ProjectionFloatRect {
+    float left{};
+    float top{};
+    float right{};
+    float bottom{};
+};
+
+// Derive the projection FOV represented by an integer submitted rectangle when
+// a symmetric REDengine image is placed in a (possibly different) integer
+// content rectangle. This closes the last sub-pixel mismatch between the
+// camera projection, the actual copy/blit coordinates and OpenXR's imageRect.
+bool derive_pixel_exact_fov(
+    const XrFovf& content_fov,
+    const XrRect2Di& content_rect,
+    const XrRect2Di& submitted_rect,
+    XrFovf& exact_fov) {
+    if (content_rect.extent.width <= 0 || content_rect.extent.height <= 0 ||
+        submitted_rect.extent.width <= 0 ||
+        submitted_rect.extent.height <= 0) {
+        return false;
+    }
+
+    const float content_left = tanf(content_fov.angleLeft);
+    const float content_right = tanf(content_fov.angleRight);
+    const float content_down = tanf(content_fov.angleDown);
+    const float content_up = tanf(content_fov.angleUp);
+    const float span_x = content_right - content_left;
+    const float span_y = content_up - content_down;
+    if (!std::isfinite(content_left) || !std::isfinite(content_right) ||
+        !std::isfinite(content_down) || !std::isfinite(content_up) ||
+        span_x <= 0.01f || span_y <= 0.01f) {
+        return false;
+    }
+
+    const float inv_width = 1.0f /
+        static_cast<float>(content_rect.extent.width);
+    const float inv_height = 1.0f /
+        static_cast<float>(content_rect.extent.height);
+    const float u0 = static_cast<float>(
+        submitted_rect.offset.x - content_rect.offset.x) * inv_width;
+    const float u1 = static_cast<float>(
+        submitted_rect.offset.x + submitted_rect.extent.width -
+        content_rect.offset.x) * inv_width;
+    const float v0 = static_cast<float>(
+        submitted_rect.offset.y - content_rect.offset.y) * inv_height;
+    const float v1 = static_cast<float>(
+        submitted_rect.offset.y + submitted_rect.extent.height -
+        content_rect.offset.y) * inv_height;
+
+    const float exact_left = content_left + span_x * u0;
+    const float exact_right = content_left + span_x * u1;
+    const float exact_up = content_up - span_y * v0;
+    const float exact_down = content_up - span_y * v1;
+    if (!std::isfinite(exact_left) || !std::isfinite(exact_right) ||
+        !std::isfinite(exact_down) || !std::isfinite(exact_up) ||
+        exact_left >= exact_right || exact_down >= exact_up) {
+        return false;
+    }
+
+    exact_fov = {
+        atanf(exact_left), atanf(exact_right),
+        atanf(exact_up), atanf(exact_down)};
+    return true;
+}
+
 // [FIX:VISIBILITY-MASK-FIT 1/7] Fit a centered REDengine projection around
 // optical zero which covers the runtime's complete visible mask. Any black
 // target pixels are therefore outside the lens aperture. When the extension is
@@ -3437,7 +3502,7 @@ void maybe_write_mode3_hud_audit(uint64_t present) {
     SYSTEMTIME st{};
     GetLocalTime(&st);
     fprintf(file,
-        "V1027 v0.9.3-alpha.1 time=%02u:%02u:%02u.%03u present=%llu\n",
+        "V1035 v0.9.3-alpha.2-hotfix time=%02u:%02u:%02u.%03u present=%llu\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
         static_cast<unsigned long long>(present));
     fprintf(file,
@@ -19585,7 +19650,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             if (g_config.hmd_lock_game_pitch &&
                 (g_hmd_game_pitch_lock_pending.exchange(false) ||
                     !g_hmd_game_pitch_lock_valid)) {
-                g_hmd_game_pitch_lock = original_pitch;
+                // A level REDengine reference prevents the vanilla camera's
+                // initial downward pitch from bending horizontal head turns.
+                // Physical OpenXR pitch remains gravity-relative and 1:1.
+                g_hmd_game_pitch_lock = 0.0f;
                 g_hmd_game_pitch_lock_valid = true;
                 log_line("HMD game pitch locked value=%.4f present=%llu",
                     g_hmd_game_pitch_lock,
@@ -24707,7 +24775,7 @@ void ensure_initialized() {
             temporal_backend_is_dlss() ? 1u : 0u,
             reverse_diagnostic_hooks_requested() ? 1u : 0u,
             g_config.openxr_mode);
-        log_line("witcher3vr dxgi proxy initialized build=V1027 v0.9.3-alpha.1");
+        log_line("witcher3vr dxgi proxy initialized build=V1035 v0.9.3-alpha.2-hotfix");
     });
 }
 
@@ -25745,7 +25813,7 @@ bool render_supersampled_fit_projection(
     XrEyeSwapchain& target_swapchain,
     uint32_t image_index,
     ID3D12Resource* const sources[2],
-    const XrRect2Di target_rects[2]) {
+    const ProjectionFloatRect target_rects[2]) {
     if (g_xr_command_list == nullptr ||
         g_xr_cinema_projection_pipeline == nullptr ||
         g_xr_cinema_projection_root_signature == nullptr ||
@@ -25790,7 +25858,9 @@ bool render_supersampled_fit_projection(
         if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
             (source_desc.Flags &
                 D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0 ||
-            rect.extent.width <= 0 || rect.extent.height <= 0) {
+            !std::isfinite(rect.left) || !std::isfinite(rect.top) ||
+            !std::isfinite(rect.right) || !std::isfinite(rect.bottom) ||
+            rect.right <= rect.left || rect.bottom <= rect.top) {
             return false;
         }
 
@@ -25829,18 +25899,16 @@ bool render_supersampled_fit_projection(
             g_xr_command_list, 0, srv_gpu);
 
         const float left =
-            2.0f * static_cast<float>(rect.offset.x) /
+            2.0f * rect.left /
                 static_cast<float>(target_swapchain.width) - 1.0f;
         const float right =
-            2.0f * static_cast<float>(
-                rect.offset.x + rect.extent.width) /
+            2.0f * rect.right /
                 static_cast<float>(target_swapchain.width) - 1.0f;
         const float top =
-            1.0f - 2.0f * static_cast<float>(rect.offset.y) /
+            1.0f - 2.0f * rect.top /
                 static_cast<float>(target_swapchain.height);
         const float bottom =
-            1.0f - 2.0f * static_cast<float>(
-                rect.offset.y + rect.extent.height) /
+            1.0f - 2.0f * rect.bottom /
                 static_cast<float>(target_swapchain.height);
         const float clip_positions[16]{
             left, top, 0.5f, 1.0f,
@@ -28093,7 +28161,11 @@ void render_openxr_test_frame(
     bool projection_eye_image_rect_valid[2]{};
     XrRect2Di projection_eye_fit_rects[2]{};
     bool projection_eye_fit_rect_valid{};
+    ProjectionFloatRect projection_eye_float_fit_rects[2]{};
+    bool projection_eye_float_fit_rect_valid{};
     bool symmetric_subimage_copy{};
+    bool scaled_fov_projection{};
+    bool scaled_fov_direct_copy{};
     int32_t projection_eye_shifts_x_px[2]{};
     int32_t projection_eye_shifts_y_px[2]{};
     bool full_surface_projection{};
@@ -28490,6 +28562,15 @@ void render_openxr_test_frame(
                             projection_image_rect.offset.y +
                             static_cast<int32_t>(ceilf(
                                 normalized_bottom * projection_height));
+                        projection_eye_float_fit_rects[eye] = {
+                            static_cast<float>(projection_image_rect.offset.x) +
+                                normalized_left * projection_width,
+                            static_cast<float>(projection_image_rect.offset.y) +
+                                normalized_top * projection_height,
+                            static_cast<float>(projection_image_rect.offset.x) +
+                                normalized_right * projection_width,
+                            static_cast<float>(projection_image_rect.offset.y) +
+                                normalized_bottom * projection_height};
                         if (fit_right <= fit_left ||
                             fit_bottom <= fit_top) {
                             all_fit_rects_valid = false;
@@ -28532,19 +28613,19 @@ void render_openxr_test_frame(
                                         content_span_y,
                                     0.0f, 1.0f);
                                 const int32_t crop_left = std::clamp(
-                                    static_cast<int32_t>(lroundf(
+                                    static_cast<int32_t>(floorf(
                                         source_left * copy_width)),
                                     0, static_cast<int32_t>(copy_width));
                                 const int32_t crop_right = std::clamp(
-                                    static_cast<int32_t>(lroundf(
+                                    static_cast<int32_t>(ceilf(
                                         source_right * copy_width)),
                                     0, static_cast<int32_t>(copy_width));
                                 const int32_t crop_top = std::clamp(
-                                    static_cast<int32_t>(lroundf(
+                                    static_cast<int32_t>(floorf(
                                         source_top * copy_height)),
                                     0, static_cast<int32_t>(copy_height));
                                 const int32_t crop_bottom = std::clamp(
-                                    static_cast<int32_t>(lroundf(
+                                    static_cast<int32_t>(ceilf(
                                         source_bottom * copy_height)),
                                     0, static_cast<int32_t>(copy_height));
                                 if (crop_right <= crop_left ||
@@ -28565,11 +28646,55 @@ void render_openxr_test_frame(
                     }
                     projection_eye_fit_rect_valid =
                         all_fit_rects_valid;
+                    projection_eye_float_fit_rect_valid =
+                        all_fit_rects_valid;
                     symmetric_subimage_copy =
                         all_fit_rects_valid && all_subimage_crops_valid;
                     if (symmetric_subimage_copy) {
                         projection_eye_image_rect_valid[0] = true;
                         projection_eye_image_rect_valid[1] = true;
+                    }
+
+                    // [FIX:PRESENTATION-SCALE-FOV 1/5] Below 1.0 the source
+                    // represents the smaller symmetric FOV built by
+                    // REDengine. Submit that exact FOV to OpenXR instead of
+                    // drawing it into the raw runtime FOV. Direct copy and
+                    // shader fallback share the same target rectangle; only
+                    // their texture transport differs.
+                    scaled_fov_projection = requested_scale < 0.9999f;
+                    if (scaled_fov_projection) {
+                        const XrRect2Di scaled_rect{
+                            {static_cast<int32_t>(centered_x),
+                             static_cast<int32_t>(centered_y)},
+                            {static_cast<int32_t>(copy_width),
+                             static_cast<int32_t>(copy_height)}};
+                        for (uint32_t eye = 0; eye < 2; ++eye) {
+                            projection_eye_image_rects[eye] = scaled_rect;
+                            projection_eye_image_rect_valid[eye] = true;
+                            projection_eye_fit_rects[eye] = scaled_rect;
+                            projection_eye_float_fit_rects[eye] = {
+                                static_cast<float>(scaled_rect.offset.x),
+                                static_cast<float>(scaled_rect.offset.y),
+                                static_cast<float>(scaled_rect.offset.x +
+                                    scaled_rect.extent.width),
+                                static_cast<float>(scaled_rect.offset.y +
+                                    scaled_rect.extent.height)};
+                        }
+                        projection_eye_fit_rect_valid = true;
+                        projection_eye_float_fit_rect_valid = true;
+                        scaled_fov_direct_copy = true;
+                        symmetric_subimage_copy = false;
+                    }
+                    // [FIX:CONTINUOUS-TANGENT-FIT 2/2] At scale 1 prefer the
+                    // continuous shader placement even when a format-compatible
+                    // 1:1 crop exists. XrRect2Di cannot express the fractional
+                    // tangent boundary, whereas the quad can; this also keeps
+                    // the runtime-provided FOV unchanged on every headset.
+                    if (!scaled_fov_projection &&
+                        projection_eye_float_fit_rect_valid) {
+                        symmetric_subimage_copy = false;
+                        projection_eye_image_rect_valid[0] = false;
+                        projection_eye_image_rect_valid[1] = false;
                     }
                 }
                 const float submitted_crop_fraction = requested_scale >
@@ -28885,7 +29010,7 @@ void render_openxr_test_frame(
                     fit_projection_sources[eye] =
                         select_projection_source(eye);
                 }
-                if (symmetric_subimage_copy) {
+                if (symmetric_subimage_copy || scaled_fov_direct_copy) {
                     const auto target_desc = texture->GetDesc();
                     const auto copy_format_compatible = [](
                             DXGI_FORMAT source_format,
@@ -28905,7 +29030,11 @@ void render_openxr_test_frame(
                     };
                     for (uint32_t eye = 0; eye < 2; ++eye) {
                         if (fit_projection_sources[eye] == nullptr) {
-                            symmetric_subimage_copy = false;
+                            if (scaled_fov_projection) {
+                                scaled_fov_direct_copy = false;
+                            } else {
+                                symmetric_subimage_copy = false;
+                            }
                             break;
                         }
                         const auto eye_desc =
@@ -28921,11 +29050,16 @@ void render_openxr_test_frame(
                                 target_desc.SampleDesc.Quality ||
                             !copy_format_compatible(
                                 eye_desc.Format, target_desc.Format)) {
-                            symmetric_subimage_copy = false;
+                            if (scaled_fov_projection) {
+                                scaled_fov_direct_copy = false;
+                            } else {
+                                symmetric_subimage_copy = false;
+                            }
                             break;
                         }
                     }
-                    if (!symmetric_subimage_copy) {
+                    if (!symmetric_subimage_copy &&
+                        !scaled_fov_projection) {
                         projection_eye_image_rect_valid[0] = false;
                         projection_eye_image_rect_valid[1] = false;
                     }
@@ -28935,10 +29069,14 @@ void render_openxr_test_frame(
                         symmetric_subimage_route_logged{};
                     if (!symmetric_subimage_route_logged.exchange(true)) {
                         log_line(
-                            "V1017 presentation route direct=%d "
+                            "V1035 presentation route scale=%.3f "
+                            "scale1_direct=%d scaled_fov=%d scaled_direct=%d "
                             "crop0=%d,%d %dx%d crop1=%d,%d %dx%d "
                             "source=%ux%u target=%ux%u",
+                            requested_scale,
                             symmetric_subimage_copy ? 1 : 0,
+                            scaled_fov_projection ? 1 : 0,
+                            scaled_fov_direct_copy ? 1 : 0,
                             projection_eye_image_rects[0].offset.x,
                             projection_eye_image_rects[0].offset.y,
                             projection_eye_image_rects[0].extent.width,
@@ -29048,7 +29186,8 @@ void render_openxr_test_frame(
                     // The per-eye OpenXR imageRect selects the useful tangent
                     // crop from this shared 1:1 placement below.
                     if ((!full_surface_projection ||
-                            symmetric_subimage_copy) &&
+                            symmetric_subimage_copy ||
+                            scaled_fov_direct_copy) &&
                         shifted_width > 0 && shifted_height > 0) {
                         g_xr_command_list->CopyTextureRegion(
                             &dst,
@@ -29059,7 +29198,8 @@ void render_openxr_test_frame(
                 }
 
                 if ((!full_surface_projection ||
-                        symmetric_subimage_copy) &&
+                        symmetric_subimage_copy ||
+                        scaled_fov_direct_copy) &&
                     live_backbuffer_source) {
                     std::swap(source_to_copy.Transition.StateBefore, source_to_copy.Transition.StateAfter);
                     g_xr_command_list->ResourceBarrier(1, &source_to_copy);
@@ -29069,19 +29209,22 @@ void render_openxr_test_frame(
                 g_xr_command_list->ResourceBarrier(1, &to_rtv);
 
                 bool fit_projection_ready = !full_surface_projection ||
-                    symmetric_subimage_copy;
+                    symmetric_subimage_copy || scaled_fov_direct_copy;
                 if (full_surface_projection &&
-                    !symmetric_subimage_copy) {
+                    !symmetric_subimage_copy &&
+                    !scaled_fov_direct_copy) {
                     fit_projection_ready = projection_eye_fit_rect_valid &&
+                        projection_eye_float_fit_rect_valid &&
                         render_supersampled_fit_projection(
                             swapchain, image_index,
                             fit_projection_sources,
-                            projection_eye_fit_rects);
+                            projection_eye_float_fit_rects);
                     if (!fit_projection_ready) {
                         log_line(
-                            "V1017 fallback visibility fit render failed image=%u present=%llu",
+                            "V1035 fallback projection render failed image=%u present=%llu scaled_fov=%d",
                             image_index,
-                            static_cast<unsigned long long>(current_present));
+                            static_cast<unsigned long long>(current_present),
+                            scaled_fov_projection ? 1 : 0);
                     }
                     if (live_backbuffer_source) {
                         std::swap(
@@ -29256,7 +29399,7 @@ void render_openxr_test_frame(
                     : (mono_cyclopean_pose_valid
                         ? mono_cyclopean_pose
                         : render_view->pose);
-                // [FIX:SYMMETRIC-SUBIMAGE-COPY 3/4] The direct path submits the
+                // [FIX:SYMMETRIC-SUBIMAGE-COPY 3/4] The scale-1 direct path submits the
                 // per-eye tangent crop from the unfiltered 1:1 source copy.
                 // The fallback shader still publishes the complete rectangle.
                 // Both paths use the unchanged raw runtime FOV.
@@ -29268,6 +29411,19 @@ void render_openxr_test_frame(
                 if (cinema_projection_panel_ready) {
                     projection_views[eye].fov =
                         current_panel_views[eye].fov;
+                } else if (scaled_fov_projection) {
+                    // [FIX:PRESENTATION-SCALE-FOV 4/5] Pair both the direct
+                    // and fallback transports with the exact symmetric FOV
+                    // that generated the REDengine texture.
+                    projection_views[eye].fov = {
+                        g_hmd_render_fov_left.load(
+                            std::memory_order_acquire),
+                        g_hmd_render_fov_right.load(
+                            std::memory_order_acquire),
+                        g_hmd_render_fov_up.load(
+                            std::memory_order_acquire),
+                        g_hmd_render_fov_down.load(
+                            std::memory_order_acquire)};
                 } else if (full_surface_projection) {
                     projection_views[eye].fov =
                         mode == 2 && eye < g_xr_views.size()
@@ -29279,20 +29435,6 @@ void render_openxr_test_frame(
                         ? g_xr_views[eye].fov
                         : render_view->fov;
                 }
-                if (g_config.hmd_freelook &&
-                    g_hmd_render_fov_valid.load() &&
-                    !g_hmd_fov_pair_logged.exchange(true)) {
-                    log_line(
-                        "HMD FOV pair render=%.6f,%.6f,%.6f,%.6f submit=%.6f,%.6f,%.6f,%.6f active=%ux%u swapchain=%ux%u",
-                        g_hmd_render_fov_left.load(), g_hmd_render_fov_right.load(),
-                        g_hmd_render_fov_up.load(), g_hmd_render_fov_down.load(),
-                        projection_views[eye].fov.angleLeft,
-                        projection_views[eye].fov.angleRight,
-                        projection_views[eye].fov.angleUp,
-                        projection_views[eye].fov.angleDown,
-                        g_game_render_width, g_game_render_height,
-                        swapchain.width, swapchain.height);
-                }
                 projection_views[eye].subImage.swapchain = swapchain.handle;
                 if (cinema_projection_panel_ready) {
                     projection_views[eye].subImage.imageRect.offset = {0, 0};
@@ -29301,7 +29443,8 @@ void render_openxr_test_frame(
                         static_cast<int32_t>(swapchain.height)};
                 } else if (full_surface_projection) {
                     projection_views[eye].subImage.imageRect =
-                        symmetric_subimage_copy &&
+                        (symmetric_subimage_copy ||
+                            scaled_fov_projection) &&
                             projection_eye_image_rect_valid[eye]
                         ? projection_eye_image_rects[eye]
                         : projection_image_rect;
@@ -29320,6 +29463,48 @@ void render_openxr_test_frame(
                     projection_views[eye].subImage.imageRect.extent = {
                         static_cast<int32_t>(submitted_width),
                         static_cast<int32_t>(submitted_height)};
+                }
+
+                // [FIX:CONTINUOUS-TANGENT-FIT 1/2] The shader fallback places
+                // the source at exact floating-point tangent coordinates, so
+                // it retains xrLocateViews' original FOV at scale 1 and the
+                // exact symmetric render FOV below scale 1. Only a true 1:1
+                // integer subimage crop needs a FOV derived from its pixel
+                // boundaries.
+                if (full_surface_projection &&
+                    symmetric_subimage_copy &&
+                    g_hmd_render_fov_valid.load(std::memory_order_acquire)) {
+                    const XrFovf content_fov{
+                        g_hmd_render_fov_left.load(
+                            std::memory_order_relaxed),
+                        g_hmd_render_fov_right.load(
+                            std::memory_order_relaxed),
+                        g_hmd_render_fov_up.load(
+                            std::memory_order_relaxed),
+                        g_hmd_render_fov_down.load(
+                            std::memory_order_relaxed)};
+                    XrFovf exact_fov{};
+                    if (derive_pixel_exact_fov(
+                            content_fov,
+                            projection_image_rect,
+                            projection_views[eye].subImage.imageRect,
+                            exact_fov)) {
+                        projection_views[eye].fov = exact_fov;
+                    }
+                }
+                if (g_config.hmd_freelook &&
+                    g_hmd_render_fov_valid.load() &&
+                    !g_hmd_fov_pair_logged.exchange(true)) {
+                    log_line(
+                        "HMD FOV pair render=%.6f,%.6f,%.6f,%.6f submit=%.6f,%.6f,%.6f,%.6f active=%ux%u swapchain=%ux%u",
+                        g_hmd_render_fov_left.load(), g_hmd_render_fov_right.load(),
+                        g_hmd_render_fov_up.load(), g_hmd_render_fov_down.load(),
+                        projection_views[eye].fov.angleLeft,
+                        projection_views[eye].fov.angleRight,
+                        projection_views[eye].fov.angleUp,
+                        projection_views[eye].fov.angleDown,
+                        g_game_render_width, g_game_render_height,
+                        swapchain.width, swapchain.height);
                 }
                 projection_views[eye].subImage.imageArrayIndex = eye;
             }
