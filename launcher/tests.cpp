@@ -66,6 +66,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "hud_stereo_shift_px=-16\r\n"
         "hud_size=1.000\r\n"
         "presentation_scale=0.900\r\n"
+        "fullscreen_projection=1\r\n"
         "hud_horizontal_scale=0.500\r\n"
         "hud_vertical_scale=0.500\r\n"
         "menu_scale=0.900\r\n"
@@ -197,6 +198,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "wrong zero-relative convergence conversion");
         Require(vr.Get("openxr", "presentation_scale") == "0.850",
             "presentation scale missing");
+        Require(vr.Get("openxr", "fullscreen_projection") == "1",
+            "launcher must preserve the advanced projection opt-in");
         Require(vr.Get("openxr", "hud_horizontal_scale") == "0.500",
             "removed HUD X control must preserve the existing INI value");
         Require(vr.Get("openxr", "hud_vertical_scale") == "0.500",
@@ -385,6 +388,8 @@ void TestHudEditorSetup(const fs::path& root) {
         "IK_Right=(Action=W3VRHudEditorNext)\r\n"
         "IK_A=(Action=W3VRHudEditorMoveX,State=Axis,Value=-1)\r\n"
         "IK_LeftMouse=(Action=W3VRHudEditorDrag)\r\n"
+        "IK_Escape=(Action=W3VRHudEditorExit)\r\n"
+        "IK_Tab=(Action=W3VRHudEditorProfile)\r\n"
         "CustomBinding=keep\r\n"
         "\r\n"
         "[Unrelated]\r\n"
@@ -409,11 +414,17 @@ void TestHudEditorSetup(const fs::path& root) {
             std::string::npos &&
         first_input.find("IK_Right=(Action=W3VRHudEditorMoveRight)") !=
             std::string::npos &&
-        first_input.find("IK_Tab=(Action=W3VRHudEditorProfile)") !=
+        first_input.find("IK_F7=(Action=W3VRHudEditorProfile)") !=
             std::string::npos,
         "validated HUD editor controls were not installed");
+    Require(CountOccurrences(first_input,
+            "Action=W3VRHudEditorProfile") == 13,
+        "global HUD profile switch was not installed in every context");
     Require(first_input.find("W3VRHudEditorMoveX") == std::string::npos &&
-        first_input.find("W3VRHudEditorDrag") == std::string::npos,
+        first_input.find("W3VRHudEditorDrag") == std::string::npos &&
+        first_input.find("W3VRHudEditorExit") == std::string::npos &&
+        first_input.find("IK_Tab=(Action=W3VRHudEditorProfile)") ==
+            std::string::npos,
         "obsolete HUD editor bindings were retained");
     Require(first_input.find("IK_F12=(Action=UnrelatedAction)") !=
             std::string::npos &&
@@ -423,6 +434,22 @@ void TestHudEditorSetup(const fs::path& root) {
     Require(fs::exists(filelist.wstring() + L".w3vr.bak") &&
         fs::exists(input.wstring() + L".w3vr.bak"),
         "HUD setup did not preserve backups");
+
+    const std::wstring manual_guide =
+        w3vr::HudEditorManualSetupInstructions(paths);
+    Require(manual_guide.find(filelist.wstring()) != std::wstring::npos &&
+        manual_guide.find(input.wstring()) != std::wstring::npos &&
+        manual_guide.find(L"modWitcher3VRHUDEditor.xml;") !=
+            std::wstring::npos &&
+        manual_guide.find(L"IK_Insert=(Action=W3VRHudEditorToggle)") !=
+            std::wstring::npos &&
+        manual_guide.find(L"IK_F7=(Action=W3VRHudEditorProfile)") !=
+            std::wstring::npos &&
+        manual_guide.find(L"IK_Tab=(Action=W3VRHudEditorProfile)") ==
+            std::wstring::npos &&
+        manual_guide.find(L"IK_Escape=(Action=W3VRHudEditorExit)") ==
+            std::wstring::npos,
+        "manual HUD recovery guide is incomplete or stale");
 
     error.clear();
     Require(w3vr::EnsureHudEditorSetup(paths, error),

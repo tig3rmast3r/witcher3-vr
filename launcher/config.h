@@ -101,6 +101,7 @@ ConfigPaths DiscoverPaths();
 bool EnsureVrConfiguration(const ConfigPaths& paths,
     const std::string& template_contents, bool& created, std::wstring& error);
 bool EnsureHudEditorSetup(const ConfigPaths& paths, std::wstring& error);
+std::wstring HudEditorManualSetupInstructions(const ConfigPaths& paths);
 LoadResult LoadConfiguration(const ConfigPaths& paths);
 CompatibilityWarnings InspectCompatibilitySettings(const ConfigPaths& paths);
 bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,

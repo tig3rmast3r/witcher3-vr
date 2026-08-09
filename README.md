@@ -156,6 +156,11 @@ whose borders are still invisible or acceptable for your headset and fit. On
 Quest 3, `0.85` is a good starting point: unless the headset is worn extremely
 close to the lenses, the borders are practically invisible.
 
+The advanced INI key `[openxr] fullscreen_projection` defaults to `0`, which
+uses the validated legacy fullscreen crop/copy route. Set it to `1` manually
+only to opt into the visibility-mask envelope/fit projection route. The
+launcher preserves this manually edited key when saving its managed settings.
+
 ## Recommended game settings
 
 The **Configure Settings for VR** button applies the settings used during
@@ -212,10 +217,14 @@ Suggested values:
 
 | Key | Action |
 |---|---|
+| `F7` | Manually switch the HUD between the VR and Cinema3D banks |
 | `F8` | Toggle between Standard and Near views |
 | `F9` | Recenter the VR view |
 | `F10` | Toggle Cinema Mode; mono in Mono modes, stereoscopic in Stereo modes |
 | `F11` | Toggle First Person (Experimental) |
+
+After every native loading-screen video ends, the view automatically recenters
+two seconds later using the same pose path as `F9`.
 
 The launcher installs the bundled HUD editor bindings idempotently, registers
 its configuration XML in the DX12 user-config filelist, and preserves unrelated
@@ -223,19 +232,24 @@ bindings and filelist entries. The initial VR bank contains the validated Quest
 3 layout; the Cinema3D bank remains neutral. Existing saved HUD layouts are not
 overwritten.
 
+The game must be closed while these files are updated. The launcher writes
+both files atomically, reads them back, and verifies the XML registration and
+all required bindings. A failed verification blocks Save/Launch, reports the
+exact target, and opens a generated manual-setup guide containing both paths
+and every line that must be added.
+
 | HUD editor control | Action |
 |---|---|
-| `Insert` | Open or close the editor |
+| `Insert` | Open, or save and close, the editor |
 | `Q` / `E` | Select previous or next panel |
 | Arrow keys | Move the selected panel |
 | Mouse wheel | Scale the selected panel |
 | `R` | Reset the selected panel to neutral position and scale |
 | `X` | Reset the active profile to `X=0`, `Y=0`, scale `1.0` |
-| `Tab` | Manually switch between VR and Cinema3D banks |
-| `Esc` | Save and close |
+| `F7` | Manually switch between VR and Cinema3D banks; the editor may be open or closed |
 
 Profile selection remains manual; the renderer does not switch the HUD bank
-automatically.
+automatically. `F7` works both inside and outside HUD editing mode.
 
 The First-Person view is experimental and intended for exploration only. It
 uses DLL-controlled placement profiles for idle movement, walking, sprinting,

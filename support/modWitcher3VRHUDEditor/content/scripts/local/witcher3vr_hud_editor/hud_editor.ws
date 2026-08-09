@@ -1164,7 +1164,7 @@ class W3VRHudEditorController
 
   event OnW3VRHudEditorProfile(action: SInputAction)
   {
-    if (!editing || !IsPressed(action))
+    if (!IsPressed(action))
     {
       return false;
     }

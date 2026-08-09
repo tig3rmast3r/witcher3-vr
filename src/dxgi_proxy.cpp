@@ -97,6 +97,9 @@ struct Config {
     int openxr_mode{2};
     float resolution_scale{1.0f};
     float presentation_scale{0.9f};
+    // The visibility-mask envelope/fit route is opt-in. Missing keys retain
+    // the proven legacy crop-and-copy presentation path.
+    bool fullscreen_projection{false};
     int openxr_mono_eye_shift_px{160};
     bool openxr_mono_eye_shift_auto{true};
     int render_width{0};
@@ -339,6 +342,12 @@ bool reverse_diagnostic_hooks_requested() {
 
 bool native_asymmetric_noaa_route_active();
 
+// The tiled-light correction is release behavior for the validated native
+// asymmetric No-AA route. It is deliberately independent of diagnostics.
+bool asymmetric_tiled_culling_fix_needed() {
+    return native_asymmetric_noaa_route_active();
+}
+
 // [FIX:ASYMMETRIC-FOCUS-FUNCTIONAL-METADATA V1081 1/5] Reading the global
 // b12 projection is functional renderer state for automatic focus correction.
 // It must not disappear when launcher diagnostics are disabled.
@@ -347,8 +356,9 @@ bool focus_projection_metadata_hooks_needed() {
 }
 
 bool focus_projection_shader_registry_enabled() {
-    return g_config.focus_projection_shader_registry ||
-        g_config.logging_enabled;
+    return g_config.runtime_diagnostics &&
+        (g_config.focus_projection_shader_registry ||
+            g_config.logging_enabled);
 }
 
 bool effect_gpu_probe_available() {
@@ -365,6 +375,7 @@ bool effect_gpu_probe_available() {
 // when the launcher disables Diagnostic Logging.
 bool real_smoke_center_fix_route_active() {
     return g_config.openxr_enabled &&
+        g_config.fullscreen_projection &&
         g_config.openxr_mode == 3 &&
         g_config.temporal_backend == TemporalBackend::None &&
         g_config.hmd_freelook &&
@@ -399,24 +410,28 @@ bool descriptor_metadata_hooks_needed() {
     return taau_metadata_hooks_needed() ||
         mode3_hud_descriptor_hooks_needed() ||
         effect_gpu_probe_available() ||
-        focus_projection_metadata_hooks_needed();
+        focus_projection_metadata_hooks_needed() ||
+        asymmetric_tiled_culling_fix_needed();
 }
 
 bool graphics_binding_hooks_needed() {
     return temporal_backend_is_dlss() || taau_metadata_hooks_needed() ||
-        mode3_hud_descriptor_hooks_needed();
+        mode3_hud_descriptor_hooks_needed() ||
+        asymmetric_tiled_culling_fix_needed();
 }
 
 bool temporal_compute_hooks_needed() {
     // DLSS keeps only its dedicated compute-PSO identification. The TAAU
     // command-list interception is selected separately below.
     return temporal_backend_is_dlss() || taau_metadata_hooks_needed() ||
-        effect_gpu_probe_available();
+        effect_gpu_probe_available() ||
+        asymmetric_tiled_culling_fix_needed();
 }
 
 bool taau_compute_hooks_needed() {
     return taau_functional_hooks_needed() ||
-        reverse_diagnostic_hooks_requested();
+        reverse_diagnostic_hooks_requested() ||
+        asymmetric_tiled_culling_fix_needed();
 }
 
 bool common_renderer_pipeline_hooks_needed() {
@@ -844,7 +859,8 @@ PresentationProjectionScales presentation_projection_scales(
         g_config.presentation_scale, 0.01f, 1.0f);
     const float horizontal_span = right - left;
     const float vertical_span = up - down;
-    if (g_xr_cinema_projection_pipeline != nullptr &&
+    if (g_config.fullscreen_projection &&
+        g_xr_cinema_projection_pipeline != nullptr &&
         std::isfinite(horizontal_span) &&
         std::isfinite(vertical_span) &&
         left < 0.0f && right > 0.0f &&
@@ -1244,6 +1260,8 @@ std::atomic<bool> g_engine_loading_screen_video_active{};
 std::atomic<bool> g_engine_loading_screen_video_poll_armed{};
 std::atomic<bool> g_loading_video_presentation_reset_requested{};
 std::atomic<uint64_t> g_engine_loading_screen_video_exit_present{UINT64_MAX};
+constexpr uint64_t kPostLoadingAutoRecenterDelayMs = 2000;
+std::atomic<uint64_t> g_post_loading_auto_recenter_deadline_ms{};
 std::atomic<uint64_t> g_loading_video_scene_pair_floor{};
 std::atomic<bool> g_loading_video_readback_rearm_requested{};
 std::atomic<uint64_t> g_engine_loading_screen_video_last_call_present{
@@ -1604,6 +1622,7 @@ std::atomic<uint32_t> g_native_asymmetric_rejected_pair_logs{};
 
 bool native_asymmetric_noaa_route_active() {
     return kNativeAsymmetricNoAaTrialBuild &&
+        g_config.fullscreen_projection &&
         g_config.openxr_mode == 3 &&
         g_config.temporal_backend == TemporalBackend::None &&
         g_config.hmd_freelook &&
@@ -3363,6 +3382,37 @@ std::array<TaauOverrideSlot, kTaauOverrideSlotCount> g_taau_override_slots{};
 ID3D12Resource* g_taau_invalid_mvec_texture{};
 UINT g_taau_descriptor_increment{};
 std::once_flag g_taau_override_once{};
+
+// REDengine's tiled-light resolve and dimmer-cull shaders build symmetric
+// tile frusta from M00/M11 and omit the asymmetric M20/M21 center. Each
+// corrected dispatch receives a private b12 copy and private descriptor block;
+// engine upload memory is never changed.
+constexpr uint64_t kTiledLightResolveComputeHash = 0x2F58A01A6E3F1800ull;
+constexpr uint64_t kTiledDimmerCullComputeHash = 0x9D732288E451D8CAull;
+constexpr UINT kTiledCullingCbvCount = 14;
+constexpr UINT kTiledCullingSrvCount = 32;
+constexpr UINT kTiledCullingUavCount = 4;
+constexpr UINT kTiledCullingDescriptorBlockSize = 64;
+constexpr UINT kTiledCullingCbvOffset = 0;
+constexpr UINT kTiledCullingSrvOffset = 16;
+constexpr UINT kTiledCullingUavOffset = 48;
+constexpr UINT kTiledCullingSharedPixelSlot = 12;
+constexpr size_t kTiledCullingSharedPixelBytes = 4608;
+constexpr size_t kTiledCullingSlotCount = 256;
+struct TiledCullingOverrideSlot {
+    std::atomic<uint64_t> fence_value{};
+    std::atomic<bool> reserved{};
+};
+std::array<TiledCullingOverrideSlot, kTiledCullingSlotCount>
+    g_tiled_culling_override_slots{};
+ID3D12DescriptorHeap* g_tiled_culling_override_heap{};
+ID3D12Resource* g_tiled_culling_upload{};
+uint8_t* g_tiled_culling_upload_mapped{};
+UINT g_tiled_culling_descriptor_increment{};
+std::once_flag g_tiled_culling_resources_once{};
+std::atomic<uint32_t> g_tiled_culling_slot_index{};
+std::atomic<uint64_t> g_tiled_culling_corrected{};
+std::atomic<uint64_t> g_tiled_culling_fallbacks{};
 std::atomic<bool> g_taau_force_matrix_fallback{};
 std::atomic<bool> g_close_camera_f8_latched{};
 std::atomic<bool> g_first_person_f11_latched{};
@@ -3592,6 +3642,7 @@ std::atomic<uint32_t> g_taau_compose_slot_index{};
 struct TaauPendingSlotUse {
     bool compose{};
     uint32_t index{};
+    bool tiled_culling{};
 };
 ID3D12Fence* g_taau_slot_fence{};
 std::atomic<uint64_t> g_taau_slot_fence_value{};
@@ -4192,7 +4243,8 @@ void update_taau_hot_hook_state() {
     // early-return after the passive event has been recorded.
     const bool effect_needed =
         g_effect_gpu_probe_active.load(std::memory_order_relaxed);
-    const bool core_needed = taau_core_needed || effect_needed;
+    const bool core_needed = taau_core_needed || effect_needed ||
+        asymmetric_tiled_culling_fix_needed();
     const bool probe_needed = taau_probe_needed || effect_needed;
     auto set_hook = [](void* target, bool enabled) {
         if (target == nullptr) {
@@ -4242,6 +4294,300 @@ void update_taau_hot_hook_state() {
     }
 }
 
+void log_line(const char* fmt, ...);
+bool copy_gpu_va_bytes(
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va, void* destination, size_t size);
+bool load_cbv_descriptor(SIZE_T cpu_handle_ptr, CbvDescriptorInfo& info_out);
+bool taau_table_cpu_handle(
+    const CommandListInfo& snapshot,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_count,
+    D3D12_CPU_DESCRIPTOR_HANDLE& cpu_out);
+bool acquire_tiled_culling_override_slot(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t& slot_index_out);
+
+// Encode the omitted asymmetric center as a translated virtual tile extent
+// while preserving projection_scale * half_extent. The dimmer shader also
+// reconstructs world positions from these dimensions, so apply the exact
+// inverse affine compensation to its inverse view-projection columns.
+bool dispatch_asymmetric_tiled_culling_remap(
+    ID3D12GraphicsCommandList* command_list,
+    UINT x,
+    UINT y,
+    UINT z) {
+    if (!asymmetric_tiled_culling_fix_needed() || command_list == nullptr) {
+        return false;
+    }
+
+    auto* pipeline = load_command_list_pipeline(command_list);
+    if (pipeline == nullptr) {
+        return false;
+    }
+    PipelineInfo pipeline_info{};
+    if (!load_effect_pipeline_info(pipeline, pipeline_info)) {
+        return false;
+    }
+    if (pipeline_info.cs_hash != kTiledLightResolveComputeHash &&
+        pipeline_info.cs_hash != kTiledDimmerCullComputeHash) {
+        return false;
+    }
+
+    const auto note_fallback = [&](const char* reason) {
+        const uint64_t count = g_tiled_culling_fallbacks.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (g_config.runtime_diagnostics &&
+            (count <= 16 || (count & (count - 1)) == 0)) {
+            log_line(
+                "V9233 tiled culling native fallback count=%llu reason=%s cs=0x%llX dispatch=%ux%ux%u",
+                static_cast<unsigned long long>(count), reason,
+                static_cast<unsigned long long>(pipeline_info.cs_hash),
+                x, y, z);
+        }
+        return false;
+    };
+
+    if (g_copy_descriptors_simple == nullptr || g_d3d12_device == nullptr) {
+        return note_fallback("device_contract");
+    }
+
+    CommandListInfo snapshot{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto found = g_command_list_infos.find(command_list);
+        if (found == g_command_list_infos.end()) {
+            return note_fallback("command_state");
+        }
+        snapshot = found->second;
+    }
+    if (snapshot.cbv_srv_uav_heap == nullptr ||
+        snapshot.sampler_heap == nullptr ||
+        snapshot.compute_tables[0].ptr == 0 ||
+        snapshot.compute_tables[1].ptr == 0 ||
+        snapshot.compute_tables[2].ptr == 0 ||
+        snapshot.compute_tables[3].ptr == 0) {
+        return note_fallback("root_tables");
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE source_cbv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_srv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_uav{};
+    if (!taau_table_cpu_handle(snapshot, snapshot.compute_tables[0],
+            kTiledCullingCbvCount, source_cbv) ||
+        !taau_table_cpu_handle(snapshot, snapshot.compute_tables[1],
+            kTiledCullingSrvCount, source_srv) ||
+        !taau_table_cpu_handle(snapshot, snapshot.compute_tables[3],
+            kTiledCullingUavCount, source_uav)) {
+        return note_fallback("descriptor_translation");
+    }
+
+    const UINT source_descriptor_increment =
+        g_d3d12_device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cb12_cpu = source_cbv.ptr +
+        static_cast<SIZE_T>(kTiledCullingSharedPixelSlot) *
+            source_descriptor_increment;
+    CbvDescriptorInfo cb12_before{};
+    if (source_descriptor_increment == 0 ||
+        !load_cbv_descriptor(cb12_cpu, cb12_before) ||
+        cb12_before.gpu_va == 0 ||
+        cb12_before.size_in_bytes != kTiledCullingSharedPixelBytes) {
+        return note_fallback("cb12_descriptor");
+    }
+
+    std::array<uint8_t, kTiledCullingSharedPixelBytes> first{};
+    std::array<uint8_t, kTiledCullingSharedPixelBytes> second{};
+    if (!copy_gpu_va_bytes(cb12_before.gpu_va, first.data(), first.size()) ||
+        !copy_gpu_va_bytes(cb12_before.gpu_va, second.data(), second.size()) ||
+        first != second) {
+        return note_fallback("cb12_unstable");
+    }
+    CbvDescriptorInfo cb12_after{};
+    if (!load_cbv_descriptor(cb12_cpu, cb12_after) ||
+        cb12_after.gpu_va != cb12_before.gpu_va ||
+        cb12_after.size_in_bytes != cb12_before.size_in_bytes) {
+        return note_fallback("cb12_recycled");
+    }
+
+    constexpr size_t kProjectionOffset = 0xD0;
+    constexpr size_t kProjectionM00Offset = kProjectionOffset;
+    constexpr size_t kProjectionM11Offset =
+        kProjectionOffset + 5 * sizeof(float);
+    constexpr size_t kProjectionCenterXOffset =
+        kProjectionOffset + 8 * sizeof(float);
+    constexpr size_t kProjectionCenterYOffset =
+        kProjectionOffset + 9 * sizeof(float);
+    constexpr size_t kRenderDimensionsOffset = 23 * 4 * sizeof(float);
+    constexpr size_t kInverseViewProjectionXOffset = 207 * 4 * sizeof(float);
+    constexpr size_t kInverseViewProjectionYOffset = 208 * 4 * sizeof(float);
+    constexpr size_t kInverseViewProjectionWOffset = 210 * 4 * sizeof(float);
+    const auto read_float = [&](size_t offset) {
+        float value{};
+        memcpy(&value, second.data() + offset, sizeof(value));
+        return value;
+    };
+    const float m00 = read_float(kProjectionM00Offset);
+    const float m11 = read_float(kProjectionM11Offset);
+    const float center_x = read_float(kProjectionCenterXOffset);
+    const float center_y = read_float(kProjectionCenterYOffset);
+    const float render_width = read_float(kRenderDimensionsOffset);
+    const float render_height = read_float(
+        kRenderDimensionsOffset + sizeof(float));
+    const float horizontal_factor = 1.0f + center_x;
+    const float vertical_factor = 1.0f - center_y;
+    if (!std::isfinite(m00) || !std::isfinite(m11) ||
+        !std::isfinite(center_x) || !std::isfinite(center_y) ||
+        !std::isfinite(render_width) || !std::isfinite(render_height) ||
+        m00 <= 0.1f || m11 <= 0.1f ||
+        render_width < 64.0f || render_height < 64.0f ||
+        horizontal_factor <= 0.05f || vertical_factor <= 0.05f) {
+        return note_fallback("projection_contract");
+    }
+    if (fabsf(center_x) < 0.001f && fabsf(center_y) < 0.001f) {
+        return false;
+    }
+    const float remapped_m00 = m00 / horizontal_factor;
+    const float remapped_m11 = m11 / vertical_factor;
+    const float remapped_width = render_width * horizontal_factor;
+    const float remapped_height = render_height * vertical_factor;
+
+    std::array<float, 4> inverse_x{};
+    std::array<float, 4> inverse_y{};
+    std::array<float, 4> inverse_w{};
+    memcpy(inverse_x.data(),
+        second.data() + kInverseViewProjectionXOffset, sizeof(inverse_x));
+    memcpy(inverse_y.data(),
+        second.data() + kInverseViewProjectionYOffset, sizeof(inverse_y));
+    memcpy(inverse_w.data(),
+        second.data() + kInverseViewProjectionWOffset, sizeof(inverse_w));
+    std::array<float, 4> remapped_inverse_x{};
+    std::array<float, 4> remapped_inverse_y{};
+    std::array<float, 4> remapped_inverse_w{};
+    for (size_t component = 0; component < 4; ++component) {
+        if (!std::isfinite(inverse_x[component]) ||
+            !std::isfinite(inverse_y[component]) ||
+            !std::isfinite(inverse_w[component])) {
+            return note_fallback("inverse_projection_contract");
+        }
+        remapped_inverse_x[component] =
+            inverse_x[component] * horizontal_factor;
+        remapped_inverse_y[component] =
+            inverse_y[component] * vertical_factor;
+        remapped_inverse_w[component] = inverse_w[component] +
+            center_x * inverse_x[component] +
+            center_y * inverse_y[component];
+    }
+
+    uint32_t slot_index{};
+    if (!acquire_tiled_culling_override_slot(command_list, slot_index)) {
+        return note_fallback("slot_retirement");
+    }
+
+    auto* slot_data = g_tiled_culling_upload_mapped +
+        slot_index * kTiledCullingSharedPixelBytes;
+    memcpy(slot_data, second.data(), second.size());
+    memcpy(slot_data + kProjectionM00Offset,
+        &remapped_m00, sizeof(remapped_m00));
+    memcpy(slot_data + kProjectionM11Offset,
+        &remapped_m11, sizeof(remapped_m11));
+    memcpy(slot_data + kRenderDimensionsOffset,
+        &remapped_width, sizeof(remapped_width));
+    memcpy(slot_data + kRenderDimensionsOffset + sizeof(float),
+        &remapped_height, sizeof(remapped_height));
+    memcpy(slot_data + kInverseViewProjectionXOffset,
+        remapped_inverse_x.data(), sizeof(remapped_inverse_x));
+    memcpy(slot_data + kInverseViewProjectionYOffset,
+        remapped_inverse_y.data(), sizeof(remapped_inverse_y));
+    memcpy(slot_data + kInverseViewProjectionWOffset,
+        remapped_inverse_w.data(), sizeof(remapped_inverse_w));
+
+    const auto heap_cpu =
+        g_tiled_culling_override_heap->GetCPUDescriptorHandleForHeapStart();
+    const auto heap_gpu =
+        g_tiled_culling_override_heap->GetGPUDescriptorHandleForHeapStart();
+    const SIZE_T descriptor_base = static_cast<SIZE_T>(slot_index) *
+        kTiledCullingDescriptorBlockSize;
+    D3D12_CPU_DESCRIPTOR_HANDLE private_cpu{
+        heap_cpu.ptr + descriptor_base * g_tiled_culling_descriptor_increment};
+    D3D12_GPU_DESCRIPTOR_HANDLE private_gpu{
+        heap_gpu.ptr + static_cast<UINT64>(descriptor_base) *
+            g_tiled_culling_descriptor_increment};
+    const auto copy_table = [&](UINT destination_offset, UINT count,
+                                D3D12_CPU_DESCRIPTOR_HANDLE source) {
+        D3D12_CPU_DESCRIPTOR_HANDLE destination{
+            private_cpu.ptr + static_cast<SIZE_T>(destination_offset) *
+                g_tiled_culling_descriptor_increment};
+        g_copy_descriptors_simple(g_d3d12_device, count, destination, source,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    };
+    copy_table(kTiledCullingCbvOffset, kTiledCullingCbvCount, source_cbv);
+    copy_table(kTiledCullingSrvOffset, kTiledCullingSrvCount, source_srv);
+    copy_table(kTiledCullingUavOffset, kTiledCullingUavCount, source_uav);
+
+    D3D12_CONSTANT_BUFFER_VIEW_DESC private_cb12{};
+    private_cb12.BufferLocation = g_tiled_culling_upload->GetGPUVirtualAddress() +
+        slot_index * kTiledCullingSharedPixelBytes;
+    private_cb12.SizeInBytes = static_cast<UINT>(
+        kTiledCullingSharedPixelBytes);
+    D3D12_CPU_DESCRIPTOR_HANDLE private_cb12_cpu{
+        private_cpu.ptr +
+            static_cast<SIZE_T>(kTiledCullingCbvOffset +
+                kTiledCullingSharedPixelSlot) *
+                g_tiled_culling_descriptor_increment};
+    g_d3d12_device->CreateConstantBufferView(
+        &private_cb12, private_cb12_cpu);
+
+    ID3D12DescriptorHeap* override_heaps[]{
+        g_tiled_culling_override_heap, snapshot.sampler_heap};
+    command_list->SetDescriptorHeaps(
+        static_cast<UINT>(std::size(override_heaps)), override_heaps);
+    command_list->SetComputeRootDescriptorTable(0,
+        D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
+            static_cast<UINT64>(kTiledCullingCbvOffset) *
+                g_tiled_culling_descriptor_increment});
+    command_list->SetComputeRootDescriptorTable(1,
+        D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
+            static_cast<UINT64>(kTiledCullingSrvOffset) *
+                g_tiled_culling_descriptor_increment});
+    command_list->SetComputeRootDescriptorTable(2, snapshot.compute_tables[2]);
+    command_list->SetComputeRootDescriptorTable(3,
+        D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
+            static_cast<UINT64>(kTiledCullingUavOffset) *
+                g_tiled_culling_descriptor_increment});
+    g_dispatch(command_list, x, y, z);
+
+    ID3D12DescriptorHeap* original_heaps[]{
+        snapshot.cbv_srv_uav_heap, snapshot.sampler_heap};
+    command_list->SetDescriptorHeaps(
+        static_cast<UINT>(std::size(original_heaps)), original_heaps);
+    for (UINT root = 0; root < snapshot.compute_tables.size(); ++root) {
+        if (snapshot.compute_tables[root].ptr != 0) {
+            command_list->SetComputeRootDescriptorTable(
+                root, snapshot.compute_tables[root]);
+        }
+    }
+    for (UINT root = 0; root < snapshot.graphics_tables.size(); ++root) {
+        if (snapshot.graphics_tables[root].ptr != 0) {
+            command_list->SetGraphicsRootDescriptorTable(
+                root, snapshot.graphics_tables[root]);
+        }
+    }
+
+    const uint64_t corrected = g_tiled_culling_corrected.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (g_config.runtime_diagnostics &&
+        (corrected <= 32 || (corrected % 240) == 0)) {
+        log_line(
+            "V9233 tiled culling corrected count=%llu cs=0x%llX dispatch=%ux%ux%u slot=%u projection=%.7f,%.7f center=%.7f,%.7f remap_projection=%.7f,%.7f dimensions=%.1f,%.1f remap_dimensions=%.1f,%.1f",
+            static_cast<unsigned long long>(corrected),
+            static_cast<unsigned long long>(pipeline_info.cs_hash),
+            x, y, z, slot_index, m00, m11, center_x, center_y,
+            remapped_m00, remapped_m11, render_width, render_height,
+            remapped_width, remapped_height);
+    }
+    return true;
+}
+
 void STDMETHODCALLTYPE hook_dispatch(
     ID3D12GraphicsCommandList* command_list,
     UINT thread_group_count_x,
@@ -4270,6 +4616,9 @@ void install_streamline_resource_barrier_probe();
 bool reverse_enabled();
 
 void write_log_line_v(const char* fmt, va_list args) {
+    if (!g_config.runtime_diagnostics) {
+        return;
+    }
     std::scoped_lock lock{g_log_mutex};
 
     char module_path[MAX_PATH]{};
@@ -4297,7 +4646,7 @@ void write_log_line_v(const char* fmt, va_list args) {
 }
 
 void log_line(const char* fmt, ...) {
-    if (!g_config.logging_enabled) {
+    if (!g_config.logging_enabled || !g_config.runtime_diagnostics) {
         return;
     }
     va_list args{};
@@ -4437,7 +4786,8 @@ bool safe_copy_asymmetric_authority(
 }
 
 void log_cinema_camera_diagnostic(const char* fmt, ...) {
-    if (!g_config.cinema_camera_diagnostics && !g_config.logging_enabled) {
+    if (!g_config.runtime_diagnostics ||
+        (!g_config.cinema_camera_diagnostics && !g_config.logging_enabled)) {
         return;
     }
     va_list args{};
@@ -4449,7 +4799,7 @@ void log_cinema_camera_diagnostic(const char* fmt, ...) {
 void maybe_write_mode3_hud_audit(uint64_t present) {
     // Release gameplay runs must perform no HUD audit I/O. The launcher turns
     // both logging flags on only when Diagnostic Logging is explicitly enabled.
-    if ((!g_config.logging_enabled && !g_config.runtime_diagnostics) ||
+    if (!g_config.logging_enabled || !g_config.runtime_diagnostics ||
         !mode3_stereo_transport_active() || present < 300) {
         return;
     }
@@ -5218,6 +5568,8 @@ void load_config() {
         g_config.openxr_mode = read_ini_int("openxr", "mode", 2);
         g_config.resolution_scale = std::clamp(read_ini_float("openxr", "resolution_scale", 1.0f), 0.25f, 2.0f);
         g_config.presentation_scale = std::clamp(read_ini_float("openxr", "presentation_scale", 0.9f), 0.5f, 1.0f);
+        g_config.fullscreen_projection = read_ini_bool(
+            "openxr", "fullscreen_projection", false);
         g_config.openxr_mono_eye_shift_px = std::clamp(read_ini_int("openxr", "mono_eye_shift_px", 160), -512, 512);
         g_config.openxr_mono_eye_shift_auto = read_ini_bool("openxr", "mono_eye_shift_auto", true);
         g_config.render_width = std::max(0, read_ini_int("openxr", "render_width", 0));
@@ -5604,10 +5956,12 @@ void load_config() {
                 g_config.runtime_diagnostics ? 1 : 0);
         }
 
-        log_line("Config openxr enabled=%d mode=%d resolution_scale=%.3f mono_shift=%d reverse enabled=%d periodic=%d unmap=%d cbv=%d active_nudge=%d nudge=%.3f start=%d cycle=%d pulse=%d orbit_probe=%d orbit_interval=%d orbit_max=%d copy_probe=%d copy_max=%d stereo_probe=%d geometry_shift=%d",
+        log_line("Config openxr enabled=%d mode=%d resolution_scale=%.3f presentation_scale=%.3f fullscreen_projection=%d mono_shift=%d reverse enabled=%d periodic=%d unmap=%d cbv=%d active_nudge=%d nudge=%.3f start=%d cycle=%d pulse=%d orbit_probe=%d orbit_interval=%d orbit_max=%d copy_probe=%d copy_max=%d stereo_probe=%d geometry_shift=%d",
             g_config.openxr_enabled,
             g_config.openxr_mode,
             g_config.resolution_scale,
+            g_config.presentation_scale,
+            g_config.fullscreen_projection ? 1 : 0,
             g_config.openxr_mono_eye_shift_px,
             g_config.reverse_enabled,
             g_config.reverse_scan_periodic,
@@ -6991,7 +7345,8 @@ constexpr const char* kFocusProjectionShaderRegistryHeader =
     "# witcher3vr focus projection shader registry v1";
 
 bool rewrite_focus_projection_shader_registry_locked() {
-    if (g_focus_projection_shader_registry_path[0] == '\0') {
+    if (!g_config.runtime_diagnostics ||
+        g_focus_projection_shader_registry_path[0] == '\0') {
         return false;
     }
     std::vector<FocusProjectionShaderPair> pairs;
@@ -8344,7 +8699,8 @@ void flush_effect_gpu_probe() {
 // [DIAG:ASYMMETRIC-EFFECT-GPU V1049 4/8] F7 starts one fresh capture while
 // inactive, or ends the current capture early. Three completed stereo pairs
 // bound descriptor-ring age; a 180-Present watchdog guarantees shutdown.
-void update_effect_gpu_probe_on_present(uint64_t present, bool f7_pressed) {
+[[maybe_unused]] void update_effect_gpu_probe_on_present(
+    uint64_t present, bool capture_requested) {
     if (!effect_gpu_probe_available()) {
         return;
     }
@@ -8364,7 +8720,7 @@ void update_effect_gpu_probe_on_present(uint64_t present, bool f7_pressed) {
             false, std::memory_order_release);
     }
 
-    if (f7_pressed) {
+    if (capture_requested) {
         if (active) {
             g_effect_gpu_probe_active.store(false, std::memory_order_release);
             g_effect_gpu_flush_pending.store(true, std::memory_order_release);
@@ -8372,7 +8728,7 @@ void update_effect_gpu_probe_on_present(uint64_t present, bool f7_pressed) {
             update_taau_hot_hook_state();
             g_effect_gpu_probe_session_active.store(
                 false, std::memory_order_release);
-            log_line("V1054 targeted effect GPU capture stopped early by F7 present=%llu",
+            log_line("V1054 targeted effect GPU capture stopped early by request present=%llu",
                 static_cast<unsigned long long>(present));
         } else if (!g_engine_dual_render_active.load(
                 std::memory_order_acquire)) {
@@ -8516,7 +8872,8 @@ void record_cinema_subtitle_draw(
 // bounded capture. Pressing it once with visible Cinema 3D subtitles and once
 // with visible Full VR subtitles produces directly comparable signatures.
 void flush_cinema_subtitle_draws() {
-    if (!g_config.cinema_subtitle_diagnostics) {
+    if (!g_config.runtime_diagnostics ||
+        !g_config.cinema_subtitle_diagnostics) {
         return;
     }
 
@@ -10643,7 +11000,8 @@ void install_reverse_hooks() {
 
     const bool metadata_hooks = taau_metadata_hooks_needed() ||
         effect_gpu_probe_available() ||
-        focus_projection_metadata_hooks_needed();
+        focus_projection_metadata_hooks_needed() ||
+        asymmetric_tiled_culling_fix_needed();
     const bool buffer_metadata_hooks = metadata_hooks ||
         real_smoke_center_fix_route_active();
     const bool hud_descriptor_hooks = mode3_hud_descriptor_hooks_needed();
@@ -11334,7 +11692,12 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         }
         const auto retired_value = SUCCEEDED(signal_hr) ? fence_value : UINT64_MAX;
         for (const auto& use : taau_slot_uses) {
-            if (use.compose && use.index < g_taau_compose_slots.size()) {
+            if (use.tiled_culling &&
+                use.index < g_tiled_culling_override_slots.size()) {
+                auto& slot = g_tiled_culling_override_slots[use.index];
+                slot.fence_value.store(retired_value, std::memory_order_release);
+                slot.reserved.store(false, std::memory_order_release);
+            } else if (use.compose && use.index < g_taau_compose_slots.size()) {
                 auto& slot = g_taau_compose_slots[use.index];
                 slot.fence_value.store(retired_value, std::memory_order_release);
                 slot.reserved.store(false, std::memory_order_release);
@@ -12040,7 +12403,11 @@ HRESULT STDMETHODCALLTYPE hook_create_compute_pipeline_state(
             log_line("TAAU root signature metadata missing rs=%p", desc->pRootSignature);
         }
     }
-    if (effect_gpu_probe_available()) {
+    const bool tiled_culling_target =
+        asymmetric_tiled_culling_fix_needed() &&
+        (info.cs_hash == kTiledLightResolveComputeHash ||
+            info.cs_hash == kTiledDimmerCullComputeHash);
+    if (effect_gpu_probe_available() || tiled_culling_target) {
         store_effect_pipeline_info(pso, info);
     }
     {
@@ -12314,7 +12681,8 @@ void STDMETHODCALLTYPE hook_set_descriptor_heaps(
     if (((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
             reverse_enabled() && g_config.reverse_cbv_probe) ||
             (taau_functional_hooks_needed() &&
-                taau_runtime_tracking_active())) &&
+                taau_runtime_tracking_active()) ||
+            asymmetric_tiled_culling_fix_needed()) &&
         descriptor_heaps != nullptr) {
         ID3D12DescriptorHeap* cbv_heap{};
         ID3D12DescriptorHeap* sampler_heap{};
@@ -12387,9 +12755,9 @@ void STDMETHODCALLTYPE hook_set_graphics_root_descriptor_table(
             state->tables[root_parameter_index] = base_descriptor;
         }
     }
-    if (!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
-        reverse_enabled() &&
-        g_config.reverse_cbv_probe &&
+    if (((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
+            reverse_enabled() && g_config.reverse_cbv_probe) ||
+            asymmetric_tiled_culling_fix_needed()) &&
         root_parameter_index < 32) {
         {
             std::scoped_lock lock{g_reverse_mutex};
@@ -12422,7 +12790,8 @@ void STDMETHODCALLTYPE hook_set_compute_root_descriptor_table(
     if (((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
             reverse_enabled()) ||
             (taau_functional_hooks_needed() &&
-                taau_runtime_tracking_active())) &&
+                taau_runtime_tracking_active()) ||
+            asymmetric_tiled_culling_fix_needed()) &&
         root_parameter_index < 32) {
         std::scoped_lock lock{g_reverse_mutex};
         g_command_list_infos[command_list].compute_tables[root_parameter_index] = base_descriptor;
@@ -12857,9 +13226,9 @@ void STDMETHODCALLTYPE hook_set_graphics_root_signature(
             state->capture_id = capture;
         }
     }
-    if (!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
-        reverse_enabled() &&
-        g_config.reverse_cbv_probe) {
+    if ((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
+            reverse_enabled() && g_config.reverse_cbv_probe) ||
+        asymmetric_tiled_culling_fix_needed()) {
         std::scoped_lock lock{g_reverse_mutex};
         auto& info = g_command_list_infos[command_list];
         info.graphics_root_signature = root_signature;
@@ -12889,7 +13258,8 @@ void STDMETHODCALLTYPE hook_set_compute_root_signature(
     if ((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
             reverse_enabled()) ||
         (taau_functional_hooks_needed() &&
-            taau_runtime_tracking_active())) {
+            taau_runtime_tracking_active()) ||
+        asymmetric_tiled_culling_fix_needed()) {
         std::scoped_lock lock{g_reverse_mutex};
         auto& info = g_command_list_infos[command_list];
         info.compute_root_signature = root_signature;
@@ -15332,6 +15702,71 @@ bool taau_table_cpu_handle(
     return true;
 }
 
+bool ensure_tiled_culling_override_resources() {
+    std::call_once(g_tiled_culling_resources_once, []() {
+        if (g_d3d12_device == nullptr) {
+            return;
+        }
+
+        g_tiled_culling_descriptor_increment =
+            g_d3d12_device->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = static_cast<UINT>(
+            kTiledCullingSlotCount * kTiledCullingDescriptorBlockSize);
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_d3d12_device->CreateDescriptorHeap(
+                &heap_desc,
+                IID_PPV_ARGS(&g_tiled_culling_override_heap)))) {
+            if (g_config.runtime_diagnostics) {
+                log_line("V9233 tiled culling failed to create descriptor heap");
+            }
+            return;
+        }
+
+        D3D12_HEAP_PROPERTIES upload_heap{};
+        upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        upload_heap.CreationNodeMask = 1;
+        upload_heap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC upload_desc{};
+        upload_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        upload_desc.Width = static_cast<UINT64>(
+            kTiledCullingSlotCount * kTiledCullingSharedPixelBytes);
+        upload_desc.Height = 1;
+        upload_desc.DepthOrArraySize = 1;
+        upload_desc.MipLevels = 1;
+        upload_desc.Format = DXGI_FORMAT_UNKNOWN;
+        upload_desc.SampleDesc.Count = 1;
+        upload_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&g_tiled_culling_upload))) ||
+            FAILED(g_tiled_culling_upload->Map(
+                0, nullptr,
+                reinterpret_cast<void**>(&g_tiled_culling_upload_mapped)))) {
+            if (g_config.runtime_diagnostics) {
+                log_line("V9233 tiled culling failed to create mapped upload ring");
+            }
+            return;
+        }
+
+        if (g_config.runtime_diagnostics) {
+            log_line(
+                "V9233 tiled culling resources ready slots=%zu cb_bytes=%zu descriptors=%u",
+                g_tiled_culling_override_slots.size(),
+                kTiledCullingSharedPixelBytes, heap_desc.NumDescriptors);
+        }
+    });
+
+    return g_tiled_culling_override_heap != nullptr &&
+        g_tiled_culling_upload != nullptr &&
+        g_tiled_culling_upload_mapped != nullptr &&
+        g_tiled_culling_descriptor_increment != 0;
+}
+
 bool initialize_taau_mvec_pipeline() {
     std::call_once(g_taau_mvec_pipeline_once, []() {
         if (g_d3d12_device == nullptr || !initialize_dxc()) {
@@ -15993,9 +16428,11 @@ bool ensure_taau_slot_fence() {
 void track_taau_slot_use(
     ID3D12GraphicsCommandList* command_list,
     bool compose,
-    uint32_t index) {
+    uint32_t index,
+    bool tiled_culling = false) {
     std::scoped_lock lock{g_taau_slot_mutex};
-    g_taau_pending_slot_uses[command_list].push_back({compose, index});
+    g_taau_pending_slot_uses[command_list].push_back(
+        {compose, index, tiled_culling});
 }
 
 bool acquire_taau_override_slot(
@@ -16022,6 +16459,39 @@ bool acquire_taau_override_slot(
         if (fence_value == 0 || completed >= fence_value) {
             slot_index_out = index;
             track_taau_slot_use(command_list, false, index);
+            return true;
+        }
+        slot.reserved.store(false, std::memory_order_release);
+    }
+    return false;
+}
+
+bool acquire_tiled_culling_override_slot(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t& slot_index_out) {
+    if (command_list == nullptr ||
+        !ensure_tiled_culling_override_resources() ||
+        !ensure_taau_slot_fence()) {
+        return false;
+    }
+    const auto completed = g_taau_slot_fence->GetCompletedValue();
+    const auto start = g_tiled_culling_slot_index.fetch_add(
+        1, std::memory_order_relaxed);
+    for (uint32_t offset = 0;
+         offset < g_tiled_culling_override_slots.size(); ++offset) {
+        const auto index = (start + offset) % static_cast<uint32_t>(
+            g_tiled_culling_override_slots.size());
+        auto& slot = g_tiled_culling_override_slots[index];
+        bool expected{};
+        if (!slot.reserved.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            continue;
+        }
+        const auto fence_value = slot.fence_value.load(
+            std::memory_order_acquire);
+        if (fence_value == 0 || completed >= fence_value) {
+            slot_index_out = index;
+            track_taau_slot_use(command_list, false, index, true);
             return true;
         }
         slot.reserved.store(false, std::memory_order_release);
@@ -17637,6 +18107,11 @@ void STDMETHODCALLTYPE hook_dispatch(
         record_effect_gpu_event(
             command_list, EffectGpuEventKind::Dispatch,
             thread_group_count_x, thread_group_count_y, thread_group_count_z);
+    }
+    if (dispatch_asymmetric_tiled_culling_remap(
+            command_list, thread_group_count_x, thread_group_count_y,
+            thread_group_count_z)) {
+        return;
     }
     if (!taau_runtime_tracking_active()) {
         g_dispatch(command_list, thread_group_count_x, thread_group_count_y,
@@ -22593,7 +23068,8 @@ bool prepare_full_vr_frame_camera(
             left, right, down, up);
         float horizontal_scale = projection_scales.horizontal;
         float vertical_scale = projection_scales.vertical;
-        if (g_xr_cinema_projection_pipeline == nullptr &&
+        if ((!g_config.fullscreen_projection ||
+                g_xr_cinema_projection_pipeline == nullptr) &&
             g_xr_eye_swapchains[0].width > 0 &&
             g_xr_eye_swapchains[0].height > 0 &&
             g_game_render_width > 0 && g_game_render_height > 0) {
@@ -25995,7 +26471,8 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             left, right, down, up);
         float horizontal_scale = projection_scales.horizontal;
         float vertical_scale = projection_scales.vertical;
-        if (g_xr_cinema_projection_pipeline == nullptr &&
+        if ((!g_config.fullscreen_projection ||
+                g_xr_cinema_projection_pipeline == nullptr) &&
             g_xr_eye_swapchains[0].width > 0 && g_xr_eye_swapchains[0].height > 0 &&
             g_game_render_width > 0 && g_game_render_height > 0) {
             horizontal_scale = std::max(horizontal_scale, std::clamp(
@@ -27023,6 +27500,14 @@ void __fastcall hook_engine_is_loading_screen_video_playing(
     }
     const bool previous = g_engine_loading_screen_video_active.exchange(
         active, std::memory_order_acq_rel);
+    if (active && !previous) {
+        g_post_loading_auto_recenter_deadline_ms.store(
+            0, std::memory_order_release);
+    } else if (!active && previous) {
+        g_post_loading_auto_recenter_deadline_ms.store(
+            GetTickCount64() + kPostLoadingAutoRecenterDelayMs,
+            std::memory_order_release);
+    }
     g_engine_loading_screen_video_poll_armed.store(
         active, std::memory_order_release);
     if (active) {
@@ -27102,6 +27587,14 @@ bool poll_engine_loading_screen_video_state() {
 
     const bool previous = g_engine_loading_screen_video_active.exchange(
         active, std::memory_order_acq_rel);
+    if (active && !previous) {
+        g_post_loading_auto_recenter_deadline_ms.store(
+            0, std::memory_order_release);
+    } else if (!active && previous) {
+        g_post_loading_auto_recenter_deadline_ms.store(
+            GetTickCount64() + kPostLoadingAutoRecenterDelayMs,
+            std::memory_order_release);
+    }
     if (!active) {
         // The next native query rearms polling for a later loading video.
         g_engine_loading_screen_video_poll_armed.store(
@@ -27126,6 +27619,31 @@ bool poll_engine_loading_screen_video_state() {
             active ? 1 : 0, state, player);
     }
     return active;
+}
+
+void service_post_loading_auto_recenter(
+    uint64_t present, bool loading_video_active) {
+    uint64_t deadline_ms =
+        g_post_loading_auto_recenter_deadline_ms.load(
+            std::memory_order_acquire);
+    if (deadline_ms == 0 || loading_video_active ||
+        GetTickCount64() < deadline_ms) {
+        return;
+    }
+    if (!g_post_loading_auto_recenter_deadline_ms.compare_exchange_strong(
+            deadline_ms, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+
+    // Reuse the exact F9 path: the next valid located HMD pose becomes the
+    // new orientation and position center. The deadline is wall-clock based,
+    // so the behavior is independent of frame rate and compositor stalls.
+    g_hmd_center_valid.store(false, std::memory_order_release);
+    log_line(
+        "HMD post-loading auto-recenter triggered present=%llu delay_ms=%llu",
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(kPostLoadingAutoRecenterDelayMs));
 }
 
 void install_engine_native_camera_authority_hooks() {
@@ -32192,10 +32710,12 @@ void ensure_initialized() {
             temporal_backend_is_dlss() ? 1u : 0u,
             reverse_diagnostic_hooks_requested() ? 1u : 0u,
             g_config.openxr_mode);
-        // [FIX:RENDER-PROXY-FOV-DISTANCE-SCALE V1101 3/3] Clean canonical
-        // source with no shadow/culling census or per-call trial logging.
-        log_line("witcher3vr dxgi proxy initialized build=V1101 base=V1081 render_proxy_fov_distance_scale_fix=1 route=mode3_symmetric_dlss view_copy_rebuild_rva=0x15FF640 output_offsets=0x20,0x24 native_fov_offset=0x468 fov_writes=0 matrix_writes=0 lod_scalar_2b0_writes=0 settings_writes=0 automatic_focus_shaders=1 structural_family=1 immutable_eye_gs=1 b1_b12_read_only_gate=1 persistent_registry=%d real_smoke_owner=world_up_specialized diagnostics_required=0 shared_writes=0 culling_audit_detours=0",
-            focus_projection_shader_registry_enabled() ? 1 : 0);
+        // V1104 consolidates the validated tiled-light correction with the
+        // legacy projection default and global HUD-profile controls.
+        if (g_config.runtime_diagnostics) {
+            log_line("witcher3vr dxgi proxy initialized build=V1104 base=V1103 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 persistent_registry=%d real_smoke_owner=world_up_specialized",
+                focus_projection_shader_registry_enabled() ? 1 : 0);
+        }
     });
 }
 
@@ -35916,6 +36436,7 @@ void render_openxr_test_frame(
                 // fallback for smaller presentation scales or unusual masks.
                 full_surface_projection =
                     !spatial_panel_active &&
+                    g_config.fullscreen_projection &&
                     g_config.hmd_freelook &&
                     g_hmd_render_fov_valid.load(std::memory_order_acquire) &&
                     g_xr_cinema_projection_pipeline != nullptr &&
@@ -36603,6 +37124,7 @@ void render_openxr_test_frame(
                     g_packed_present_cache_valid &&
                     g_packed_present_cache_native_asymmetric;
                 native_asymmetric_projection =
+                    g_config.fullscreen_projection &&
                     native_pair_fully_built && !spatial_panel_active;
                 native_asymmetric_black_frame =
                     native_asymmetric_projection &&
@@ -38100,7 +38622,7 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     const auto frame = ++g_present_count;
     const bool loading_video_active =
         poll_engine_loading_screen_video_state();
-    (void)loading_video_active;
+    service_post_loading_auto_recenter(frame, loading_video_active);
     if (g_loading_video_presentation_reset_requested.exchange(
             false, std::memory_order_acq_rel)) {
         reset_loading_video_presentation_state(frame);
@@ -38243,17 +38765,9 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
         bootstrap_until != UINT64_MAX && frame >= bootstrap_until) {
         g_taau_descriptor_bootstrap_active.store(false, std::memory_order_relaxed);
     }
-    // [DIAG:POSE-TIMELINE 4/4] Mark immediately after a visible rotational
-    // step. The preceding in-memory timeline is then written once to CSV.
-    // [DIAG:ASYMMETRIC-EFFECT-GPU V1049 6/8] Read F7 exactly once.  The
-    // existing pose/subtitle flush and the new GPU capture therefore observe
-    // the same edge without consuming or duplicating it.
-    const bool f7_pressed = (GetAsyncKeyState(VK_F7) & 1) != 0;
-    update_effect_gpu_probe_on_present(frame, f7_pressed);
-    if (f7_pressed) {
-        flush_pose_timeline();
-        flush_cinema_subtitle_draws();
-    }
+    // F5-F7 are intentionally not polled by the renderer. F7 belongs to the
+    // Witcher input action that switches the HUD profile, including when
+    // diagnostic logging is enabled.
     // [FIX:FIRST-PERSON-SPLIT-HOTKEYS 1/1] F8 owns only main/near.
     // F11 owns first-person as an independent toggle, removing the fragile
     // three-state counter shared with the companion WitcherScript.

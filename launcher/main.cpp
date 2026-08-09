@@ -3,6 +3,7 @@
 
 #include <Windows.h>
 #include <CommCtrl.h>
+#include <Shellapi.h>
 #include <TlHelp32.h>
 
 #include <algorithm>
@@ -364,6 +365,83 @@ bool IsGameRunning() {
     return found;
 }
 
+std::optional<std::filesystem::path> WriteHudEditorManualSetupGuide() {
+    std::array<wchar_t, 32768> temporary_directory{};
+    const DWORD length = GetTempPathW(
+        static_cast<DWORD>(temporary_directory.size()),
+        temporary_directory.data());
+    if (length == 0 || length >= temporary_directory.size()) {
+        return std::nullopt;
+    }
+
+    const auto path = std::filesystem::path(temporary_directory.data()) /
+        L"Witcher3VR-HUD-Editor-Manual-Setup.txt";
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+
+    const std::wstring instructions =
+        w3vr::HudEditorManualSetupInstructions(g_app.paths);
+    const wchar_t bom = static_cast<wchar_t>(0xFEFF);
+    DWORD bom_written{};
+    DWORD contents_written{};
+    const bool size_valid = instructions.size() <=
+        MAXDWORD / sizeof(wchar_t);
+    const DWORD contents_size = size_valid
+        ? static_cast<DWORD>(instructions.size() * sizeof(wchar_t))
+        : 0;
+    const bool written = size_valid &&
+        WriteFile(file, &bom, sizeof(bom), &bom_written, nullptr) &&
+        bom_written == sizeof(bom) &&
+        WriteFile(file, instructions.data(), contents_size,
+            &contents_written, nullptr) &&
+        contents_written == contents_size &&
+        FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!written) {
+        DeleteFileW(path.c_str());
+        return std::nullopt;
+    }
+    return path;
+}
+
+void ShowHudEditorSetupFailure(HWND owner, const std::wstring& error) {
+    const auto guide = WriteHudEditorManualSetupGuide();
+    std::wstring message = error;
+    message +=
+        L"\n\nAutomatic HUD Editor setup was not confirmed. Close The "
+        L"Witcher 3 before retrying; the game can overwrite input.settings "
+        L"when it exits.";
+    if (guide) {
+        message += L"\n\nA manual setup guide was created at:\n" +
+            guide->wstring() + L"\n\nIt will open after this warning.";
+    } else {
+        message += L"\n\n" +
+            w3vr::HudEditorManualSetupInstructions(g_app.paths);
+    }
+    MessageBoxW(owner, message.c_str(),
+        L"Witcher 3 VR HUD Editor setup", MB_OK | MB_ICONWARNING);
+    if (guide) {
+        ShellExecuteW(owner, L"open", guide->c_str(), nullptr, nullptr,
+            SW_SHOWNORMAL);
+    }
+}
+
+bool EnsureHudEditorReady(HWND owner) {
+    std::wstring error;
+    if (IsGameRunning()) {
+        error = L"The Witcher 3 is currently running. HUD Editor setup was "
+            L"not attempted because the game could overwrite input.settings "
+            L"when it exits.";
+    } else if (w3vr::EnsureHudEditorSetup(g_app.paths, error)) {
+        return true;
+    }
+    ShowHudEditorSetupFailure(owner, error);
+    return false;
+}
+
 struct GameWindowSearch {
     DWORD process_id{};
     HWND window{};
@@ -579,6 +657,9 @@ void Save(bool launch) {
         MessageBoxW(g_app.window,
             L"Close The Witcher 3 before changing startup settings.",
             L"Witcher 3 VR Launcher", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (!EnsureHudEditorReady(g_app.window)) {
         return;
     }
     LauncherState state;
@@ -811,9 +892,9 @@ void CreateInterface(HWND window) {
         20, 804, 680, 112);
     AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
         38, 830, 650, 24);
-    AddLabel(L"HUD editor: Insert open/close    Q/E select panel    Arrow keys move    Wheel scales",
+    AddLabel(L"HUD editor: INS open / save and close    Q/E select panel    Arrow keys move    Wheel scales",
         38, 854, 650, 24);
-    AddLabel(L"Esc save/close    R reset panel    X reset profile    Tab switch VR / Cinema3D",
+    AddLabel(L"R reset panel    X reset profile    F7 switch VR / Cinema3D (editor open or closed)",
         38, 878, 650, 24);
 
     AddLabel(L"", 20, 924, 680, 30, IdStatus, SS_LEFT);
@@ -909,11 +990,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         return 4;
     }
 
-    std::wstring hud_setup_error;
-    if (!w3vr::EnsureHudEditorSetup(g_app.paths, hud_setup_error)) {
-        MessageBoxW(nullptr, hud_setup_error.c_str(),
-            L"Witcher 3 VR HUD Editor setup", MB_OK | MB_ICONWARNING);
-    }
+    EnsureHudEditorReady(nullptr);
 
     WNDCLASSEXW window_class{sizeof(window_class)};
     window_class.lpfnWndProc = WindowProcedure;

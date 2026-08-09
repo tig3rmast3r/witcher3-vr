@@ -403,6 +403,8 @@ void RemoveLegacyHudEditorBindings(std::vector<EditableTextLine>& lines) {
             line.find("Action=W3VRHudEditorMoveX") != std::string::npos ||
             line.find("Action=W3VRHudEditorMoveY") != std::string::npos ||
             line.find("Action=W3VRHudEditorDrag") != std::string::npos ||
+            line.find("Action=W3VRHudEditorExit") != std::string::npos ||
+            line.find("Action=W3VRHudEditorProfile") != std::string::npos ||
             line == "IK_MouseX=(Action=GI_MouseDampX)" ||
             line == "IK_MouseY=(Action=GI_MouseDampY)" ||
             (legacy_arrows &&
@@ -426,11 +428,12 @@ std::string MergeHudEditorBindings(const std::string& original) {
     for (const char* context : toggle_contexts) {
         EnsureSectionAction(lines, context, "W3VRHudEditorToggle",
             "IK_Insert=(Action=W3VRHudEditorToggle)", newline);
+        EnsureSectionAction(lines, context, "W3VRHudEditorProfile",
+            "IK_F7=(Action=W3VRHudEditorProfile)", newline);
     }
 
-    constexpr std::array<std::pair<const char*, const char*>, 12> editor_actions{{
+    constexpr std::array<std::pair<const char*, const char*>, 11> editor_actions{{
         {"W3VRHudEditorToggle", "IK_Insert=(Action=W3VRHudEditorToggle)"},
-        {"W3VRHudEditorExit", "IK_Escape=(Action=W3VRHudEditorExit)"},
         {"W3VRHudEditorPrevious", "IK_Q=(Action=W3VRHudEditorPrevious)"},
         {"W3VRHudEditorNext", "IK_E=(Action=W3VRHudEditorNext)"},
         {"W3VRHudEditorMoveLeft", "IK_Left=(Action=W3VRHudEditorMoveLeft)"},
@@ -440,7 +443,7 @@ std::string MergeHudEditorBindings(const std::string& original) {
         {"W3VRHudEditorScale", "IK_MouseZ=(Action=W3VRHudEditorScale)"},
         {"W3VRHudEditorResetCurrent", "IK_R=(Action=W3VRHudEditorResetCurrent)"},
         {"W3VRHudEditorResetProfile", "IK_X=(Action=W3VRHudEditorResetProfile)"},
-        {"W3VRHudEditorProfile", "IK_Tab=(Action=W3VRHudEditorProfile)"},
+        {"W3VRHudEditorProfile", "IK_F7=(Action=W3VRHudEditorProfile)"},
     }};
     for (const auto& [action, binding] : editor_actions) {
         EnsureSectionAction(lines, "W3VRHudEditor", action, binding, newline);
@@ -675,6 +678,45 @@ ConfigPaths DiscoverPaths() {
     };
 }
 
+std::wstring HudEditorManualSetupInstructions(const ConfigPaths& paths) {
+    const auto bin_directory = paths.launcher_directory.parent_path();
+    const auto filelist = bin_directory / L"config" / L"r4game" /
+        L"user_config_matrix" / L"pc" / L"dx12filelist.txt";
+    const auto input_settings =
+        paths.game_settings.parent_path() / L"input.settings";
+
+    std::wostringstream guide;
+    guide << L"Witcher 3 VR HUD Editor - manual setup\r\n\r\n"
+        L"Close The Witcher 3 completely before editing these files. The game "
+        L"can overwrite input.settings when it exits.\r\n\r\n"
+        L"1. Open:\r\n" << filelist.wstring() << L"\r\n\r\n"
+        L"Add this line once:\r\n"
+        L"modWitcher3VRHUDEditor.xml;\r\n\r\n"
+        L"2. Open:\r\n" << input_settings.wstring() << L"\r\n\r\n"
+        L"Under each of these existing sections:\r\n"
+        L"Boat, BoatPassenger, Combat, Combat_Replacer_Ciri, Diving, "
+        L"Exploration, Exploration_Replacer_Ciri, Horse, "
+        L"Horse_Replacer_Ciri, JumpClimb, Scene, Swimming\r\n\r\n"
+        L"add these two lines once:\r\n"
+        L"IK_Insert=(Action=W3VRHudEditorToggle)\r\n"
+        L"IK_F7=(Action=W3VRHudEditorProfile)\r\n\r\n"
+        L"Add this section, or add the missing lines to the existing section:\r\n"
+        L"[W3VRHudEditor]\r\n"
+        L"IK_Insert=(Action=W3VRHudEditorToggle)\r\n"
+        L"IK_F7=(Action=W3VRHudEditorProfile)\r\n"
+        L"IK_Q=(Action=W3VRHudEditorPrevious)\r\n"
+        L"IK_E=(Action=W3VRHudEditorNext)\r\n"
+        L"IK_Left=(Action=W3VRHudEditorMoveLeft)\r\n"
+        L"IK_Right=(Action=W3VRHudEditorMoveRight)\r\n"
+        L"IK_Up=(Action=W3VRHudEditorMoveUp)\r\n"
+        L"IK_Down=(Action=W3VRHudEditorMoveDown)\r\n"
+        L"IK_MouseZ=(Action=W3VRHudEditorScale)\r\n"
+        L"IK_R=(Action=W3VRHudEditorResetCurrent)\r\n"
+        L"IK_X=(Action=W3VRHudEditorResetProfile)\r\n\r\n"
+        L"Save both files, then start the game through the launcher.\r\n";
+    return guide.str();
+}
+
 bool EnsureVrConfiguration(const ConfigPaths& paths,
     const std::string& template_contents, bool& created, std::wstring& error) {
     created = false;
@@ -803,6 +845,35 @@ bool EnsureHudEditorSetup(const ConfigPaths& paths, std::wstring& error) {
     const std::string merged_input = MergeHudEditorBindings(*original_input);
     if (merged_input != *original_input &&
         !AtomicWriteWithBackup(input_settings, merged_input, error)) {
+        return false;
+    }
+
+    // A successful ReplaceFile call is not enough evidence: antivirus,
+    // synchronization software, or a running game can replace the file again.
+    // Read both targets back and validate the exact state consumed by REDengine.
+    const auto verified_filelist = read_text(filelist);
+    if (!verified_filelist) return false;
+    const auto verified_filelist_lines = ParseEditableText(*verified_filelist);
+    const bool registration_verified = std::any_of(
+        verified_filelist_lines.begin(), verified_filelist_lines.end(),
+        [](const EditableTextLine& line) {
+            return Trim(line.text) == "modWitcher3VRHUDEditor.xml;";
+        });
+    if (!registration_verified) {
+        error = L"HUD Editor setup verification failed after writing:\n" +
+            filelist.wstring() +
+            L"\n\nThe required XML registration was not present when the file "
+            L"was read back.";
+        return false;
+    }
+
+    const auto verified_input = read_text(input_settings);
+    if (!verified_input) return false;
+    if (MergeHudEditorBindings(*verified_input) != *verified_input) {
+        error = L"HUD Editor setup verification failed after writing:\n" +
+            input_settings.wstring() +
+            L"\n\nOne or more required INS/F7 bindings were not present when "
+            L"the file was read back. Close The Witcher 3 before retrying.";
         return false;
     }
     return true;
