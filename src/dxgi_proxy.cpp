@@ -229,11 +229,6 @@ struct Config {
     float streamline_temporal_clip_correction{0.0f};
     bool streamline_trace{false};
     int streamline_trace_start_frame{500};
-    bool streamline_mvec_probe{false};
-    bool streamline_output_probe{false};
-    bool streamline_mvec_correction{false};
-    bool streamline_reconstruct_camera_motion{false};
-    bool streamline_force_camera_mvec{false};
     bool streamline_taau_bridge{false};
     bool ngx_trace{false};
     bool dlss_dlaa{false};
@@ -1174,6 +1169,9 @@ using EngineViewRebuildFn = void(__fastcall*)(float*);
 EngineViewRebuildFn g_engine_view_rebuild{};
 using EngineViewCopyRebuildFn = float*(__fastcall*)(float*, const float*);
 EngineViewCopyRebuildFn g_engine_view_copy_rebuild{};
+using EngineTemporalCameraBuildFn = void*(__fastcall*)(
+    void*, float, const void*, const void*, float, float, float, float, float);
+EngineTemporalCameraBuildFn g_engine_temporal_camera_build{};
 using EngineCameraDirectionFn = void(__fastcall*)(void*, void*, float*);
 EngineCameraDirectionFn g_engine_camera_direction{};
 using EngineTransformToEulerFn =
@@ -1296,7 +1294,6 @@ std::atomic<float> g_fallback_gameplay_far{};
 std::atomic<bool> g_auto_recenter_on_packed_lock_armed{};
 constexpr uint32_t kSequentialStartupDiagnosticEvaluationLimit = 64;
 std::atomic<uint32_t> g_sequential_startup_diagnostic_window{};
-std::atomic<uint32_t> g_sequential_mvec_diagnostic_logs{};
 std::atomic<uint32_t> g_sequential_ngx_diagnostic_logs{};
 std::atomic<uint64_t> g_gameplay_world_pipeline_present{UINT64_MAX};
 std::mutex g_engine_view_snapshot_mutex{};
@@ -1561,6 +1558,18 @@ thread_local int g_engine_factory_eye{-1};
 thread_local int g_engine_render_eye{-1};
 thread_local uint32_t g_engine_render_generation{};
 thread_local uint64_t g_engine_render_pair_id{};
+constexpr size_t kEngineTemporalCameraRecordBytes = 0xB0;
+struct EnginePerEyeTemporalCameraHistory {
+    std::array<uint8_t, kEngineTemporalCameraRecordBytes> record{};
+    uint64_t pair_id{};
+    bool valid{};
+};
+std::mutex g_engine_per_eye_temporal_camera_mutex{};
+std::array<EnginePerEyeTemporalCameraHistory, 2>
+    g_engine_per_eye_temporal_camera_history{};
+std::atomic<float> g_engine_temporal_camera_build_time{};
+std::atomic<bool> g_engine_temporal_camera_build_time_valid{};
+std::atomic<uint8_t> g_engine_per_eye_temporal_camera_logged_mask{};
 thread_local XrView g_engine_render_view{XR_TYPE_VIEW};
 thread_local bool g_engine_render_view_valid{};
 struct HmdCameraPoseSnapshot {
@@ -1909,14 +1918,10 @@ std::atomic<uint32_t> g_ngx_trace_count{};
 thread_local bool g_ngx_creating_feature{};
 std::atomic<uint64_t> g_streamline_reset_last_logged_present{UINT64_MAX};
 std::atomic<uint32_t> g_streamline_trace_counts[2]{};
-std::atomic<uint32_t> g_streamline_mvec_probe_counts[2]{};
-std::atomic<uint32_t> g_streamline_output_probe_counts[2]{};
 std::atomic<uint32_t> g_streamline_taau_bridge_match_logs{};
 std::atomic<uint64_t> g_streamline_taau_bridge_matches{};
 std::atomic<uint64_t> g_streamline_taau_bridge_misses{};
 std::atomic<uint64_t> g_streamline_dlss_evaluate_calls{};
-std::atomic<uint64_t> g_streamline_mvec_dispatch_calls{};
-std::atomic<uint64_t> g_streamline_mvec_ready_misses{};
 std::atomic<uint64_t> g_ngx_dlss_evaluate_calls{};
 struct PackedDlssInputs {
     ID3D12Resource* color{};
@@ -2133,32 +2138,6 @@ std::atomic<uint64_t> g_taau_drop_queue_signal_max_ticks{};
 std::atomic<uint64_t> g_taau_drop_queue_slot_uses{};
 std::atomic<ID3D12Resource*> g_ngx_input_resources[3]{};
 std::atomic<uint32_t> g_ngx_input_states[3]{UINT32_MAX, UINT32_MAX, UINT32_MAX};
-struct StreamlineMVecFrameState {
-    uint32_t frame_token{};
-    bool ready{};
-    float original_clip_to_previous[16]{};
-    float corrected_clip_to_previous[16]{};
-    float current_to_previous_hmd[12]{};
-    float hmd_projection[4]{};
-    bool hmd_motion_valid{};
-    float mvec_scale[2]{};
-    ID3D12Resource* depth{};
-    ID3D12Resource* mvec{};
-    D3D12_RESOURCE_STATES depth_state{};
-    D3D12_RESOURCE_STATES mvec_state{};
-};
-struct StreamlineMVecTemporalState {
-    float original_clip_to_previous[16]{};
-    float current_to_previous_hmd[12]{};
-    std::array<float, 12> matched_corrected_camera{};
-    std::array<XrView, 2> matched_render_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
-    float hmd_projection[4]{};
-    float mvec_scale[2]{};
-    bool hmd_motion_valid{};
-    bool matched_camera_valid{};
-    bool matched_render_views_valid{};
-    uint8_t sequential_consumed_eye_mask{};
-};
 struct StreamlineOutputFrameState {
     ID3D12Resource* output{};
     D3D12_RESOURCE_STATES state{};
@@ -2167,38 +2146,7 @@ struct StreamlineOutputFrameState {
     XrView render_view{XR_TYPE_VIEW};
     bool render_view_valid{};
 };
-std::mutex g_streamline_mvec_mutex{};
-StreamlineMVecFrameState g_streamline_mvec_frame{};
-std::unordered_map<uint32_t, StreamlineMVecTemporalState>
-    g_streamline_mvec_temporal_frames{};
-std::array<std::array<float, 12>, 2> g_streamline_dlss_previous_camera{};
-bool g_streamline_dlss_previous_camera_valid[2]{};
-constexpr uint32_t kPackedDlssCameraCommitSlotCount = 64;
-struct PackedDlssCameraCommitSlot {
-    uint64_t pair_id{UINT64_MAX};
-    std::array<std::array<float, 12>, 2> camera{};
-    bool valid[2]{};
-};
-std::array<PackedDlssCameraCommitSlot, kPackedDlssCameraCommitSlotCount>
-    g_packed_dlss_camera_commit_slots{};
-std::atomic<uint64_t> g_packed_dlss_camera_history_deferred{};
-std::atomic<uint64_t> g_packed_dlss_camera_history_committed{};
 thread_local StreamlineOutputFrameState g_streamline_output_frame{};
-std::atomic<bool> g_streamline_mvec_skip_logged{};
-ID3D12DescriptorHeap* g_streamline_mvec_heap{};
-ID3D12DescriptorHeap* g_streamline_mvec_clear_heap{};
-ID3D12RootSignature* g_streamline_mvec_root_signature{};
-ID3D12PipelineState* g_streamline_mvec_pipeline{};
-UINT g_streamline_mvec_descriptor_increment{};
-std::once_flag g_streamline_mvec_pipeline_once{};
-std::once_flag g_streamline_mvec_clear_heap_once{};
-ID3D12Resource* g_dlss_mvec_readback_buffer{};
-ID3D12Fence* g_dlss_mvec_readback_fence{};
-D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_dlss_mvec_readback_footprint{};
-std::atomic<ID3D12GraphicsCommandList*> g_dlss_mvec_readback_command_list{};
-std::atomic<bool> g_dlss_mvec_readback_scheduled{};
-std::atomic<bool> g_dlss_mvec_readback_submitted{};
-std::atomic<bool> g_dlss_mvec_readback_logged{};
 ID3D12Resource* g_stereo_luma_readback[2]{};
 D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_stereo_luma_footprint{};
 uint64_t g_stereo_luma_readback_bytes{};
@@ -2354,20 +2302,6 @@ bool streamline_command_list_bridged_this_present(
     return found != g_streamline_command_list_bridge_presents.end() &&
         found->second == present;
 }
-std::atomic<float> g_streamline_hmd_motion_angle{};
-std::atomic<uint32_t> g_streamline_hmd_delta_logs{};
-constexpr UINT kDlssComponentProbeColumns = 24;
-constexpr UINT kDlssComponentProbeRows = 24;
-constexpr UINT kDlssComponentProbeElements =
-    kDlssComponentProbeColumns * kDlssComponentProbeRows * 2;
-ID3D12Resource* g_dlss_component_probe_buffer{};
-ID3D12Resource* g_dlss_component_probe_readback{};
-ID3D12Fence* g_dlss_component_probe_fence{};
-std::atomic<ID3D12GraphicsCommandList*> g_dlss_component_probe_command_list{};
-std::atomic<bool> g_dlss_component_probe_scheduled{};
-std::atomic<bool> g_dlss_component_probe_submitted{};
-std::atomic<bool> g_dlss_component_probe_logged{};
-
 struct ResourceInfo {
     D3D12_RESOURCE_DESC desc{};
     D3D12_HEAP_TYPE heap_type{D3D12_HEAP_TYPE_CUSTOM};
@@ -5857,13 +5791,6 @@ void load_config() {
         g_config.streamline_trace = read_ini_bool("engine", "streamline_trace", false);
         g_config.streamline_trace_start_frame = std::max(
             0, read_ini_int("engine", "streamline_trace_start_frame", 500));
-        g_config.streamline_mvec_probe = read_ini_bool("engine", "streamline_mvec_probe", false);
-        g_config.streamline_output_probe = read_ini_bool("engine", "streamline_output_probe", false);
-        g_config.streamline_mvec_correction = read_ini_bool("engine", "streamline_mvec_correction", false);
-        g_config.streamline_reconstruct_camera_motion = read_ini_bool(
-            "engine", "streamline_reconstruct_camera_motion", false);
-        g_config.streamline_force_camera_mvec = read_ini_bool(
-            "engine", "streamline_force_camera_mvec", false);
         g_config.streamline_taau_bridge = read_ini_bool(
             "engine", "streamline_taau_bridge", false);
         g_config.ngx_trace = read_ini_bool("engine", "ngx_trace", false);
@@ -5923,9 +5850,6 @@ void load_config() {
             g_config.ngx_trace = false;
             g_config.streamline_split_viewports = false;
             g_config.streamline_taau_bridge = false;
-            g_config.streamline_mvec_correction = false;
-            g_config.streamline_reconstruct_camera_motion = false;
-            g_config.streamline_force_camera_mvec = false;
         }
 
         const bool mode3_non_taau_backend =
@@ -5942,9 +5866,7 @@ void load_config() {
             !g_config.logging_enabled &&
             !g_config.cinema_camera_diagnostics &&
             !g_config.cinema_subtitle_diagnostics &&
-            !g_config.streamline_trace &&
-            !g_config.streamline_mvec_probe &&
-            !g_config.streamline_output_probe;
+            !g_config.streamline_trace;
         g_packed_hang_diagnostics_enabled =
             g_config.runtime_diagnostics && g_config.openxr_mode == 4;
 
@@ -5979,7 +5901,7 @@ void load_config() {
             g_config.reverse_copy_max_logs,
             g_config.reverse_stereo_probe,
             g_config.reverse_geometry_shift);
-        log_line("Config engine temporal_backend=%s dlss_dlaa=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_split_viewports=%d streamline_right_temporal_offset=%.4f streamline_temporal_eye=%d streamline_temporal_clip_correction=%.5f streamline_trace=%d streamline_trace_start_frame=%d streamline_mvec_probe=%d streamline_output_probe=%d streamline_mvec_correction=%d streamline_reconstruct_camera_motion=%d streamline_force_camera_mvec=%d",
+        log_line("Config engine temporal_backend=%s dlss_dlaa=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_split_viewports=%d streamline_right_temporal_offset=%.4f streamline_temporal_eye=%d streamline_temporal_clip_correction=%.5f streamline_trace=%d streamline_trace_start_frame=%d native_mvec_passthrough=1",
             temporal_backend_name(),
             g_config.dlss_dlaa,
             g_config.engine_view_probe, g_config.engine_frame_builder_probe,
@@ -5996,12 +5918,7 @@ void load_config() {
             g_config.streamline_temporal_eye,
             g_config.streamline_temporal_clip_correction,
             g_config.streamline_trace,
-            g_config.streamline_trace_start_frame,
-            g_config.streamline_mvec_probe,
-            g_config.streamline_output_probe,
-            g_config.streamline_mvec_correction,
-            g_config.streamline_reconstruct_camera_motion,
-            g_config.streamline_force_camera_mvec);
+            g_config.streamline_trace_start_frame);
         log_line(
             "Config cinema render_stereo_strength=%.3f hud_stereo_shift_px=%d "
             "full_vr_hud_scale=%.3f full_vr_hud_stereo_shift_px=%d",
@@ -11554,30 +11471,6 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         }
     }
 
-    bool submits_dlss_mvec_readback{};
-    auto* dlss_readback_list = g_dlss_mvec_readback_command_list.load();
-    if (dlss_readback_list != nullptr && command_lists != nullptr &&
-        !g_dlss_mvec_readback_submitted.load()) {
-        for (UINT index = 0; index < num_command_lists; ++index) {
-            if (command_lists[index] == static_cast<ID3D12CommandList*>(dlss_readback_list)) {
-                submits_dlss_mvec_readback = true;
-                break;
-            }
-        }
-    }
-
-    bool submits_dlss_component_probe{};
-    auto* component_probe_list = g_dlss_component_probe_command_list.load();
-    if (component_probe_list != nullptr && command_lists != nullptr &&
-        !g_dlss_component_probe_submitted.load()) {
-        for (UINT index = 0; index < num_command_lists; ++index) {
-            if (command_lists[index] == static_cast<ID3D12CommandList*>(component_probe_list)) {
-                submits_dlss_component_probe = true;
-                break;
-            }
-        }
-    }
-
     bool submits_dlss_output_luma[2]{};
     if (command_lists != nullptr) {
         for (uint32_t lane = 0; lane < 2; ++lane) {
@@ -11717,18 +11610,6 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         const HRESULT signal_hr = queue->Signal(g_taau_readback_fence, 1);
         log_line("TAAU readback submitted command_list=%p signal_hr=0x%08X",
             readback_list, static_cast<unsigned>(signal_hr));
-    }
-    if (submits_dlss_mvec_readback && g_dlss_mvec_readback_fence != nullptr &&
-        !g_dlss_mvec_readback_submitted.exchange(true)) {
-        const HRESULT signal_hr = queue->Signal(g_dlss_mvec_readback_fence, 1);
-        log_line("DLSS MVec readback submitted command_list=%p signal_hr=0x%08X",
-            dlss_readback_list, static_cast<unsigned>(signal_hr));
-    }
-    if (submits_dlss_component_probe && g_dlss_component_probe_fence != nullptr &&
-        !g_dlss_component_probe_submitted.exchange(true)) {
-        const HRESULT signal_hr = queue->Signal(g_dlss_component_probe_fence, 1);
-        log_line("DLSS component probe submitted command_list=%p signal_hr=0x%08X",
-            component_probe_list, static_cast<unsigned>(signal_hr));
     }
     for (uint32_t lane = 0; lane < 2; ++lane) {
         if (submits_dlss_output_luma[lane] &&
@@ -26053,6 +25934,101 @@ void trace_native_camera_authority(
         changed ? 1 : 0);
 }
 
+// [FIX:DLSS-NATIVE-PER-EYE-HISTORY V9416 1/4] Retain only REDengine's native
+// frame time here. Eye and pair ownership are established later, after the
+// final HMD pose, projection and stereo offset have been applied.
+void* __fastcall hook_engine_temporal_camera_build(
+    void* history,
+    float time,
+    const void* position,
+    const void* rotation,
+    float fov,
+    float aspect,
+    float near_plane,
+    float far_plane,
+    float projection_scale) {
+    void* result = g_engine_temporal_camera_build(
+        history, time, position, rotation, fov, aspect,
+        near_plane, far_plane, projection_scale);
+    if (dlss_sequential_mode_active() && std::isfinite(time)) {
+        g_engine_temporal_camera_build_time.store(
+            time, std::memory_order_relaxed);
+        g_engine_temporal_camera_build_time_valid.store(
+            true, std::memory_order_release);
+    }
+    return result;
+}
+
+bool prepare_engine_per_eye_native_temporal_history(
+    float* view,
+    uintptr_t caller_rva,
+    bool temporal_scene_camera) {
+    constexpr uintptr_t kViewFactoryReturnRva = 0x0162196D;
+    if (view == nullptr || caller_rva != kViewFactoryReturnRva ||
+        !temporal_scene_camera || !dlss_sequential_mode_active() ||
+        !g_engine_dual_render_active.load(std::memory_order_acquire) ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        g_engine_temporal_camera_build == nullptr) {
+        return false;
+    }
+
+    const int eye = g_engine_factory_eye;
+    const uint64_t pair_id = g_engine_producer_pair_id;
+    const bool time_valid =
+        g_engine_temporal_camera_build_time_valid.load(
+            std::memory_order_acquire);
+    const float engine_time = g_engine_temporal_camera_build_time.load(
+        std::memory_order_relaxed);
+    if (eye < 0 || eye > 1 || pair_id == 0 || pair_id == UINT64_MAX ||
+        !time_valid || !std::isfinite(engine_time) ||
+        !std::isfinite(view[7]) || view[7] <= 0.1f ||
+        !std::isfinite(view[10]) || view[10] <= 0.1f ||
+        !std::isfinite(view[11]) ||
+        !std::isfinite(view[12]) || view[12] <= 0.0f ||
+        !std::isfinite(view[13]) || view[13] <= view[12]) {
+        return false;
+    }
+
+    alignas(16) std::array<uint8_t, kEngineTemporalCameraRecordBytes>
+        current_record{};
+    void* built = g_engine_temporal_camera_build(
+        current_record.data(), engine_time, view, view + 4,
+        view[7], view[10], view[12], view[13], view[11]);
+    if (built != current_record.data() || current_record[0] == 0) {
+        return false;
+    }
+
+    bool continued{};
+    {
+        std::scoped_lock lock{g_engine_per_eye_temporal_camera_mutex};
+        auto& slot = g_engine_per_eye_temporal_camera_history[
+            static_cast<size_t>(eye)];
+        continued = slot.valid && slot.pair_id != UINT64_MAX &&
+            pair_id == slot.pair_id + 1;
+        const auto& previous_record = continued
+            ? slot.record
+            : current_record;
+        memcpy(reinterpret_cast<uint8_t*>(view) + 0x460,
+            previous_record.data(), previous_record.size());
+        slot.record = current_record;
+        slot.pair_id = pair_id;
+        slot.valid = true;
+    }
+
+    if (g_config.runtime_diagnostics) {
+        const uint8_t eye_bit = static_cast<uint8_t>(1u << eye);
+        if ((g_engine_per_eye_temporal_camera_logged_mask.fetch_or(
+                eye_bit, std::memory_order_relaxed) & eye_bit) == 0) {
+            log_line(
+                "V9416 native per-eye temporal history active "
+                "eye=%d pair=%llu continued=%u",
+                eye, static_cast<unsigned long long>(pair_id),
+                continued ? 1u : 0u);
+        }
+    }
+    return true;
+}
+
 void __fastcall hook_engine_view_rebuild(float* view) {
     constexpr uintptr_t kViewFactoryReturnRva = 0x0162196D;
     constexpr uintptr_t kViewCopyRebuildReturnRva = 0x015FF863;
@@ -27129,6 +27105,11 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                 reinterpret_cast<const uint8_t*>(view),
                 asymmetric_factory_pending->pre_rebuild);
     }
+    // [FIX:DLSS-NATIVE-PER-EYE-HISTORY V9416 2/4] Snapshot the exact final
+    // camera sent to REDengine and install the previous snapshot belonging to
+    // this same eye before the native motion-vector matrix is rebuilt.
+    prepare_engine_per_eye_native_temporal_history(
+        view, caller_rva, temporal_scene_camera);
     g_engine_view_rebuild(view);
     if (native_asymmetric_factory_projection_applied) {
         uint32_t native_asymmetric_factory_post_width{};
@@ -28485,8 +28466,41 @@ void install_engine_world_vector_to_view_ratio_hook() {
     }
 }
 
+// [FIX:DLSS-NATIVE-PER-EYE-HISTORY V9416 3/4] REDengine's constructor is
+// reused to create a byte-compatible 0xB0 temporal record from the final
+// corrected camera. Logging remains fully dependent on Diagnostic Logging.
+void install_engine_temporal_camera_builder_hook() {
+    if (!dlss_sequential_mode_active() ||
+        g_engine_temporal_camera_build != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineTemporalCameraBuildRva = 0x015FE010;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr
+        ? module + kEngineTemporalCameraBuildRva
+        : nullptr;
+    const bool installed = target != nullptr &&
+        MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_engine_temporal_camera_build),
+            reinterpret_cast<void**>(
+                &g_engine_temporal_camera_build)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK;
+    if (g_config.runtime_diagnostics) {
+        log_line(
+            "V9416 REDengine temporal camera builder %s "
+            "RVA=0x%llX target=%p",
+            installed ? "hooked" : "hook failed",
+            static_cast<unsigned long long>(
+                kEngineTemporalCameraBuildRva),
+            target);
+    }
+}
+
 void install_engine_view_factory_probe() {
-    if ((!g_config.engine_view_factory_probe && g_config.engine_factory_stereo_offset == 0.0f) ||
+    if ((!g_config.engine_view_factory_probe &&
+            g_config.engine_factory_stereo_offset == 0.0f &&
+            !dlss_sequential_mode_active()) ||
         g_engine_view_rebuild != nullptr) {
         return;
     }
@@ -28716,12 +28730,6 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
             false, std::memory_order_release);
         g_packed_dlss_last_published_pair.store(
             0, std::memory_order_release);
-        {
-            std::scoped_lock history_lock{g_streamline_mvec_mutex};
-            for (auto& commit : g_packed_dlss_camera_commit_slots) {
-                commit = {};
-            }
-        }
         std::scoped_lock present_lock{g_packed_dlss_present_mutex};
         g_packed_dlss_collect_metadata = {};
         g_packed_dlss_next_metadata = {};
@@ -28767,14 +28775,16 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
     g_engine_completed_view = {XR_TYPE_VIEW};
     g_engine_completed_view_valid = false;
     g_engine_completed_view_mutex.unlock();
-    {
-        std::scoped_lock lock{g_streamline_mvec_mutex};
-        g_streamline_mvec_temporal_frames.clear();
-        g_streamline_dlss_previous_camera_valid[0] = false;
-        g_streamline_dlss_previous_camera_valid[1] = false;
-    }
     g_streamline_dual_capture_sequence.store(0);
     g_streamline_dual_evaluate_log_count.store(0);
+    {
+        std::scoped_lock lock{g_engine_per_eye_temporal_camera_mutex};
+        g_engine_per_eye_temporal_camera_history = {};
+    }
+    g_engine_temporal_camera_build_time_valid.store(
+        false, std::memory_order_release);
+    g_engine_per_eye_temporal_camera_logged_mask.store(
+        0, std::memory_order_relaxed);
     g_taau_packed_core_prearmed.store(
         enabled && taau_functional_hooks_needed(),
         std::memory_order_relaxed);
@@ -29327,43 +29337,6 @@ void multiply_row_major_4x4(const float* left, const float* right, float* out) {
     memcpy(out, result, sizeof(result));
 }
 
-std::array<float, 12> invert_rigid_transform_3x4(const std::array<float, 12>& transform) {
-    std::array<float, 12> inverse{};
-    for (size_t row = 0; row < 3; ++row) {
-        for (size_t column = 0; column < 3; ++column) {
-            inverse[row * 4 + column] = transform[column * 4 + row];
-        }
-        inverse[row * 4 + 3] = -(
-            inverse[row * 4] * transform[3] +
-            inverse[row * 4 + 1] * transform[7] +
-            inverse[row * 4 + 2] * transform[11]);
-    }
-    return inverse;
-}
-
-std::array<float, 12> camera_to_previous_transform(
-    const std::array<float, 12>& current,
-    const std::array<float, 12>& previous) {
-    std::array<float, 12> transform{};
-    const float* current_basis[3] = {
-        current.data() + 3, current.data() + 6, current.data() + 9};
-    const float* previous_basis[3] = {
-        previous.data() + 3, previous.data() + 6, previous.data() + 9};
-    for (size_t row = 0; row < 3; ++row) {
-        for (size_t column = 0; column < 3; ++column) {
-            for (size_t axis = 0; axis < 3; ++axis) {
-                transform[row * 4 + column] +=
-                    previous_basis[row][axis] * current_basis[column][axis];
-            }
-        }
-        for (size_t axis = 0; axis < 3; ++axis) {
-            transform[row * 4 + 3] += previous_basis[row][axis] *
-                (current[axis] - previous[axis]);
-        }
-    }
-    return transform;
-}
-
 void apply_right_eye_temporal_offset(void* constants, float offset) {
     auto* values = static_cast<float*>(constants);
 
@@ -29411,444 +29384,6 @@ uint32_t streamline_eye() {
     return static_cast<uint32_t>(g_present_count.load() & 1ull);
 }
 
-uint32_t streamline_history_eye() {
-    if (g_config.streamline_split_viewports &&
-        (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
-        g_engine_dual_render_active.load()) {
-        return streamline_eye() & 1u;
-    }
-    return 0;
-}
-
-bool initialize_streamline_mvec_clear_heap() {
-    std::call_once(g_streamline_mvec_clear_heap_once, []() {
-        if (g_d3d12_device == nullptr) {
-            return;
-        }
-
-        D3D12_DESCRIPTOR_HEAP_DESC desc{};
-        desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        desc.NumDescriptors = 1;
-        desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (SUCCEEDED(g_d3d12_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&g_streamline_mvec_clear_heap)))) {
-            log_line("Streamline MVec clear descriptor heap initialized");
-        }
-    });
-    return g_streamline_mvec_clear_heap != nullptr;
-}
-
-bool clear_streamline_mvec(ID3D12GraphicsCommandList* command_list, StreamlineMVecFrameState& frame) {
-    if (command_list == nullptr || frame.mvec == nullptr ||
-        frame.mvec_state != D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE ||
-        !initialize_streamline_mvec_clear_heap()) {
-        return false;
-    }
-
-    const auto desc = frame.mvec->GetDesc();
-    if (desc.Format != DXGI_FORMAT_R16G16_FLOAT) {
-        return false;
-    }
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-    uav.Format = DXGI_FORMAT_R16G16_FLOAT;
-    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    const auto cpu = g_streamline_mvec_clear_heap->GetCPUDescriptorHandleForHeapStart();
-    const auto gpu = g_streamline_mvec_clear_heap->GetGPUDescriptorHandleForHeapStart();
-    g_d3d12_device->CreateUnorderedAccessView(frame.mvec, nullptr, &uav, cpu);
-
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = frame.mvec;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    command_list->ResourceBarrier(1, &barrier);
-    ID3D12DescriptorHeap* heaps[] = {g_streamline_mvec_clear_heap};
-    command_list->SetDescriptorHeaps(1, heaps);
-    const float zeros[4]{};
-    command_list->ClearUnorderedAccessViewFloat(gpu, cpu, frame.mvec, zeros, 0, nullptr);
-    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    command_list->ResourceBarrier(1, &barrier);
-    return true;
-}
-
-bool initialize_streamline_mvec_pipeline() {
-    std::call_once(g_streamline_mvec_pipeline_once, []() {
-        if (g_d3d12_device == nullptr || !initialize_dxc()) {
-            return;
-        }
-
-        static constexpr char kShaderSource[] = R"(
-Texture2D<float> depth_texture : register(t0);
-RWTexture2D<float2> mvec_texture : register(u0);
-RWStructuredBuffer<float4> component_probe : register(u1);
-cbuffer Parameters : register(b0) {
-    float4x4 original_clip_to_previous;
-    float4 current_to_previous_hmd_row0;
-    float4 current_to_previous_hmd_row1;
-    float4 current_to_previous_hmd_row2;
-    float4 hmd_projection;
-    float2 mvec_scale;
-    uint2 texture_size;
-    uint probe_enabled;
-};
-[numthreads(8, 8, 1)]
-void main(uint3 dispatch_id : SV_DispatchThreadID) {
-    if (any(dispatch_id.xy >= texture_size)) return;
-    float2 uv = (float2(dispatch_id.xy) + 0.5) / float2(texture_size);
-    float depth = depth_texture.Load(int3(dispatch_id.xy, 0));
-    float2 native_motion = mvec_texture[dispatch_id.xy];
-
-    float4 clip = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    float4 previous_engine = mul(original_clip_to_previous, clip);
-    float2 engine_camera_motion = float2(0.0, 0.0);
-    if (abs(previous_engine.w) >= 1e-6) {
-        float3 previous_engine_ndc = previous_engine.xyz / previous_engine.w;
-        float2 previous_engine_uv = float2(
-            previous_engine_ndc.x * 0.5 + 0.5,
-            previous_engine_ndc.y * -0.5 + 0.5);
-        engine_camera_motion = previous_engine_uv - uv;
-    }
-
-    float tan_half_y = hmd_projection.x;
-    float tan_half_x = tan_half_y * hmd_projection.y;
-    float near_plane = hmd_projection.z;
-    float far_plane = hmd_projection.w;
-    float linear_depth = near_plane * far_plane /
-        max(near_plane + depth * (far_plane - near_plane), 1e-6);
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    float3 current_position = float3(
-        ndc.x * tan_half_x, ndc.y * tan_half_y, 1.0) * linear_depth;
-    float3 previous_hmd_position = float3(
-        dot(current_to_previous_hmd_row0.xyz, current_position) +
-            current_to_previous_hmd_row0.w,
-        dot(current_to_previous_hmd_row1.xyz, current_position) +
-            current_to_previous_hmd_row1.w,
-        dot(current_to_previous_hmd_row2.xyz, current_position) +
-            current_to_previous_hmd_row2.w);
-    float2 hmd_camera_motion = float2(0.0, 0.0);
-    if (previous_hmd_position.z > 1e-5) {
-        float2 previous_hmd_ndc = float2(
-            previous_hmd_position.x / (previous_hmd_position.z * tan_half_x),
-            previous_hmd_position.y / (previous_hmd_position.z * tan_half_y));
-        float2 previous_hmd_uv = float2(
-            previous_hmd_ndc.x * 0.5 + 0.5,
-            0.5 - previous_hmd_ndc.y * 0.5);
-        hmd_camera_motion = previous_hmd_uv - uv;
-    }
-
-    // REDengine stores normalized UV displacement. Streamline's original NGX
-    // MV scales convert it to input pixels during evaluation.
-    // V199: REDengine's native velocity points from the HMD-corrected current
-    // image toward its uncorrected/centered previous camera. Remove that camera
-    // component and replace it with the actual corrected N-to-N-1 camera motion,
-    // preserving the native per-object residual.
-    float2 raw_engine_camera_motion = engine_camera_motion;
-    // V206 camera-only diagnostic with token-stable routing. Keep native
-    // object residuals out until the HMD camera field direction is validated.
-    float2 corrected_motion = hmd_camera_motion;
-    if (probe_enabled != 0) {
-        uint column = min(dispatch_id.x * 24 / texture_size.x, 23u);
-        uint row = min(dispatch_id.y * 24 / texture_size.y, 23u);
-        uint sample_x = ((2 * column + 1) * texture_size.x) / 48;
-        uint sample_y = ((2 * row + 1) * texture_size.y) / 48;
-        if (dispatch_id.x == sample_x && dispatch_id.y == sample_y) {
-            uint sample = row * 24 + column;
-            component_probe[sample * 2] =
-                float4(native_motion, raw_engine_camera_motion);
-            component_probe[sample * 2 + 1] =
-                float4(hmd_camera_motion, corrected_motion);
-        }
-    }
-    mvec_texture[dispatch_id.xy] = corrected_motion;
-}
-)";
-
-        DxcBuffer source{};
-        source.Ptr = kShaderSource;
-        source.Size = sizeof(kShaderSource) - 1;
-        source.Encoding = DXC_CP_UTF8;
-        LPCWSTR arguments[] = {L"-E", L"main", L"-T", L"cs_6_0", L"-O3"};
-        IDxcResult* result{};
-        if (FAILED(g_dxc_compiler->Compile(&source, arguments, static_cast<UINT32>(std::size(arguments)),
-                nullptr, IID_PPV_ARGS(&result))) || result == nullptr) {
-            return;
-        }
-
-        HRESULT status{};
-        result->GetStatus(&status);
-        if (FAILED(status)) {
-            IDxcBlobUtf8* errors{};
-            result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
-            log_line("Streamline MVec compute shader compile failed: %s",
-                errors != nullptr ? errors->GetStringPointer() : "unknown");
-            if (errors != nullptr) errors->Release();
-            result->Release();
-            return;
-        }
-
-        IDxcBlob* shader{};
-        if (FAILED(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shader), nullptr)) || shader == nullptr) {
-            result->Release();
-            return;
-        }
-
-        D3D12_DESCRIPTOR_RANGE ranges[2]{};
-        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        ranges[0].NumDescriptors = 1;
-        ranges[0].BaseShaderRegister = 0;
-        ranges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        ranges[1].NumDescriptors = 2;
-        ranges[1].BaseShaderRegister = 0;
-        ranges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-        D3D12_ROOT_PARAMETER parameters[3]{};
-        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        parameters[0].DescriptorTable.NumDescriptorRanges = 1;
-        parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
-        parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-        parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
-        parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        parameters[2].Constants.ShaderRegister = 0;
-        parameters[2].Constants.Num32BitValues = 37;
-        parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC root_desc{};
-        root_desc.NumParameters = static_cast<UINT>(std::size(parameters));
-        root_desc.pParameters = parameters;
-        root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ID3DBlob* serialized{};
-        ID3DBlob* errors{};
-        if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors))) {
-            log_line("Streamline MVec root signature serialization failed: %s",
-                errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown");
-            if (errors != nullptr) errors->Release();
-            shader->Release();
-            result->Release();
-            return;
-        }
-
-        if (FAILED(g_d3d12_device->CreateRootSignature(0, serialized->GetBufferPointer(),
-                serialized->GetBufferSize(), IID_PPV_ARGS(&g_streamline_mvec_root_signature)))) {
-            serialized->Release();
-            shader->Release();
-            result->Release();
-            return;
-        }
-        serialized->Release();
-
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{};
-        pipeline_desc.pRootSignature = g_streamline_mvec_root_signature;
-        pipeline_desc.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
-        const auto pipeline_result = g_d3d12_device->CreateComputePipelineState(
-            &pipeline_desc, IID_PPV_ARGS(&g_streamline_mvec_pipeline));
-        shader->Release();
-        result->Release();
-        if (FAILED(pipeline_result)) {
-            return;
-        }
-
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
-        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heap_desc.NumDescriptors = 3;
-        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(g_d3d12_device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_streamline_mvec_heap)))) {
-            return;
-        }
-        g_streamline_mvec_descriptor_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(heap_desc.Type);
-
-        const UINT64 probe_bytes =
-            static_cast<UINT64>(kDlssComponentProbeElements) * sizeof(float) * 4;
-        D3D12_RESOURCE_DESC probe_desc{};
-        probe_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        probe_desc.Width = probe_bytes;
-        probe_desc.Height = 1;
-        probe_desc.DepthOrArraySize = 1;
-        probe_desc.MipLevels = 1;
-        probe_desc.SampleDesc.Count = 1;
-        probe_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        probe_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        D3D12_HEAP_PROPERTIES default_heap{};
-        default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_HEAP_PROPERTIES readback_heap{};
-        readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
-        auto readback_desc = probe_desc;
-        readback_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        if (FAILED(g_d3d12_device->CreateCommittedResource(
-                &default_heap, D3D12_HEAP_FLAG_NONE, &probe_desc,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                IID_PPV_ARGS(&g_dlss_component_probe_buffer))) ||
-            FAILED(g_d3d12_device->CreateCommittedResource(
-                &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
-                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                IID_PPV_ARGS(&g_dlss_component_probe_readback))) ||
-            FAILED(g_d3d12_device->CreateFence(
-                0, D3D12_FENCE_FLAG_NONE,
-                IID_PPV_ARGS(&g_dlss_component_probe_fence)))) {
-            log_line("DLSS component probe resource initialization failed");
-            return;
-        }
-        D3D12_UNORDERED_ACCESS_VIEW_DESC probe_uav{};
-        probe_uav.Format = DXGI_FORMAT_UNKNOWN;
-        probe_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        probe_uav.Buffer.NumElements = kDlssComponentProbeElements;
-        probe_uav.Buffer.StructureByteStride = sizeof(float) * 4;
-        auto probe_cpu = g_streamline_mvec_heap->GetCPUDescriptorHandleForHeapStart();
-        probe_cpu.ptr += static_cast<SIZE_T>(2) * g_streamline_mvec_descriptor_increment;
-        g_d3d12_device->CreateUnorderedAccessView(
-            g_dlss_component_probe_buffer, nullptr, &probe_uav, probe_cpu);
-        log_line("Streamline MVec compute pipeline initialized");
-    });
-
-    return g_streamline_mvec_pipeline != nullptr && g_streamline_mvec_root_signature != nullptr &&
-        g_streamline_mvec_heap != nullptr && g_dlss_component_probe_buffer != nullptr &&
-        g_dlss_component_probe_readback != nullptr && g_dlss_component_probe_fence != nullptr;
-}
-
-bool schedule_dlss_mvec_readback(
-    ID3D12GraphicsCommandList* command_list, ID3D12Resource* motion_vectors);
-
-bool dispatch_streamline_mvec_correction(ID3D12GraphicsCommandList* command_list, StreamlineMVecFrameState& frame) {
-    if (command_list == nullptr || frame.depth == nullptr || frame.mvec == nullptr ||
-        !frame.hmd_motion_valid ||
-        frame.depth_state != D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE ||
-        frame.mvec_state != D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE ||
-        !initialize_streamline_mvec_pipeline()) {
-        return false;
-    }
-
-    const auto depth_desc = frame.depth->GetDesc();
-    const auto mvec_desc = frame.mvec->GetDesc();
-    if (depth_desc.Width != mvec_desc.Width || depth_desc.Height != mvec_desc.Height ||
-        mvec_desc.Format != DXGI_FORMAT_R16G16_FLOAT ||
-        (mvec_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
-        return false;
-    }
-
-    DXGI_FORMAT depth_srv_format = DXGI_FORMAT_UNKNOWN;
-    switch (depth_desc.Format) {
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        depth_srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-        break;
-    case DXGI_FORMAT_R32_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT:
-        depth_srv_format = DXGI_FORMAT_R32_FLOAT;
-        break;
-    case DXGI_FORMAT_R24G8_TYPELESS:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        depth_srv_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-        break;
-    case DXGI_FORMAT_R16_TYPELESS:
-    case DXGI_FORMAT_D16_UNORM:
-        depth_srv_format = DXGI_FORMAT_R16_UNORM;
-        break;
-    default:
-        return false;
-    }
-
-    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
-    depth_srv.Format = depth_srv_format;
-    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    depth_srv.Texture2D.MipLevels = 1;
-    auto cpu_handle = g_streamline_mvec_heap->GetCPUDescriptorHandleForHeapStart();
-    g_d3d12_device->CreateShaderResourceView(frame.depth, &depth_srv, cpu_handle);
-
-    D3D12_UNORDERED_ACCESS_VIEW_DESC mvec_uav{};
-    mvec_uav.Format = DXGI_FORMAT_R16G16_FLOAT;
-    mvec_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    cpu_handle.ptr += g_streamline_mvec_descriptor_increment;
-    g_d3d12_device->CreateUnorderedAccessView(frame.mvec, nullptr, &mvec_uav, cpu_handle);
-
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = frame.mvec;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    command_list->ResourceBarrier(1, &barrier);
-
-    ID3D12DescriptorHeap* heaps[] = {g_streamline_mvec_heap};
-    command_list->SetDescriptorHeaps(1, heaps);
-    command_list->SetComputeRootSignature(g_streamline_mvec_root_signature);
-    command_list->SetPipelineState(g_streamline_mvec_pipeline);
-    auto gpu_handle = g_streamline_mvec_heap->GetGPUDescriptorHandleForHeapStart();
-    command_list->SetComputeRootDescriptorTable(0, gpu_handle);
-    gpu_handle.ptr += g_streamline_mvec_descriptor_increment;
-    command_list->SetComputeRootDescriptorTable(1, gpu_handle);
-
-    float constants[37]{};
-    memcpy(constants, frame.original_clip_to_previous, sizeof(frame.original_clip_to_previous));
-    memcpy(constants + 16, frame.current_to_previous_hmd,
-        sizeof(frame.current_to_previous_hmd));
-    memcpy(constants + 28, frame.hmd_projection, sizeof(frame.hmd_projection));
-    constants[32] = frame.mvec_scale[0];
-    constants[33] = frame.mvec_scale[1];
-    const uint32_t width = static_cast<uint32_t>(mvec_desc.Width);
-    const uint32_t height = mvec_desc.Height;
-    memcpy(constants + 34, &width, sizeof(width));
-    memcpy(constants + 35, &height, sizeof(height));
-    const bool component_probe = g_config.runtime_diagnostics && g_config.ngx_trace &&
-        !g_dlss_component_probe_scheduled.load() &&
-        fabsf(g_hmd_yaw_degrees) > 10.0f &&
-        g_streamline_hmd_motion_angle.load() < 0.0015f;
-    const uint32_t component_probe_flag = component_probe ? 1u : 0u;
-    memcpy(constants + 36, &component_probe_flag, sizeof(component_probe_flag));
-    command_list->SetComputeRoot32BitConstants(2, static_cast<UINT>(std::size(constants)), constants, 0);
-    static std::atomic<bool> dispatch_begin_logged{};
-    if (g_config.logging_enabled && !dispatch_begin_logged.exchange(true)) {
-        log_line("Streamline MVec dispatch begin depth=%p mvec=%p depth_format=%u srv_format=%u size=%ux%u mvec_state=0x%X scale=%.7f,%.7f",
-            frame.depth, frame.mvec,
-            static_cast<unsigned>(depth_desc.Format),
-            static_cast<unsigned>(depth_srv_format), width, height,
-            static_cast<unsigned>(frame.mvec_state),
-            frame.mvec_scale[0], frame.mvec_scale[1]);
-    }
-    command_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
-
-    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    command_list->ResourceBarrier(1, &barrier);
-    if (component_probe && !g_dlss_component_probe_scheduled.exchange(true)) {
-        D3D12_RESOURCE_BARRIER probe_barriers[2]{};
-        probe_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        probe_barriers[0].UAV.pResource = g_dlss_component_probe_buffer;
-        probe_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        probe_barriers[1].Transition.pResource = g_dlss_component_probe_buffer;
-        probe_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        probe_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        probe_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        command_list->ResourceBarrier(static_cast<UINT>(std::size(probe_barriers)), probe_barriers);
-        command_list->CopyResource(
-            g_dlss_component_probe_readback, g_dlss_component_probe_buffer);
-        std::swap(probe_barriers[1].Transition.StateBefore,
-            probe_barriers[1].Transition.StateAfter);
-        command_list->ResourceBarrier(1, &probe_barriers[1]);
-        g_dlss_component_probe_command_list.store(command_list);
-        log_line("DLSS component probe scheduled command_list=%p yaw=%.4f angle=%.7f samples=%u",
-            command_list, g_hmd_yaw_degrees,
-            g_streamline_hmd_motion_angle.load(),
-            kDlssComponentProbeColumns * kDlssComponentProbeRows);
-    }
-    // Capture on this command list, immediately after the custom write and
-    // before Streamline records NGX evaluation. A later NGX-hook capture can
-    // observe a subsequent REDengine rewrite of the shared motion resource.
-    if (g_config.runtime_diagnostics && g_config.ngx_trace &&
-        g_streamline_hmd_motion_angle.load() > 0.0001f &&
-        !g_dlss_mvec_readback_scheduled.load()) {
-        schedule_dlss_mvec_readback(command_list, frame.mvec);
-    }
-    static std::atomic<bool> dispatch_end_logged{};
-    if (g_config.logging_enabled && !dispatch_end_logged.exchange(true)) {
-        log_line("Streamline MVec dispatch recorded");
-    }
-    return true;
-}
-
 void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uint32_t viewport) {
     const uint32_t eye = streamline_eye();
     const uint32_t source_viewport = viewport;
@@ -29860,13 +29395,6 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
     uint64_t physical_pair{UINT64_MAX};
     std::array<XrView, 2> physical_render_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
     bool physical_render_views_valid{};
-    if (packed_private_active && constants != nullptr &&
-        g_config.streamline_force_camera_mvec &&
-        g_config.streamline_reconstruct_camera_motion) {
-        // Match the stable AER/DLSS route: the tagged field contains no camera
-        // velocity, so NGX reconstructs camera motion from sl::Constants.
-        static_cast<uint8_t*>(constants)[0x19D] = 0;
-    }
     if (packed_private_active && constants != nullptr &&
         g_config.streamline_taau_bridge) {
         const auto* values = static_cast<const float*>(constants);
@@ -29888,79 +29416,12 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
                 g_streamline_taau_bridge_matches.fetch_add(
                     1, std::memory_order_relaxed);
             }
-            {
-                std::scoped_lock lock{g_streamline_mvec_mutex};
-                // A Streamline frame token is unique for one eye submission in
-                // the packed path. setConstants commonly runs one Present
-                // before evaluateFeature, so Present parity is not a stable
-                // part of the identity here.
-                auto& temporal = g_streamline_mvec_temporal_frames[frame_token];
-                memcpy(temporal.original_clip_to_previous, values + 48,
-                    sizeof(temporal.original_clip_to_previous));
-                memcpy(temporal.current_to_previous_hmd,
-                    motion.current_to_previous_base.data(),
-                    sizeof(temporal.current_to_previous_hmd));
-                temporal.matched_corrected_camera =
-                    motion.matched_corrected_camera;
-                temporal.matched_camera_valid = true;
-                temporal.matched_render_views = motion.matched_render_views;
-                temporal.matched_render_views_valid =
-                    motion.matched_render_views_valid;
-                if (g_config.logging_enabled || g_config.runtime_diagnostics) {
-                    const float rotation_trace =
-                        motion.current_to_previous_hmd_only[0] +
-                        motion.current_to_previous_hmd_only[5] +
-                        motion.current_to_previous_hmd_only[10];
-                    const float hmd_motion_angle = acosf(std::clamp(
-                        (rotation_trace - 1.0f) * 0.5f, -1.0f, 1.0f));
-                    g_streamline_hmd_motion_angle.store(hmd_motion_angle);
-                    if (hmd_motion_angle > 0.0001f &&
-                        take_bounded_log_slot(g_streamline_hmd_delta_logs, 64)) {
-                        const auto& h = motion.current_to_previous_hmd_only;
-                        log_line("Streamline HMD delta current=%llu pair=%llu previous=%llu pair=%llu gap=%lld angle=%.7f rows=[%.6f %.6f %.6f %.6f][%.6f %.6f %.6f %.6f][%.6f %.6f %.6f %.6f]",
-                            static_cast<unsigned long long>(motion.matched_present),
-                            static_cast<unsigned long long>(motion.matched_pair_id),
-                            static_cast<unsigned long long>(motion.previous_matched_present),
-                            static_cast<unsigned long long>(motion.previous_matched_pair_id),
-                            static_cast<long long>(motion.matched_present) -
-                                static_cast<long long>(motion.previous_matched_present),
-                            hmd_motion_angle,
-                            h[0], h[1], h[2], h[3],
-                            h[4], h[5], h[6], h[7],
-                            h[8], h[9], h[10], h[11]);
-                    }
-                }
-                temporal.hmd_projection[0] =
-                    tanf(motion.vertical_fov_degrees *
-                        (3.14159265358979323846f / 360.0f));
-                temporal.hmd_projection[1] = motion.aspect;
-                temporal.hmd_projection[2] = motion.near_plane;
-                temporal.hmd_projection[3] = motion.far_plane;
-                temporal.hmd_motion_valid = true;
-                temporal.mvec_scale[0] = values[82];
-                temporal.mvec_scale[1] = values[83];
-                temporal.sequential_consumed_eye_mask = 0;
-                if (g_streamline_mvec_temporal_frames.size() > 32) {
-                    auto oldest = g_streamline_mvec_temporal_frames.end();
-                    int32_t oldest_age = 0;
-                    for (auto candidate =
-                             g_streamline_mvec_temporal_frames.begin();
-                         candidate != g_streamline_mvec_temporal_frames.end();
-                         ++candidate) {
-                        // Tokens are monotonically increasing modulo uint32.
-                        // A negative signed age is a newer, not-yet-consumed
-                        // token and must never be selected for eviction.
-                        const int32_t age = static_cast<int32_t>(
-                            frame_token - candidate->first);
-                        if (age > oldest_age) {
-                            oldest_age = age;
-                            oldest = candidate;
-                        }
-                    }
-                    if (oldest != g_streamline_mvec_temporal_frames.end()) {
-                        g_streamline_mvec_temporal_frames.erase(oldest);
-                    }
-                }
+            if (g_config.openxr_mode == 2 &&
+                motion.matched_render_views_valid) {
+                std::scoped_lock view_lock{g_engine_completed_view_mutex};
+                g_mono_dlss_render_views[0] = motion.matched_render_views[0];
+                g_mono_dlss_render_views[1] = motion.matched_render_views[1];
+                g_mono_dlss_render_views_valid = true;
             }
             if (take_bounded_log_slot(
                     g_streamline_taau_bridge_match_logs, 12)) {
@@ -30016,23 +29477,8 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
         // The alternating eye contributes a fixed horizontal baseline to
         // both inverse reprojection matrices. Remove it only when present.
         if (values[56] > g_config.streamline_temporal_clip_correction * 0.5f) {
-            std::scoped_lock lock{g_streamline_mvec_mutex};
-            g_streamline_mvec_frame.frame_token = frame_token;
-            g_streamline_mvec_frame.ready = true;
-            memcpy(g_streamline_mvec_frame.original_clip_to_previous, values + 48,
-                sizeof(g_streamline_mvec_frame.original_clip_to_previous));
-            g_streamline_mvec_frame.mvec_scale[0] = values[82];
-            g_streamline_mvec_frame.mvec_scale[1] = values[83];
             values[56] -= g_config.streamline_temporal_clip_correction;
             values[72] += g_config.streamline_temporal_clip_correction;
-            if (g_config.streamline_reconstruct_camera_motion) {
-                // cameraMotionIncluded is immediately before the reset byte in
-                // Streamline 1.5's Constants. Let the DLSS plugin rebuild the
-                // camera component using the corrected clip-to-previous matrix.
-                static_cast<uint8_t*>(constants)[0x19D] = 0;
-            }
-            memcpy(g_streamline_mvec_frame.corrected_clip_to_previous, values + 48,
-                sizeof(g_streamline_mvec_frame.corrected_clip_to_previous));
         }
     }
 
@@ -30352,9 +29798,7 @@ int __fastcall hook_sl_set_tag(const void* resource, uint32_t tag, uint32_t view
         uint32_t width;
         uint32_t height;
     } tagged_extent{};
-    if (extent != nullptr &&
-        (g_config.logging_enabled || g_config.streamline_mvec_probe ||
-            g_config.streamline_output_probe)) {
+    if (extent != nullptr && g_config.logging_enabled) {
         memcpy(&tagged_extent, extent, sizeof(tagged_extent));
     }
     if (resource != nullptr && (tag == 0 || tag == 1 || tag == 3) &&
@@ -30394,81 +29838,6 @@ int __fastcall hook_sl_set_tag(const void* resource, uint32_t tag, uint32_t view
             tag, viewport, tagged_extent.left, tagged_extent.top,
             tagged_extent.width, tagged_extent.height);
     }
-    if (resource != nullptr && tag <= 1 && g_config.streamline_mvec_probe &&
-        g_present_count.load() >= static_cast<uint64_t>(g_config.streamline_trace_start_frame) &&
-        g_streamline_mvec_probe_counts[eye].fetch_add(1) < 4) {
-        void* native{};
-        void* view{};
-        uint32_t state{};
-        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
-        memcpy(&view, static_cast<const uint8_t*>(resource) + 24, sizeof(view));
-        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
-        auto* texture = static_cast<ID3D12Resource*>(native);
-        const auto desc = texture != nullptr ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
-        log_line("Streamline %s eye=%u present=%llu viewport=%u resource=%p native=%p view=%p state=0x%X format=%u size=%llux%u flags=0x%X",
-            tag == 0 ? "Depth" : "MVec",
-            eye,
-            static_cast<unsigned long long>(g_present_count.load()),
-            viewport,
-            resource,
-            native,
-            view,
-            state,
-            static_cast<unsigned>(desc.Format),
-            static_cast<unsigned long long>(desc.Width),
-            desc.Height,
-            static_cast<unsigned>(desc.Flags));
-    }
-
-    if (resource != nullptr && (tag == 3 || tag == 4) && g_config.streamline_output_probe &&
-        g_streamline_output_probe_counts[eye].fetch_add(1) < 4) {
-        void* native{};
-        void* view{};
-        uint32_t state{};
-        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
-        memcpy(&view, static_cast<const uint8_t*>(resource) + 24, sizeof(view));
-        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
-        auto* texture = static_cast<ID3D12Resource*>(native);
-        const auto desc = texture != nullptr ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
-        log_line("Streamline %s eye=%u present=%llu viewport=%u resource=%p native=%p view=%p state=0x%X format=%u size=%llux%u flags=0x%X",
-            tag == 3 ? "ScalingInput" : "ScalingOutput",
-            eye,
-            static_cast<unsigned long long>(g_present_count.load()),
-            viewport,
-            resource,
-            native,
-            view,
-            state,
-            static_cast<unsigned>(desc.Format),
-            static_cast<unsigned long long>(desc.Width),
-            desc.Height,
-            static_cast<unsigned>(desc.Flags));
-    }
-
-    if (resource != nullptr && tag <= 1 &&
-        (g_config.streamline_mvec_correction || g_config.streamline_force_camera_mvec)) {
-        void* native{};
-        uint32_t state{};
-        memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
-        memcpy(&state, static_cast<const uint8_t*>(resource) + 32, sizeof(state));
-        auto* texture = static_cast<ID3D12Resource*>(native);
-        if (texture != nullptr) {
-            std::scoped_lock lock{g_streamline_mvec_mutex};
-            auto*& destination = tag == 0 ? g_streamline_mvec_frame.depth : g_streamline_mvec_frame.mvec;
-            if (destination != texture) {
-                if (destination != nullptr) destination->Release();
-                texture->AddRef();
-                destination = texture;
-            }
-            if (tag == 0) {
-                g_streamline_mvec_frame.depth_state = static_cast<D3D12_RESOURCE_STATES>(state);
-            } else {
-                g_streamline_mvec_frame.mvec_state = static_cast<D3D12_RESOURCE_STATES>(state);
-            }
-        }
-    }
-
-
     if (!skip_mode3_legacy_sl_tracking && resource != nullptr && tag == 4 &&
         g_engine_dual_render_active.load() &&
         g_engine_render_eye >= 0 &&
@@ -30622,206 +29991,6 @@ int __fastcall hook_sl_evaluate_feature(
             command_buffer, g_engine_render_eye,
             static_cast<unsigned long long>(g_present_count.load()), frame_token, viewport);
     }
-    const bool packed_private_active = !temporal_backend_is_dlss_packed() ||
-        (g_engine_dual_render_active.load(std::memory_order_acquire) &&
-            g_engine_dual_gameplay_armed.load(std::memory_order_acquire) &&
-            !g_cinema_mode_active.load(std::memory_order_relaxed));
-    if (packed_private_active &&
-        (g_config.streamline_mvec_correction ||
-            g_config.streamline_force_camera_mvec) && feature == 0) {
-        StreamlineMVecFrameState frame{};
-        bool should_dispatch{};
-        const bool collect_mvec_diagnostics = g_config.runtime_diagnostics;
-        uint32_t diagnostic_history_eye = UINT32_MAX;
-        bool diagnostic_temporal_found{};
-        bool diagnostic_frame_resources{};
-        bool diagnostic_fallback_used{};
-        bool diagnostic_matched_camera_valid{};
-        bool diagnostic_previous_camera_valid{};
-        uint8_t diagnostic_mask_before{};
-        uint8_t diagnostic_mask_after{};
-        {
-            std::scoped_lock lock{g_streamline_mvec_mutex};
-            const uint32_t history_eye = streamline_history_eye();
-            if (collect_mvec_diagnostics) {
-                diagnostic_history_eye = history_eye;
-            }
-            const auto temporal = g_streamline_mvec_temporal_frames.find(frame_token);
-            if (collect_mvec_diagnostics) {
-                diagnostic_temporal_found =
-                    temporal != g_streamline_mvec_temporal_frames.end();
-                diagnostic_frame_resources =
-                    g_streamline_mvec_frame.depth != nullptr &&
-                    g_streamline_mvec_frame.mvec != nullptr;
-            }
-            if (temporal != g_streamline_mvec_temporal_frames.end() &&
-                g_streamline_mvec_frame.depth != nullptr &&
-                g_streamline_mvec_frame.mvec != nullptr) {
-                frame = g_streamline_mvec_frame;
-                frame.frame_token = frame_token;
-                frame.ready = true;
-                if (collect_mvec_diagnostics) {
-                    diagnostic_matched_camera_valid =
-                        temporal->second.matched_camera_valid;
-                    diagnostic_previous_camera_valid =
-                        history_eye <= 1 &&
-                        g_streamline_dlss_previous_camera_valid[history_eye];
-                }
-                memcpy(frame.original_clip_to_previous,
-                    temporal->second.original_clip_to_previous,
-                    sizeof(frame.original_clip_to_previous));
-                if (temporal->second.matched_camera_valid &&
-                    g_streamline_dlss_previous_camera_valid[history_eye]) {
-                    const auto history_motion = camera_to_previous_transform(
-                        temporal->second.matched_corrected_camera,
-                        g_streamline_dlss_previous_camera[history_eye]);
-                    memcpy(frame.current_to_previous_hmd, history_motion.data(),
-                        sizeof(frame.current_to_previous_hmd));
-                } else {
-                    memcpy(frame.current_to_previous_hmd,
-                        temporal->second.current_to_previous_hmd,
-                        sizeof(frame.current_to_previous_hmd));
-                }
-                if (temporal->second.matched_camera_valid) {
-                    if (temporal_backend_is_dlss_packed() &&
-                        g_streamline_dlss_pair_id != 0 &&
-                        g_streamline_dlss_pair_id != UINT64_MAX) {
-                        auto& commit = g_packed_dlss_camera_commit_slots[
-                            g_streamline_dlss_pair_id %
-                            kPackedDlssCameraCommitSlotCount];
-                        if (commit.pair_id != g_streamline_dlss_pair_id) {
-                            commit = {};
-                            commit.pair_id = g_streamline_dlss_pair_id;
-                        }
-                        commit.camera[history_eye] =
-                            temporal->second.matched_corrected_camera;
-                        commit.valid[history_eye] = true;
-                        g_packed_dlss_camera_history_deferred.fetch_add(
-                            1, std::memory_order_relaxed);
-                    } else {
-                        g_streamline_dlss_previous_camera[history_eye] =
-                            temporal->second.matched_corrected_camera;
-                        g_streamline_dlss_previous_camera_valid[history_eye] = true;
-                    }
-                }
-                if (g_config.openxr_mode == 2 &&
-                    temporal->second.matched_render_views_valid) {
-                    std::scoped_lock view_lock{g_engine_completed_view_mutex};
-                    g_mono_dlss_render_views[0] =
-                        temporal->second.matched_render_views[0];
-                    g_mono_dlss_render_views[1] =
-                        temporal->second.matched_render_views[1];
-                    g_mono_dlss_render_views_valid = true;
-                }
-                memcpy(frame.hmd_projection, temporal->second.hmd_projection,
-                    sizeof(frame.hmd_projection));
-                memcpy(frame.mvec_scale, temporal->second.mvec_scale,
-                    sizeof(frame.mvec_scale));
-                frame.hmd_motion_valid = temporal->second.hmd_motion_valid;
-                // The natural packed command and its public replay evaluate the
-                // same frame token on two independent viewport/NGX histories.
-                // Keep the temporal input alive after the natural eye consumes
-                // it, then release it after the replayed eye has consumed it.
-                const bool retain_for_packed_replay =
-                    g_config.openxr_mode == 4 &&
-                    g_config.streamline_split_viewports &&
-                    g_streamline_dlss_capture_active &&
-                    !g_streamline_dlss_recipe_replay;
-                // [FIX:DLSS-SEQUENTIAL-MVEC 1/1] Both natural Mode 3
-                // evaluations share one Streamline token. Retain its HMD
-                // temporal state after the first eye and erase it only after
-                // both exact routed eyes have consumed their correction.
-                bool retain_for_sequential_eye{};
-                if (dlss_sequential_mode_active() && history_eye <= 1) {
-                    if (collect_mvec_diagnostics) {
-                        diagnostic_mask_before =
-                            temporal->second.sequential_consumed_eye_mask;
-                    }
-                    temporal->second.sequential_consumed_eye_mask =
-                        static_cast<uint8_t>(
-                            temporal->second.sequential_consumed_eye_mask |
-                            (1u << history_eye));
-                    if (collect_mvec_diagnostics) {
-                        diagnostic_mask_after =
-                            temporal->second.sequential_consumed_eye_mask;
-                    }
-                    retain_for_sequential_eye =
-                        temporal->second.sequential_consumed_eye_mask != 0x3;
-                }
-                if (!retain_for_packed_replay &&
-                    !retain_for_sequential_eye) {
-                    g_streamline_mvec_temporal_frames.erase(temporal);
-                }
-                should_dispatch = true;
-            } else if (g_streamline_mvec_frame.ready &&
-                g_streamline_mvec_frame.frame_token == frame_token &&
-                g_streamline_mvec_frame.depth != nullptr &&
-                g_streamline_mvec_frame.mvec != nullptr) {
-                frame = g_streamline_mvec_frame;
-                g_streamline_mvec_frame.ready = false;
-                if (collect_mvec_diagnostics) {
-                    diagnostic_fallback_used = true;
-                }
-                should_dispatch = true;
-            }
-        }
-
-        dlss_gpu_profile_mark(
-            static_cast<ID3D12GraphicsCommandList*>(command_buffer), 1);
-        const bool corrected = should_dispatch && (g_config.streamline_force_camera_mvec
-            ? clear_streamline_mvec(static_cast<ID3D12GraphicsCommandList*>(command_buffer), frame)
-            : dispatch_streamline_mvec_correction(static_cast<ID3D12GraphicsCommandList*>(command_buffer), frame));
-        dlss_gpu_profile_mark(
-            static_cast<ID3D12GraphicsCommandList*>(command_buffer), 2);
-        if (g_config.runtime_diagnostics && corrected) {
-            g_streamline_mvec_dispatch_calls.fetch_add(1, std::memory_order_relaxed);
-        } else if (g_config.runtime_diagnostics && !should_dispatch) {
-            g_streamline_mvec_ready_misses.fetch_add(1, std::memory_order_relaxed);
-        }
-        // [DIAG:DLSS-SEQUENTIAL-STARTUP-MVEC 1/1] A bad startup survives
-        // correct dynamic history ownership. Record only the first evaluations
-        // needed to prove whether both routed eyes consume the same temporal
-        // token with valid HMD/motion-vector state. This does not alter routing.
-        if (g_config.runtime_diagnostics && dlss_sequential_mode_active()) {
-            if (g_sequential_mvec_diagnostic_logs.fetch_add(
-                    1, std::memory_order_relaxed) <
-                kSequentialStartupDiagnosticEvaluationLimit) {
-                log_dlss_sequential_startup(
-                    "Sequential MVec evaluate window=%u eye=%u history_eye=%u "
-                    "token=%u temporal=%u resources=%u fallback=%u "
-                    "matched_camera=%u previous_camera=%u hmd_motion=%u "
-                    "mask=0x%02X->0x%02X dispatch=%u corrected=%u "
-                    "pair=%llu present=%llu command_list=%p",
-                    g_sequential_startup_diagnostic_window.load(
-                        std::memory_order_relaxed),
-                    streamline_eye(), diagnostic_history_eye, frame_token,
-                    diagnostic_temporal_found ? 1u : 0u,
-                    diagnostic_frame_resources ? 1u : 0u,
-                    diagnostic_fallback_used ? 1u : 0u,
-                    diagnostic_matched_camera_valid ? 1u : 0u,
-                    diagnostic_previous_camera_valid ? 1u : 0u,
-                    frame.hmd_motion_valid ? 1u : 0u,
-                    diagnostic_mask_before, diagnostic_mask_after,
-                    should_dispatch ? 1u : 0u, corrected ? 1u : 0u,
-                    static_cast<unsigned long long>(
-                        g_streamline_dlss_pair_id),
-                    static_cast<unsigned long long>(
-                        g_present_count.load(std::memory_order_relaxed)),
-                    command_buffer);
-            }
-        }
-        if (should_dispatch && !corrected && g_config.logging_enabled &&
-            !g_streamline_mvec_skip_logged.exchange(true)) {
-            log_line("Streamline MVec correction skipped token=%u depth=%p state=0x%X mvec=%p state=0x%X scale=%.7f,%.7f",
-                frame_token,
-                frame.depth,
-                static_cast<unsigned>(frame.depth_state),
-                frame.mvec,
-                static_cast<unsigned>(frame.mvec_state),
-                frame.mvec_scale[0], frame.mvec_scale[1]);
-        }
-    }
-
     dlss_gpu_profile_mark(
         static_cast<ID3D12GraphicsCommandList*>(command_buffer), 3);
     const uint32_t routed_viewport =
@@ -30835,68 +30004,6 @@ int __fastcall hook_sl_evaluate_feature(
         g_streamline_forced_eye = previous_token_eye;
     }
     return result;
-}
-
-bool schedule_dlss_mvec_readback(
-    ID3D12GraphicsCommandList* command_list, ID3D12Resource* motion_vectors) {
-    if (command_list == nullptr || motion_vectors == nullptr || g_d3d12_device == nullptr ||
-        g_dlss_mvec_readback_scheduled.exchange(true)) {
-        return false;
-    }
-
-    const auto desc = motion_vectors->GetDesc();
-    if (desc.Format != DXGI_FORMAT_R16G16_FLOAT) {
-        g_dlss_mvec_readback_scheduled.store(false);
-        return false;
-    }
-
-    UINT64 total_bytes{};
-    g_d3d12_device->GetCopyableFootprints(&desc, 0, 1, 0,
-        &g_dlss_mvec_readback_footprint, nullptr, nullptr, &total_bytes);
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC buffer{};
-    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = total_bytes;
-    buffer.Height = 1;
-    buffer.DepthOrArraySize = 1;
-    buffer.MipLevels = 1;
-    buffer.SampleDesc.Count = 1;
-    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(g_d3d12_device->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &buffer,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-            IID_PPV_ARGS(&g_dlss_mvec_readback_buffer))) ||
-        FAILED(g_d3d12_device->CreateFence(
-            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_dlss_mvec_readback_fence)))) {
-        log_line("DLSS MVec readback initialization failed");
-        return false;
-    }
-
-    D3D12_RESOURCE_BARRIER to_copy{};
-    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    to_copy.Transition.pResource = motion_vectors;
-    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
-    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    command_list->ResourceBarrier(1, &to_copy);
-
-    D3D12_TEXTURE_COPY_LOCATION source{};
-    source.pResource = motion_vectors;
-    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_TEXTURE_COPY_LOCATION destination{};
-    destination.pResource = g_dlss_mvec_readback_buffer;
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    destination.PlacedFootprint = g_dlss_mvec_readback_footprint;
-    command_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-
-    std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
-    command_list->ResourceBarrier(1, &to_copy);
-    g_dlss_mvec_readback_command_list.store(command_list);
-    log_line("DLSS MVec readback scheduled command_list=%p resource=%p size=%ux%u bytes=%llu",
-        command_list, motion_vectors, static_cast<unsigned>(desc.Width), desc.Height,
-        static_cast<unsigned long long>(total_bytes));
-    return true;
 }
 
 void schedule_dlss_output_luminance_readback(
@@ -31268,30 +30375,6 @@ NVSDK_NGX_Handle* lookup_packed_dlss_handle(
         : g_packed_dlss_primary_handle;
 }
 
-void commit_packed_dlss_camera_history(uint64_t pair_id) {
-    if (pair_id == 0 || pair_id == UINT64_MAX) {
-        return;
-    }
-    std::scoped_lock lock{g_streamline_mvec_mutex};
-    auto& commit = g_packed_dlss_camera_commit_slots[
-        pair_id % kPackedDlssCameraCommitSlotCount];
-    if (commit.pair_id != pair_id) {
-        return;
-    }
-    uint32_t committed{};
-    for (uint32_t eye = 0; eye < 2; ++eye) {
-        if (!commit.valid[eye]) {
-            continue;
-        }
-        g_streamline_dlss_previous_camera[eye] = commit.camera[eye];
-        g_streamline_dlss_previous_camera_valid[eye] = true;
-        ++committed;
-    }
-    commit = {};
-    g_packed_dlss_camera_history_committed.fetch_add(
-        committed, std::memory_order_relaxed);
-}
-
 void audit_asymmetric_ngx_entry_after_evaluation(
     ID3D12GraphicsCommandList* command_list,
     const NVSDK_NGX_Handle* handle,
@@ -31597,8 +30680,6 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature_impl(
                     NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
                     original_subrect_height);
                 if (result == NVSDK_NGX_Result_Success) {
-                    commit_packed_dlss_camera_history(
-                        g_packed_dlss_pair_id);
                     g_packed_dlss_output_pending_pair.store(
                         g_packed_dlss_pair_id, std::memory_order_relaxed);
                     g_packed_dlss_output_pending_publish.store(
@@ -32321,7 +31402,6 @@ void install_streamline_hook() {
     if ((!g_config.streamline_force_reset && !g_config.streamline_split_viewports &&
             g_config.streamline_right_temporal_offset == 0.0f &&
             g_config.streamline_temporal_clip_correction == 0.0f &&
-            !g_config.streamline_mvec_correction && !g_config.streamline_force_camera_mvec &&
             !g_config.streamline_taau_bridge &&
             !g_config.ngx_trace &&
             !asymmetric_authority_audit_active() &&
@@ -32690,6 +31770,7 @@ void ensure_initialized() {
         install_engine_frame_builder_probe();
         install_engine_gameplay_entry_probe();
         install_engine_scene_enqueue_probe();
+        install_engine_temporal_camera_builder_hook();
         install_engine_view_factory_probe();
         install_engine_render_proxy_distance_scale_hook();
         install_engine_native_camera_authority_hooks();
@@ -32710,10 +31791,11 @@ void ensure_initialized() {
             temporal_backend_is_dlss() ? 1u : 0u,
             reverse_diagnostic_hooks_requested() ? 1u : 0u,
             g_config.openxr_mode);
-        // V1104 consolidates the validated tiled-light correction with the
-        // legacy projection default and global HUD-profile controls.
+        // V1106 combines V1104 with V9416's clean native per-eye DLSS motion
+        // history. The removed analytic MVec route and its diagnostics remain
+        // absent; DLSS consumes REDengine's combined native motion field.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1104 base=V1103 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1106 base=V1104/V9416 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
@@ -36026,8 +35108,6 @@ void render_openxr_test_frame(
         // diagnostic run, every cinema exit opens a fresh bounded window.
         if (previous_cinema && !cinema_mode &&
             g_config.runtime_diagnostics && dlss_sequential_mode_active()) {
-            g_sequential_mvec_diagnostic_logs.store(
-                0, std::memory_order_relaxed);
             g_sequential_ngx_diagnostic_logs.store(
                 0, std::memory_order_relaxed);
             const uint32_t diagnostic_window =
@@ -38326,85 +37406,6 @@ void try_log_taau_readback() {
     g_taau_readback_logged.store(true);
 }
 
-void try_log_dlss_component_probe() {
-    if (!g_dlss_component_probe_submitted.load() ||
-        g_dlss_component_probe_logged.load() ||
-        g_dlss_component_probe_fence == nullptr ||
-        g_dlss_component_probe_readback == nullptr ||
-        g_dlss_component_probe_fence->GetCompletedValue() < 1) {
-        return;
-    }
-    struct ProbeValue { float x, y, z, w; };
-    ProbeValue* values{};
-    const SIZE_T probe_bytes =
-        static_cast<SIZE_T>(kDlssComponentProbeElements) * sizeof(ProbeValue);
-    const D3D12_RANGE read_range{0, probe_bytes};
-    if (FAILED(g_dlss_component_probe_readback->Map(
-            0, &read_range, reinterpret_cast<void**>(&values))) || values == nullptr) {
-        return;
-    }
-
-    double numerator_x{};
-    double denominator_x{};
-    double numerator_y{};
-    double denominator_y{};
-    std::vector<float> ratios_x{};
-    std::vector<float> ratios_y{};
-    UINT valid{};
-    for (UINT sample = 0;
-        sample < kDlssComponentProbeColumns * kDlssComponentProbeRows; ++sample) {
-        const auto& native_engine = values[sample * 2];
-        const auto& corrected_final = values[sample * 2 + 1];
-        const float components[] = {
-            native_engine.x, native_engine.y, native_engine.z, native_engine.w,
-            corrected_final.x, corrected_final.y, corrected_final.z, corrected_final.w};
-        bool sane = true;
-        for (const float component : components) {
-            sane = sane && std::isfinite(component) && fabsf(component) < 4096.0f;
-        }
-        if (!sane) continue;
-        ++valid;
-        const float target_x = native_engine.x + corrected_final.x;
-        const float target_y = native_engine.y + corrected_final.y;
-        if (fabsf(native_engine.z) > 0.25f && fabsf(target_x) < 1024.0f) {
-            numerator_x += static_cast<double>(native_engine.z) * target_x;
-            denominator_x += static_cast<double>(native_engine.z) * native_engine.z;
-            ratios_x.push_back(target_x / native_engine.z);
-        }
-        if (fabsf(native_engine.w) > 0.25f && fabsf(target_y) < 1024.0f) {
-            numerator_y += static_cast<double>(native_engine.w) * target_y;
-            denominator_y += static_cast<double>(native_engine.w) * native_engine.w;
-            ratios_y.push_back(target_y / native_engine.w);
-        }
-    }
-    const auto median = [](std::vector<float>& ratios) {
-        if (ratios.empty()) return 0.0f;
-        const auto middle = ratios.begin() + ratios.size() / 2;
-        std::nth_element(ratios.begin(), middle, ratios.end());
-        return *middle;
-    };
-    const double fit_x = denominator_x > 1e-9 ? numerator_x / denominator_x : 0.0;
-    const double fit_y = denominator_y > 1e-9 ? numerator_y / denominator_y : 0.0;
-    log_line("DLSS component probe fit valid=%u ratio_samples=%zu,%zu least_squares=%.9f,%.9f median=%.9f,%.9f",
-        valid, ratios_x.size(), ratios_y.size(), fit_x, fit_y,
-        median(ratios_x), median(ratios_y));
-
-    constexpr UINT probe_points[][2] = {
-        {0, 0}, {12, 0}, {23, 0}, {0, 12}, {12, 12},
-        {23, 12}, {0, 23}, {12, 23}, {23, 23}};
-    for (const auto& point : probe_points) {
-        const UINT sample = point[1] * kDlssComponentProbeColumns + point[0];
-        const auto& ne = values[sample * 2];
-        const auto& cf = values[sample * 2 + 1];
-        log_line("DLSS component probe sample=%u,%u native=%.7f,%.7f centered=%.7f,%.7f corrected=%.7f,%.7f final=%.7f,%.7f",
-            point[0], point[1], ne.x, ne.y, ne.z, ne.w,
-            cf.x, cf.y, cf.z, cf.w);
-    }
-    const D3D12_RANGE written_range{0, 0};
-    g_dlss_component_probe_readback->Unmap(0, &written_range);
-    g_dlss_component_probe_logged.store(true);
-}
-
 void try_log_dlss_output_luminance_readback() {
     for (uint32_t lane = 0; lane < 2; ++lane) {
         if (!g_dlss_output_luma_submitted[lane].load() ||
@@ -38486,79 +37487,6 @@ void try_log_dlss_output_luminance_readback() {
     }
 }
 
-void try_log_dlss_mvec_readback() {
-    if (!g_dlss_mvec_readback_submitted.load() || g_dlss_mvec_readback_logged.load() ||
-        g_dlss_mvec_readback_fence == nullptr || g_dlss_mvec_readback_buffer == nullptr ||
-        g_dlss_mvec_readback_fence->GetCompletedValue() < 1) {
-        return;
-    }
-    uint8_t* mapped{};
-    const D3D12_RANGE read_range{
-        0, static_cast<SIZE_T>(g_dlss_mvec_readback_buffer->GetDesc().Width)};
-    if (FAILED(g_dlss_mvec_readback_buffer->Map(
-            0, &read_range, reinterpret_cast<void**>(&mapped))) || mapped == nullptr) {
-        return;
-    }
-    const UINT width = g_dlss_mvec_readback_footprint.Footprint.Width;
-    const UINT height = g_dlss_mvec_readback_footprint.Footprint.Height;
-    const UINT row_pitch = g_dlss_mvec_readback_footprint.Footprint.RowPitch;
-    const auto half_to_float = [](uint16_t value) {
-        const float sign = (value & 0x8000u) != 0 ? -1.0f : 1.0f;
-        const uint16_t exponent = (value >> 10) & 0x1Fu;
-        const uint16_t mantissa = value & 0x03FFu;
-        if (exponent == 0) {
-            return mantissa == 0 ? sign * 0.0f
-                : sign * ldexpf(static_cast<float>(mantissa) / 1024.0f, -14);
-        }
-        if (exponent == 0x1F) {
-            return mantissa == 0 ? sign * INFINITY : NAN;
-        }
-        return sign * ldexpf(1.0f + static_cast<float>(mantissa) / 1024.0f,
-            static_cast<int>(exponent) - 15);
-    };
-    auto pixel = [&](UINT x, UINT y) {
-        const auto* raw = reinterpret_cast<const uint16_t*>(
-            mapped + g_dlss_mvec_readback_footprint.Offset +
-            static_cast<size_t>(y) * row_pitch + static_cast<size_t>(x) * 4);
-        return std::array<float, 2>{half_to_float(raw[0]), half_to_float(raw[1])};
-    };
-    const auto first = pixel(0, 0);
-    const auto center = pixel(width / 2, height / 2);
-    const auto last = pixel(width - 1, height - 1);
-    double sum_x{};
-    double sum_y{};
-    float min_x = FLT_MAX;
-    float max_x = -FLT_MAX;
-    float min_y = FLT_MAX;
-    float max_y = -FLT_MAX;
-    uint32_t samples{};
-    constexpr UINT kGridX = 32;
-    constexpr UINT kGridY = 18;
-    for (UINT gy = 0; gy < kGridY; ++gy) {
-        for (UINT gx = 0; gx < kGridX; ++gx) {
-            const auto value = pixel(
-                std::min(width - 1, (gx * width + width / 2) / kGridX),
-                std::min(height - 1, (gy * height + height / 2) / kGridY));
-            if (!std::isfinite(value[0]) || !std::isfinite(value[1])) continue;
-            sum_x += value[0];
-            sum_y += value[1];
-            min_x = std::min(min_x, value[0]);
-            max_x = std::max(max_x, value[0]);
-            min_y = std::min(min_y, value[1]);
-            max_y = std::max(max_y, value[1]);
-            ++samples;
-        }
-    }
-    log_line("DLSS MVec pre-NGX readback samples=%u first=%.7f,%.7f center=%.7f,%.7f last=%.7f,%.7f mean=%.7f,%.7f range_x=%.7f..%.7f range_y=%.7f..%.7f",
-        samples, first[0], first[1], center[0], center[1], last[0], last[1],
-        samples != 0 ? sum_x / samples : 0.0,
-        samples != 0 ? sum_y / samples : 0.0,
-        min_x, max_x, min_y, max_y);
-    const D3D12_RANGE written_range{0, 0};
-    g_dlss_mvec_readback_buffer->Unmap(0, &written_range);
-    g_dlss_mvec_readback_logged.store(true);
-}
-
 HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
     const bool taau_drop_profile_requested =
         taau_drop_diagnostics_active();
@@ -38602,8 +37530,6 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     int64_t phase_prepare_end_qpc{};
     if (g_config.runtime_diagnostics && temporal_backend_is_dlss()) {
         process_dlss_gpu_profile();
-        try_log_dlss_component_probe();
-        try_log_dlss_mvec_readback();
         try_log_dlss_output_luminance_readback();
     }
     if (g_game_swapchain == nullptr && swapchain != nullptr) {
@@ -38736,12 +37662,10 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     }
     if (g_config.runtime_diagnostics && g_config.ngx_trace &&
         frame % 120 == 0) {
-        log_line("DLSS routing totals present=%llu bridge=%llu sl_eval=%llu dispatch=%llu ready_miss=%llu ngx_hook=%llu packed_calls=%llu packed_eval=%llu packed_resets=%llu packed_published=%llu packed_tag_override=%llu prep_publish=%llu prep_wait=%llu prep_hit=%llu prep_timeout=%llu",
+        log_line("DLSS routing totals present=%llu bridge=%llu sl_eval=%llu ngx_hook=%llu packed_calls=%llu packed_eval=%llu packed_resets=%llu packed_published=%llu packed_tag_override=%llu prep_publish=%llu prep_wait=%llu prep_hit=%llu prep_timeout=%llu",
             static_cast<unsigned long long>(frame),
             static_cast<unsigned long long>(g_streamline_taau_bridge_matches.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_streamline_dlss_evaluate_calls.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_streamline_mvec_dispatch_calls.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_streamline_mvec_ready_misses.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_ngx_dlss_evaluate_calls.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_packed_dlss_calls.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_packed_dlss_single_evaluations.load(std::memory_order_relaxed)),
@@ -38752,12 +37676,10 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             static_cast<unsigned long long>(g_packed_temporal_preparation_waits.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_packed_temporal_preparation_hits.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_packed_temporal_preparation_timeouts.load(std::memory_order_relaxed)));
-        log_line("DLSS final-fix totals token_drop=%llu stale_pair_drop=%llu last_published_pair=%llu history_defer=%llu history_commit=%llu",
+        log_line("DLSS final-fix totals token_drop=%llu stale_pair_drop=%llu last_published_pair=%llu",
             static_cast<unsigned long long>(g_packed_dlss_invalid_token_drops.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_packed_dlss_stale_pair_drops.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_packed_dlss_last_published_pair.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_packed_dlss_camera_history_deferred.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_packed_dlss_camera_history_committed.load(std::memory_order_relaxed)));
+            static_cast<unsigned long long>(g_packed_dlss_last_published_pair.load(std::memory_order_relaxed)));
     }
     const auto bootstrap_until =
         g_taau_descriptor_bootstrap_until_present.load(std::memory_order_relaxed);
