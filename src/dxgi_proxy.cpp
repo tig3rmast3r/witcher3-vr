@@ -1156,6 +1156,8 @@ EngineSceneEnqueueFn g_engine_scene_enqueue{};
 std::atomic<uint64_t> g_engine_scene_enqueue_last_logged_present{UINT64_MAX};
 using EngineViewRebuildFn = void(__fastcall*)(float*);
 EngineViewRebuildFn g_engine_view_rebuild{};
+using EngineViewCopyRebuildFn = float*(__fastcall*)(float*, const float*);
+EngineViewCopyRebuildFn g_engine_view_copy_rebuild{};
 using EngineCameraDirectionFn = void(__fastcall*)(void*, void*, float*);
 EngineCameraDirectionFn g_engine_camera_direction{};
 using EngineTransformToEulerFn =
@@ -27986,6 +27988,111 @@ void install_engine_view_factory_probe() {
     }
 }
 
+// [FIX:RENDER-PROXY-FOV-DISTANCE-SCALE V1101 1/3] REDengine derives the
+// render-proxy squared-distance multiplier from the widened visible FOV:
+// raw view+0x24 = 3*tan(FOV/2)^2 and clamped view+0x20 = max(1, raw).
+// FUN_141E6D660 consumes +0x20 for maximum-distance culling and downstream
+// proxy LOD work. Rebuild only this pair from the preserved native FOV at
+// source+0x468; visible projection, matrices and view+0x2B0 stay untouched.
+float* __fastcall hook_engine_render_proxy_distance_scale(
+    float* destination, const float* source) {
+    float* result = g_engine_view_copy_rebuild(destination, source);
+
+    constexpr size_t kVisibleFovIndex = 0x1C / sizeof(float);
+    constexpr size_t kDistanceScaleIndex = 0x20 / sizeof(float);
+    constexpr size_t kRawDistanceScaleIndex = 0x24 / sizeof(float);
+    constexpr size_t kAspectIndex = 0x28 / sizeof(float);
+    constexpr size_t kNativeFovIndex = 0x468 / sizeof(float);
+    constexpr float kDegreesToHalfRadians =
+        3.14159265358979323846f / 360.0f;
+    // Exact witcher3.exe constant at RVA 0x2D85084 (bits 0x4040000C).
+    constexpr float kDistanceScaleCoefficient = 3.00000286102294921875f;
+
+    if (destination == nullptr || source == nullptr ||
+        !g_config.openxr_enabled || g_config.openxr_mode != 3 ||
+        g_config.temporal_backend != TemporalBackend::Dlss ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0) {
+        return result;
+    }
+
+    __try {
+        const float visible_fov = source[kVisibleFovIndex];
+        const float native_fov = source[kNativeFovIndex];
+        const float aspect = source[kAspectIndex];
+        const float original_scale = destination[kDistanceScaleIndex];
+        const float original_raw_scale =
+            destination[kRawDistanceScaleIndex];
+        const float visible_tangent =
+            tanf(visible_fov * kDegreesToHalfRadians);
+        const float expected_raw_scale = visible_tangent * visible_tangent *
+            kDistanceScaleCoefficient;
+        const float expected_scale = std::max(1.0f, expected_raw_scale);
+        const bool world_view_signature =
+            std::isfinite(visible_fov) &&
+            visible_fov >= 90.0f && visible_fov <= 115.0f &&
+            std::isfinite(native_fov) &&
+            native_fov >= 45.0f && native_fov <= 75.0f &&
+            std::isfinite(aspect) && aspect >= 0.75f && aspect <= 1.25f &&
+            visible_fov > native_fov + 15.0f &&
+            std::isfinite(expected_raw_scale) &&
+            std::isfinite(original_scale) &&
+            std::isfinite(original_raw_scale) &&
+            fabsf(original_raw_scale - expected_raw_scale) <=
+                std::max(0.01f, expected_raw_scale * 0.005f) &&
+            fabsf(original_scale - expected_scale) <=
+                std::max(0.01f, expected_scale * 0.005f);
+        if (!world_view_signature) {
+            return result;
+        }
+
+        const float native_tangent =
+            tanf(native_fov * kDegreesToHalfRadians);
+        const float native_raw_scale = native_tangent * native_tangent *
+            kDistanceScaleCoefficient;
+        const float native_scale = std::max(1.0f, native_raw_scale);
+        if (std::isfinite(native_raw_scale) &&
+            std::isfinite(native_scale) && native_raw_scale > 0.0f &&
+            native_scale < original_scale * 0.8f) {
+            destination[kRawDistanceScaleIndex] = native_raw_scale;
+            destination[kDistanceScaleIndex] = native_scale;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return result;
+    }
+    return result;
+}
+
+// [FIX:RENDER-PROXY-FOV-DISTANCE-SCALE V1101 2/3] Install only for the
+// runtime-validated Mode-3 symmetric sequential DLSS route.
+void install_engine_render_proxy_distance_scale_hook() {
+    if (!g_config.openxr_enabled || g_config.openxr_mode != 3 ||
+        g_config.temporal_backend != TemporalBackend::Dlss ||
+        g_engine_view_copy_rebuild != nullptr) {
+        return;
+    }
+
+    constexpr uintptr_t kEngineViewCopyRebuildRva = 0x015FF640;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr
+        ? module + kEngineViewCopyRebuildRva : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_engine_render_proxy_distance_scale),
+            reinterpret_cast<void**>(&g_engine_view_copy_rebuild)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line(
+            "Render-proxy FOV distance scale hook installed "
+            "RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineViewCopyRebuildRva), target);
+    } else {
+        g_engine_view_copy_rebuild = nullptr;
+        log_line(
+            "Render-proxy FOV distance scale hook failed "
+            "RVA=0x%llX target=%p",
+            static_cast<unsigned long long>(kEngineViewCopyRebuildRva), target);
+    }
+}
+
 void poll_engine_menu_state() {
     auto* gui_manager = g_engine_gui_manager.load();
     if (gui_manager == nullptr) {
@@ -32066,6 +32173,7 @@ void ensure_initialized() {
         install_engine_gameplay_entry_probe();
         install_engine_scene_enqueue_probe();
         install_engine_view_factory_probe();
+        install_engine_render_proxy_distance_scale_hook();
         install_engine_native_camera_authority_hooks();
         install_engine_camera_direction_hook();
         initialize_engine_idle_root_yaw_helpers();
@@ -32084,7 +32192,9 @@ void ensure_initialized() {
             temporal_backend_is_dlss() ? 1u : 0u,
             reverse_diagnostic_hooks_requested() ? 1u : 0u,
             g_config.openxr_mode);
-        log_line("witcher3vr dxgi proxy initialized build=V1081 automatic_focus_shaders base=V1080 structural_family=1 immutable_eye_gs=1 b1_b12_read_only_gate=1 persistent_registry=%d real_smoke_owner=world_up_specialized diagnostics_required=0 shared_writes=0 culling_audit_detours=0",
+        // [FIX:RENDER-PROXY-FOV-DISTANCE-SCALE V1101 3/3] Clean canonical
+        // source with no shadow/culling census or per-call trial logging.
+        log_line("witcher3vr dxgi proxy initialized build=V1101 base=V1081 render_proxy_fov_distance_scale_fix=1 route=mode3_symmetric_dlss view_copy_rebuild_rva=0x15FF640 output_offsets=0x20,0x24 native_fov_offset=0x468 fov_writes=0 matrix_writes=0 lod_scalar_2b0_writes=0 settings_writes=0 automatic_focus_shaders=1 structural_family=1 immutable_eye_gs=1 b1_b12_read_only_gate=1 persistent_registry=%d real_smoke_owner=world_up_specialized diagnostics_required=0 shared_writes=0 culling_audit_detours=0",
             focus_projection_shader_registry_enabled() ? 1 : 0);
     });
 }
