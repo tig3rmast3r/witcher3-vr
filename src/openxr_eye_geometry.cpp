@@ -244,6 +244,69 @@ bool compute(const std::array<XrView, 2>& views, EyeGeometry& geometry) {
     return true;
 }
 
+bool derive_asymmetric_projection_descriptor(
+    const XrFovf& fov,
+    uint32_t render_width,
+    uint32_t render_height,
+    AsymmetricProjectionDescriptor& descriptor) {
+    if (render_width == 0 || render_height == 0 ||
+        !std::isfinite(fov.angleLeft) ||
+        !std::isfinite(fov.angleRight) ||
+        !std::isfinite(fov.angleUp) ||
+        !std::isfinite(fov.angleDown)) {
+        return false;
+    }
+
+    const float left = std::tan(fov.angleLeft);
+    const float right = std::tan(fov.angleRight);
+    const float up = std::tan(fov.angleUp);
+    const float down = std::tan(fov.angleDown);
+    const float horizontal_span = right - left;
+    const float vertical_span = up - down;
+    if (!std::isfinite(left) || !std::isfinite(right) ||
+        !std::isfinite(up) || !std::isfinite(down) ||
+        !std::isfinite(horizontal_span) ||
+        !std::isfinite(vertical_span) ||
+        horizontal_span <= 0.01f || vertical_span <= 0.01f) {
+        return false;
+    }
+
+    AsymmetricProjectionDescriptor candidate{};
+    candidate.horizontal_tangent_span = horizontal_span;
+    candidate.vertical_tangent_span = vertical_span;
+    candidate.vertical_fov_degrees =
+        2.0f * std::atan(vertical_span * 0.5f) * (180.0f / kPi);
+    candidate.aspect = horizontal_span / vertical_span;
+    candidate.center_ndc_x = -(right + left) / horizontal_span;
+    candidate.center_ndc_y = -(up + down) / vertical_span;
+    candidate.optical_center_offset_px_x = candidate.center_ndc_x *
+        static_cast<float>(render_width) * 0.5f;
+    candidate.optical_center_offset_px_y = candidate.center_ndc_y *
+        static_cast<float>(render_height) * 0.5f;
+    // FUN_1415FE550 post-multiplies the REDengine row-vector projection by a
+    // translation of +2*offset/extent, so its X field has the same sign as the
+    // OpenXR optical center in NDC. V1043 used the opposite sign here.
+    candidate.redengine_center_offset_px_x =
+        candidate.optical_center_offset_px_x;
+    candidate.redengine_center_offset_px_y =
+        candidate.optical_center_offset_px_y;
+    if (!std::isfinite(candidate.vertical_fov_degrees) ||
+        !std::isfinite(candidate.aspect) ||
+        !std::isfinite(candidate.center_ndc_x) ||
+        !std::isfinite(candidate.center_ndc_y) ||
+        !std::isfinite(candidate.optical_center_offset_px_x) ||
+        !std::isfinite(candidate.optical_center_offset_px_y) ||
+        !std::isfinite(candidate.redengine_center_offset_px_x) ||
+        !std::isfinite(candidate.redengine_center_offset_px_y) ||
+        candidate.vertical_fov_degrees <= 0.0f ||
+        candidate.aspect <= 0.0f) {
+        return false;
+    }
+
+    descriptor = candidate;
+    return true;
+}
+
 float inverse_hud_distance_from_parallel_reference(
     float left_eye_shift_px,
     float hud_size,

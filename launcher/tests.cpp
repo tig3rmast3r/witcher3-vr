@@ -232,7 +232,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "manual F10 HUD scale must remain independently tuned");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
             "fixed cinema framing flag missing");
-        Require(vr.Get("meta", "config_version") == "5",
+        Require(vr.Get("meta", "config_version") == "6",
             "configuration version marker missing");
         Require(vr.Get("openxr", "cinema_full_vr") == "1",
             "automatic full-VR cutscene flag missing");
@@ -590,7 +590,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[meta]\r\n"
-        "config_version=5\r\n"
+        "config_version=6\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
         "render_width=2688\r\n"
@@ -638,8 +638,11 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "migrated INI must not be reported as newly created");
     auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated.has_value(), "migrated INI could not be read");
-    Require(migrated->Get("meta", "config_version") == "5",
+    Require(migrated->Get("meta", "config_version") == "6",
         "old INI was not versioned");
+    Require(migrated->Get(
+            "focus_projection", "shader_registry_enabled") == "0",
+        "shader registry migration default missing");
     Require(migrated->Get("openxr", "mode") == "2" &&
         migrated->Get("openxr", "render_width") == "3100" &&
         migrated->Get("openxr", "render_height") == "3200",
@@ -668,6 +671,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     migrated->Set("openxr", "manual_cinema_hud_scale", "1.100");
     migrated->Set("openxr", "hud_horizontal_scale", "0.900");
     migrated->Set("openxr", "hud_vertical_scale", "0.950");
+    migrated->Set("focus_projection", "shader_registry_enabled", "1");
     Write(paths.vr_ini, migrated->Serialize());
     Require(w3vr::EnsureVrConfiguration(
         paths, defaults, created, error), "versioned INI check failed");
@@ -675,7 +679,9 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(versioned.has_value() &&
         versioned->Get("openxr", "manual_cinema_hud_scale") == "1.100" &&
         versioned->Get("openxr", "hud_horizontal_scale") == "0.900" &&
-        versioned->Get("openxr", "hud_vertical_scale") == "0.950",
+        versioned->Get("openxr", "hud_vertical_scale") == "0.950" &&
+        versioned->Get(
+            "focus_projection", "shader_registry_enabled") == "1",
         "current-version INI manual tuning was overwritten");
 
     Write(paths.vr_ini,
@@ -691,18 +697,20 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[engine]\r\n"
         "first_person_stationary_turn=0\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V2-to-V5 migration failed");
+        paths, defaults, created, error), "V2-to-V6 migration failed");
     auto migrated_v4 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_v4.has_value() &&
-        migrated_v4->Get("meta", "config_version") == "5" &&
+        migrated_v4->Get("meta", "config_version") == "6" &&
         migrated_v4->Get("openxr", "cinema_hud_stereo_shift_px") == "-91" &&
         migrated_v4->Get("openxr", "cinema_hud_scale") == "1.100" &&
         migrated_v4->Get("openxr", "full_vr_hud_stereo_shift_px") == "-26" &&
         migrated_v4->Get("openxr", "full_vr_hud_scale") == "1.000" &&
         migrated_v4->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_v4->Get("openxr", "hud_vertical_scale") == "1.000" &&
-        migrated_v4->Get("engine", "first_person_stationary_turn") == "0",
-        "V5 migration changed the Full VR offset or missed HUD normalization");
+        migrated_v4->Get("engine", "first_person_stationary_turn") == "0" &&
+        migrated_v4->Get(
+            "focus_projection", "shader_registry_enabled") == "0",
+        "V6 migration changed the Full VR offset or missed registry/HUD defaults");
 
     Write(paths.vr_ini,
         "[meta]\r\n"
@@ -712,14 +720,14 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "hud_vertical_scale=0.780\r\n"
         "custom_user_value=keep\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V3-to-V5 migration failed");
+        paths, defaults, created, error), "V3-to-V6 migration failed");
     auto migrated_from_v3 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v3.has_value() &&
-        migrated_from_v3->Get("meta", "config_version") == "5" &&
+        migrated_from_v3->Get("meta", "config_version") == "6" &&
         migrated_from_v3->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "hud_vertical_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "custom_user_value") == "keep",
-        "V3-to-V5 HUD migration damaged unrelated settings");
+        "V3-to-V6 HUD migration damaged unrelated settings");
 }
 
 void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {

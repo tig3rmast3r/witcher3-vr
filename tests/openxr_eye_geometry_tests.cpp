@@ -509,6 +509,122 @@ void test_parallel_headset_adaptation() {
     }
 }
 
+void test_asymmetric_projection_descriptor() {
+    constexpr uint32_t width = 3072;
+    constexpr uint32_t height = 3216;
+    const XrFovf quest_left{
+        -0.942478f, 0.698132f, 0.767945f, -0.959931f};
+    const XrFovf quest_right{
+        -0.698132f, 0.942478f, 0.767945f, -0.959931f};
+    eye_geometry::AsymmetricProjectionDescriptor left{};
+    eye_geometry::AsymmetricProjectionDescriptor right{};
+    require(eye_geometry::derive_asymmetric_projection_descriptor(
+        quest_left, width, height, left),
+        "Quest left asymmetric descriptor");
+    require(eye_geometry::derive_asymmetric_projection_descriptor(
+        quest_right, width, height, right),
+        "Quest right asymmetric descriptor");
+    require(std::fabs(left.optical_center_offset_px_x - 372.50f) < 0.2f,
+        "Quest left optical center X");
+    require(std::fabs(right.optical_center_offset_px_x + 372.50f) < 0.2f,
+        "Quest right optical center X");
+    require(std::fabs(left.optical_center_offset_px_y - 310.65f) < 0.2f &&
+        std::fabs(right.optical_center_offset_px_y - 310.65f) < 0.2f,
+        "Quest optical center Y");
+    require(std::fabs(left.redengine_center_offset_px_x - 372.50f) < 0.2f &&
+        std::fabs(right.redengine_center_offset_px_x + 372.50f) < 0.2f,
+        "Quest REDengine native center X convention");
+    require(std::fabs(left.redengine_center_offset_px_y - 310.65f) < 0.2f &&
+        std::fabs(right.redengine_center_offset_px_y - 310.65f) < 0.2f,
+        "Quest REDengine native center Y convention");
+    require(std::fabs(left.center_ndc_x + right.center_ndc_x) < 2.0e-6f,
+        "Quest mirrored horizontal NDC centers");
+    require(std::fabs(left.center_ndc_y - right.center_ndc_y) < 2.0e-6f,
+        "Quest shared vertical NDC center");
+    require(std::fabs(left.aspect - right.aspect) < 2.0e-6f,
+        "Quest mirrored raw aspect");
+    require(std::fabs(left.vertical_fov_degrees - 100.2439f) < 0.002f &&
+        std::fabs(right.vertical_fov_degrees - 100.2439f) < 0.002f,
+        "Quest lossless vertical FOV");
+    require(std::fabs(left.aspect - 0.92549446f) < 2.0e-6f &&
+        std::fabs(right.aspect - 0.92549446f) < 2.0e-6f,
+        "Quest lossless tangent aspect");
+    require(std::fabs(left.horizontal_tangent_span - 2.21548265f) <
+            3.0e-6f &&
+        std::fabs(right.horizontal_tangent_span - 2.21548265f) <
+            3.0e-6f &&
+        std::fabs(left.vertical_tangent_span - 2.39383676f) <
+            3.0e-6f &&
+        std::fabs(right.vertical_tangent_span - 2.39383676f) <
+            3.0e-6f,
+        "Quest lossless tangent spans");
+    const auto require_fov_roundtrip = [=](
+            const XrFovf& source,
+            const eye_geometry::AsymmetricProjectionDescriptor& descriptor,
+            const char* label) {
+        constexpr float pi = 3.14159265358979323846f;
+        const float reconstructed_vertical_span = 2.0f * std::tan(
+            descriptor.vertical_fov_degrees * pi / 360.0f);
+        const float reconstructed_horizontal_span =
+            descriptor.aspect * reconstructed_vertical_span;
+        const float sum_x =
+            -descriptor.center_ndc_x * reconstructed_horizontal_span;
+        const float reconstructed_left =
+            (sum_x - reconstructed_horizontal_span) * 0.5f;
+        const float reconstructed_right =
+            (sum_x + reconstructed_horizontal_span) * 0.5f;
+        const float sum_y =
+            -descriptor.center_ndc_y * reconstructed_vertical_span;
+        const float reconstructed_down =
+            (sum_y - reconstructed_vertical_span) * 0.5f;
+        const float reconstructed_up =
+            (sum_y + reconstructed_vertical_span) * 0.5f;
+        require(std::fabs(
+            descriptor.horizontal_tangent_span -
+                (std::tan(source.angleRight) -
+                    std::tan(source.angleLeft))) < 2.0e-6f,
+            label);
+        require(std::fabs(
+            descriptor.vertical_tangent_span -
+                (std::tan(source.angleUp) -
+                    std::tan(source.angleDown))) < 2.0e-6f,
+            label);
+        require(std::fabs(reconstructed_left -
+                std::tan(source.angleLeft)) < 2.0e-6f &&
+            std::fabs(reconstructed_right -
+                std::tan(source.angleRight)) < 2.0e-6f &&
+            std::fabs(reconstructed_up -
+                std::tan(source.angleUp)) < 2.0e-6f &&
+            std::fabs(reconstructed_down -
+                std::tan(source.angleDown)) < 2.0e-6f,
+            label);
+    };
+    require_fov_roundtrip(quest_left, left,
+        "Quest left tangent roundtrip");
+    require_fov_roundtrip(quest_right, right,
+        "Quest right tangent roundtrip");
+
+    const XrFovf symmetric{-0.8f, 0.8f, 0.9f, -0.9f};
+    eye_geometry::AsymmetricProjectionDescriptor centered{};
+    require(eye_geometry::derive_asymmetric_projection_descriptor(
+        symmetric, 2160, 2104, centered),
+        "symmetric descriptor");
+    require(std::fabs(centered.optical_center_offset_px_x) < 1.0e-5f &&
+        std::fabs(centered.optical_center_offset_px_y) < 1.0e-5f &&
+        std::fabs(centered.redengine_center_offset_px_x) < 1.0e-5f &&
+        std::fabs(centered.redengine_center_offset_px_y) < 1.0e-5f,
+        "symmetric descriptor has zero optical offset");
+
+    XrFovf invalid = symmetric;
+    invalid.angleRight = invalid.angleLeft;
+    require(!eye_geometry::derive_asymmetric_projection_descriptor(
+        invalid, width, height, centered),
+        "asymmetric descriptor rejects collapsed FOV");
+    require(!eye_geometry::derive_asymmetric_projection_descriptor(
+        symmetric, 0, height, centered),
+        "asymmetric descriptor rejects zero extent");
+}
+
 } // namespace
 
 int main() {
@@ -521,6 +637,7 @@ int main() {
     test_quest_reference_hud_plane();
     test_canted_hud_plane_and_invalid_fallback();
     test_parallel_headset_adaptation();
+    test_asymmetric_projection_descriptor();
     if (failures != 0) {
         std::fprintf(stderr, "%d eye-geometry test(s) failed\n", failures);
         return 1;

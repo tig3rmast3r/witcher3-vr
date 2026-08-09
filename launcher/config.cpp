@@ -24,7 +24,7 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {3, true, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 5;
+constexpr int kCurrentConfigVersion = 6;
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
 constexpr float kFullVrHudReferenceScale = 1.00f;
@@ -150,6 +150,16 @@ void MigrateConfigurationToV5(IniDocument& ini) {
         PhysicalPlaneHudConvergenceShift(
             1.0f, kFullVrHudReferenceScale,
             kFullVrHudReferenceShift, preserved_offset)));
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "5");
+}
+
+void MigrateConfigurationToV6(IniDocument& ini) {
+    // Keep the automatic shader registry independent from the launcher's broad
+    // Diagnostic Logging switch. Existing manual values remain authoritative.
+    if (!ini.Get("focus_projection", "shader_registry_enabled").has_value()) {
+        ini.Set("focus_projection", "shader_registry_enabled", "0");
+    }
     RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
@@ -689,6 +699,9 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         }
         if (existing_version < 5) {
             MigrateConfigurationToV5(migrated);
+        }
+        if (existing_version < 6) {
+            MigrateConfigurationToV6(migrated);
         }
         return AtomicWriteWithBackup(paths.vr_ini, migrated.Serialize(), error);
     }
