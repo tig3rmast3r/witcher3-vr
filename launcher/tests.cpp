@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -25,6 +26,22 @@ void Write(const fs::path& path, const std::string& text) {
 std::string Read(const fs::path& path) {
     std::ifstream stream(path, std::ios::binary);
     return {(std::istreambuf_iterator<char>(stream)), {}};
+}
+
+std::string Utf16Bytes(std::u16string_view text, bool little_endian = true) {
+    std::string bytes;
+    bytes.reserve(2 + text.size() * 2);
+    bytes.push_back(little_endian ? static_cast<char>(0xFF) :
+        static_cast<char>(0xFE));
+    bytes.push_back(little_endian ? static_cast<char>(0xFE) :
+        static_cast<char>(0xFF));
+    for (const char16_t value : text) {
+        const char low = static_cast<char>(value & 0xFF);
+        const char high = static_cast<char>((value >> 8) & 0xFF);
+        bytes.push_back(little_endian ? low : high);
+        bytes.push_back(little_endian ? high : low);
+    }
+    return bytes;
 }
 
 size_t CountOccurrences(const std::string& text, const std::string& token) {
@@ -465,6 +482,47 @@ void TestHudEditorSetup(const fs::path& root) {
         "idempotent HUD editor setup failed");
     Require(Read(filelist) == first_filelist && Read(input) == first_input,
         "repeated HUD editor setup changed already-correct files");
+
+    const std::string utf16_le_expected = Utf16Bytes(
+        u"audio.xml;\r\nBrothersInArms.xml;\r\n"
+        u"modWitcher3VRHUDEditor.xml;\r\n");
+    Write(filelist, Utf16Bytes(
+        u"audio.xml;\r\nBrothersInArms.xml;\r\n"));
+    error.clear();
+    Require(w3vr::EnsureHudEditorSetup(paths, error),
+        "UTF-16LE HUD editor registration failed");
+    Require(Read(filelist) == utf16_le_expected,
+        "UTF-16LE filelist encoding or newlines were not preserved");
+    Require(CountOccurrences(Read(filelist),
+        "modWitcher3VRHUDEditor.xml;") == 0,
+        "HUD editor registration was appended as narrow text to UTF-16LE");
+    error.clear();
+    Require(w3vr::EnsureHudEditorSetup(paths, error) &&
+        Read(filelist) == utf16_le_expected,
+        "repeated UTF-16LE HUD editor setup was not idempotent");
+
+    std::string mixed_encoding = Utf16Bytes(
+        u"audio.xml;\r\nBrothersInArms.xml;");
+    mixed_encoding += "\r\nmodWitcher3VRHUDEditor.xml;\r\n";
+    Write(filelist, mixed_encoding);
+    error.clear();
+    Require(w3vr::EnsureHudEditorSetup(paths, error),
+        "mixed UTF-16LE/ASCII HUD filelist repair failed");
+    Require(Read(filelist) == utf16_le_expected,
+        "mixed-encoding HUD filelist was not repaired exactly");
+    error.clear();
+    Require(w3vr::EnsureHudEditorSetup(paths, error) &&
+        Read(filelist) == utf16_le_expected,
+        "repaired UTF-16LE HUD filelist was not idempotent");
+
+    const std::string utf16_be_expected = Utf16Bytes(
+        u"audio.xml;\ninput.xml;\nmodWitcher3VRHUDEditor.xml;\n", false);
+    Write(filelist, Utf16Bytes(u"audio.xml;\ninput.xml;\n", false));
+    error.clear();
+    Require(w3vr::EnsureHudEditorSetup(paths, error),
+        "UTF-16BE HUD editor registration failed");
+    Require(Read(filelist) == utf16_be_expected,
+        "UTF-16BE filelist encoding or newlines were not preserved");
 }
 
 void TestDlssNearSquareResolutionCompatibility() {

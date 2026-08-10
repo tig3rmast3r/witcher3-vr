@@ -29009,16 +29009,52 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     const bool native_loading_video =
         g_engine_loading_screen_video_active.load(
             std::memory_order_acquire);
+    // [FIX:POST-VIDEO-FULL-VR-BOOTSTRAP 1/2] Some introductory cutscenes do
+    // not publish another accepted factory camera after the native movie. In
+    // that state the old auto-start waited for a recent HMD camera, while the
+    // HMD camera route could only resume after stereo production had started.
+    // Let the already-debounced automatic cinema state break that cycle when
+    // Full VR is explicitly enabled. The exact native-video, menu and manual
+    // F10 gates remain independent below, so loading/movie presentation is
+    // never used as stereo bootstrap authority.
+    const bool automatic_full_vr_bootstrap =
+        g_config.cinema_full_vr &&
+        g_cinema_mode_active.load(std::memory_order_acquire) &&
+        !g_force_mono_cinema.load(std::memory_order_acquire);
+    // [FIX:POST-VIDEO-FULL-VR-BOOTSTRAP 2/2] Starting the stereo producer is
+    // insufficient when this special cutscene also skips the perspective-view
+    // factory: that hook normally owns g_automatic_full_vr_camera_active, so
+    // the final-frame fallback remained disabled and the camera stayed native
+    // and head-locked despite valid left/right pairs. The debounced automatic
+    // cinema state is already outside the native loading-video/grace window;
+    // arm only its existing Full-VR camera fallback from a real scene factory.
+    const bool automatic_full_vr_frame_camera_bootstrap =
+        automatic_full_vr_bootstrap &&
+        !native_loading_video &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        render_context != nullptr && render_settings != nullptr &&
+        scene_descriptor != nullptr;
+    if (automatic_full_vr_frame_camera_bootstrap &&
+        !g_automatic_full_vr_camera_active.exchange(
+            true, std::memory_order_acq_rel)) {
+        log_line(
+            "Automatic Full VR frame-camera fallback armed present=%llu "
+            "reason=post_video_cinema",
+            static_cast<unsigned long long>(present));
+    }
     const bool dual_render_auto_ready = g_config.engine_dual_render_start &&
         !native_loading_video &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
-        hmd_camera_recent && render_context != nullptr && render_settings != nullptr &&
+        (hmd_camera_recent || automatic_full_vr_bootstrap) &&
+        render_context != nullptr && render_settings != nullptr &&
         scene_descriptor != nullptr;
     if (g_config.engine_dual_render_probe && !g_engine_dual_render_active.load() &&
         dual_render_auto_ready && !g_dual_render_auto_start_consumed.exchange(true)) {
         g_engine_dual_render_requested.store(1);
-        log_line("Engine dual render INI auto-start queued present=%llu",
-            static_cast<unsigned long long>(present));
+        log_line(
+            "Engine dual render INI auto-start queued present=%llu reason=%s",
+            static_cast<unsigned long long>(present),
+            hmd_camera_recent ? "hmd_camera" : "automatic_full_vr");
     }
 
     // [FIX:FULL-VR-GAMEPLAY-CAMERA-ROUTE 2/3] Native Full VR camera authority
@@ -31928,10 +31964,10 @@ void ensure_initialized() {
             temporal_backend_is_dlss() ? 1u : 0u,
             reverse_diagnostic_hooks_requested() ? 1u : 0u,
             g_config.openxr_mode);
-        // V1113 completes the four accepted djules75 performance imports. The
-        // fork's separate pacing gates and both withdrawn cheap rejects are absent.
+        // V1117 completes V1116's post-video automatic Full-VR bootstrap by
+        // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1113 base=V1112 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 native_stereo_launcher=1 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1117 base=V1116 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 native_stereo_launcher=1 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });

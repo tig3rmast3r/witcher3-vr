@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 
 namespace w3vr {
 namespace {
@@ -308,6 +309,153 @@ std::string PreferredNewline(const std::vector<EditableTextLine>& lines) {
         if (!line.newline.empty()) return line.newline;
     }
     return "\r\n";
+}
+
+constexpr std::string_view kHudEditorFilelistRegistration =
+    "modWitcher3VRHUDEditor.xml;";
+constexpr std::u16string_view kHudEditorFilelistRegistrationUtf16 =
+    u"modWitcher3VRHUDEditor.xml;";
+
+bool Utf16LineIsHudEditorRegistration(std::u16string_view line) {
+    const auto is_space = [](char16_t value) {
+        return value == u' ' || value == u'\t' || value == u'\r' ||
+            value == u'\n';
+    };
+    while (!line.empty() && is_space(line.front())) line.remove_prefix(1);
+    while (!line.empty() && is_space(line.back())) line.remove_suffix(1);
+    return line == kHudEditorFilelistRegistrationUtf16;
+}
+
+bool Utf16HasHudEditorRegistration(std::u16string_view text) {
+    size_t cursor{};
+    while (cursor <= text.size()) {
+        size_t end = cursor;
+        while (end < text.size() && text[end] != u'\r' &&
+            text[end] != u'\n') {
+            ++end;
+        }
+        if (Utf16LineIsHudEditorRegistration(
+                text.substr(cursor, end - cursor))) {
+            return true;
+        }
+        if (end == text.size()) break;
+        cursor = end + 1;
+        if (text[end] == u'\r' && cursor < text.size() &&
+            text[cursor] == u'\n') {
+            ++cursor;
+        }
+    }
+    return false;
+}
+
+std::u16string PreferredUtf16Newline(std::u16string_view text) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == u'\r') {
+            return i + 1 < text.size() && text[i + 1] == u'\n'
+                ? u"\r\n" : u"\r";
+        }
+        if (text[i] == u'\n') return u"\n";
+    }
+    return u"\r\n";
+}
+
+bool IsMixedEncodingHudEditorSuffix(
+    const std::string& bytes, size_t registration_position) {
+    size_t cursor = registration_position;
+    while (cursor < bytes.size()) {
+        if (bytes.compare(cursor, kHudEditorFilelistRegistration.size(),
+                kHudEditorFilelistRegistration) == 0) {
+            cursor += kHudEditorFilelistRegistration.size();
+            continue;
+        }
+        if (bytes[cursor] == '\r' || bytes[cursor] == '\n') {
+            ++cursor;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::string> PrepareHudEditorFilelist(
+    const std::string& original) {
+    const bool utf16_le = original.size() >= 2 &&
+        static_cast<unsigned char>(original[0]) == 0xFF &&
+        static_cast<unsigned char>(original[1]) == 0xFE;
+    const bool utf16_be = original.size() >= 2 &&
+        static_cast<unsigned char>(original[0]) == 0xFE &&
+        static_cast<unsigned char>(original[1]) == 0xFF;
+    if (!utf16_le && !utf16_be) {
+        auto lines = ParseEditableText(original);
+        const bool registered = std::any_of(lines.begin(), lines.end(),
+            [](const EditableTextLine& line) {
+                return Trim(line.text) == kHudEditorFilelistRegistration;
+            });
+        if (registered) return original;
+
+        const std::string newline = PreferredNewline(lines);
+        if (!lines.empty() && lines.back().newline.empty()) {
+            lines.back().newline = newline;
+        }
+        lines.push_back(
+            {std::string(kHudEditorFilelistRegistration), newline});
+        return SerializeEditableText(lines);
+    }
+
+    // Older launchers parsed the UTF-16 file as narrow text and appended an
+    // ASCII registration to it. That produces the reported Chinese-looking
+    // suffix in editors. Recognize only the exact launcher-owned suffix before
+    // truncating it, then rebuild the registration in the original encoding.
+    std::string clean = original;
+    const size_t mixed_registration =
+        clean.find(kHudEditorFilelistRegistration);
+    if (mixed_registration != std::string::npos &&
+        IsMixedEncodingHudEditorSuffix(clean, mixed_registration)) {
+        size_t valid_end = mixed_registration;
+        while (valid_end > 2 &&
+            (clean[valid_end - 1] == '\r' || clean[valid_end - 1] == '\n')) {
+            --valid_end;
+        }
+        if ((valid_end - 2) % 2 != 0) return std::nullopt;
+        clean.resize(valid_end);
+    }
+
+    if (clean.size() < 2 || (clean.size() - 2) % 2 != 0) {
+        return std::nullopt;
+    }
+
+    std::u16string text;
+    text.reserve((clean.size() - 2) / 2);
+    for (size_t i = 2; i < clean.size(); i += 2) {
+        const auto first = static_cast<unsigned char>(clean[i]);
+        const auto second = static_cast<unsigned char>(clean[i + 1]);
+        text.push_back(static_cast<char16_t>(utf16_le
+            ? first | (static_cast<unsigned int>(second) << 8)
+            : (static_cast<unsigned int>(first) << 8) | second));
+    }
+
+    if (!Utf16HasHudEditorRegistration(text)) {
+        const std::u16string newline = PreferredUtf16Newline(text);
+        if (!text.empty() && text.back() != u'\r' && text.back() != u'\n') {
+            text += newline;
+        }
+        text += kHudEditorFilelistRegistrationUtf16;
+        text += newline;
+    }
+
+    std::string prepared;
+    prepared.reserve(2 + text.size() * 2);
+    prepared.push_back(utf16_le ? static_cast<char>(0xFF) :
+        static_cast<char>(0xFE));
+    prepared.push_back(utf16_le ? static_cast<char>(0xFE) :
+        static_cast<char>(0xFF));
+    for (const char16_t value : text) {
+        const char low = static_cast<char>(value & 0xFF);
+        const char high = static_cast<char>((value >> 8) & 0xFF);
+        prepared.push_back(utf16_le ? low : high);
+        prepared.push_back(utf16_le ? high : low);
+    }
+    return prepared;
 }
 
 bool SectionBounds(const std::vector<EditableTextLine>& lines,
@@ -822,22 +970,16 @@ bool EnsureHudEditorSetup(const ConfigPaths& paths, std::wstring& error) {
 
     const auto original_filelist = read_text(filelist);
     if (!original_filelist) return false;
-    auto filelist_lines = ParseEditableText(*original_filelist);
-    const bool registered = std::any_of(filelist_lines.begin(),
-        filelist_lines.end(), [](const EditableTextLine& line) {
-            return Trim(line.text) == "modWitcher3VRHUDEditor.xml;";
-        });
-    if (!registered) {
-        const std::string newline = PreferredNewline(filelist_lines);
-        if (!filelist_lines.empty() && filelist_lines.back().newline.empty()) {
-            filelist_lines.back().newline = newline;
-        }
-        filelist_lines.push_back(
-            {"modWitcher3VRHUDEditor.xml;", newline});
-        if (!AtomicWriteWithBackup(
-                filelist, SerializeEditableText(filelist_lines), error)) {
-            return false;
-        }
+    const auto prepared_filelist =
+        PrepareHudEditorFilelist(*original_filelist);
+    if (!prepared_filelist) {
+        error = L"HUD Editor setup stopped because dx12filelist.txt has an "
+            L"invalid UTF-16 byte layout:\n" + filelist.wstring();
+        return false;
+    }
+    if (*prepared_filelist != *original_filelist &&
+        !AtomicWriteWithBackup(filelist, *prepared_filelist, error)) {
+        return false;
     }
 
     const auto original_input = read_text(input_settings);
@@ -853,17 +995,14 @@ bool EnsureHudEditorSetup(const ConfigPaths& paths, std::wstring& error) {
     // Read both targets back and validate the exact state consumed by REDengine.
     const auto verified_filelist = read_text(filelist);
     if (!verified_filelist) return false;
-    const auto verified_filelist_lines = ParseEditableText(*verified_filelist);
-    const bool registration_verified = std::any_of(
-        verified_filelist_lines.begin(), verified_filelist_lines.end(),
-        [](const EditableTextLine& line) {
-            return Trim(line.text) == "modWitcher3VRHUDEditor.xml;";
-        });
-    if (!registration_verified) {
+    const auto verified_prepared_filelist =
+        PrepareHudEditorFilelist(*verified_filelist);
+    if (!verified_prepared_filelist ||
+        *verified_prepared_filelist != *verified_filelist) {
         error = L"HUD Editor setup verification failed after writing:\n" +
             filelist.wstring() +
-            L"\n\nThe required XML registration was not present when the file "
-            L"was read back.";
+            L"\n\nThe required XML registration was not present in the file's "
+            L"original encoding when it was read back.";
         return false;
     }
 

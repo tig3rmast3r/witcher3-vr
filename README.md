@@ -82,10 +82,6 @@ installation. Please do not open issues for problems that occur only while
 another mod is installed. This is a temporary development-scope limitation, not
 a restriction on using mods.
 
-## Known issues
-
-- Some rare shadows may flicker in stereo.
-
 ## Requirements
 
 - A legally owned copy of *The Witcher 3: Wild Hunt — Next-Gen Update*
