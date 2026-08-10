@@ -643,7 +643,17 @@ XrEyeSwapchain g_xr_eye_swapchains[2]{};
 XrEyeSwapchain g_xr_hud_swapchain{};
 ID3D12DescriptorHeap* g_xr_rtv_heap{};
 UINT g_xr_rtv_increment{};
-ID3D12CommandAllocator* g_xr_command_allocator{};
+// [FIX:XR-ALLOCATOR-PIPELINING 1/4] One allocator forced every frame to drain
+// the whole queue before it could be reset, because that reset is a CPU-side
+// write to memory the GPU still reads. Rotating through a few allocators lets
+// a frame reset one the GPU finished with while later work is still in
+// flight. Cross-frame GPU hazards need no extra waiting: every list here is
+// submitted to the single game queue, which executes them in submission
+// order.
+constexpr size_t kXrCommandAllocatorCount = 3;
+ID3D12CommandAllocator* g_xr_command_allocators[kXrCommandAllocatorCount]{};
+uint64_t g_xr_command_allocator_fences[kXrCommandAllocatorCount]{};
+size_t g_xr_command_allocator_index{};
 std::vector<uint64_t> g_xr_hud_fence_values{};
 ID3D12GraphicsCommandList* g_xr_command_list{};
 ID3D12Fence* g_xr_fence{};
@@ -1741,6 +1751,31 @@ std::atomic<uint64_t> g_engine_pair_captured_signal{};
 std::atomic<uint64_t> g_engine_pair_wait_floor{};
 std::atomic<uint64_t> g_engine_pair_capture_floor{};
 std::atomic<uint64_t> g_engine_pair_retry_present{};
+// [FIX:PRODUCER-BARRIER-WAKE 1/8] wait_for_engine_pair_completion() has to
+// watch three independent signals (completed/captured/accepted), and
+// WaitOnAddress can only park on one address. This counter is the single
+// address every waiter parks on: any advance of any of the three bumps it,
+// and the woken waiter re-reads all three. Keep it 32-bit; WaitOnAddress
+// accepts 1/2/4/8-byte addresses and 4 is the cheapest to compare.
+std::atomic<uint32_t> g_engine_pair_signal_generation{};
+// Non-zero only while a producer is parked. It keeps the wake side free for
+// the overwhelmingly common case of nobody waiting: one relaxed-ish load
+// instead of a call into the kernel's wait-address hash.
+std::atomic<uint32_t> g_engine_pair_signal_waiters{};
+
+// [FIX:PRODUCER-BARRIER-WAKE 2/8] Call after any store that can make a
+// waiter's predicate true. The seq_cst on both the bump here and the waiter
+// registration is load-bearing, not decoration: notifier does
+// bump-then-read-waiters while waiter does register-then-read-generation, so
+// a single total order guarantees at least one side sees the other. Weaken
+// either and a producer can park microseconds before its pair completes and
+// then sleep out the whole timeout.
+void notify_engine_pair_signal() {
+    g_engine_pair_signal_generation.fetch_add(1, std::memory_order_seq_cst);
+    if (g_engine_pair_signal_waiters.load(std::memory_order_seq_cst) != 0) {
+        WakeByAddressAll(&g_engine_pair_signal_generation);
+    }
+}
 thread_local bool g_packed_capture_internal{};
 std::array<std::vector<uint8_t>, 16> g_engine_dual_scene_descriptors{};
 std::mutex g_engine_dual_frame_mutex{};
@@ -4549,25 +4584,35 @@ void install_command_list_hooks();
 void install_streamline_resource_barrier_probe();
 bool reverse_enabled();
 
+// [PERF:LOG-FILE-HANDLE 1/1] A diagnostic has to observe the frame without
+// reshaping it. Re-deriving the path and reopening plus closing the file for
+// every record turned each line into a synchronous filesystem metadata
+// operation, taken while holding this mutex, so the frames that emit a burst
+// of records paid a periodic cost that the capture then blamed on the
+// renderer. Hold the handle open and flush per line instead: the bytes still
+// reach the OS on every line, so a crashed process keeps its log tail.
 void write_log_line_v(const char* fmt, va_list args) {
     if (!g_config.runtime_diagnostics) {
         return;
     }
     std::scoped_lock lock{g_log_mutex};
 
-    char module_path[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+    static FILE* file{};
+    if (file == nullptr) {
+        char module_path[MAX_PATH]{};
+        GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
 
-    char* slash = strrchr(module_path, '\\');
-    if (slash != nullptr) {
-        slash[1] = '\0';
-    }
+        char* slash = strrchr(module_path, '\\');
+        if (slash != nullptr) {
+            slash[1] = '\0';
+        }
 
-    strcat_s(module_path, "witcher3vr.log");
+        strcat_s(module_path, "witcher3vr.log");
 
-    FILE* file{};
-    if (fopen_s(&file, module_path, "a") != 0 || file == nullptr) {
-        return;
+        if (fopen_s(&file, module_path, "a") != 0 || file == nullptr) {
+            file = nullptr;
+            return;
+        }
     }
 
     SYSTEMTIME st{};
@@ -4576,7 +4621,7 @@ void write_log_line_v(const char* fmt, va_list args) {
     vfprintf(file, fmt, args);
 
     fprintf(file, "\n");
-    fclose(file);
+    fflush(file);
 }
 
 void log_line(const char* fmt, ...) {
@@ -12298,6 +12343,28 @@ HRESULT STDMETHODCALLTYPE hook_create_compute_pipeline_state(
     return hr;
 }
 
+// [PERF:DESCRIPTOR-INCREMENT-CACHE 1/3] The handle increment is a fixed
+// property of the device and heap type, but the descriptor copy hooks below
+// run on every dynamic table the engine builds, so asking the runtime for it
+// per call is pure repeated work. Racing threads can only ever store the same
+// value here.
+UINT cached_descriptor_increment(
+    ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_TYPE type) {
+    if (device == nullptr || type < 0 ||
+        type >= D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES) {
+        return 0;
+    }
+    static std::atomic<UINT>
+        cached[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES]{};
+    auto& slot = cached[static_cast<size_t>(type)];
+    UINT increment = slot.load(std::memory_order_relaxed);
+    if (increment == 0) {
+        increment = device->GetDescriptorHandleIncrementSize(type);
+        slot.store(increment, std::memory_order_relaxed);
+    }
+    return increment;
+}
+
 void STDMETHODCALLTYPE hook_copy_descriptors(
     ID3D12Device* device,
     UINT num_dest_descriptor_ranges,
@@ -12332,7 +12399,9 @@ void STDMETHODCALLTYPE hook_copy_descriptors(
         return;
     }
 
-    const auto increment = device->GetDescriptorHandleIncrementSize(descriptor_heaps_type);
+    // [PERF:DESCRIPTOR-INCREMENT-CACHE 2/3]
+    const auto increment =
+        cached_descriptor_increment(device, descriptor_heaps_type);
     UINT dest_range = 0;
     UINT src_range = 0;
     UINT dest_index = 0;
@@ -12404,7 +12473,9 @@ void STDMETHODCALLTYPE hook_copy_descriptors_simple(
         return;
     }
 
-    const auto increment = device->GetDescriptorHandleIncrementSize(descriptor_heaps_type);
+    // [PERF:DESCRIPTOR-INCREMENT-CACHE 3/3]
+    const auto increment =
+        cached_descriptor_increment(device, descriptor_heaps_type);
     const bool full_metadata = taau_metadata_hooks_needed() ||
         effect_gpu_probe_available() || real_smoke_center_fix_route_active() ||
         focus_projection_metadata_hooks_needed();
@@ -21029,6 +21100,7 @@ void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
             auto& completion_mask = g_engine_pair_completion_masks[g_engine_render_pair_id];
             completion_mask = static_cast<uint8_t>(
                 completion_mask | (1u << static_cast<uint32_t>(g_engine_render_eye)));
+            bool completion_advanced = false;
             if (completion_mask == 0x3) {
                 auto completed = g_engine_pair_completed_signal.load(std::memory_order_relaxed);
                 while (completed < g_engine_render_pair_id &&
@@ -21036,8 +21108,15 @@ void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
                         completed, g_engine_render_pair_id,
                         std::memory_order_release, std::memory_order_relaxed)) {
                 }
+                completion_advanced = true;
             }
             g_engine_pair_completion_mutex.unlock();
+            // [FIX:PRODUCER-BARRIER-WAKE 4/8] Wake outside the mutex: the
+            // producer this releases immediately tries to take the same lock
+            // to erase its mask.
+            if (completion_advanced) {
+                notify_engine_pair_signal();
+            }
         }
         // Mode 3 needs the same completed-task identity queue as Mode 4, but
         // consumes it at each natural final PRESENT instead of synthesizing a
@@ -21189,24 +21268,68 @@ void install_engine_scene_enqueue_probe() {
 
 bool wait_for_engine_pair_completion(uint64_t pair_id, uint64_t timeout_ms) {
     const auto wait_begin = GetTickCount64();
-    constexpr uint32_t kMaxCooperativeWaitIterations = 10'000'000;
-    uint32_t wait_iterations{};
     bool pair_complete{};
     bool pair_captured{};
     bool pair_accepted{};
-    while (GetTickCount64() - wait_begin < timeout_ms &&
-        wait_iterations++ < kMaxCooperativeWaitIterations) {
+    const auto check_pair_signals = [&]() {
         pair_complete =
             g_engine_pair_completed_signal.load(std::memory_order_acquire) >= pair_id;
         pair_captured =
             g_engine_pair_captured_signal.load(std::memory_order_acquire) >= pair_id;
         pair_accepted = g_packed_accepted_pair_signal.load(std::memory_order_acquire) >= pair_id;
-        if (pair_complete || pair_captured || pair_accepted) {
+        return pair_complete || pair_captured || pair_accepted;
+    };
+
+    // [FIX:PRODUCER-BARRIER-SPIN 1/1] Pure-spin only for a short bounded
+    // window (~200us): REDengine's render worker can spin without yielding,
+    // so the fast/common case (near-instant completion) still resolves at
+    // PAUSE-instruction latency. Past that window the wait is genuinely long
+    // (a hitch), and holding a full logical core at boost clock for the rest
+    // of the up-to-64ms timeout is what was pinning AMD X3D parts against
+    // their PPT/TDC limits every frame.
+    static const long long kQpcFrequency = [] {
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        return frequency.QuadPart;
+    }();
+    const long long spin_budget_ticks = std::max(1LL, kQpcFrequency / 5000); // ~200us
+    LARGE_INTEGER spin_start{};
+    QueryPerformanceCounter(&spin_start);
+    bool signaled = false;
+    while (!(signaled = check_pair_signals())) {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - spin_start.QuadPart >= spin_budget_ticks) {
             break;
         }
-        // Do not enter the scheduler here. REDengine's render worker can spin
-        // without yielding, leaving this producer parked despite the deadline.
         YieldProcessor();
+    }
+
+    // [FIX:PRODUCER-BARRIER-WAKE 3/8] Past the spin budget, park on the
+    // signal generation instead of yield-polling. WaitOnAddress gives up the
+    // core, but the consumer wakes it directly, so wake latency no longer
+    // depends on the scheduler re-running a yielded thread against busy cores.
+    if (!signaled) {
+        g_engine_pair_signal_waiters.fetch_add(1, std::memory_order_seq_cst);
+        while (!signaled) {
+            // Read the generation before re-checking, so a bump landing
+            // between the check and the park makes WaitOnAddress return
+            // immediately rather than sleep on an already-stale value.
+            uint32_t observed =
+                g_engine_pair_signal_generation.load(std::memory_order_seq_cst);
+            signaled = check_pair_signals();
+            if (signaled) {
+                break;
+            }
+            const auto elapsed = GetTickCount64() - wait_begin;
+            if (elapsed >= timeout_ms) {
+                break;
+            }
+            WaitOnAddress(&g_engine_pair_signal_generation, &observed,
+                sizeof(observed), static_cast<DWORD>(timeout_ms - elapsed));
+            signaled = check_pair_signals();
+        }
+        g_engine_pair_signal_waiters.fetch_sub(1, std::memory_order_seq_cst);
     }
     g_engine_pair_completion_mutex.lock();
     g_engine_pair_completion_masks.erase(pair_id);
@@ -21264,15 +21387,24 @@ void mark_engine_pair_output_captured(uint64_t pair_id, uint32_t eye) {
         pair_id < g_engine_pair_capture_floor.load(std::memory_order_relaxed)) {
         return;
     }
-    std::scoped_lock lock{g_engine_pair_capture_mutex};
-    auto& capture_mask = g_engine_pair_capture_masks[pair_id];
-    capture_mask = static_cast<uint8_t>(capture_mask | (1u << eye));
-    if (capture_mask == 0x3) {
-        auto captured = g_engine_pair_captured_signal.load(std::memory_order_relaxed);
-        while (captured < pair_id &&
-            !g_engine_pair_captured_signal.compare_exchange_weak(
-                captured, pair_id, std::memory_order_release, std::memory_order_relaxed)) {
+    bool capture_advanced = false;
+    {
+        std::scoped_lock lock{g_engine_pair_capture_mutex};
+        auto& capture_mask = g_engine_pair_capture_masks[pair_id];
+        capture_mask = static_cast<uint8_t>(capture_mask | (1u << eye));
+        if (capture_mask == 0x3) {
+            auto captured = g_engine_pair_captured_signal.load(std::memory_order_relaxed);
+            while (captured < pair_id &&
+                !g_engine_pair_captured_signal.compare_exchange_weak(
+                    captured, pair_id, std::memory_order_release, std::memory_order_relaxed)) {
+            }
+            capture_advanced = true;
         }
+    }
+    // [FIX:PRODUCER-BARRIER-WAKE 5/8] Outside the scoped_lock for the same
+    // reason as the completion signal: the waiter wants this mutex next.
+    if (capture_advanced) {
+        notify_engine_pair_signal();
     }
 }
 
@@ -28674,6 +28806,11 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
     g_packed_accepted_pair_signal.store(0, std::memory_order_release);
     g_engine_pair_completed_signal.store(0, std::memory_order_release);
     g_engine_pair_captured_signal.store(0, std::memory_order_release);
+    // [FIX:PRODUCER-BARRIER-WAKE 8/8] Resetting the signals to 0 cannot
+    // satisfy a waiter, but a producer parked across this teardown would
+    // otherwise sit until its deadline. Wake it so it re-reads and unwinds
+    // now.
+    notify_engine_pair_signal();
     g_packed_last_accepted_present = UINT64_MAX;
     g_openxr_last_projection_submit_present = UINT64_MAX;
     g_packed_runtime_ready.store(false, std::memory_order_relaxed);
@@ -31791,11 +31928,10 @@ void ensure_initialized() {
             temporal_backend_is_dlss() ? 1u : 0u,
             reverse_diagnostic_hooks_requested() ? 1u : 0u,
             g_config.openxr_mode);
-        // V1107 combines V1106's clean native per-eye DLSS motion history with
-        // V1105's launcher-owned native-stereo opt-in. The removed analytic
-        // MVec route remains absent; DLSS consumes REDengine's native field.
+        // V1113 completes the four accepted djules75 performance imports. The
+        // fork's separate pacing gates and both withdrawn cheap rejects are absent.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1107 base=V1106/V1105 native_stereo_launcher=1 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1113 base=V1112 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 native_stereo_launcher=1 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
@@ -31852,6 +31988,29 @@ void wait_for_xr_gpu() {
         g_xr_fence->SetEventOnCompletion(value, g_xr_fence_event);
         WaitForSingleObject(g_xr_fence_event, 1000);
     }
+}
+
+// [FIX:XR-ALLOCATOR-PIPELINING 3/4] Wait only for the submission that last
+// used this allocator, instead of signalling a fresh value and draining
+// everything the game has queued. Frames the GPU already finished with cost
+// nothing here.
+bool wait_for_xr_command_allocator(size_t index) {
+    // Feeds the previously unpopulated allocator_wait_ms field in the TAAU
+    // drop-spike record, so a capture shows directly whether this rotation
+    // still blocks or has become free.
+    TaauDropFrameScope taau_scope{g_taau_drop_frame_timing.allocator_wait_ms};
+    if (g_xr_fence == nullptr || g_xr_fence_event == nullptr ||
+        index >= kXrCommandAllocatorCount) {
+        return false;
+    }
+    const uint64_t value = g_xr_command_allocator_fences[index];
+    if (value == 0 || g_xr_fence->GetCompletedValue() >= value) {
+        return true;
+    }
+    if (FAILED(g_xr_fence->SetEventOnCompletion(value, g_xr_fence_event))) {
+        return false;
+    }
+    return WaitForSingleObject(g_xr_fence_event, 1000) == WAIT_OBJECT_0;
 }
 
 bool wait_for_xr_hud_slot(uint32_t image_index) {
@@ -33271,13 +33430,25 @@ bool create_openxr_swapchains() {
             "Cinema anchored stereo projection unavailable; mono quad bootstrap retained");
     }
 
-    if (FAILED(g_d3d12_device->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_DIRECT,
-            IID_PPV_ARGS(&g_xr_command_allocator))) ||
-        FAILED(g_d3d12_device->CreateCommandList(
+    // [FIX:XR-ALLOCATOR-PIPELINING 2/4] One command list is still enough: a
+    // list may be reset onto another allocator immediately after submission.
+    // Only the allocators have to be rotated.
+    for (auto*& allocator : g_xr_command_allocators) {
+        if (FAILED(g_d3d12_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&allocator)))) {
+            log_line("OpenXR failed to create D3D12 clear resources");
+            return false;
+        }
+    }
+    g_xr_command_allocator_index = 0;
+    for (auto& fence_value : g_xr_command_allocator_fences) {
+        fence_value = 0;
+    }
+    if (FAILED(g_d3d12_device->CreateCommandList(
             0,
             D3D12_COMMAND_LIST_TYPE_DIRECT,
-            g_xr_command_allocator,
+            g_xr_command_allocators[0],
             nullptr,
             IID_PPV_ARGS(&g_xr_command_list))) ||
         FAILED(g_xr_command_list->Close()) ||
@@ -33290,7 +33461,8 @@ bool create_openxr_swapchains() {
     g_xr_fence_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     g_xr_views.assign(2, {XR_TYPE_VIEW});
     g_xr_resources_ready = true;
-    log_line("OpenXR stereo swapchains ready stable_single_allocator=1");
+    log_line("OpenXR stereo swapchains ready rotating_allocators=%zu",
+        kXrCommandAllocatorCount);
     return true;
 }
 
@@ -33914,6 +34086,11 @@ bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
     g_packed_accepted_pair_signal.store(0, std::memory_order_release);
     g_engine_pair_completed_signal.store(0, std::memory_order_release);
     g_engine_pair_captured_signal.store(0, std::memory_order_release);
+    // [FIX:PRODUCER-BARRIER-WAKE 8/8] Resetting the signals to 0 cannot
+    // satisfy a waiter, but a producer parked across this teardown would
+    // otherwise sit until its deadline. Wake it so it re-reads and unwinds
+    // now.
+    notify_engine_pair_signal();
     g_packed_last_accepted_present = UINT64_MAX;
     g_openxr_last_projection_submit_present = UINT64_MAX;
     g_packed_runtime_ready.store(false, std::memory_order_relaxed);
@@ -34464,6 +34641,8 @@ bool update_packed_eye_cache() {
     g_packed_present_cache_native_asymmetric = native_pair_complete;
     g_packed_accepted_pair_id = accepted_pair;
     g_packed_accepted_pair_signal.store(accepted_pair, std::memory_order_release);
+    // [FIX:PRODUCER-BARRIER-WAKE 6/8]
+    notify_engine_pair_signal();
     g_packed_last_accepted_present = g_present_count.load(std::memory_order_relaxed);
     g_packed_runtime_ready.store(true, std::memory_order_relaxed);
     g_packed_eye_version[0] = accepted_pair;
@@ -34607,6 +34786,8 @@ bool update_packed_eye_cache() {
     g_packed_present_cache_native_asymmetric = false;
     g_packed_accepted_pair_id = accepted_pair;
     g_packed_accepted_pair_signal.store(accepted_pair, std::memory_order_release);
+    // [FIX:PRODUCER-BARRIER-WAKE 7/8]
+    notify_engine_pair_signal();
     g_packed_eye_version[0] = accepted_pair;
     g_packed_eye_version[1] = accepted_pair;
     return true;
@@ -35278,13 +35459,24 @@ void render_openxr_test_frame(
         bool acquired{};
         bool command_list_recording{};
 
-        // [FIX:OPENXR-STABLE-PACING 1/2] Apply only V579's validated queue
-        // boundary to the clean V737 renderer. No returned-control-scene,
-        // final-composite or later diagnostic change is present in this build.
-        wait_for_xr_gpu();
-        // Readback copies recorded by the previous XR frame are complete at
-        // this queue boundary. Mapping here avoids racing the GPU immediately
-        // after ExecuteCommandLists.
+        // [FIX:OPENXR-STABLE-PACING 1/2] V579's queue boundary used to drain
+        // the whole queue here on every frame, which stopped the CPU from
+        // preparing frame N+1 while the GPU was still rendering frame N and
+        // cost roughly the GPU frame time per frame. The allocator reset
+        // below is now covered by its own fence, so keep the hard boundary
+        // only for the case that still needs it: mapping a scheduled
+        // diagnostic readback must not race the GPU writing it.
+        const bool stereo_luma_readback_pending =
+            g_stereo_luma_scheduled.load() && !g_stereo_luma_logged.load();
+        const bool startup_luma_readback_pending =
+            g_startup_backbuffer_luma_scheduled.load(
+                std::memory_order_acquire) &&
+            !g_startup_backbuffer_luma_logged.load(
+                std::memory_order_acquire) &&
+            g_startup_backbuffer_luma_readback != nullptr;
+        if (stereo_luma_readback_pending || startup_luma_readback_pending) {
+            wait_for_xr_gpu();
+        }
         log_stereo_luminance_readback();
         log_startup_backbuffer_luminance();
         if (g_loading_video_readback_rearm_requested.exchange(
@@ -35297,10 +35489,15 @@ void render_openxr_test_frame(
                 "offsets=0,15,30,60,90,120,160,200",
                 static_cast<unsigned long long>(current_present));
         }
-        if (g_xr_command_allocator == nullptr ||
-            FAILED(g_xr_command_allocator->Reset()) ||
+        g_xr_command_allocator_index =
+            (g_xr_command_allocator_index + 1) % kXrCommandAllocatorCount;
+        auto* xr_command_allocator =
+            g_xr_command_allocators[g_xr_command_allocator_index];
+        if (xr_command_allocator == nullptr ||
+            !wait_for_xr_command_allocator(g_xr_command_allocator_index) ||
+            FAILED(xr_command_allocator->Reset()) ||
             FAILED(g_xr_command_list->Reset(
-                g_xr_command_allocator, nullptr))) {
+                xr_command_allocator, nullptr))) {
             submitted = false;
         } else {
             command_list_recording = true;
@@ -36953,8 +37150,20 @@ void render_openxr_test_frame(
             if (SUCCEEDED(g_xr_command_list->Close())) {
                 ID3D12CommandList* lists[] = {g_xr_command_list};
                 g_command_queue->ExecuteCommandLists(1, lists);
-                // [FIX:OPENXR-STABLE-PACING 2/2] The next frame drains this
-                // submission before reusing the single allocator.
+                // [FIX:XR-ALLOCATOR-PIPELINING 4/4] Remember which submission
+                // this allocator belongs to. The frame that comes back round
+                // to it waits for exactly this value and nothing else, so the
+                // CPU keeps running while earlier frames finish on the GPU.
+                const uint64_t submission = ++g_xr_fence_value;
+                if (SUCCEEDED(g_command_queue->Signal(g_xr_fence, submission))) {
+                    g_xr_command_allocator_fences[g_xr_command_allocator_index] =
+                        submission;
+                } else {
+                    // Without a usable fence value the next reuse of this
+                    // allocator must not assume the GPU is done with it.
+                    wait_for_xr_gpu();
+                    g_xr_command_allocator_fences[g_xr_command_allocator_index] = 0;
+                }
             } else {
                 submitted = false;
                 log_taau_trace_line(

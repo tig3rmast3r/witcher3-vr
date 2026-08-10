@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1107.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1113.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -56,6 +56,8 @@ target_link_libraries(witcher3vr_dxgi PRIVATE
     minhook
     d3d12
     dxguid
+    # WaitOnAddress/WakeByAddressAll for the engine pair producer barrier.
+    Synchronization
 )
 set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
