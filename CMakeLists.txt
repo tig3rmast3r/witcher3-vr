@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1106.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1107.0 LANGUAGES C CXX)
 
 include(CTest)
 

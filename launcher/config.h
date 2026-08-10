@@ -46,6 +46,7 @@ struct LauncherState {
     bool first_person_combat_exit{true};
     bool first_person_stationary_turn{};
     bool fast_movement_transitions{true};
+    bool native_stereo{};
     bool diagnostic_logging{};
 };
 

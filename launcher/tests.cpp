@@ -159,6 +159,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.first_person_combat_exit = true;
         state.first_person_stationary_turn = index % 2 != 0;
         state.fast_movement_transitions = index % 2 == 0;
+        state.native_stereo = true;
         state.diagnostic_logging = true;
 
         w3vr::IniDocument vr;
@@ -196,10 +197,13 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "unrelated DLC flag not preserved");
         Require(vr.Get("openxr", "hud_stereo_shift_px") == "-9",
             "wrong zero-relative convergence conversion");
-        Require(vr.Get("openxr", "presentation_scale") == "0.850",
-            "presentation scale missing");
-        Require(vr.Get("openxr", "fullscreen_projection") == "1",
-            "launcher must preserve the advanced projection opt-in");
+        Require(vr.Get("openxr", "presentation_scale") ==
+            std::string(state.mode == w3vr::RenderMode::StereoNone
+                ? "1.000" : "0.850"),
+            "native stereo presentation-scale contract mismatch");
+        Require(vr.Get("openxr", "fullscreen_projection") ==
+            std::string(state.mode == w3vr::RenderMode::StereoNone ? "1" : "0"),
+            "native stereo must be limited to Stereo No AA");
         Require(vr.Get("openxr", "hud_horizontal_scale") == "0.500",
             "removed HUD X control must preserve the existing INI value");
         Require(vr.Get("openxr", "hud_vertical_scale") == "0.500",
@@ -286,6 +290,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(loaded.state.mode == state.mode, "round-trip mode mismatch");
         Require(loaded.state.width == state.width && loaded.state.height == state.height,
             "round-trip resolution mismatch");
+        Require(loaded.state.native_stereo ==
+            (state.mode == w3vr::RenderMode::StereoNone),
+            "round-trip native stereo mode gate mismatch");
         if (w3vr::ModeUsesDlss(state.mode)) {
             Require(loaded.state.dlss_quality == state.dlss_quality,
                 "round-trip DLSS/DLAA selection mismatch");
@@ -353,6 +360,8 @@ void TestReleaseDefaults() {
         "stationary first-person body turn must default to disabled");
     Require(defaults.fast_movement_transitions,
         "faster movement transitions must default to enabled");
+    Require(!defaults.native_stereo,
+        "experimental native stereo must default to disabled");
     Require(!defaults.diagnostic_logging,
         "diagnostic logging must default to disabled");
 }
@@ -515,8 +524,8 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     Require(std::wstring(w3vr::ModeDisplayName(w3vr::RenderMode::StereoNone)) ==
         L"Stereo - No AA / FXAA", "stereo No AA / FXAA label mismatch");
     Require(std::wstring(w3vr::ModeDisplayName(
-        w3vr::RenderMode::StereoDlssSequential)) ==
-        L"Stereo - DLSS Sequential", "stereo DLSS label mismatch");
+            w3vr::RenderMode::StereoDlssSequential)) ==
+        L"Stereo - DLSS", "stereo DLSS label mismatch");
     Require(w3vr::SettingsForMode(w3vr::RenderMode::StereoNone).openxr_mode == 3 &&
         w3vr::SettingsForMode(w3vr::RenderMode::StereoTaau).openxr_mode == 3 &&
         w3vr::SettingsForMode(

@@ -156,10 +156,11 @@ whose borders are still invisible or acceptable for your headset and fit. On
 Quest 3, `0.85` is a good starting point: unless the headset is worn extremely
 close to the lenses, the borders are practically invisible.
 
-The advanced INI key `[openxr] fullscreen_projection` defaults to `0`, which
-uses the validated legacy fullscreen crop/copy route. Set it to `1` manually
-only to opt into the visibility-mask envelope/fit projection route. The
-launcher preserves this manually edited key when saving its managed settings.
+The experimental **Native Stereo (Stereo no AA only, Experimental)** launcher
+option enables the asymmetric projection route. It is available only with
+**Stereo - No AA / FXAA**, forces Presentation size to `1.00`, and defaults to
+off. Saving any other render mode keeps the validated legacy fullscreen
+crop/copy route active.
 
 ## Recommended game settings
 

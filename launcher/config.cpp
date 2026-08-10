@@ -616,7 +616,7 @@ const wchar_t* ModeDisplayName(RenderMode mode) {
     constexpr const wchar_t* names[]{
         L"Mono - No AA / FXAA", L"Mono - TAAU", L"Mono - DLSS",
         L"Stereo - No AA / FXAA", L"Stereo - TAAU",
-        L"Stereo - DLSS Sequential"};
+        L"Stereo - DLSS"};
     return names[static_cast<size_t>(mode)];
 }
 
@@ -963,6 +963,8 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         *vr, "engine", "first_person_stationary_turn", false);
     result.state.fast_movement_transitions = ReadBool(
         *game, "DLC", "DlcEnabled_movementinputfix", true);
+    result.state.native_stereo = ReadBool(
+        *vr, "openxr", "fullscreen_projection", false);
     result.state.diagnostic_logging =
         ReadBool(*vr, "debug", "logging_enabled", false) &&
         ReadBool(*vr, "debug", "runtime_diagnostics", false);
@@ -996,9 +998,16 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "mode", std::to_string(mode.openxr_mode));
     vr_ini.Set("openxr", "render_width", std::to_string(state.width));
     vr_ini.Set("openxr", "render_height", std::to_string(state.height));
+    // Native asymmetric stereo is a launcher-owned experimental route. Keep
+    // the underlying projection authority off for every other render mode.
+    const bool native_stereo_active =
+        state.native_stereo && state.mode == RenderMode::StereoNone;
+    vr_ini.Set("openxr", "fullscreen_projection",
+        native_stereo_active ? "1" : "0");
     vr_ini.Set("openxr", "hud_stereo_shift_px",
         std::to_string(std::clamp(state.hud_convergence_delta - 16, -256, 256)));
-    vr_ini.Set("openxr", "presentation_scale", FloatString(state.presentation_scale));
+    vr_ini.Set("openxr", "presentation_scale", FloatString(
+        native_stereo_active ? 1.0f : state.presentation_scale));
     vr_ini.Set("openxr", "menu_scale", FloatString(state.menu_scale));
     vr_ini.Set("openxr", "cinema_scale", FloatString(state.cinema_scale));
     vr_ini.Set("openxr", "cinema_hud_scale",
