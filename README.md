@@ -196,10 +196,15 @@ currently recommended.
 | Ray tracing | Off |
 | Screen Space Reflections | Off or Low |
 | Motion blur | Off |
+| Shadow quality | Extreme+ |
 
 The launcher warns when Ray Tracing or SSR High is detected. These settings
 are not changed automatically: disable Ray Tracing and set Screen Space
 Reflections to Low or Off before launching VR.
+
+The bundled VR profile uses Extreme+ shadows. Lower shadow presets can expose
+VR cascade flicker; Extreme+ is the validated default even though it carries a
+higher GPU cost.
 
 All remaining settings can be adjusted to preference, but configurations
 different from the provided VR preset may not have been tested.

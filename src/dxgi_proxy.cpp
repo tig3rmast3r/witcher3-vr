@@ -3208,6 +3208,11 @@ constexpr uint32_t kMode3SceneOnlyPairHistory = 4;
 std::mutex g_mode3_scene_only_output_mutex{};
 std::array<uint64_t, kMode3SceneOnlyPairHistory>
     g_mode3_scene_only_output_pairs{};
+// A command list can bind another PSO after the scene-only HUD draw and before
+// its final PRESENT transition. Track the draw in the current recording epoch
+// instead of inferring it from whichever PSO happens to remain bound later.
+std::unordered_map<ID3D12GraphicsCommandList*, uint32_t>
+    g_mode3_scene_only_draw_generations{};
 uint32_t g_mode3_scene_only_output_generation{};
 uint32_t g_mode3_scene_only_output_cursor{};
 uint64_t g_mode3_scene_only_pending_pair{};
@@ -12835,6 +12840,13 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
         tracked = {};
         tracked.pipeline_state = initial_state;
     }
+    // [FIX:RETAINED-CINEMA-HUD-PREVIOUS-FRAME V1123 1/3] A successful Reset
+    // starts a new recording epoch. Do not let a scene-only HUD draw from the
+    // preceding recording authorize the next output that reuses this object.
+    {
+        std::scoped_lock lock{g_mode3_scene_only_output_mutex};
+        g_mode3_scene_only_draw_generations.erase(command_list);
+    }
     return result;
 }
 
@@ -15291,12 +15303,23 @@ bool label_mode3_early_hud_at_present(
         tag.pair_id == 0 || tag.generation != generation) {
         return false;
     }
-    // Record complete L/R scene pairs actually finalized with scene-only PSOs.
+    // [FIX:RETAINED-CINEMA-HUD-PREVIOUS-FRAME V1123 3/3] Record complete L/R
+    // scene pairs that actually executed a scene-only HUD
+    // draw. The PSO can legitimately be rebound before this PRESENT barrier,
+    // so the final bound-pipeline snapshot is not draw-history authority.
     // Keep a short exact history so a retained-pair rescue can still composite
     // the preceding pair while the next pair has produced only one eye.
     {
         std::scoped_lock scene_only_lock{
             g_mode3_scene_only_output_mutex};
+        bool scene_only_draw_recorded{};
+        const auto draw_marker =
+            g_mode3_scene_only_draw_generations.find(command_list);
+        if (draw_marker != g_mode3_scene_only_draw_generations.end()) {
+            scene_only_draw_recorded =
+                draw_marker->second == tag.generation;
+            g_mode3_scene_only_draw_generations.erase(draw_marker);
+        }
         if (g_mode3_scene_only_output_generation != tag.generation) {
             g_mode3_scene_only_output_pairs.fill(0);
             g_mode3_scene_only_output_generation = tag.generation;
@@ -15310,8 +15333,7 @@ bool label_mode3_early_hud_at_present(
             g_mode3_scene_only_pending_eye_mask = 0;
             g_mode3_scene_only_pending_valid = true;
         }
-        if (load_command_list_pipeline(command_list) ==
-            g_mode3_scene_only_pso.load(std::memory_order_acquire)) {
+        if (scene_only_draw_recorded) {
             g_mode3_scene_only_pending_eye_mask |= 1u << tag.eye;
         } else {
             g_mode3_scene_only_pending_valid = false;
@@ -15771,12 +15793,26 @@ void STDMETHODCALLTYPE hook_draw_instanced(
             }
         }
     }
+    const bool scene_only_hud_draw =
+        mode3_stereo_transport_active() && command_list != nullptr &&
+        load_command_list_pipeline(command_list) ==
+            g_mode3_scene_only_pso.load(std::memory_order_acquire);
     g_draw_instanced(
         command_list,
         vertex_count_per_instance,
         instance_count,
         start_vertex_location,
         start_instance_location);
+    // [FIX:RETAINED-CINEMA-HUD-PREVIOUS-FRAME V1123 2/3] Commit the marker
+    // only after the real scene-only draw has executed. If the current HUD
+    // pair is incomplete, get_mode3_early_hud_pair() already falls back to the
+    // last accepted immutable pair, so Cinema repeats that previous HUD frame
+    // instead of presenting a scene with no HUD.
+    if (scene_only_hud_draw) {
+        std::scoped_lock lock{g_mode3_scene_only_output_mutex};
+        g_mode3_scene_only_draw_generations[command_list] =
+            g_streamline_capture_generation.load(std::memory_order_acquire);
+    }
     publish_mode3_hud_source(command_list);
     replay_mono_hud_composites(command_list,
         vertex_count_per_instance, instance_count,
@@ -32228,7 +32264,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1122 base=V1121 render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1123 base=V1122 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
