@@ -47,6 +47,8 @@ struct LauncherState {
     bool first_person_stationary_turn{};
     bool fast_movement_transitions{true};
     bool native_stereo{};
+    bool fullscreen_projection{};
+    bool alternate_presentation_resize{};
     bool diagnostic_logging{};
 };
 

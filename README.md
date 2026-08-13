@@ -152,11 +152,17 @@ whose borders are still invisible or acceptable for your headset and fit. On
 Quest 3, `0.85` is a good starting point: unless the headset is worn extremely
 close to the lenses, the borders are practically invisible.
 
-The experimental **Native Stereo (Stereo no AA only, Experimental)** launcher
-option enables the asymmetric projection route. It is available only with
-**Stereo - No AA / FXAA**, forces Presentation size to `1.00`, and defaults to
-off. Saving any other render mode keeps the validated legacy fullscreen
-crop/copy route active.
+The three experimental presentation controls are independent:
+
+- **Native Stereo** enables asymmetric stereo geometry only. It is available
+  only with **Stereo - No AA / FXAA**, forces Presentation Size to `1.00`, and
+  otherwise uses the same legacy presentation path as every render mode.
+- **Fullscreen Projection** changes the presentation method for every render
+  mode. It defaults to off, so all modes use the validated legacy presenter.
+- **Alternate Presentation Resize** opts into the PR-style resize needed for
+  Virtual Desktop foveated-rendering experiments. It is effective only with
+  Fullscreen Projection and Presentation Size below `1.00`, and defaults to
+  off.
 
 ## Recommended game settings
 

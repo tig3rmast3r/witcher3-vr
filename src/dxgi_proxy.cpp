@@ -97,9 +97,15 @@ struct Config {
     int openxr_mode{2};
     float resolution_scale{1.0f};
     float presentation_scale{0.9f};
+    // Native asymmetric geometry is independent from the final presentation
+    // method. It remains a No-AA, scale-1 experimental renderer route.
+    bool native_stereo{false};
     // The visibility-mask envelope/fit route is opt-in. Missing keys retain
     // the proven legacy crop-and-copy presentation path.
     bool fullscreen_projection{false};
+    // Optional runtime-FOV letterbox used by Virtual Desktop foveated
+    // rendering. This changes only reduced-size fullscreen presentation.
+    bool alternate_presentation_resize{false};
     int openxr_mono_eye_shift_px{160};
     bool openxr_mono_eye_shift_auto{true};
     int render_width{0};
@@ -370,7 +376,7 @@ bool effect_gpu_probe_available() {
 // when the launcher disables Diagnostic Logging.
 bool real_smoke_center_fix_route_active() {
     return g_config.openxr_enabled &&
-        g_config.fullscreen_projection &&
+        g_config.native_stereo &&
         g_config.openxr_mode == 3 &&
         g_config.temporal_backend == TemporalBackend::None &&
         g_config.hmd_freelook &&
@@ -1040,6 +1046,10 @@ using SetGraphicsRoot32BitConstantFn = SetComputeRoot32BitConstantFn;
 using SetGraphicsRoot32BitConstantsFn = SetComputeRoot32BitConstantsFn;
 using SetRootGpuVirtualAddressFn = void(STDMETHODCALLTYPE*)(
     ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+using ResetCommandListFn = HRESULT(STDMETHODCALLTYPE*)(
+    ID3D12GraphicsCommandList*,
+    ID3D12CommandAllocator*,
+    ID3D12PipelineState*);
 using SetPipelineStateFn = void(STDMETHODCALLTYPE*)(
     ID3D12GraphicsCommandList*,
     ID3D12PipelineState*);
@@ -1112,6 +1122,7 @@ SetRootGpuVirtualAddressFn g_set_compute_root_srv{};
 SetRootGpuVirtualAddressFn g_set_graphics_root_srv{};
 SetRootGpuVirtualAddressFn g_set_compute_root_uav{};
 SetRootGpuVirtualAddressFn g_set_graphics_root_uav{};
+ResetCommandListFn g_reset_command_list{};
 SetPipelineStateFn g_set_pipeline_state{};
 SetGraphicsRootSignatureFn g_set_graphics_root_signature{};
 SetGraphicsRootSignatureFn g_set_compute_root_signature{};
@@ -1641,7 +1652,7 @@ std::atomic<uint32_t> g_native_asymmetric_rejected_pair_logs{};
 
 bool native_asymmetric_noaa_route_active() {
     return kNativeAsymmetricNoAaTrialBuild &&
-        g_config.fullscreen_projection &&
+        g_config.native_stereo &&
         g_config.openxr_mode == 3 &&
         g_config.temporal_backend == TemporalBackend::None &&
         g_config.hmd_freelook &&
@@ -3929,6 +3940,10 @@ void STDMETHODCALLTYPE hook_set_compute_root_uav(
     ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
 void STDMETHODCALLTYPE hook_set_graphics_root_uav(
     ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
+HRESULT STDMETHODCALLTYPE hook_reset_command_list(
+    ID3D12GraphicsCommandList*,
+    ID3D12CommandAllocator*,
+    ID3D12PipelineState*);
 void STDMETHODCALLTYPE hook_set_pipeline_state(
     ID3D12GraphicsCommandList* command_list,
     ID3D12PipelineState* pipeline_state);
@@ -5356,6 +5371,23 @@ bool read_ini_bool(const char* section, const char* key, bool default_value) {
     return GetPrivateProfileIntA(section, key, default_value ? 1 : 0, module_path) != 0;
 }
 
+bool ini_key_exists(const char* section, const char* key) {
+    char module_path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
+
+    char* slash = strrchr(module_path, '\\');
+    if (slash != nullptr) {
+        slash[1] = '\0';
+    }
+
+    strcat_s(module_path, "witcher3vr.ini");
+    constexpr char kMissingValue[] = "__w3vr_missing__";
+    char value[32]{};
+    GetPrivateProfileStringA(
+        section, key, kMissingValue, value, sizeof(value), module_path);
+    return strcmp(value, kMissingValue) != 0;
+}
+
 int read_ini_int(const char* section, const char* key, int default_value) {
     char module_path[MAX_PATH]{};
     GetModuleFileNameA(nullptr, module_path, sizeof(module_path));
@@ -5547,8 +5579,21 @@ void load_config() {
         g_config.openxr_mode = read_ini_int("openxr", "mode", 2);
         g_config.resolution_scale = std::clamp(read_ini_float("openxr", "resolution_scale", 1.0f), 0.25f, 2.0f);
         g_config.presentation_scale = std::clamp(read_ini_float("openxr", "presentation_scale", 0.9f), 0.5f, 1.0f);
-        g_config.fullscreen_projection = read_ini_bool(
+        // V1118 and earlier used fullscreen_projection as the launcher-owned
+        // Native Stereo switch. If native_stereo is absent, preserve that
+        // renderer choice while migrating presentation back to legacy in
+        // memory. The V7 launcher writes both independent keys explicitly.
+        const bool native_stereo_key_present =
+            ini_key_exists("openxr", "native_stereo");
+        const bool legacy_combined_projection = read_ini_bool(
             "openxr", "fullscreen_projection", false);
+        g_config.native_stereo = read_ini_bool(
+            "openxr", "native_stereo", legacy_combined_projection);
+        g_config.fullscreen_projection = native_stereo_key_present
+            ? legacy_combined_projection
+            : false;
+        g_config.alternate_presentation_resize = read_ini_bool(
+            "openxr", "alternate_presentation_resize", false);
         g_config.openxr_mono_eye_shift_px = std::clamp(read_ini_int("openxr", "mono_eye_shift_px", 160), -512, 512);
         g_config.openxr_mono_eye_shift_auto = read_ini_bool("openxr", "mono_eye_shift_auto", true);
         g_config.render_width = std::max(0, read_ini_int("openxr", "render_width", 0));
@@ -5923,12 +5968,14 @@ void load_config() {
                 g_config.runtime_diagnostics ? 1 : 0);
         }
 
-        log_line("Config openxr enabled=%d mode=%d resolution_scale=%.3f presentation_scale=%.3f fullscreen_projection=%d mono_shift=%d reverse enabled=%d periodic=%d unmap=%d cbv=%d active_nudge=%d nudge=%.3f start=%d cycle=%d pulse=%d orbit_probe=%d orbit_interval=%d orbit_max=%d copy_probe=%d copy_max=%d stereo_probe=%d geometry_shift=%d",
+        log_line("Config openxr enabled=%d mode=%d resolution_scale=%.3f presentation_scale=%.3f native_stereo=%d fullscreen_projection=%d alternate_presentation_resize=%d mono_shift=%d reverse enabled=%d periodic=%d unmap=%d cbv=%d active_nudge=%d nudge=%.3f start=%d cycle=%d pulse=%d orbit_probe=%d orbit_interval=%d orbit_max=%d copy_probe=%d copy_max=%d stereo_probe=%d geometry_shift=%d",
             g_config.openxr_enabled,
             g_config.openxr_mode,
             g_config.resolution_scale,
             g_config.presentation_scale,
+            g_config.native_stereo ? 1 : 0,
             g_config.fullscreen_projection ? 1 : 0,
+            g_config.alternate_presentation_resize ? 1 : 0,
             g_config.openxr_mono_eye_shift_px,
             g_config.reverse_enabled,
             g_config.reverse_scan_periodic,
@@ -11196,6 +11243,18 @@ void install_command_list_hooks() {
     const bool compute_hooks =
         taau_compute_hooks_needed() || effect_gpu_probe_available();
 
+    if (g_reset_command_list == nullptr) {
+        auto target = method<void*>(command_list, 10);
+        if (MH_CreateHook(target,
+                reinterpret_cast<void*>(&hook_reset_command_list),
+                reinterpret_cast<void**>(&g_reset_command_list)) == MH_OK &&
+            MH_EnableHook(target) == MH_OK) {
+            log_line(
+                "Renderer hooked ID3D12GraphicsCommandList::Reset at %p",
+                target);
+        }
+    }
+
     if (g_draw_instanced == nullptr) {
         auto target = method<void*>(command_list, 12);
         if (MH_CreateHook(target, reinterpret_cast<void*>(&hook_draw_instanced), reinterpret_cast<void**>(&g_draw_instanced)) == MH_OK &&
@@ -12694,6 +12753,37 @@ void STDMETHODCALLTYPE hook_set_descriptor_heaps(
     }
 
     g_set_descriptor_heaps(command_list, num_descriptor_heaps, descriptor_heaps);
+}
+
+// [FIX:COMMAND-LIST-RESET-EPOCH V1120] D3D12 invalidates descriptor heaps,
+// root signatures and root arguments when a command list begins a new
+// recording. The renderer tracker previously kept those bindings indefinitely,
+// so a compute-only reuse could make the asymmetric tiled-culling restore replay
+// graphics tables from the preceding recording into an undefined graphics-root
+// state. Commit the new epoch only after Reset succeeds; the optional initial
+// PSO is the sole state carried into the fresh recording by the D3D12 contract.
+HRESULT STDMETHODCALLTYPE hook_reset_command_list(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12CommandAllocator* allocator,
+    ID3D12PipelineState* initial_state) {
+    const HRESULT result =
+        g_reset_command_list(command_list, allocator, initial_state);
+    if (FAILED(result)) {
+        return result;
+    }
+
+    store_command_list_pipeline(command_list, initial_state);
+    if (auto* local = access_dlss_graphics_state(command_list, false)) {
+        *local = {};
+        local->pipeline_state = initial_state;
+    }
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        auto& tracked = g_command_list_infos[command_list];
+        tracked = {};
+        tracked.pipeline_state = initial_state;
+    }
+    return result;
 }
 
 void STDMETHODCALLTYPE hook_set_graphics_root_descriptor_table(
@@ -31967,7 +32057,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1118 base=V1117 amd_static_root_vertices=1 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 native_stereo_launcher=1 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1120 base=V1119 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
@@ -35485,6 +35575,8 @@ void render_openxr_test_frame(
     ProjectionFloatRect projection_eye_float_fit_rects[2]{};
     bool projection_eye_float_fit_rect_valid{};
     bool symmetric_subimage_copy{};
+    bool scaled_fov_projection{};
+    bool scaled_fov_direct_copy{};
     bool native_asymmetric_projection{};
     bool native_asymmetric_direct_copy{};
     bool native_asymmetric_black_frame{};
@@ -35777,6 +35869,10 @@ void render_openxr_test_frame(
                     g_xr_cinema_projection_pipeline != nullptr &&
                     g_xr_cinema_projection_root_signature != nullptr &&
                     g_xr_cinema_projection_srv_heap != nullptr;
+                const bool alternate_presentation_resize_active =
+                    full_surface_projection &&
+                    g_config.alternate_presentation_resize &&
+                    requested_scale < 0.9999f;
 
                 // [FIX:PRESENTATION-COVER-SCALE 1/4] Rebase the slider around
                 // the largest uniform crop that preserves each runtime optical
@@ -35805,12 +35901,13 @@ void render_openxr_test_frame(
                 UINT projection_height = std::min(swapchain.height,
                     std::max(copy_height, static_cast<UINT>(lroundf(
                         static_cast<float>(copy_height) / effective_vertical_scale))));
-                // Virtual Desktop and Quest report fovMutable=false, so a
-                // reduced Presentation value must keep xrLocateViews' FOV and
-                // letterbox the smaller REDengine image inside a full-FOV
-                // swapchain. The extra pixels were already allocated as
-                // source/presentation_scale.
-                if (full_surface_projection && requested_scale < 0.9999f) {
+                // [TRIAL:ALTERNATE-PRESENTATION-RESIZE V1119] Virtual Desktop
+                // foveated rendering needs the runtime xrLocateViews FOV to
+                // remain unchanged. Keep the full swapchain as the submitted
+                // angular surface and letterbox the reduced REDengine image
+                // into its exact tangent-space rectangle. The default-off
+                // flag preserves V1118's validated reduced-FOV direct route.
+                if (alternate_presentation_resize_active) {
                     projection_width = swapchain.width;
                     projection_height = swapchain.height;
                 }
@@ -36003,12 +36100,45 @@ void render_openxr_test_frame(
                         projection_eye_image_rect_valid[1] = true;
                     }
 
-                    // Prefer the continuous shader placement even when a
-                    // format-compatible 1:1 crop exists. XrRect2Di cannot
-                    // express the fractional tangent boundary, whereas the
-                    // quad can; this also keeps the runtime-provided FOV
-                    // unchanged at every Presentation value.
-                    if (projection_eye_float_fit_rect_valid) {
+                    // [FIX:PRESENTATION-SCALE-FOV 1/5] Below 1.0 the source
+                    // represents the smaller symmetric FOV built by
+                    // REDengine. Submit that exact FOV to OpenXR instead of
+                    // drawing it into the raw runtime FOV. Direct copy and
+                    // shader fallback share the same target rectangle; only
+                    // their texture transport differs.
+                    scaled_fov_projection =
+                        requested_scale < 0.9999f &&
+                        !alternate_presentation_resize_active;
+                    if (scaled_fov_projection) {
+                        const XrRect2Di scaled_rect{
+                            {static_cast<int32_t>(centered_x),
+                             static_cast<int32_t>(centered_y)},
+                            {static_cast<int32_t>(copy_width),
+                             static_cast<int32_t>(copy_height)}};
+                        for (uint32_t eye = 0; eye < 2; ++eye) {
+                            projection_eye_image_rects[eye] = scaled_rect;
+                            projection_eye_image_rect_valid[eye] = true;
+                            projection_eye_fit_rects[eye] = scaled_rect;
+                            projection_eye_float_fit_rects[eye] = {
+                                static_cast<float>(scaled_rect.offset.x),
+                                static_cast<float>(scaled_rect.offset.y),
+                                static_cast<float>(scaled_rect.offset.x +
+                                    scaled_rect.extent.width),
+                                static_cast<float>(scaled_rect.offset.y +
+                                    scaled_rect.extent.height)};
+                        }
+                        projection_eye_fit_rect_valid = true;
+                        projection_eye_float_fit_rect_valid = true;
+                        scaled_fov_direct_copy = true;
+                        symmetric_subimage_copy = false;
+                    }
+                    // [FIX:CONTINUOUS-TANGENT-FIT 2/2] At scale 1, and for the
+                    // V1119 alternate resize, prefer continuous shader
+                    // placement even when a format-compatible 1:1 crop exists.
+                    // XrRect2Di cannot express fractional tangent boundaries;
+                    // the quad retains the runtime-provided FOV exactly.
+                    if (!scaled_fov_projection &&
+                        projection_eye_float_fit_rect_valid) {
                         symmetric_subimage_copy = false;
                         projection_eye_image_rect_valid[0] = false;
                         projection_eye_image_rect_valid[1] = false;
@@ -36338,7 +36468,7 @@ void render_openxr_test_frame(
                     asymmetric_submit_copy_height[eye] = copy_height;
                 }
                 const bool target_desc_needed =
-                    symmetric_subimage_copy ||
+                    symmetric_subimage_copy || scaled_fov_direct_copy ||
                     native_asymmetric_noaa_route_active();
                 D3D12_RESOURCE_DESC target_desc{};
                 if (target_desc_needed) {
@@ -36437,7 +36567,6 @@ void render_openxr_test_frame(
                     g_packed_present_cache_valid &&
                     g_packed_present_cache_native_asymmetric;
                 native_asymmetric_projection =
-                    g_config.fullscreen_projection &&
                     native_pair_fully_built && !spatial_panel_active;
                 native_asymmetric_black_frame =
                     native_asymmetric_projection &&
@@ -36445,7 +36574,8 @@ void render_openxr_test_frame(
                 native_asymmetric_direct_copy =
                     native_asymmetric_projection &&
                     native_asymmetric_transport_capable &&
-                    native_asymmetric_copy_compatible;
+                    native_asymmetric_copy_compatible &&
+                    !full_surface_projection;
                 if (native_asymmetric_black_frame) {
                     // The XR slice was cleared above. A transient resize or
                     // cache recreation therefore produces one black raw-FOV
@@ -36454,8 +36584,15 @@ void render_openxr_test_frame(
                     hud_composite_ready = false;
                 }
                 if (native_asymmetric_projection) {
-                    full_surface_projection = true;
+                    // [FIX:INDEPENDENT-NATIVE-PRESENTATION V1119] A raw
+                    // off-axis pair keeps its per-eye FOV authority, but does
+                    // not turn on the fullscreen presenter. With the config
+                    // flag off it uses the same centered legacy copy transport
+                    // as every other mode. With the flag on it takes the same
+                    // fullscreen shader presenter selected by every mode.
                     symmetric_subimage_copy = false;
+                    scaled_fov_projection = false;
+                    scaled_fov_direct_copy = false;
                     projection_image_rect = menu_image_rect;
                     for (uint32_t eye = 0; eye < 2; ++eye) {
                         projection_eye_image_rects[eye] =
@@ -36511,12 +36648,14 @@ void render_openxr_test_frame(
                     }
                 }
 
-                if (symmetric_subimage_copy ||
+                if (symmetric_subimage_copy || scaled_fov_direct_copy ||
                     native_asymmetric_direct_copy) {
                     for (uint32_t eye = 0; eye < 2; ++eye) {
                         if (fit_projection_sources[eye] == nullptr) {
                             if (native_asymmetric_direct_copy) {
                                 native_asymmetric_direct_copy = false;
+                            } else if (scaled_fov_projection) {
+                                scaled_fov_direct_copy = false;
                             } else {
                                 symmetric_subimage_copy = false;
                             }
@@ -36537,13 +36676,16 @@ void render_openxr_test_frame(
                                 eye_desc.Format, target_desc.Format)) {
                             if (native_asymmetric_direct_copy) {
                                 native_asymmetric_direct_copy = false;
+                            } else if (scaled_fov_projection) {
+                                scaled_fov_direct_copy = false;
                             } else {
                                 symmetric_subimage_copy = false;
                             }
                             break;
                         }
                     }
-                    if (!symmetric_subimage_copy) {
+                    if (!symmetric_subimage_copy &&
+                        !scaled_fov_projection) {
                         if (!native_asymmetric_projection) {
                             projection_eye_image_rect_valid[0] = false;
                             projection_eye_image_rect_valid[1] = false;
@@ -36555,13 +36697,18 @@ void render_openxr_test_frame(
                         symmetric_subimage_route_logged{};
                     if (!symmetric_subimage_route_logged.exchange(true)) {
                         log_line(
-                            "V1046 presentation route scale=%.3f "
-                            "scale1_direct=%d native_asymmetric=%d "
-                            "native_direct=%d "
+                            "V1119 presentation route scale=%.3f "
+                            "fullscreen=%d alternate_resize=%d "
+                            "scale1_direct=%d scaled_fov=%d scaled_direct=%d "
+                            "native_asymmetric=%d native_direct=%d "
                             "crop0=%d,%d %dx%d crop1=%d,%d %dx%d "
                             "source=%ux%u target=%ux%u",
                             requested_scale,
+                            full_surface_projection ? 1 : 0,
+                            alternate_presentation_resize_active ? 1 : 0,
                             symmetric_subimage_copy ? 1 : 0,
+                            scaled_fov_projection ? 1 : 0,
+                            scaled_fov_direct_copy ? 1 : 0,
                             native_asymmetric_projection ? 1 : 0,
                             native_asymmetric_direct_copy ? 1 : 0,
                             projection_eye_image_rects[0].offset.x,
@@ -36588,7 +36735,8 @@ void render_openxr_test_frame(
                     // scene and HUD copies must remain unshifted.
                     int eye_shift_x = calibrated_eye_shifts_x[eye];
                     int eye_shift_y = calibrated_eye_shifts_y[eye];
-                    if (spatial_panel_active || full_surface_projection) {
+                    if (spatial_panel_active || full_surface_projection ||
+                        native_asymmetric_projection) {
                         eye_shift_x = 0;
                         eye_shift_y = 0;
                     }
@@ -36672,8 +36820,10 @@ void render_openxr_test_frame(
                     // copy the complete post-temporal source without filtering.
                     // The per-eye OpenXR imageRect selects the useful tangent
                     // crop from this shared 1:1 placement below.
-                    if ((!full_surface_projection ||
+                    if (((!full_surface_projection &&
+                                !native_asymmetric_projection) ||
                             symmetric_subimage_copy ||
+                            scaled_fov_direct_copy ||
                             native_asymmetric_direct_copy) &&
                         shifted_width > 0 && shifted_height > 0) {
                         g_xr_command_list->CopyTextureRegion(
@@ -36684,8 +36834,10 @@ void render_openxr_test_frame(
                     }
                 }
 
-                if ((!full_surface_projection ||
+                if (((!full_surface_projection &&
+                            !native_asymmetric_projection) ||
                         symmetric_subimage_copy ||
+                        scaled_fov_direct_copy ||
                         native_asymmetric_direct_copy ||
                         native_asymmetric_black_frame) &&
                     live_backbuffer_source) {
@@ -36697,11 +36849,14 @@ void render_openxr_test_frame(
                 g_xr_command_list->ResourceBarrier(1, &to_rtv);
 
                 bool fit_projection_ready = native_asymmetric_black_frame ||
-                    !full_surface_projection ||
-                    symmetric_subimage_copy ||
+                    (!full_surface_projection &&
+                        !native_asymmetric_projection) ||
+                    symmetric_subimage_copy || scaled_fov_direct_copy ||
                     native_asymmetric_direct_copy;
-                if (full_surface_projection &&
+                if ((full_surface_projection ||
+                        native_asymmetric_projection) &&
                     !symmetric_subimage_copy &&
+                    !scaled_fov_direct_copy &&
                     !native_asymmetric_direct_copy &&
                     !native_asymmetric_black_frame) {
                     fit_projection_ready = projection_eye_fit_rect_valid &&
@@ -36712,9 +36867,11 @@ void render_openxr_test_frame(
                             projection_eye_float_fit_rects);
                     if (!fit_projection_ready) {
                         log_line(
-                            "V1046 fallback projection render failed image=%u present=%llu native_asymmetric=%d",
+                            "V1119 fallback projection render failed image=%u present=%llu scaled_fov=%d alternate_resize=%d native_asymmetric=%d",
                             image_index,
                             static_cast<unsigned long long>(current_present),
+                            scaled_fov_projection ? 1 : 0,
+                            alternate_presentation_resize_active ? 1 : 0,
                             native_asymmetric_projection ? 1 : 0);
                     }
                     if (live_backbuffer_source) {
@@ -36910,6 +37067,24 @@ void render_openxr_test_frame(
                 } else if (native_asymmetric_projection) {
                     projection_views[eye].fov =
                         g_packed_present_cache_views[render_source_eye].fov;
+                } else if (scaled_fov_projection) {
+                    // [FIX:PRESENTATION-SCALE-FOV 4/5] Pair both the direct
+                    // and fallback transports with the exact symmetric FOV
+                    // that generated the REDengine texture.
+                    projection_views[eye].fov = {
+                        g_hmd_render_fov_left.load(
+                            std::memory_order_acquire),
+                        g_hmd_render_fov_right.load(
+                            std::memory_order_acquire),
+                        g_hmd_render_fov_up.load(
+                            std::memory_order_acquire),
+                        g_hmd_render_fov_down.load(
+                            std::memory_order_acquire)};
+                } else if (full_surface_projection) {
+                    projection_views[eye].fov =
+                        mode == 2 && eye < g_xr_views.size()
+                        ? g_xr_views[eye].fov
+                        : render_view->fov;
                 } else {
                     projection_views[eye].fov =
                         mode == 2 && eye < g_xr_views.size()
@@ -36925,6 +37100,7 @@ void render_openxr_test_frame(
                 } else if (full_surface_projection) {
                     projection_views[eye].subImage.imageRect =
                         (symmetric_subimage_copy ||
+                            scaled_fov_projection ||
                             native_asymmetric_projection) &&
                             projection_eye_image_rect_valid[eye]
                         ? projection_eye_image_rects[eye]
@@ -36946,10 +37122,11 @@ void render_openxr_test_frame(
                         static_cast<int32_t>(submitted_height)};
                 }
 
-                // The shader fallback places the source at exact
-                // floating-point tangent coordinates and always retains
-                // xrLocateViews' original FOV. Only a true 1:1 integer
-                // subimage crop needs a FOV derived from its pixel
+                // [FIX:CONTINUOUS-TANGENT-FIT 1/2] The shader fallback places
+                // the source at exact floating-point tangent coordinates, so
+                // it retains xrLocateViews' original FOV at scale 1 and the
+                // exact symmetric render FOV below scale 1. Only a true 1:1
+                // integer subimage crop needs a FOV derived from its pixel
                 // boundaries.
                 if (full_surface_projection &&
                     symmetric_subimage_copy &&
@@ -37027,7 +37204,7 @@ void render_openxr_test_frame(
                             "source_resource=%p resource_extent=%llux%u format=%u "
                             "copy_extent=%ux%u swapchain=%ux%u image_rect=%d,%d,%d,%d "
                             "projection_rect=%d,%d,%d,%d float_fit=%.9g,%.9g,%.9g,%.9g "
-                            "copy_shift=%d,%d direct=%u native=%u "
+                            "copy_shift=%d,%d direct=%u scaled=%u native=%u "
                             "native_direct=%u float_fit_valid=%u "
                             "expected_valid=%u expected_fov_aspect=%.9g,%.9g "
                             "expected_ndc=%.9g,%.9g optical_px=%.9g,%.9g "
@@ -37074,6 +37251,7 @@ void render_openxr_test_frame(
                             projection_eye_shifts_x_px[eye],
                             projection_eye_shifts_y_px[eye],
                             symmetric_subimage_copy ? 1u : 0u,
+                            scaled_fov_projection ? 1u : 0u,
                             native_asymmetric_projection ? 1u : 0u,
                             native_asymmetric_direct_copy ? 1u : 0u,
                             projection_eye_float_fit_rect_valid ? 1u : 0u,

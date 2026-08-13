@@ -25,7 +25,7 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {3, true, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 6;
+constexpr int kCurrentConfigVersion = 7;
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
 constexpr float kFullVrHudReferenceScale = 1.00f;
@@ -162,7 +162,7 @@ void MigrateConfigurationToV6(IniDocument& ini) {
         ini.Set("focus_projection", "shader_registry_enabled", "0");
     }
     RemoveObsoleteSettings(ini);
-    ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
+    ini.Set("meta", "config_version", "6");
 }
 
 std::string Trim(std::string value) {
@@ -218,6 +218,19 @@ bool ReadBool(const IniDocument& doc, const char* section, const char* key,
     if (value == "1" || value == "true" || value == "yes" || value == "on") return true;
     if (value == "0" || value == "false" || value == "no" || value == "off") return false;
     return fallback;
+}
+
+void MigrateConfigurationToV7(IniDocument& ini) {
+    // Through V6 the launcher used fullscreen_projection as the Native Stereo
+    // switch. Preserve that user choice under its new dedicated key, then make
+    // both presentation experiments explicit opt-ins.
+    const bool legacy_native_stereo = ReadBool(
+        ini, "openxr", "fullscreen_projection", false);
+    ini.Set("openxr", "native_stereo", legacy_native_stereo ? "1" : "0");
+    ini.Set("openxr", "fullscreen_projection", "0");
+    ini.Set("openxr", "alternate_presentation_resize", "0");
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
 
 std::string ReadString(const IniDocument& doc, const char* section,
@@ -893,6 +906,9 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         if (existing_version < 6) {
             MigrateConfigurationToV6(migrated);
         }
+        if (existing_version < 7) {
+            MigrateConfigurationToV7(migrated);
+        }
         return AtomicWriteWithBackup(paths.vr_ini, migrated.Serialize(), error);
     }
     const DWORD lookup_error = GetLastError();
@@ -1103,7 +1119,11 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     result.state.fast_movement_transitions = ReadBool(
         *game, "DLC", "DlcEnabled_movementinputfix", true);
     result.state.native_stereo = ReadBool(
+        *vr, "openxr", "native_stereo", false);
+    result.state.fullscreen_projection = ReadBool(
         *vr, "openxr", "fullscreen_projection", false);
+    result.state.alternate_presentation_resize = ReadBool(
+        *vr, "openxr", "alternate_presentation_resize", false);
     result.state.diagnostic_logging =
         ReadBool(*vr, "debug", "logging_enabled", false) &&
         ReadBool(*vr, "debug", "runtime_diagnostics", false);
@@ -1137,12 +1157,16 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "mode", std::to_string(mode.openxr_mode));
     vr_ini.Set("openxr", "render_width", std::to_string(state.width));
     vr_ini.Set("openxr", "render_height", std::to_string(state.height));
-    // Native asymmetric stereo is a launcher-owned experimental route. Keep
-    // the underlying projection authority off for every other render mode.
+    // Native asymmetric geometry is independent from the presentation route.
+    // It remains valid only for Stereo No AA and keeps its 1:1 source scale.
     const bool native_stereo_active =
         state.native_stereo && state.mode == RenderMode::StereoNone;
-    vr_ini.Set("openxr", "fullscreen_projection",
+    vr_ini.Set("openxr", "native_stereo",
         native_stereo_active ? "1" : "0");
+    vr_ini.Set("openxr", "fullscreen_projection",
+        state.fullscreen_projection ? "1" : "0");
+    vr_ini.Set("openxr", "alternate_presentation_resize",
+        state.alternate_presentation_resize ? "1" : "0");
     vr_ini.Set("openxr", "hud_stereo_shift_px",
         std::to_string(std::clamp(state.hud_convergence_delta - 16, -256, 256)));
     vr_ini.Set("openxr", "presentation_scale", FloatString(

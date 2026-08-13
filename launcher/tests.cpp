@@ -177,6 +177,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.first_person_stationary_turn = index % 2 != 0;
         state.fast_movement_transitions = index % 2 == 0;
         state.native_stereo = true;
+        state.fullscreen_projection = true;
+        state.alternate_presentation_resize = true;
         state.diagnostic_logging = true;
 
         w3vr::IniDocument vr;
@@ -218,9 +220,13 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             std::string(state.mode == w3vr::RenderMode::StereoNone
                 ? "1.000" : "0.850"),
             "native stereo presentation-scale contract mismatch");
-        Require(vr.Get("openxr", "fullscreen_projection") ==
+        Require(vr.Get("openxr", "native_stereo") ==
             std::string(state.mode == w3vr::RenderMode::StereoNone ? "1" : "0"),
             "native stereo must be limited to Stereo No AA");
+        Require(vr.Get("openxr", "fullscreen_projection") == "1",
+            "fullscreen projection must remain available in every render mode");
+        Require(vr.Get("openxr", "alternate_presentation_resize") == "1",
+            "alternate presentation resize was not saved independently");
         Require(vr.Get("openxr", "hud_horizontal_scale") == "0.500",
             "removed HUD X control must preserve the existing INI value");
         Require(vr.Get("openxr", "hud_vertical_scale") == "0.500",
@@ -256,7 +262,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "manual F10 HUD scale must remain independently tuned");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
             "fixed cinema framing flag missing");
-        Require(vr.Get("meta", "config_version") == "6",
+        Require(vr.Get("meta", "config_version") == "7",
             "configuration version marker missing");
         Require(vr.Get("openxr", "cinema_full_vr") == "1",
             "automatic full-VR cutscene flag missing");
@@ -310,6 +316,10 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(loaded.state.native_stereo ==
             (state.mode == w3vr::RenderMode::StereoNone),
             "round-trip native stereo mode gate mismatch");
+        Require(loaded.state.fullscreen_projection,
+            "round-trip fullscreen projection mismatch");
+        Require(loaded.state.alternate_presentation_resize,
+            "round-trip alternate presentation resize mismatch");
         if (w3vr::ModeUsesDlss(state.mode)) {
             Require(loaded.state.dlss_quality == state.dlss_quality,
                 "round-trip DLSS/DLAA selection mismatch");
@@ -341,6 +351,24 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(loaded.state.diagnostic_logging,
             "round-trip diagnostic logging mismatch");
     }
+
+    // Native Stereo must no longer imply the fullscreen presenter.
+    WriteBaseFixtures(paths);
+    w3vr::LauncherState native_legacy;
+    native_legacy.mode = w3vr::RenderMode::StereoNone;
+    native_legacy.native_stereo = true;
+    native_legacy.fullscreen_projection = false;
+    native_legacy.alternate_presentation_resize = false;
+    w3vr::IniDocument vr;
+    w3vr::IniDocument game;
+    std::wstring error;
+    Require(w3vr::BuildUpdatedDocuments(
+        paths, native_legacy, vr, game, error),
+        "independent presentation document build failed");
+    Require(vr.Get("openxr", "native_stereo") == "1" &&
+        vr.Get("openxr", "fullscreen_projection") == "0" &&
+        vr.Get("openxr", "alternate_presentation_resize") == "0",
+        "Native Stereo still implies a presentation experiment");
 }
 
 void TestProportionalCutsceneConvergence() {
@@ -379,6 +407,10 @@ void TestReleaseDefaults() {
         "faster movement transitions must default to enabled");
     Require(!defaults.native_stereo,
         "experimental native stereo must default to disabled");
+    Require(!defaults.fullscreen_projection,
+        "experimental fullscreen projection must default to disabled");
+    Require(!defaults.alternate_presentation_resize,
+        "alternate presentation resize must default to disabled");
     Require(!defaults.diagnostic_logging,
         "diagnostic logging must default to disabled");
 }
@@ -684,11 +716,14 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[meta]\r\n"
-        "config_version=6\r\n"
+        "config_version=7\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
         "render_width=2688\r\n"
         "render_height=2784\r\n"
+        "native_stereo=0\r\n"
+        "fullscreen_projection=0\r\n"
+        "alternate_presentation_resize=0\r\n"
         "hud_horizontal_scale=1.000\r\n"
         "hud_vertical_scale=1.000\r\n"
         "cinema_5x4=1\r\n"
@@ -732,8 +767,12 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "migrated INI must not be reported as newly created");
     auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated.has_value(), "migrated INI could not be read");
-    Require(migrated->Get("meta", "config_version") == "6",
+    Require(migrated->Get("meta", "config_version") == "7",
         "old INI was not versioned");
+    Require(migrated->Get("openxr", "native_stereo") == "0" &&
+        migrated->Get("openxr", "fullscreen_projection") == "0" &&
+        migrated->Get("openxr", "alternate_presentation_resize") == "0",
+        "old INI did not receive safe independent presentation defaults");
     Require(migrated->Get(
             "focus_projection", "shader_registry_enabled") == "0",
         "shader registry migration default missing");
@@ -791,10 +830,10 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[engine]\r\n"
         "first_person_stationary_turn=0\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V2-to-V6 migration failed");
+        paths, defaults, created, error), "V2-to-V7 migration failed");
     auto migrated_v4 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_v4.has_value() &&
-        migrated_v4->Get("meta", "config_version") == "6" &&
+        migrated_v4->Get("meta", "config_version") == "7" &&
         migrated_v4->Get("openxr", "cinema_hud_stereo_shift_px") == "-91" &&
         migrated_v4->Get("openxr", "cinema_hud_scale") == "1.100" &&
         migrated_v4->Get("openxr", "full_vr_hud_stereo_shift_px") == "-26" &&
@@ -804,7 +843,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         migrated_v4->Get("engine", "first_person_stationary_turn") == "0" &&
         migrated_v4->Get(
             "focus_projection", "shader_registry_enabled") == "0",
-        "V6 migration changed the Full VR offset or missed registry/HUD defaults");
+        "V7 migration changed the Full VR offset or missed registry/HUD defaults");
 
     Write(paths.vr_ini,
         "[meta]\r\n"
@@ -814,14 +853,31 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "hud_vertical_scale=0.780\r\n"
         "custom_user_value=keep\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V3-to-V6 migration failed");
+        paths, defaults, created, error), "V3-to-V7 migration failed");
     auto migrated_from_v3 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v3.has_value() &&
-        migrated_from_v3->Get("meta", "config_version") == "6" &&
+        migrated_from_v3->Get("meta", "config_version") == "7" &&
         migrated_from_v3->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "hud_vertical_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "custom_user_value") == "keep",
-        "V3-to-V6 HUD migration damaged unrelated settings");
+        "V3-to-V7 HUD migration damaged unrelated settings");
+
+    // V6 used fullscreen_projection as Native Stereo. Preserve that choice
+    // under the dedicated key without opting the user into a new presenter.
+    Write(paths.vr_ini,
+        "[meta]\r\n"
+        "config_version=6\r\n"
+        "[openxr]\r\n"
+        "fullscreen_projection=1\r\n");
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "V6-to-V7 migration failed");
+    auto migrated_from_v6 = w3vr::IniDocument::Load(paths.vr_ini, error);
+    Require(migrated_from_v6.has_value() &&
+        migrated_from_v6->Get("meta", "config_version") == "7" &&
+        migrated_from_v6->Get("openxr", "native_stereo") == "1" &&
+        migrated_from_v6->Get("openxr", "fullscreen_projection") == "0" &&
+        migrated_from_v6->Get("openxr", "alternate_presentation_resize") == "0",
+        "V6 combined flag was not split safely");
 }
 
 void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {

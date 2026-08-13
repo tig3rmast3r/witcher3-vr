@@ -22,7 +22,7 @@ using w3vr::RenderMode;
 
 constexpr wchar_t kWindowClass[] = L"Witcher3VRLauncherWindow";
 constexpr int kClientWidth = 720;
-constexpr int kClientHeight = 1088;
+constexpr int kClientHeight = 1120;
 constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
     WS_MINIMIZEBOX;
 
@@ -58,6 +58,7 @@ enum ControlId {
     IdFastMovementTransitions,
     IdCinemaFullVr,
     IdSteadyIcons,
+    IdAlternatePresentationResize,
     IdNativeStereo,
     IdDiagnosticLogging,
     IdStatus,
@@ -78,6 +79,9 @@ struct App {
     HFONT font{};
     w3vr::ConfigPaths paths;
     LauncherState loaded;
+    // Advanced INI-only option. Keep the loaded value across launcher saves
+    // without exposing a UI control or silently disabling a manual opt-in.
+    bool fullscreen_projection{};
     std::vector<ControlLayout> controls;
 };
 
@@ -247,6 +251,8 @@ void UpdateModeControls() {
         SendMessageW(Item(IdPresentationScale), TBM_SETPOS, TRUE, 100);
     }
     EnableWindow(Item(IdPresentationScale), !native_stereo_active);
+    EnableWindow(Item(IdAlternatePresentationResize),
+        g_app.fullscreen_projection && !native_stereo_active);
     UpdateTrackLabels();
 }
 
@@ -354,6 +360,9 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdCinemaFullVr), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.steady_icons = SendMessageW(
         Item(IdSteadyIcons), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.fullscreen_projection = g_app.fullscreen_projection;
+    state.alternate_presentation_resize = SendMessageW(
+        Item(IdAlternatePresentationResize), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.native_stereo = SendMessageW(
         Item(IdNativeStereo), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.diagnostic_logging = SendMessageW(
@@ -658,6 +667,9 @@ void RestoreLauncherDefaults() {
         defaults.cinema_full_vr ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
         defaults.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_app.fullscreen_projection = defaults.fullscreen_projection;
+    SendMessageW(Item(IdAlternatePresentationResize), BM_SETCHECK,
+        defaults.alternate_presentation_resize ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdNativeStereo), BM_SETCHECK,
         defaults.native_stereo ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK, BST_UNCHECKED, 0);
@@ -747,6 +759,7 @@ void PopulateControls() {
 
     const auto loaded = w3vr::LoadConfiguration(g_app.paths);
     g_app.loaded = loaded.state;
+    g_app.fullscreen_projection = loaded.state.fullscreen_projection;
     SendMessageW(mode, CB_SETCURSEL, static_cast<int>(loaded.state.mode), 0);
     const int preset = ResolutionPresetFor(loaded.state.width, loaded.state.height);
     SendMessageW(resolution, CB_SETCURSEL, preset, 0);
@@ -793,6 +806,9 @@ void PopulateControls() {
         loaded.state.cinema_full_vr ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
         loaded.state.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdAlternatePresentationResize), BM_SETCHECK,
+        loaded.state.alternate_presentation_resize
+            ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdNativeStereo), BM_SETCHECK,
         loaded.state.native_stereo ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK,
@@ -830,7 +846,7 @@ void CreateInterface(HWND window) {
         589, 76, 82, 25, IdHeight, WS_EX_CLIENTEDGE);
 
     AddControl(L"BUTTON", L"Comfort and interface", BS_GROUPBOX,
-        20, 138, 680, 690);
+        20, 138, 680, 722);
     AddLabel(L"Presentation size", 38, 166, 170, 22);
     AddTrack(205, 160, 405, IdPresentationScale, 50, 100);
     AddLabel(L"1.00", 625, 166, 54, 22, IdPresentationScaleValue, SS_RIGHT);
@@ -901,35 +917,40 @@ void CreateInterface(HWND window) {
         IdFastMovementTransitions);
 
     AddControl(L"BUTTON",
+        L"Alternate Presentation Resize (Experimental; needed for VD foveated rendering)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 720, 640, 26,
+        IdAlternatePresentationResize);
+
+    AddControl(L"BUTTON",
         L"Native Stereo (Stereo no AA only, Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 720, 610, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 752, 610, 26,
         IdNativeStereo);
 
     AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 752, 410, 26, IdDiagnosticLogging);
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 784, 410, 26, IdDiagnosticLogging);
     AddLabel(L"Saves witcher3vr.log in the game folder for debugging. May affect performance.",
-        58, 778, 610, 34);
+        58, 810, 610, 34);
 
     AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
-        20, 836, 680, 112);
+        20, 868, 680, 112);
     AddLabel(L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
-        38, 862, 650, 24);
+        38, 894, 650, 24);
     AddLabel(L"HUD editor: INS open / save and close    Q/E select panel    Arrow keys move    Wheel scales",
-        38, 886, 650, 24);
+        38, 918, 650, 24);
     AddLabel(L"R reset panel    X reset profile    F7 switch VR / Cinema3D (editor open or closed)",
-        38, 910, 650, 24);
+        38, 942, 650, 24);
 
-    AddLabel(L"", 20, 956, 680, 30, IdStatus, SS_LEFT);
+    AddLabel(L"", 20, 988, 680, 30, IdStatus, SS_LEFT);
     AddControl(L"BUTTON", L"Configure Settings for VR", BS_PUSHBUTTON | WS_TABSTOP,
-        20, 990, 220, 36, IdConfigureVr);
+        20, 1022, 220, 36, IdConfigureVr);
     AddControl(L"BUTTON", L"Restore Original Settings", BS_PUSHBUTTON | WS_TABSTOP,
-        252, 990, 220, 36, IdRestoreOriginal);
+        252, 1022, 220, 36, IdRestoreOriginal);
     AddControl(L"BUTTON", L"Restore Defaults", BS_PUSHBUTTON | WS_TABSTOP,
-        484, 990, 216, 36, IdRestoreDefaults);
+        484, 1022, 216, 36, IdRestoreDefaults);
     AddControl(L"BUTTON", L"Save Only", BS_PUSHBUTTON | WS_TABSTOP,
-        406, 1040, 130, 36, IdSave);
+        406, 1072, 130, 36, IdSave);
     AddControl(L"BUTTON", L"Save && Launch", BS_DEFPUSHBUTTON | WS_TABSTOP,
-        550, 1040, 150, 36, IdSaveLaunch);
+        550, 1072, 150, 36, IdSaveLaunch);
 
     PopulateControls();
     LayoutInterface();
