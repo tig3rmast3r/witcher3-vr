@@ -31967,7 +31967,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1117 base=V1116 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 native_stereo_launcher=1 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1118 base=V1117 amd_static_root_vertices=1 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 native_stereo_launcher=1 projection_default=legacy fullscreen_projection_ini_control=1 post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
@@ -32082,21 +32082,33 @@ bool initialize_mode3_hud_layer_pipeline(
     }
     static constexpr char kVertexShader[] = R"(
 cbuffer HudPlaneVertices : register(b0) {
-    float4 clip_positions[4];
+    float4 clip_top_left;
+    float4 clip_top_right;
+    float4 clip_bottom_left;
+    float4 clip_bottom_right;
 };
 struct VertexOutput {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
 };
 VertexOutput vs_main(uint vertex_id : SV_VertexID) {
-    static const uint indices[6] = {0, 1, 2, 2, 1, 3};
-    static const float2 uvs[4] = {
-        float2(0.0, 0.0), float2(1.0, 0.0),
-        float2(0.0, 1.0), float2(1.0, 1.0)};
-    uint corner = indices[vertex_id];
     VertexOutput output;
-    output.position = clip_positions[corner];
-    output.uv = uvs[corner];
+    // [FIX:AMD-STATIC-ROOT-VERTICES 1/2] Root-constant storage is not
+    // dynamically indexable on every D3D12 implementation. Keep every access
+    // literal so AMD's native driver and vkd3d-proton see legal root loads.
+    if (vertex_id == 0) {
+        output.position = clip_top_left;
+        output.uv = float2(0.0, 0.0);
+    } else if (vertex_id == 1 || vertex_id == 4) {
+        output.position = clip_top_right;
+        output.uv = float2(1.0, 0.0);
+    } else if (vertex_id == 2 || vertex_id == 3) {
+        output.position = clip_bottom_left;
+        output.uv = float2(0.0, 1.0);
+    } else {
+        output.position = clip_bottom_right;
+        output.uv = float2(1.0, 1.0);
+    }
     return output;
 }
 )";
@@ -32639,21 +32651,33 @@ bool initialize_anchored_cinema_projection_pipeline(
 
     static constexpr char kVertexShader[] = R"(
 cbuffer PanelVertices : register(b0) {
-    float4 clip_positions[4];
+    float4 clip_top_left;
+    float4 clip_top_right;
+    float4 clip_bottom_left;
+    float4 clip_bottom_right;
 };
 struct VertexOutput {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
 };
 VertexOutput vs_main(uint vertex_id : SV_VertexID) {
-    static const uint indices[6] = {0, 1, 2, 2, 1, 3};
-    static const float2 uvs[4] = {
-        float2(0.0, 0.0), float2(1.0, 0.0),
-        float2(0.0, 1.0), float2(1.0, 1.0)};
-    uint corner = indices[vertex_id];
     VertexOutput output;
-    output.position = clip_positions[corner];
-    output.uv = uvs[corner];
+    // [FIX:AMD-STATIC-ROOT-VERTICES 2/2] Match the HUD path: use four named
+    // root values and only literal accesses instead of indexing an array with
+    // SV_VertexID-derived data.
+    if (vertex_id == 0) {
+        output.position = clip_top_left;
+        output.uv = float2(0.0, 0.0);
+    } else if (vertex_id == 1 || vertex_id == 4) {
+        output.position = clip_top_right;
+        output.uv = float2(1.0, 0.0);
+    } else if (vertex_id == 2 || vertex_id == 3) {
+        output.position = clip_bottom_left;
+        output.uv = float2(0.0, 1.0);
+    } else {
+        output.position = clip_bottom_right;
+        output.uv = float2(1.0, 1.0);
+    }
     return output;
 }
 )";
