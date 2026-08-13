@@ -1190,6 +1190,12 @@ using EngineViewRebuildFn = void(__fastcall*)(float*);
 EngineViewRebuildFn g_engine_view_rebuild{};
 using EngineViewCopyRebuildFn = float*(__fastcall*)(float*, const float*);
 EngineViewCopyRebuildFn g_engine_view_copy_rebuild{};
+// The per-eye DLSS temporal record at view+0x460 deliberately carries the
+// previous corrected VR camera. Its +0x08 field is therefore the previous VR
+// FOV, not the native gameplay FOV that the render-distance fix needs. Retain
+// that independent authority at the native CCustomCamera boundary instead.
+std::atomic<float> g_native_world_fov_degrees{60.0f};
+std::atomic<bool> g_native_world_fov_valid{};
 using EngineTemporalCameraBuildFn = void*(__fastcall*)(
     void*, float, const void*, const void*, float, float, float, float, float);
 EngineTemporalCameraBuildFn g_engine_temporal_camera_build{};
@@ -3198,6 +3204,15 @@ std::atomic<ID3D12PipelineState*> g_cinema_hud_composite_eye1_pso{};
 std::atomic<ID3D12PipelineState*> g_auto_cinema_hud_composite_eye0_pso{};
 std::atomic<ID3D12PipelineState*> g_auto_cinema_hud_composite_eye1_pso{};
 std::atomic<ID3D12PipelineState*> g_mode3_scene_only_pso{};
+constexpr uint32_t kMode3SceneOnlyPairHistory = 4;
+std::mutex g_mode3_scene_only_output_mutex{};
+std::array<uint64_t, kMode3SceneOnlyPairHistory>
+    g_mode3_scene_only_output_pairs{};
+uint32_t g_mode3_scene_only_output_generation{};
+uint32_t g_mode3_scene_only_output_cursor{};
+uint64_t g_mode3_scene_only_pending_pair{};
+uint32_t g_mode3_scene_only_pending_eye_mask{};
+bool g_mode3_scene_only_pending_valid{};
 std::atomic<ID3D12Resource*> g_mode3_latest_hud_source{};
 std::atomic<uint32_t> g_mode3_latest_hud_format{
     static_cast<uint32_t>(DXGI_FORMAT_UNKNOWN)};
@@ -3256,6 +3271,43 @@ uint64_t g_mode3_early_hud_accepted_pair{};
 std::atomic<uint32_t> g_mode3_hud_srv_root{UINT32_MAX};
 std::atomic<uint32_t> g_mode3_hud_srv_offset{UINT32_MAX};
 std::mutex g_hud_composite_pso_creation_mutex{};
+
+bool mode3_early_hud_pair_ready();
+
+bool mode3_hud_pipeline_family(ID3D12PipelineState* pipeline) {
+    return pipeline != nullptr &&
+        (pipeline == g_hud_composite_original_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_hud_composite_eye0_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_hud_composite_eye1_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_cinema_hud_composite_eye0_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_cinema_hud_composite_eye1_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_auto_cinema_hud_composite_eye0_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_auto_cinema_hud_composite_eye1_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_mode3_scene_only_pso.load(
+            std::memory_order_acquire));
+}
+
+bool mode3_scene_only_output_pair_ready(uint64_t pair_id) {
+    if (pair_id == 0 || pair_id == UINT64_MAX) {
+        return false;
+    }
+    std::scoped_lock lock{g_mode3_scene_only_output_mutex};
+    if (g_mode3_scene_only_output_generation !=
+        g_streamline_capture_generation.load(std::memory_order_acquire)) {
+        return false;
+    }
+    return std::find(
+        g_mode3_scene_only_output_pairs.begin(),
+        g_mode3_scene_only_output_pairs.end(), pair_id) !=
+        g_mode3_scene_only_output_pairs.end();
+}
 ID3D12DescriptorHeap* g_mono_hud_rtv_heap{};
 ID3D12Resource* g_mono_hud_outputs[2]{};
 D3D12_CPU_DESCRIPTOR_HANDLE g_mono_hud_rtvs[2]{};
@@ -13079,6 +13131,10 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
         const bool automatic_stereo_cinema_hud =
             normal_stereo_cinema_hud &&
             !g_force_mono_cinema.load(std::memory_order_relaxed);
+        const bool retained_cinema_hud_ready =
+            normal_stereo_cinema_hud &&
+            g_mode3_hud_layer_available.load(std::memory_order_acquire) &&
+            mode3_early_hud_pair_ready();
         const bool automatic_full_vr_hud =
             mode3_stereo_transport_active() &&
             g_config.cinema_full_vr &&
@@ -13153,17 +13209,17 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                     : g_hud_composite_eye1_pso.load(
                         std::memory_order_acquire));
             }
-            // [FIX:CINEMA-DEPTH-COHERENCE 3/3] Gameplay separates scene and
-            // HUD for its late projection composite. Cinema deliberately keeps
-            // the shifted HUD inside each matched panel texture; its OpenXR
-            // projection path does not perform that late gameplay composite.
             // [FIX:COMMON-MODE3-TRANSPORT 3/8] Mode 3 publishes an
             // untouched scene projection. The same draw's t1 binding is
             // captured below and rendered into fixed left/right HUD slices.
-            if (!normal_stereo_cinema_hud &&
-                mode3_stereo_transport_active() &&
+            // [FIX:RETAINED-CINEMA-HUD V1121] Normal Cinema now joins that
+            // same retained path only after a complete HUD pair exists. Until
+            // then the baked Cinema PSO above remains a fail-open bootstrap.
+            if (mode3_stereo_transport_active() &&
                 g_mode3_hud_layer_available.load(
-                    std::memory_order_acquire)) {
+                    std::memory_order_acquire) &&
+                (!normal_stereo_cinema_hud ||
+                    retained_cinema_hud_ready)) {
                 auto* scene_only =
                     g_mode3_scene_only_pso.load(std::memory_order_acquire);
                 if (scene_only != nullptr) {
@@ -13178,8 +13234,9 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                 if (cinema_hud_route_logs.fetch_add(
                         1, std::memory_order_relaxed) < 24) {
                     log_line(
-                        "Cinema HUD convergence routed eye=%d shift=%d pso=%p present=%llu",
+                        "Cinema HUD route eye=%d shift=%d retained=%d pso=%p present=%llu",
                         hud_eye, g_config.cinema_hud_stereo_shift_px,
+                        retained_cinema_hud_ready ? 1 : 0,
                         bound_pipeline_state,
                         static_cast<unsigned long long>(
                             g_present_count.load(std::memory_order_relaxed)));
@@ -14974,6 +15031,16 @@ void reset_loading_video_presentation_state(uint64_t present) {
     g_mode3_strict_hud_target_pair.store(0, std::memory_order_relaxed);
     g_mode3_strict_hud_target_generation.store(
         generation, std::memory_order_release);
+    {
+        std::scoped_lock scene_only_lock{
+            g_mode3_scene_only_output_mutex};
+        g_mode3_scene_only_output_pairs.fill(0);
+        g_mode3_scene_only_output_generation = generation;
+        g_mode3_scene_only_output_cursor = 0;
+        g_mode3_scene_only_pending_pair = 0;
+        g_mode3_scene_only_pending_eye_mask = 0;
+        g_mode3_scene_only_pending_valid = false;
+    }
 
     g_mode3_latest_hud_source.store(nullptr, std::memory_order_release);
     g_mode3_latest_hud_format.store(
@@ -15224,6 +15291,42 @@ bool label_mode3_early_hud_at_present(
         tag.pair_id == 0 || tag.generation != generation) {
         return false;
     }
+    // Record complete L/R scene pairs actually finalized with scene-only PSOs.
+    // Keep a short exact history so a retained-pair rescue can still composite
+    // the preceding pair while the next pair has produced only one eye.
+    {
+        std::scoped_lock scene_only_lock{
+            g_mode3_scene_only_output_mutex};
+        if (g_mode3_scene_only_output_generation != tag.generation) {
+            g_mode3_scene_only_output_pairs.fill(0);
+            g_mode3_scene_only_output_generation = tag.generation;
+            g_mode3_scene_only_output_cursor = 0;
+            g_mode3_scene_only_pending_pair = 0;
+            g_mode3_scene_only_pending_eye_mask = 0;
+            g_mode3_scene_only_pending_valid = false;
+        }
+        if (g_mode3_scene_only_pending_pair != tag.pair_id) {
+            g_mode3_scene_only_pending_pair = tag.pair_id;
+            g_mode3_scene_only_pending_eye_mask = 0;
+            g_mode3_scene_only_pending_valid = true;
+        }
+        if (load_command_list_pipeline(command_list) ==
+            g_mode3_scene_only_pso.load(std::memory_order_acquire)) {
+            g_mode3_scene_only_pending_eye_mask |= 1u << tag.eye;
+        } else {
+            g_mode3_scene_only_pending_valid = false;
+        }
+        if (g_mode3_scene_only_pending_valid &&
+            g_mode3_scene_only_pending_eye_mask == 0x3u &&
+            std::find(
+                g_mode3_scene_only_output_pairs.begin(),
+                g_mode3_scene_only_output_pairs.end(), tag.pair_id) ==
+                g_mode3_scene_only_output_pairs.end()) {
+            g_mode3_scene_only_output_pairs[
+                g_mode3_scene_only_output_cursor++ %
+                    kMode3SceneOnlyPairHistory] = tag.pair_id;
+        }
+    }
     std::scoped_lock lock{g_mode3_early_hud_mutex};
     const auto found =
         g_mode3_early_hud_pending_by_command_list.find(command_list);
@@ -15459,6 +15562,9 @@ bool mode3_early_hud_pair_ready() {
 // pair cache, or REDengine command list is retained here.
 bool publish_mode3_hud_source(
     ID3D12GraphicsCommandList* command_list) {
+    const bool cinema_active =
+        g_cinema_mode_active.load(std::memory_order_relaxed);
+    auto* const bound_pipeline = load_command_list_pipeline(command_list);
     if (!mode3_stereo_transport_active() ||
         // [FIX:POST-LOADING-INIT-TRANSACTION 4/8] A scene-only PSO can still
         // appear after GuiManager drops its menu flag but before CRenderVideo
@@ -15466,9 +15572,9 @@ bool publish_mode3_hud_source(
         g_engine_loading_screen_video_active.load(
             std::memory_order_acquire) ||
         g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
-        g_cinema_mode_active.load(std::memory_order_relaxed) ||
-        load_command_list_pipeline(command_list) !=
-            g_mode3_scene_only_pso.load(std::memory_order_acquire)) {
+        (!cinema_active && bound_pipeline !=
+            g_mode3_scene_only_pso.load(std::memory_order_acquire)) ||
+        (cinema_active && !mode3_hud_pipeline_family(bound_pipeline))) {
         return false;
     }
     const bool hud_audit_enabled =
@@ -15635,6 +15741,36 @@ void STDMETHODCALLTYPE hook_draw_instanced(
     const bool publish_packed_after_draw =
         try_bridge_streamline_second_present_before_draw(command_list, false,
             vertex_count_per_instance, instance_count);
+    // Native No-AA can keep the already-bound gameplay HUD PSO across the
+    // F10/Cinema transition, while DLSS tends to rebind it. Make the final HUD
+    // draw independent of that backend cadence: once a retained pair exists,
+    // replace any known member of the HUD PSO family at draw time as well.
+    if (g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        mode3_stereo_transport_active() &&
+        (g_force_mono_cinema.load(std::memory_order_relaxed) ||
+            !g_config.cinema_full_vr) &&
+        g_mode3_hud_layer_available.load(std::memory_order_acquire)) {
+        auto* const current_pipeline =
+            load_command_list_pipeline(command_list);
+        auto* const scene_only =
+            g_mode3_scene_only_pso.load(std::memory_order_acquire);
+        if (g_set_pipeline_state != nullptr &&
+            scene_only != nullptr && current_pipeline != scene_only &&
+            mode3_hud_pipeline_family(current_pipeline) &&
+            mode3_early_hud_pair_ready()) {
+            g_set_pipeline_state(command_list, scene_only);
+            store_command_list_pipeline(command_list, scene_only);
+            static std::atomic<uint32_t> cinema_draw_fallback_logs{};
+            if (cinema_draw_fallback_logs.fetch_add(
+                    1, std::memory_order_relaxed) < 24) {
+                log_line(
+                    "Cinema retained HUD draw fallback original=%p scene=%p present=%llu",
+                    current_pipeline, scene_only,
+                    static_cast<unsigned long long>(
+                        g_present_count.load(std::memory_order_relaxed)));
+            }
+        }
+    }
     g_draw_instanced(
         command_list,
         vertex_count_per_instance,
@@ -26330,6 +26466,17 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             kNativeCustomCameraVtableRva &&
         native_camera_authority.player_non_gameplay_cutscene == 0 &&
         native_camera_authority.game_non_gameplay_scene == 0;
+    // [FIX:RENDER-PROXY-FOV-DISTANCE-AUTHORITY V1122 1/4] Capture the native
+    // gameplay FOV before the HMD projection replaces view[7]. V1106's clean
+    // per-eye motion history correctly repurposed view+0x468 as the previous
+    // corrected VR FOV, so that temporal field can no longer double as the
+    // distance/LOD baseline used by the older V1101 fix.
+    if (native_gameplay_camera_authority && std::isfinite(view[7]) &&
+        view[7] >= 20.0f && view[7] <= 100.0f) {
+        g_native_world_fov_degrees.store(
+            view[7], std::memory_order_relaxed);
+        g_native_world_fov_valid.store(true, std::memory_order_release);
+    }
     const bool fallback_native_gameplay_authority =
         fallback_camera_candidate &&
         native_gameplay_camera_authority;
@@ -28742,12 +28889,14 @@ void install_engine_view_factory_probe() {
     }
 }
 
-// [FIX:RENDER-PROXY-FOV-DISTANCE-SCALE V1101 1/3] REDengine derives the
+// [FIX:RENDER-PROXY-FOV-DISTANCE-AUTHORITY V1122 2/4] REDengine derives the
 // render-proxy squared-distance multiplier from the widened visible FOV:
 // raw view+0x24 = 3*tan(FOV/2)^2 and clamped view+0x20 = max(1, raw).
 // FUN_141E6D660 consumes +0x20 for maximum-distance culling and downstream
-// proxy LOD work. Rebuild only this pair from the preserved native FOV at
-// source+0x468; visible projection, matrices and view+0x2B0 stay untouched.
+// proxy LOD work. Rebuild only this pair from the separately retained native
+// gameplay FOV. The temporal record at source+0x468 must remain the corrected
+// per-eye VR history used for DLSS motion. Visible projection, matrices and
+// view+0x2B0 stay untouched.
 float* __fastcall hook_engine_render_proxy_distance_scale(
     float* destination, const float* source) {
     float* result = g_engine_view_copy_rebuild(destination, source);
@@ -28756,22 +28905,22 @@ float* __fastcall hook_engine_render_proxy_distance_scale(
     constexpr size_t kDistanceScaleIndex = 0x20 / sizeof(float);
     constexpr size_t kRawDistanceScaleIndex = 0x24 / sizeof(float);
     constexpr size_t kAspectIndex = 0x28 / sizeof(float);
-    constexpr size_t kNativeFovIndex = 0x468 / sizeof(float);
     constexpr float kDegreesToHalfRadians =
         3.14159265358979323846f / 360.0f;
     // Exact witcher3.exe constant at RVA 0x2D85084 (bits 0x4040000C).
     constexpr float kDistanceScaleCoefficient = 3.00000286102294921875f;
 
     if (destination == nullptr || source == nullptr ||
-        !g_config.openxr_enabled || g_config.openxr_mode != 3 ||
-        g_config.temporal_backend != TemporalBackend::Dlss ||
+        !g_config.openxr_enabled || !mode3_stereo_transport_active() ||
+        !g_native_world_fov_valid.load(std::memory_order_acquire) ||
         g_engine_menu_state.load(std::memory_order_relaxed) != 0) {
         return result;
     }
 
     __try {
         const float visible_fov = source[kVisibleFovIndex];
-        const float native_fov = source[kNativeFovIndex];
+        const float native_fov = g_native_world_fov_degrees.load(
+            std::memory_order_relaxed);
         const float aspect = source[kAspectIndex];
         const float original_scale = destination[kDistanceScaleIndex];
         const float original_raw_scale =
@@ -28783,9 +28932,9 @@ float* __fastcall hook_engine_render_proxy_distance_scale(
         const float expected_scale = std::max(1.0f, expected_raw_scale);
         const bool world_view_signature =
             std::isfinite(visible_fov) &&
-            visible_fov >= 90.0f && visible_fov <= 115.0f &&
+            visible_fov >= 90.0f && visible_fov <= 125.0f &&
             std::isfinite(native_fov) &&
-            native_fov >= 45.0f && native_fov <= 75.0f &&
+            native_fov >= 20.0f && native_fov <= 100.0f &&
             std::isfinite(aspect) && aspect >= 0.75f && aspect <= 1.25f &&
             visible_fov > native_fov + 15.0f &&
             std::isfinite(expected_raw_scale) &&
@@ -28809,6 +28958,25 @@ float* __fastcall hook_engine_render_proxy_distance_scale(
             native_scale < original_scale * 0.8f) {
             destination[kRawDistanceScaleIndex] = native_raw_scale;
             destination[kDistanceScaleIndex] = native_scale;
+            if (g_config.logging_enabled || g_config.runtime_diagnostics) {
+                static std::atomic<uint32_t> applied_logs{};
+                const uint32_t index = applied_logs.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (index < 16) {
+                    log_line(
+                        "V1122 render-proxy distance authority applied "
+                        "sample=%u present=%llu backend=%s visible_fov=%.7g "
+                        "native_fov=%.7g aspect=%.7g raw=%.7g->%.7g "
+                        "scale=%.7g->%.7g",
+                        index,
+                        static_cast<unsigned long long>(
+                            g_present_count.load(std::memory_order_relaxed)),
+                        temporal_backend_name(),
+                        visible_fov, native_fov, aspect,
+                        original_raw_scale, native_raw_scale,
+                        original_scale, native_scale);
+                }
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return result;
@@ -28816,11 +28984,13 @@ float* __fastcall hook_engine_render_proxy_distance_scale(
     return result;
 }
 
-// [FIX:RENDER-PROXY-FOV-DISTANCE-SCALE V1101 2/3] Install only for the
-// runtime-validated Mode-3 symmetric sequential DLSS route.
+// [FIX:RENDER-PROXY-FOV-DISTANCE-AUTHORITY V1122 3/4] The derived distance
+// authority is common REDengine geometry work, independent of the selected AA
+// backend. Install it for every Mode-3 stereo route; the strict view signature
+// and native-camera validity gate still decide whether an individual view is
+// eligible.
 void install_engine_render_proxy_distance_scale_hook() {
-    if (!g_config.openxr_enabled || g_config.openxr_mode != 3 ||
-        g_config.temporal_backend != TemporalBackend::Dlss ||
+    if (!g_config.openxr_enabled || !mode3_stereo_transport_active() ||
         g_engine_view_copy_rebuild != nullptr) {
         return;
     }
@@ -28836,7 +29006,8 @@ void install_engine_render_proxy_distance_scale_hook() {
         MH_EnableHook(target) == MH_OK) {
         log_line(
             "Render-proxy FOV distance scale hook installed "
-            "RVA=0x%llX target=%p",
+            "RVA=0x%llX target=%p route=all_mode3_backends "
+            "native_fov_authority=gameplay_camera",
             static_cast<unsigned long long>(kEngineViewCopyRebuildRva), target);
     } else {
         g_engine_view_copy_rebuild = nullptr;
@@ -32057,7 +32228,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1120 base=V1119 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1122 base=V1121 render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
@@ -32206,8 +32377,10 @@ VertexOutput vs_main(uint vertex_id : SV_VertexID) {
 Texture2D<float4> hud_texture : register(t0);
 cbuffer HudSamplingParameters : register(b1) {
     int2 source_shift_px;
-    float hud_size;
-    uint headset_projection;
+    float hud_scale_x;
+    float hud_scale_y;
+    uint geometry_owns_hud_transform;
+    uint3 sampling_padding;
 };
 struct PixelInput {
     float4 position : SV_Position;
@@ -32228,14 +32401,17 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     float2 source_size = float2(source_width, source_height);
     float2 source_position = input.uv * source_size;
     int2 coordinate;
-    if (headset_projection != 0u) {
+    if (geometry_owns_hud_transform != 0u) {
         // UVs are perspective-correct across the physical cyclopean plane.
         coordinate = int2(source_position);
     } else {
-        // Exact V1021 fallback for invalid/missing runtime eye geometry.
+        // Legacy fallback and the physical Cinema panel transform HUD pixels
+        // around their own source center. Cinema may use a distinct X scale
+        // to preserve HUD proportions on the optional 5:4 panel.
         float2 center = source_size * 0.5;
         coordinate = int2(
-            (source_position - center) / max(hud_size, 0.01) + center);
+            (source_position - center) /
+                max(float2(hud_scale_x, hud_scale_y), 0.01) + center);
         coordinate += source_shift_px;
     }
     if (coordinate.x < 0 || coordinate.y < 0 ||
@@ -32323,7 +32499,7 @@ float4 ps_main(PixelInput input) : SV_Target0 {
         D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[2].Constants.ShaderRegister = 1;
     parameters[2].Constants.RegisterSpace = 0;
-    parameters[2].Constants.Num32BitValues = 4;
+    parameters[2].Constants.Num32BitValues = 8;
     parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     root_desc.NumParameters = static_cast<UINT>(std::size(parameters));
@@ -32413,6 +32589,28 @@ float4 ps_main(PixelInput input) : SV_Target0 {
 // source into the unequivocal left/right slices of the current projection
 // image. Eye-specific convergence is applied here; no independent XR layer is
 // submitted and no scene resource is retained.
+enum class Mode3HudProjectionRoute : uint32_t {
+    Gameplay,
+    FullVr,
+    Cinema,
+};
+
+struct CinemaHudProjectionParameters {
+    const XrView* eye_views{};
+    const XrPosef* panel_pose{};
+    float panel_width{};
+    float panel_height{};
+    bool use_5x4{};
+    bool automatic{};
+};
+
+bool build_anchored_panel_clip_positions(
+    const XrView& eye_view,
+    const XrPosef& panel_pose,
+    float panel_width,
+    float panel_height,
+    std::array<float, 16>& clip_positions);
+
 bool composite_mode3_hud_into_projection_image(
     XrEyeSwapchain& target_swapchain,
     uint32_t image_index,
@@ -32422,7 +32620,8 @@ bool composite_mode3_hud_into_projection_image(
     const int32_t projection_eye_shifts_y_px[2],
     const XrCompositionLayerProjectionView* submitted_views,
     uint64_t scene_pair_id,
-    bool automatic_full_vr_cutscene) {
+    Mode3HudProjectionRoute route,
+    const CinemaHudProjectionParameters* cinema_parameters) {
     ID3D12Resource* sources[2]{};
     DXGI_FORMAT source_formats[2]{
         DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
@@ -32491,14 +32690,34 @@ bool composite_mode3_hud_into_projection_image(
         projection_image_rect.extent.height > 0
         ? static_cast<uint32_t>(projection_image_rect.extent.height)
         : target_swapchain.height;
-    const int reference_left_eye_shift = automatic_full_vr_cutscene
+    const bool cinema_projection =
+        route == Mode3HudProjectionRoute::Cinema;
+    const bool automatic_full_vr_cutscene =
+        route == Mode3HudProjectionRoute::FullVr;
+    if (cinema_projection &&
+        (cinema_parameters == nullptr ||
+            cinema_parameters->eye_views == nullptr ||
+            cinema_parameters->panel_pose == nullptr ||
+            !std::isfinite(cinema_parameters->panel_width) ||
+            !std::isfinite(cinema_parameters->panel_height) ||
+            cinema_parameters->panel_width <= 0.01f ||
+            cinema_parameters->panel_height <= 0.01f)) {
+        return false;
+    }
+    const int reference_left_eye_shift = cinema_projection
+        ? g_config.cinema_hud_stereo_shift_px
+        : automatic_full_vr_cutscene
         ? g_config.full_vr_hud_stereo_shift_px
         : g_config.hud_stereo_shift_px;
-    // Full VR cutscenes keep their independently calibrated Quest 3 size and
-    // convergence. Gameplay uses the same physical conversion at size 1.0.
+    // Each route keeps its existing independently calibrated size and
+    // convergence. Cinema applies these in panel-local source pixels.
     const float hud_size = std::max(
         g_config.hud_size *
-            (automatic_full_vr_cutscene
+            (cinema_projection
+                ? (cinema_parameters->automatic
+                    ? 1.30f
+                    : g_config.manual_cinema_hud_scale)
+                : automatic_full_vr_cutscene
                 ? g_config.full_vr_hud_scale
                 : 1.0f),
         0.01f);
@@ -32537,7 +32756,8 @@ bool composite_mode3_hud_into_projection_image(
         XR_VIEW_STATE_POSITION_VALID_BIT;
     const XrViewStateFlags current_view_flags =
         g_xr_render_view_state_flags.load(std::memory_order_acquire);
-    bool headset_projection = submitted_views != nullptr &&
+    bool headset_projection = !cinema_projection &&
+        submitted_views != nullptr &&
         g_hmd_render_fov_valid.load(std::memory_order_acquire) &&
         (current_view_flags & kRequiredPoseFlags) == kRequiredPoseFlags &&
         std::isfinite(inverse_hud_distance) &&
@@ -32564,7 +32784,33 @@ bool composite_mode3_hud_into_projection_image(
                     submitted_views[eye].fov, hud_size,
                     inverse_hud_distance, hud_clip_positions[eye]);
     }
-    if (headset_projection) {
+    if (cinema_projection) {
+        bool panel_geometry_valid = true;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            panel_geometry_valid = panel_geometry_valid &&
+                build_anchored_panel_clip_positions(
+                    cinema_parameters->eye_views[eye],
+                    *cinema_parameters->panel_pose,
+                    cinema_parameters->panel_width,
+                    cinema_parameters->panel_height,
+                    hud_clip_positions[eye]);
+        }
+        if (!panel_geometry_valid) {
+            return false;
+        }
+        static std::atomic<uint32_t> cinema_projection_hud_logs{};
+        if (cinema_projection_hud_logs.fetch_add(
+                1, std::memory_order_relaxed) < 4) {
+            log_line(
+                "Cinema retained HUD projection pair=%llu shift=%d size=%.3f panel=%.3fx%.3f aspect_5x4=%d automatic=%d",
+                static_cast<unsigned long long>(scene_pair_id),
+                reference_left_eye_shift, hud_size,
+                cinema_parameters->panel_width,
+                cinema_parameters->panel_height,
+                cinema_parameters->use_5x4 ? 1 : 0,
+                cinema_parameters->automatic ? 1 : 0);
+        }
+    } else if (headset_projection) {
         // Log gameplay and Full VR independently. The old shared four-sample
         // budget was exhausted during gameplay before a cutscene could prove
         // which Full-VR scale, shift and physical distance were consumed.
@@ -32604,28 +32850,37 @@ bool composite_mode3_hud_into_projection_image(
         hud_clip_positions[1] = kLegacyFullscreenClip;
     }
     for (uint32_t eye = 0; eye < 2; ++eye) {
-        const bool fitted_eye = !headset_projection &&
+        const bool fitted_eye = !cinema_projection &&
+            !headset_projection &&
             projection_eye_fit_rects != nullptr &&
             projection_eye_fit_rects[eye].extent.width > 0 &&
             projection_eye_fit_rects[eye].extent.height > 0;
-        const int32_t target_x = headset_projection
+        const int32_t target_x = cinema_projection
+            ? 0
+            : headset_projection
             ? submitted_views[eye].subImage.imageRect.offset.x
             : fitted_eye
             ? projection_eye_fit_rects[eye].offset.x
             : default_target_x;
-        const int32_t target_y = headset_projection
+        const int32_t target_y = cinema_projection
+            ? 0
+            : headset_projection
             ? submitted_views[eye].subImage.imageRect.offset.y
             : fitted_eye
             ? projection_eye_fit_rects[eye].offset.y
             : default_target_y;
-        const uint32_t target_width = headset_projection
+        const uint32_t target_width = cinema_projection
+            ? target_swapchain.width
+            : headset_projection
             ? static_cast<uint32_t>(
                 submitted_views[eye].subImage.imageRect.extent.width)
             : fitted_eye
             ? static_cast<uint32_t>(
                 projection_eye_fit_rects[eye].extent.width)
             : default_target_width;
-        const uint32_t target_height = headset_projection
+        const uint32_t target_height = cinema_projection
+            ? target_swapchain.height
+            : headset_projection
             ? static_cast<uint32_t>(
                 submitted_views[eye].subImage.imageRect.extent.height)
             : fitted_eye
@@ -32691,13 +32946,15 @@ bool composite_mode3_hud_into_projection_image(
         // existing horizontal convergence offset. The headset projection
         // instead uses the exact raw FOV/imageRect and already contains both
         // scene placement and Quest-reference convergence geometrically.
-        const int32_t scene_shift_x_in_source = headset_projection
+        const int32_t scene_shift_x_in_source =
+            (headset_projection || cinema_projection)
             ? 0
             : static_cast<int32_t>(lroundf(
                 static_cast<float>(projection_eye_shifts_x_px[eye]) *
                 static_cast<float>(source_descs[eye].Width) /
                 static_cast<float>(std::max(target_width, 1u))));
-        const int32_t scene_shift_y_in_source = headset_projection
+        const int32_t scene_shift_y_in_source =
+            (headset_projection || cinema_projection)
             ? 0
             : static_cast<int32_t>(lroundf(
                 static_cast<float>(projection_eye_shifts_y_px[eye]) *
@@ -32705,16 +32962,30 @@ bool composite_mode3_hud_into_projection_image(
                 static_cast<float>(std::max(target_height, 1u))));
         const int32_t source_shift_x = headset_projection
             ? 0
+            : cinema_projection
+            ? convergence_shift
             : convergence_shift - scene_shift_x_in_source;
-        const int32_t source_shift_y = headset_projection
+        const int32_t source_shift_y =
+            (headset_projection || cinema_projection)
             ? 0
             : -scene_shift_y_in_source;
-        uint32_t sampling_constants[4]{
+        const float source_aspect =
+            static_cast<float>(source_descs[eye].Width) /
+            static_cast<float>(std::max<UINT>(source_descs[eye].Height, 1));
+        const float hud_scale_x = cinema_projection &&
+                cinema_parameters->use_5x4
+            ? hud_size * source_aspect / 1.25f
+            : hud_size;
+        const float hud_scale_y = hud_size;
+        uint32_t sampling_constants[8]{
             static_cast<uint32_t>(source_shift_x),
             static_cast<uint32_t>(source_shift_y),
             0,
-            headset_projection ? 1u : 0u};
-        memcpy(&sampling_constants[2], &hud_size, sizeof(hud_size));
+            0,
+            headset_projection ? 1u : 0u,
+            0, 0, 0};
+        memcpy(&sampling_constants[2], &hud_scale_x, sizeof(hud_scale_x));
+        memcpy(&sampling_constants[3], &hud_scale_y, sizeof(hud_scale_y));
         g_xr_command_list->SetGraphicsRoot32BitConstants(
             1, static_cast<UINT>(hud_clip_positions[eye].size()),
             hud_clip_positions[eye].data(), 0);
@@ -35584,6 +35855,9 @@ void render_openxr_test_frame(
     int32_t projection_eye_shifts_y_px[2]{};
     bool full_surface_projection{};
     bool cinema_projection_panel_ready{};
+    float cinema_projection_panel_width{};
+    float cinema_projection_panel_height{};
+    bool cinema_projection_uses_5x4{};
     bool submitted = views_valid && frame_state.shouldRender;
     const uint64_t loading_video_scene_pair_floor =
         g_loading_video_scene_pair_floor.load(std::memory_order_acquire);
@@ -35591,12 +35865,18 @@ void render_openxr_test_frame(
         !mode3_stereo_transport_active() ||
         (g_packed_present_cache_valid &&
             g_packed_accepted_pair_id >= loading_video_scene_pair_floor);
-    bool hud_composite_ready = submitted && !spatial_panel_active &&
-        (!cinema_mode || automatic_full_vr_cutscene) &&
+    const auto hud_projection_route = cinema_panel
+        ? Mode3HudProjectionRoute::Cinema
+        : automatic_full_vr_cutscene
+        ? Mode3HudProjectionRoute::FullVr
+        : Mode3HudProjectionRoute::Gameplay;
+    bool hud_composite_ready = submitted && !fullscreen_menu &&
         mode3_stereo_transport_active() &&
         post_loading_stereo_pair_ready &&
         g_mode3_hud_layer_available.load(std::memory_order_acquire) &&
-        mode3_early_hud_pair_ready();
+        mode3_early_hud_pair_ready() &&
+        (!cinema_panel ||
+            mode3_scene_only_output_pair_ready(trace_pair_id));
 
     if (submitted) {
         if (!g_xr_first_frame_logged) {
@@ -36908,23 +37188,25 @@ void render_openxr_test_frame(
                             current_present >= projection_last
                         ? current_present - projection_last
                         : UINT64_MAX;
-                    const bool use_5x4 = g_config.cinema_5x4 &&
+                    cinema_projection_uses_5x4 = g_config.cinema_5x4 &&
                         projection_age <= kCinemaProjectionAspectMaxAge;
-                    const float panel_width =
+                    cinema_projection_panel_width =
                         1.6f * g_config.cinema_scale;
                     const float source_height_over_width = copy_width > 0
                         ? static_cast<float>(copy_height) /
                             static_cast<float>(copy_width)
                         : 1.0f;
-                    const float panel_height = panel_width *
-                        (use_5x4 ? 4.0f / 5.0f
+                    cinema_projection_panel_height =
+                        cinema_projection_panel_width *
+                        (cinema_projection_uses_5x4 ? 4.0f / 5.0f
                                  : source_height_over_width);
                     cinema_projection_panel_ready =
                         render_anchored_cinema_projection(
                             swapchain, image_index,
                             cinema_sources, current_panel_views,
                             cinema_projection_anchor,
-                            panel_width, panel_height);
+                            cinema_projection_panel_width,
+                            cinema_projection_panel_height);
                 }
 
                 copied_game = fit_projection_ready;
@@ -37274,7 +37556,8 @@ void render_openxr_test_frame(
         // XR image in render-target state. Blend the latest HUD into each
         // matching slice before closing this same command list, then submit
         // only the projection layer so scene, markers and HUD share one pose.
-        if (command_list_recording && submitted && hud_composite_ready) {
+        if (command_list_recording && submitted && hud_composite_ready &&
+            (!cinema_panel || cinema_projection_panel_ready)) {
             const bool collect_hud_audit =
                 g_config.logging_enabled || g_config.runtime_diagnostics;
             if (collect_hud_audit) {
@@ -37284,6 +37567,13 @@ void render_openxr_test_frame(
             // [FIX:SYMMETRIC-SUBIMAGE-COPY 4/4] Direct presentation keeps the
             // scene and HUD at their original 1:1 placement; OpenXR crops both
             // together. Only the filtered fallback needs the oversized fit.
+            const CinemaHudProjectionParameters cinema_hud_parameters{
+                current_panel_views,
+                &cinema_projection_anchor,
+                cinema_projection_panel_width,
+                cinema_projection_panel_height,
+                cinema_projection_uses_5x4,
+                !manual_cinema};
             const bool hud_composited =
                 composite_mode3_hud_into_projection_image(
                 swapchain, image_index, projection_image_rect,
@@ -37294,7 +37584,8 @@ void render_openxr_test_frame(
                 projection_eye_shifts_x_px,
                 projection_eye_shifts_y_px,
                 projection_views.data(),
-                trace_pair_id, automatic_full_vr_cutscene);
+                trace_pair_id, hud_projection_route,
+                cinema_panel ? &cinema_hud_parameters : nullptr);
             if (hud_composited) {
                 if (collect_hud_audit) {
                     g_mode3_hud_composite_success.fetch_add(
