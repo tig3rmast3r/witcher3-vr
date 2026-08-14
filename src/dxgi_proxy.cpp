@@ -1670,6 +1670,23 @@ bool native_asymmetric_noaa_route_active() {
         std::fabs(g_config.presentation_scale - 1.0f) <= 0.0001f;
 }
 
+// [FIX:CINEMA-EFFECT-CENTER-GUARD V1135] A normal Cinema presentation renders
+// a symmetric stereo camera into an anchored panel.  The native asymmetric
+// center correction belongs only to headset projection; applying it to that
+// panel makes automatic fire/smoke jump when mouse rotation changes the scene
+// camera.  Manual F10 Cinema is always a panel, while automatic Full VR keeps
+// the asymmetric correction.
+bool native_asymmetric_cinema_panel_active() {
+    return g_force_mono_cinema.load(std::memory_order_relaxed) ||
+        (g_cinema_mode_active.load(std::memory_order_relaxed) &&
+            !g_config.cinema_full_vr);
+}
+
+bool native_asymmetric_transparent_center_route_active() {
+    return native_asymmetric_noaa_route_active() &&
+        !native_asymmetric_cinema_panel_active();
+}
+
 NativeAsymmetricPairSlot* native_asymmetric_pair_slot(uint64_t pair_id) {
     if (pair_id == 0 || pair_id == UINT64_MAX) {
         return nullptr;
@@ -14988,7 +15005,9 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
         g_set_pipeline_state != nullptr &&
         g_set_graphics_root_descriptor_table != nullptr) {
         ID3D12PipelineState* variant_pipeline{};
-        const bool asymmetric_center = real_smoke_center_fix_route_active();
+        const bool asymmetric_center =
+            real_smoke_center_fix_route_active() &&
+            !native_asymmetric_cinema_panel_active();
         const bool variant_selected = asymmetric_center
             ? select_real_smoke_offaxis_pipeline(
                 command_list, variant_pipeline)
@@ -15023,7 +15042,7 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
     // restore the original PSO immediately afterward.
     ID3D12PipelineState* focus_fire_original{};
     ID3D12PipelineState* focus_fire_selected{};
-    if (native_asymmetric_noaa_route_active()) {
+    if (native_asymmetric_transparent_center_route_active()) {
         focus_fire_original = load_command_list_pipeline(command_list);
         focus_fire_selected = resolve_focus_fire_horizontal_draw_pso(
             command_list, focus_fire_original);
@@ -16051,6 +16070,14 @@ void STDMETHODCALLTYPE hook_draw_instanced(
     // draw independent of that backend cadence: once a retained pair exists,
     // replace any known member of the HUD PSO family at draw time as well.
     if (g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        // [FIX:CINEMA-MENU-HUD-GUARD V1135] Match the already-correct
+        // SetPipelineState route.  During pause/inventory the menu quad owns
+        // REDengine's original UI composite; replacing it at draw time with
+        // scene-only drops the zoom animation and right-side text.  Keep the
+        // Cinema latch itself armed so closing the menu restores the panel.
+        !g_engine_loading_screen_video_active.load(
+            std::memory_order_acquire) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
         mode3_stereo_transport_active() &&
         (g_force_mono_cinema.load(std::memory_order_relaxed) ||
             !g_config.cinema_full_vr) &&
@@ -32799,7 +32826,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1134 base=V1133 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 native_stereo_taau_trial=1 native_stereo_dlss=0 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1135 base=V1134 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 native_stereo_taau_trial=1 native_stereo_dlss=0 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
