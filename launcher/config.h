@@ -96,6 +96,7 @@ private:
 const ModeSettings& SettingsForMode(RenderMode mode);
 const wchar_t* ModeDisplayName(RenderMode mode);
 bool ModeUsesDlss(RenderMode mode);
+bool ModeUsesStereo(RenderMode mode);
 std::optional<int> DlssNearSquareCompatibleWidth(const LauncherState& state);
 int CinemaHudConvergenceShift(float hud_scale, int offset);
 int FullVrHudConvergenceShift(float hud_scale, int offset);

@@ -786,6 +786,12 @@ bool ModeUsesDlss(RenderMode mode) {
         mode == RenderMode::StereoDlssSequential;
 }
 
+bool ModeUsesStereo(RenderMode mode) {
+    return mode == RenderMode::StereoNone ||
+        mode == RenderMode::StereoTaau ||
+        mode == RenderMode::StereoDlssSequential;
+}
+
 int CinemaHudConvergenceShift(float hud_scale, int offset) {
     return ProportionalHudConvergenceShift(
         hud_scale, kCinemaHudReferenceScale,
@@ -1158,9 +1164,10 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "render_width", std::to_string(state.width));
     vr_ini.Set("openxr", "render_height", std::to_string(state.height));
     // Native asymmetric geometry is independent from the presentation route.
-    // It remains valid only for Stereo No AA and keeps its 1:1 source scale.
+    // Keep its 1:1 source scale in every stereo mode; renderer support is
+    // introduced one temporal backend at a time.
     const bool native_stereo_active =
-        state.native_stereo && state.mode == RenderMode::StereoNone;
+        state.native_stereo && ModeUsesStereo(state.mode);
     vr_ini.Set("openxr", "native_stereo",
         native_stereo_active ? "1" : "0");
     vr_ini.Set("openxr", "fullscreen_projection",

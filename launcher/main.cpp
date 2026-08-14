@@ -242,8 +242,8 @@ void UpdateModeControls() {
     const int selected = static_cast<int>(SendMessageW(Item(IdMode), CB_GETCURSEL, 0, 0));
     const bool dlss = selected >= 0 && w3vr::ModeUsesDlss(static_cast<RenderMode>(selected));
     EnableWindow(Item(IdDlssQuality), dlss);
-    const bool native_stereo_available =
-        selected == static_cast<int>(RenderMode::StereoNone);
+    const bool native_stereo_available = selected >= 0 &&
+        w3vr::ModeUsesStereo(static_cast<RenderMode>(selected));
     EnableWindow(Item(IdNativeStereo), native_stereo_available);
     const bool native_stereo_active = native_stereo_available &&
         SendMessageW(Item(IdNativeStereo), BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -922,7 +922,7 @@ void CreateInterface(HWND window) {
         IdAlternatePresentationResize);
 
     AddControl(L"BUTTON",
-        L"Native Stereo (Stereo no AA only, Experimental)",
+        L"Native Stereo (All stereo modes, Experimental)",
         BS_AUTOCHECKBOX | WS_TABSTOP, 38, 752, 610, 26,
         IdNativeStereo);
 

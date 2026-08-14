@@ -216,13 +216,14 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "unrelated DLC flag not preserved");
         Require(vr.Get("openxr", "hud_stereo_shift_px") == "-9",
             "wrong zero-relative convergence conversion");
+        const bool expected_native_stereo =
+            w3vr::ModeUsesStereo(state.mode);
         Require(vr.Get("openxr", "presentation_scale") ==
-            std::string(state.mode == w3vr::RenderMode::StereoNone
-                ? "1.000" : "0.850"),
+            std::string(expected_native_stereo ? "1.000" : "0.850"),
             "native stereo presentation-scale contract mismatch");
         Require(vr.Get("openxr", "native_stereo") ==
-            std::string(state.mode == w3vr::RenderMode::StereoNone ? "1" : "0"),
-            "native stereo must be limited to Stereo No AA");
+            std::string(expected_native_stereo ? "1" : "0"),
+            "native stereo must remain enabled in every stereo mode");
         Require(vr.Get("openxr", "fullscreen_projection") == "1",
             "fullscreen projection must remain available in every render mode");
         Require(vr.Get("openxr", "alternate_presentation_resize") == "1",
@@ -314,7 +315,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(loaded.state.width == state.width && loaded.state.height == state.height,
             "round-trip resolution mismatch");
         Require(loaded.state.native_stereo ==
-            (state.mode == w3vr::RenderMode::StereoNone),
+            w3vr::ModeUsesStereo(state.mode),
             "round-trip native stereo mode gate mismatch");
         Require(loaded.state.fullscreen_projection,
             "round-trip fullscreen projection mismatch");

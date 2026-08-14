@@ -372,13 +372,14 @@ bool effect_gpu_probe_available() {
 
 // [FIX:REAL-SMOKE-RELEASE-ROUTE V1070] The V1065-V1069 center correction is
 // rendering behavior, not a diagnostic probe. Keep the minimal CBV/upload
-// metadata authority alive for the accepted native asymmetric No-AA route even
-// when the launcher disables Diagnostic Logging.
+// metadata authority alive for the native asymmetric route even when the
+// launcher disables Diagnostic Logging. V1124 extends this authority to TAAU.
 bool real_smoke_center_fix_route_active() {
     return g_config.openxr_enabled &&
         g_config.native_stereo &&
         g_config.openxr_mode == 3 &&
-        g_config.temporal_backend == TemporalBackend::None &&
+        (g_config.temporal_backend == TemporalBackend::None ||
+            g_config.temporal_backend == TemporalBackend::Taau) &&
         g_config.hmd_freelook &&
         fabsf(g_config.presentation_scale - 1.0f) <= 0.0005f;
 }
@@ -1657,10 +1658,14 @@ std::atomic<uint32_t> g_native_asymmetric_present_logs{};
 std::atomic<uint32_t> g_native_asymmetric_rejected_pair_logs{};
 
 bool native_asymmetric_noaa_route_active() {
+    // [TRIAL:NATIVE-STEREO-TAAU V1124] Reuse the validated native-asymmetric
+    // geometry ledger with TAAU while leaving both DLSS routes excluded. TAAU
+    // is the only new renderer variable in this build.
     return kNativeAsymmetricNoAaTrialBuild &&
         g_config.native_stereo &&
         g_config.openxr_mode == 3 &&
-        g_config.temporal_backend == TemporalBackend::None &&
+        (g_config.temporal_backend == TemporalBackend::None ||
+            g_config.temporal_backend == TemporalBackend::Taau) &&
         g_config.hmd_freelook &&
         std::fabs(g_config.presentation_scale - 1.0f) <= 0.0001f;
 }
@@ -3409,6 +3414,8 @@ constexpr UINT kTaauCbvOffset = 0;
 constexpr UINT kTaauSrvOffset = 16;
 constexpr UINT kTaauUavOffset = 32;
 constexpr UINT kTaauDummyUavOffset = 48;
+constexpr UINT64 kTaauPrivateCb10Stride = 512;
+constexpr size_t kTaauPrivateCb10Bytes = 512;
 struct TaauOverrideSlot {
     ID3D12DescriptorHeap* heap{};
     std::atomic<uint64_t> fence_value{};
@@ -3417,6 +3424,8 @@ struct TaauOverrideSlot {
 constexpr size_t kTaauOverrideSlotCount = 64;
 std::array<TaauOverrideSlot, kTaauOverrideSlotCount> g_taau_override_slots{};
 ID3D12Resource* g_taau_invalid_mvec_texture{};
+ID3D12Resource* g_taau_private_cb10_upload{};
+uint8_t* g_taau_private_cb10_mapped{};
 UINT g_taau_descriptor_increment{};
 std::once_flag g_taau_override_once{};
 
@@ -15859,6 +15868,32 @@ bool ensure_taau_matrix_fallback_resources() {
             return;
         }
 
+        D3D12_HEAP_PROPERTIES upload_heap{};
+        upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        upload_heap.CreationNodeMask = 1;
+        upload_heap.VisibleNodeMask = 1;
+        D3D12_RESOURCE_DESC upload_desc{};
+        upload_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        upload_desc.Width = kTaauPrivateCb10Stride *
+            static_cast<UINT64>(kTaauOverrideSlotCount);
+        upload_desc.Height = 1;
+        upload_desc.DepthOrArraySize = 1;
+        upload_desc.MipLevels = 1;
+        upload_desc.Format = DXGI_FORMAT_UNKNOWN;
+        upload_desc.SampleDesc.Count = 1;
+        upload_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_d3d12_device->CreateCommittedResource(
+                &upload_heap, D3D12_HEAP_FLAG_NONE, &upload_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&g_taau_private_cb10_upload))) ||
+            FAILED(g_taau_private_cb10_upload->Map(
+                0, nullptr,
+                reinterpret_cast<void**>(&g_taau_private_cb10_mapped)))) {
+            log_taau_trace_line(
+                "TAAU matrix fallback failed to create private CB10 upload");
+            return;
+        }
+
         g_taau_descriptor_increment = g_d3d12_device->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
@@ -15883,7 +15918,10 @@ bool ensure_taau_matrix_fallback_resources() {
             static_cast<unsigned long long>(texture_desc.Width), texture_desc.Height);
     });
 
-    if (g_taau_invalid_mvec_texture == nullptr || g_taau_descriptor_increment == 0) {
+    if (g_taau_invalid_mvec_texture == nullptr ||
+        g_taau_private_cb10_upload == nullptr ||
+        g_taau_private_cb10_mapped == nullptr ||
+        g_taau_descriptor_increment == 0) {
         return false;
     }
     return std::all_of(g_taau_override_slots.begin(), g_taau_override_slots.end(),
@@ -16002,7 +16040,10 @@ cbuffer Parameters : register(b0) {
     float4 current_to_previous_corrected_row0;
     float4 current_to_previous_corrected_row1;
     float4 current_to_previous_corrected_row2;
+    // [FIX:NATIVE-STEREO-TAAU-ASYMMETRIC-MOTION-PROJECTION V1133]
+    // xy = optical center in NDC, zw = half tangent span.
     float4 hmd_projection;
+    float2 hmd_depth_planes;
 };
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
@@ -16026,14 +16067,18 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
         previous_ndc.x * 0.5 + 0.5,
         previous_ndc.y * -0.5 + 0.5);
     float2 ndc = float2(source_uv.x * 2.0 - 1.0, 1.0 - source_uv.y * 2.0);
-    float tan_half_y = hmd_projection.x;
-    float tan_half_x = tan_half_y * hmd_projection.y;
-    float near_plane = hmd_projection.z;
-    float far_plane = hmd_projection.w;
+    float2 projection_center_ndc = hmd_projection.xy;
+    float2 projection_half_tangent_span = hmd_projection.zw;
+    float near_plane = hmd_depth_planes.x;
+    float far_plane = hmd_depth_planes.y;
     float linear_depth = near_plane * far_plane /
         max(near_plane + depth * (far_plane - near_plane), 1e-6);
     float3 current_position = float3(
-        ndc.x * tan_half_x, ndc.y * tan_half_y, 1.0) * linear_depth;
+        (ndc.x - projection_center_ndc.x) *
+            projection_half_tangent_span.x,
+        (ndc.y - projection_center_ndc.y) *
+            projection_half_tangent_span.y,
+        1.0) * linear_depth;
     float3 previous_base_position = float3(
         dot(current_to_previous_base_row0.xyz, current_position) +
             current_to_previous_base_row0.w,
@@ -16054,11 +16099,19 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     }
 
     float2 previous_base_ndc = float2(
-        previous_base_position.x / (previous_base_position.z * tan_half_x),
-        previous_base_position.y / (previous_base_position.z * tan_half_y));
+        previous_base_position.x /
+            (previous_base_position.z * projection_half_tangent_span.x) +
+            projection_center_ndc.x,
+        previous_base_position.y /
+            (previous_base_position.z * projection_half_tangent_span.y) +
+            projection_center_ndc.y);
     float2 previous_corrected_ndc = float2(
-        previous_corrected_position.x / (previous_corrected_position.z * tan_half_x),
-        previous_corrected_position.y / (previous_corrected_position.z * tan_half_y));
+        previous_corrected_position.x /
+            (previous_corrected_position.z * projection_half_tangent_span.x) +
+            projection_center_ndc.x,
+        previous_corrected_position.y /
+            (previous_corrected_position.z * projection_half_tangent_span.y) +
+            projection_center_ndc.y);
     float2 previous_base_uv = float2(
         previous_base_ndc.x * 0.5 + 0.5, 0.5 - previous_base_ndc.y * 0.5);
     float2 previous_corrected_uv = float2(
@@ -16120,7 +16173,9 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
         parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         parameters[2].Constants.ShaderRegister = 0;
-        parameters[2].Constants.Num32BitValues = 60;
+        // Two descriptor tables plus 62 DWORD constants exactly fill the
+        // D3D12 root-signature limit of 64 DWORDs.
+        parameters[2].Constants.Num32BitValues = 62;
         parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC root_desc{};
         root_desc.NumParameters = static_cast<UINT>(std::size(parameters));
@@ -16453,6 +16508,81 @@ bool find_taau_hmd_motion_parameters(
     out.matched_eye = current.eye;
     out.matrix_error = best_error;
     out.exact_pair_match = exact_pair_match;
+    return true;
+}
+
+bool derive_taau_private_resolve_jitter(
+    const std::array<uint8_t, kTaauPrivateCb10Bytes>& source,
+    const TaauHmdMotionParameters& motion,
+    float (&pure_jitter)[2],
+    w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor& descriptor) {
+    if (!native_asymmetric_noaa_route_active() ||
+        !temporal_backend_is_taau() ||
+        motion.matched_eye < 0 || motion.matched_eye > 1) {
+        return false;
+    }
+
+    float source_jitter[2]{};
+    float render_extent[2]{};
+    memcpy(source_jitter, source.data(), sizeof(source_jitter));
+    memcpy(render_extent, source.data() + 16, sizeof(render_extent));
+    if (!std::isfinite(source_jitter[0]) ||
+        !std::isfinite(source_jitter[1]) ||
+        !std::isfinite(render_extent[0]) ||
+        !std::isfinite(render_extent[1]) ||
+        render_extent[0] < 256.0f || render_extent[0] > 8192.0f ||
+        render_extent[1] < 256.0f || render_extent[1] > 8192.0f) {
+        return false;
+    }
+
+    const auto* pair_slot = native_asymmetric_pair_slot(
+        motion.matched_pair_id);
+    if (pair_slot == nullptr ||
+        !w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(
+            pair_slot->fov[static_cast<size_t>(motion.matched_eye)],
+            render_extent[0], render_extent[1], descriptor)) {
+        return false;
+    }
+
+    // V1129 runtime proves CB10 keeps writer pixel units with texture-Y sign:
+    // x=centerX+jitterX, y=-(centerY+jitterY). Strip the immutable pair FOV
+    // center in that exact encoding and leave shared TemporalAAData untouched.
+    pure_jitter[0] =
+        source_jitter[0] - descriptor.redengine_center_offset_px_x;
+    pure_jitter[1] =
+        source_jitter[1] + descriptor.redengine_center_offset_px_y;
+    if (!std::isfinite(pure_jitter[0]) ||
+        !std::isfinite(pure_jitter[1]) ||
+        fabsf(pure_jitter[0]) > 1.0f ||
+        fabsf(pure_jitter[1]) > 1.0f) {
+        return false;
+    }
+    return true;
+}
+
+bool write_taau_private_resolve_cb10(
+    uint32_t slot_index,
+    const std::array<uint8_t, kTaauPrivateCb10Bytes>& source,
+    const float (&pure_jitter)[2],
+    D3D12_CPU_DESCRIPTOR_HANDLE destination) {
+    if (slot_index >= kTaauOverrideSlotCount ||
+        g_taau_private_cb10_upload == nullptr ||
+        g_taau_private_cb10_mapped == nullptr) {
+        return false;
+    }
+
+    const UINT64 upload_offset = static_cast<UINT64>(slot_index) *
+        kTaauPrivateCb10Stride;
+    auto* private_data = g_taau_private_cb10_mapped + upload_offset;
+    memset(private_data, 0, static_cast<size_t>(kTaauPrivateCb10Stride));
+    memcpy(private_data, source.data(), source.size());
+    memcpy(private_data, pure_jitter, sizeof(pure_jitter));
+
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc{};
+    cbv_desc.BufferLocation =
+        g_taau_private_cb10_upload->GetGPUVirtualAddress() + upload_offset;
+    cbv_desc.SizeInBytes = static_cast<UINT>(kTaauPrivateCb10Stride);
+    g_d3d12_device->CreateConstantBufferView(&cbv_desc, destination);
     return true;
 }
 
@@ -16927,8 +17057,14 @@ bool dispatch_taau_inplace_marker(
         return false;
     }
 
-    std::array<uint8_t, 10 * 16> cb_data{};
-    if (!copy_gpu_va_bytes(cb10.gpu_va, cb_data.data(), cb_data.size())) {
+    // [FIX:NATIVE-STEREO-TAAU-FULL-512B-CB10 V1132] The native resolve DXIL
+    // consumes 272 bytes through register r16, while REDengine exposes b10
+    // through a 512-byte aligned descriptor. V1131 copied and declared only
+    // 256 bytes, leaving r16 outside the private CBV. Preserve the complete
+    // engine descriptor and patch only its first two floats.
+    std::array<uint8_t, kTaauPrivateCb10Bytes> cb_data{};
+    if (cb10.size_in_bytes < kTaauPrivateCb10Bytes ||
+        !copy_gpu_va_bytes(cb10.gpu_va, cb_data.data(), cb_data.size())) {
         const auto health_failure = g_taau_health_cb10_fail.fetch_add(
             1, std::memory_order_relaxed) + 1;
         log_taau_early_failure("cb10", health_failure);
@@ -16938,13 +17074,14 @@ bool dispatch_taau_inplace_marker(
                 taau_drop_diagnostics_active()) &&
             (taau_drop_diagnostics_active() ||
                 failure <= 16 || failure % 120 == 0)) {
-            log_taau_trace_line("TAAU b10 snapshot skipped failure=%u present=%llu gpuva=0x%llX",
+            log_taau_trace_line("TAAU b10 snapshot skipped failure=%u present=%llu gpuva=0x%llX size=%u required=%zu",
                 failure, static_cast<unsigned long long>(g_present_count.load()),
-                static_cast<unsigned long long>(cb10.gpu_va));
+                static_cast<unsigned long long>(cb10.gpu_va),
+                cb10.size_in_bytes, kTaauPrivateCb10Bytes);
         }
         return false;
     }
-    std::array<uint32_t, 60> constants{};
+    std::array<uint32_t, 62> constants{};
     memcpy(constants.data(), cb_data.data() + 6 * 16, 64);
     memcpy(constants.data() + 16, cb_data.data(), 64);
 
@@ -17432,6 +17569,65 @@ bool dispatch_taau_inplace_marker(
         }
         return false;
     }
+    float private_resolve_jitter[2]{};
+    w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor
+        private_resolve_descriptor{};
+    const bool private_resolve_jitter_required =
+        native_asymmetric_noaa_route_active() && temporal_backend_is_taau();
+    const bool private_resolve_jitter_valid =
+        private_resolve_jitter_required &&
+        derive_taau_private_resolve_jitter(
+            cb_data, hmd_motion, private_resolve_jitter,
+            private_resolve_descriptor);
+    if (private_resolve_jitter_required &&
+        !private_resolve_jitter_valid) {
+        static std::atomic<uint32_t> private_jitter_rejections{};
+        const uint32_t failure = private_jitter_rejections.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (g_config.runtime_diagnostics &&
+            (failure <= 16 || failure % 120 == 0)) {
+            float source_jitter[2]{};
+            float render_extent[2]{};
+            memcpy(source_jitter, cb_data.data(), sizeof(source_jitter));
+            memcpy(render_extent, cb_data.data() + 16,
+                sizeof(render_extent));
+            log_taau_trace_line(
+                "TAAU pair-FOV resolve jitter rejected failure=%u eye=%d pair=%llu source=%.9g,%.9g cb_extent=%.9g,%.9g",
+                failure, hmd_motion.matched_eye,
+                static_cast<unsigned long long>(
+                    hmd_motion.matched_pair_id),
+                source_jitter[0], source_jitter[1],
+                render_extent[0], render_extent[1]);
+        }
+        return false;
+    }
+    if (private_resolve_jitter_valid) {
+        // The custom motion-vector composition and the native TAAU resolve must
+        // consume the same pure sampling jitter. Neither write touches the
+        // shared REDengine TemporalAAData used by world materials.
+        memcpy(constants.data() + 16, private_resolve_jitter,
+            sizeof(private_resolve_jitter));
+        static std::atomic<uint32_t> private_jitter_logs{};
+        const uint32_t sample = private_jitter_logs.fetch_add(
+            1, std::memory_order_relaxed);
+        if (g_config.runtime_diagnostics && sample < 24) {
+            float source_jitter[2]{};
+            float render_extent[2]{};
+            memcpy(source_jitter, cb_data.data(), sizeof(source_jitter));
+            memcpy(render_extent, cb_data.data() + 16,
+                sizeof(render_extent));
+            log_taau_trace_line(
+                "TAAU pair-FOV resolve jitter sample=%u eye=%d pair=%llu source=%.9g,%.9g center=%.9g,%.9g pure=%.9g,%.9g cb_extent=%.9g,%.9g",
+                sample + 1, hmd_motion.matched_eye,
+                static_cast<unsigned long long>(
+                    hmd_motion.matched_pair_id),
+                source_jitter[0], source_jitter[1],
+                private_resolve_descriptor.redengine_center_offset_px_x,
+                private_resolve_descriptor.redengine_center_offset_px_y,
+                private_resolve_jitter[0], private_resolve_jitter[1],
+                render_extent[0], render_extent[1]);
+        }
+    }
     if (g_config.openxr_mode == 2) {
         constexpr uint64_t kMonoTaauStaleCameraAge = 4;
         constexpr uint64_t kMonoTaauFreshCameraAge = 2;
@@ -17570,7 +17766,7 @@ bool dispatch_taau_inplace_marker(
             static_cast<unsigned long long>(hmd_motion.matched_pair_id),
             hmd_motion.matrix_error);
     }
-    float hmd_constants[28]{};
+    float hmd_constants[30]{};
     memcpy(hmd_constants, hmd_motion.current_to_previous_base.data(), 12 * sizeof(float));
     memcpy(hmd_constants + 12, hmd_motion.current_to_previous_corrected.data(),
         12 * sizeof(float));
@@ -17581,10 +17777,24 @@ bool dispatch_taau_inplace_marker(
         // This row translation is otherwise unused by the correction output.
         hmd_constants[15] = 1.0f;
     }
-    const float projection_constants[4] = {
+    const float symmetric_half_tangent_y =
         tanf(hmd_motion.vertical_fov_degrees *
-            (3.14159265358979323846f / 360.0f)),
-        hmd_motion.aspect,
+            (3.14159265358979323846f / 360.0f));
+    // V1132 proved that pose/pair timing is exact. Its remaining head-motion
+    // scale/shift came from reconstructing rays around symmetric NDC zero even
+    // when native stereo rendered an off-axis frustum. Use the same immutable
+    // pair-FOV descriptor already validated for the private resolve jitter.
+    const float projection_constants[6] = {
+        private_resolve_jitter_valid
+            ? private_resolve_descriptor.center_ndc_x : 0.0f,
+        private_resolve_jitter_valid
+            ? private_resolve_descriptor.center_ndc_y : 0.0f,
+        private_resolve_jitter_valid
+            ? private_resolve_descriptor.horizontal_tangent_span * 0.5f
+            : symmetric_half_tangent_y * hmd_motion.aspect,
+        private_resolve_jitter_valid
+            ? private_resolve_descriptor.vertical_tangent_span * 0.5f
+            : symmetric_half_tangent_y,
         hmd_motion.near_plane,
         hmd_motion.far_plane};
     memcpy(hmd_constants + 24, projection_constants, sizeof(projection_constants));
@@ -17827,6 +18037,34 @@ bool dispatch_taau_inplace_marker(
             copy_table(kTaauCbvOffset, 14, source_cbv);
             copy_table(kTaauSrvOffset, 16, source_srv);
             copy_table(kTaauUavOffset, 4, source_uav);
+
+            // [FIX:NATIVE-STEREO-TAAU-FULL-512B-CB10 V1132]
+            // Override only b10 in this resolve-private descriptor block.
+            // Shared engine temporal data keeps center+jitter for terrain and
+            // world passes.
+            D3D12_CPU_DESCRIPTOR_HANDLE private_cb10_cpu{
+                private_cpu.ptr + static_cast<SIZE_T>(kTaauCbvOffset + 10) *
+                    g_taau_descriptor_increment};
+            const bool private_resolve_cb10_written =
+                private_resolve_jitter_valid &&
+                write_taau_private_resolve_cb10(
+                    slot_index, cb_data, private_resolve_jitter,
+                    private_cb10_cpu);
+            if (native_asymmetric_noaa_route_active() &&
+                temporal_backend_is_taau() && !private_resolve_cb10_written) {
+                static std::atomic<uint32_t> private_cb10_failures{};
+                const uint32_t failure = private_cb10_failures.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                if (g_config.runtime_diagnostics &&
+                    (failure <= 16 || failure % 120 == 0)) {
+                    log_taau_trace_line(
+                        "TAAU private resolve CB10 rejected failure=%u eye=%d pair=%llu slot=%u",
+                        failure, hmd_motion.matched_eye,
+                        static_cast<unsigned long long>(
+                            hmd_motion.matched_pair_id),
+                        slot_index);
+                }
+            }
 
             if (history_was_initialized) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC history_srv{};
@@ -19867,7 +20105,19 @@ void __fastcall hook_engine_temporal_writer(
         w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(
             native_asymmetric_pair_fov,
             value2, value3, native_asymmetric_descriptor);
-    if (native_asymmetric_center_applied) {
+    // [FIX:NATIVE-STEREO-TAAU-PAIR-FOV-RESOLVE-JITTER V1130] The raw TAAU
+    // writer rebuilds the scene projection and publishes shared temporal data
+    // reused by world materials. Keep center+jitter in both here. V1127 restored
+    // these shared fields to pure jitter immediately after the rebuild, which
+    // aligned the final resolve but detached terrain/material sampling from the
+    // scene projection. V1130 removes the pair-FOV center only from the private
+    // resolve CB10 using the runtime-proven pixel/texture-Y encoding.
+    constexpr uintptr_t kTaauCenteredTemporalWriterReturnRva = 0x01D87EC0;
+    const bool taau_center_already_applied =
+        temporal_backend_is_taau() &&
+        caller_rva == kTaauCenteredTemporalWriterReturnRva;
+    if (native_asymmetric_center_applied &&
+        !taau_center_already_applied) {
         routed_value0 +=
             native_asymmetric_descriptor.redengine_center_offset_px_x;
         routed_value1 +=
@@ -19998,6 +20248,8 @@ void __fastcall hook_engine_temporal_writer(
         temporal_data, routed_value0, routed_value1, value2, value3);
     float native_primary_post_center[2]{NAN, NAN};
     float native_secondary_post_center[2]{NAN, NAN};
+    const float native_expected_post_value0 = routed_value0;
+    const float native_expected_post_value1 = routed_value1;
     const bool native_asymmetric_post_center_valid =
         native_asymmetric_tag_valid && temporal_bytes != nullptr &&
         safe_copy_asymmetric_authority(
@@ -20006,13 +20258,13 @@ void __fastcall hook_engine_temporal_writer(
         safe_copy_asymmetric_authority(
             temporal_bytes + 0x920, native_secondary_post_center,
             sizeof(native_secondary_post_center)) &&
-        memcmp(native_primary_post_center, &routed_value0,
+        memcmp(native_primary_post_center, &native_expected_post_value0,
             sizeof(float)) == 0 &&
-        memcmp(native_primary_post_center + 1, &routed_value1,
+        memcmp(native_primary_post_center + 1, &native_expected_post_value1,
             sizeof(float)) == 0 &&
-        memcmp(native_secondary_post_center, &routed_value0,
+        memcmp(native_secondary_post_center, &native_expected_post_value0,
             sizeof(float)) == 0 &&
-        memcmp(native_secondary_post_center + 1, &routed_value1,
+        memcmp(native_secondary_post_center + 1, &native_expected_post_value1,
             sizeof(float)) == 0;
     if (native_asymmetric_writer_probe_valid &&
         native_asymmetric_post_center_valid &&
@@ -20035,14 +20287,23 @@ void __fastcall hook_engine_temporal_writer(
                 true, std::memory_order_release);
         }
     }
+    const bool taau_projection_center_preserved =
+        !temporal_backend_is_taau() ||
+        (taau_center_already_applied &&
+            fabsf(routed_value0 - native_asymmetric_descriptor.
+                redengine_center_offset_px_x) <= 0.0001f &&
+            fabsf(routed_value1 - native_asymmetric_descriptor.
+                redengine_center_offset_px_y) <= 0.0001f);
     if (native_asymmetric_center_applied &&
         native_asymmetric_post_center_valid &&
         native_asymmetric_slot != nullptr &&
         native_asymmetric_slot->pair_id.load(
             std::memory_order_acquire) ==
                 native_asymmetric_tag.pair_id) {
-        native_asymmetric_slot->temporal_mask.fetch_or(
-            native_asymmetric_eye_bit, std::memory_order_release);
+        if (taau_projection_center_preserved) {
+            native_asymmetric_slot->temporal_mask.fetch_or(
+                native_asymmetric_eye_bit, std::memory_order_release);
+        }
         const uint32_t log_index =
             g_native_asymmetric_temporal_logs.fetch_add(
                 1, std::memory_order_relaxed);
@@ -32264,7 +32525,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1123 base=V1122 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1133 base=V1132 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 native_stereo_taau_trial=1 native_stereo_dlss=0 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
