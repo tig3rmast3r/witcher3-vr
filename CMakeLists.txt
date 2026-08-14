@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1136.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1137.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -39,9 +39,12 @@ target_include_directories(minhook PUBLIC
 )
 
 add_library(witcher3vr_dxgi SHARED
+    src/aer_scheduler.cpp
     src/dxgi_proxy.cpp
     src/dxgi_proxy.def
     src/openxr_eye_geometry.cpp
+    src/puredark_afw_bridge.cpp
+    src/puredark_afw_camera.cpp
 )
 target_compile_definitions(witcher3vr_dxgi PRIVATE
     WIN32_LEAN_AND_MEAN
@@ -63,6 +66,41 @@ set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
+    add_executable(w3vr_aer_scheduler_tests
+        tests/aer_scheduler_tests.cpp
+        src/aer_scheduler.cpp
+    )
+    target_include_directories(w3vr_aer_scheduler_tests PRIVATE src)
+    add_test(NAME renderer_aer_scheduler COMMAND w3vr_aer_scheduler_tests)
+
+    add_executable(w3vr_puredark_afw_bridge_tests
+        tests/puredark_afw_bridge_tests.cpp
+        src/puredark_afw_bridge.cpp
+    )
+    target_include_directories(w3vr_puredark_afw_bridge_tests PRIVATE src)
+    target_compile_definitions(w3vr_puredark_afw_bridge_tests PRIVATE
+        UNICODE
+        _UNICODE
+    )
+    target_link_libraries(w3vr_puredark_afw_bridge_tests PRIVATE
+        d3d12
+        dxgi
+    )
+    add_test(NAME renderer_puredark_afw_bridge
+        COMMAND w3vr_puredark_afw_bridge_tests)
+
+    add_executable(w3vr_puredark_afw_camera_tests
+        tests/puredark_afw_camera_tests.cpp
+        src/puredark_afw_camera.cpp
+    )
+    target_include_directories(w3vr_puredark_afw_camera_tests PRIVATE src)
+    target_compile_definitions(w3vr_puredark_afw_camera_tests PRIVATE
+        UNICODE
+        _UNICODE
+    )
+    add_test(NAME renderer_puredark_afw_camera
+        COMMAND w3vr_puredark_afw_camera_tests)
+
     add_executable(w3vr_openxr_eye_geometry_tests
         tests/openxr_eye_geometry_tests.cpp
         src/openxr_eye_geometry.cpp

@@ -8,9 +8,9 @@
 namespace w3vr {
 
 enum class RenderMode {
-    MonoNone,
-    MonoTaau,
-    MonoDlss,
+    AerAfwNone,
+    AerAfwTaau,
+    AerAfwDlss,
     StereoNone,
     StereoTaau,
     StereoDlssSequential,
@@ -19,6 +19,7 @@ enum class RenderMode {
 struct ModeSettings {
     int openxr_mode{};
     bool dual_render{};
+    bool mode3_aer_presentation{};
     const char* temporal_backend{};
     int aa_mode{};
     bool allow_dlss{};

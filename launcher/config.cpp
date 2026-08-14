@@ -17,15 +17,15 @@ namespace w3vr {
 namespace {
 
 constexpr std::array<ModeSettings, 6> kModes{{
-    {2, false, "none", 0, false},
-    {2, false, "taau", 3, false},
-    {2, false, "dlss", 6, true},
-    {3, true, "none", 0, false},
-    {3, true, "taau", 3, false},
-    {3, true, "dlss", 6, true},
+    {3, true, true, "none", 0, false},
+    {3, true, true, "taau", 3, false},
+    {3, true, true, "dlss", 6, true},
+    {3, true, false, "none", 0, false},
+    {3, true, false, "taau", 3, false},
+    {3, true, false, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 7;
+constexpr int kCurrentConfigVersion = 8;
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
 constexpr float kFullVrHudReferenceScale = 1.00f;
@@ -230,6 +230,25 @@ void MigrateConfigurationToV7(IniDocument& ini) {
     ini.Set("openxr", "fullscreen_projection", "0");
     ini.Set("openxr", "alternate_presentation_resize", "0");
     RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "7");
+}
+
+void MigrateConfigurationToV8(IniDocument& ini) {
+    // AER and Stereo now share the validated Mode-3 producer. Preserve the old
+    // launcher family across migration: legacy Mode 1/2 becomes Mode-3 AER,
+    // while an existing Mode 3/4 configuration remains strict Stereo.
+    const int legacy_mode = ReadInt(ini, "openxr", "mode", 3);
+    const bool legacy_aer = legacy_mode == 1 || legacy_mode == 2;
+    const bool aer_presentation = ReadBool(
+        ini, "openxr", "mode3_aer_presentation", legacy_aer);
+    ini.Set("openxr", "mode3_aer_presentation",
+        aer_presentation ? "1" : "0");
+    if (legacy_aer) {
+        ini.Set("openxr", "mode", "3");
+        ini.Set("engine", "dual_render_probe", "1");
+        ini.Set("engine", "dual_render_start", "1");
+    }
+    RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
 
@@ -264,11 +283,14 @@ std::wstring LastErrorMessage(const wchar_t* operation,
 }
 
 std::optional<RenderMode> ExactMode(int xr_mode, bool dual_probe,
-    bool dual_start, const std::string& backend, int aa_mode, bool allow_dlss) {
+    bool dual_start, bool mode3_aer_presentation,
+    const std::string& backend, int aa_mode, bool allow_dlss) {
     for (size_t i = 0; i < kModes.size(); ++i) {
         const auto& mode = kModes[i];
         if (mode.openxr_mode == xr_mode && mode.dual_render == dual_probe &&
-            mode.dual_render == dual_start && mode.temporal_backend == backend &&
+            mode.dual_render == dual_start &&
+            mode.mode3_aer_presentation == mode3_aer_presentation &&
+            mode.temporal_backend == backend &&
             mode.aa_mode == aa_mode && mode.allow_dlss == allow_dlss) {
             return static_cast<RenderMode>(i);
         }
@@ -276,12 +298,15 @@ std::optional<RenderMode> ExactMode(int xr_mode, bool dual_probe,
     return std::nullopt;
 }
 
-RenderMode BestEffortMode(int xr_mode, const std::string& backend) {
-    const bool stereo = xr_mode == 3 || xr_mode == 4;
-    if (backend == "taau") return stereo ? RenderMode::StereoTaau : RenderMode::MonoTaau;
+RenderMode BestEffortMode(
+    int xr_mode,
+    bool mode3_aer_presentation,
+    const std::string& backend) {
+    const bool aer = mode3_aer_presentation || xr_mode == 1 || xr_mode == 2;
+    if (backend == "taau") return aer ? RenderMode::AerAfwTaau : RenderMode::StereoTaau;
     if (backend == "dlss_packed") return RenderMode::StereoDlssSequential;
-    if (backend == "dlss") return stereo ? RenderMode::StereoDlssSequential : RenderMode::MonoDlss;
-    return stereo ? RenderMode::StereoNone : RenderMode::MonoNone;
+    if (backend == "dlss") return aer ? RenderMode::AerAfwDlss : RenderMode::StereoDlssSequential;
+    return aer ? RenderMode::AerAfwNone : RenderMode::StereoNone;
 }
 
 struct EditableTextLine {
@@ -775,19 +800,25 @@ const ModeSettings& SettingsForMode(RenderMode mode) {
 
 const wchar_t* ModeDisplayName(RenderMode mode) {
     constexpr const wchar_t* names[]{
-        L"Mono - No AA / FXAA", L"Mono - TAAU", L"Mono - DLSS",
+        L"AER - No AA / FXAA", L"AER - TAAU",
+        L"AER - DLSS",
         L"Stereo - No AA / FXAA", L"Stereo - TAAU",
         L"Stereo - DLSS"};
     return names[static_cast<size_t>(mode)];
 }
 
 bool ModeUsesDlss(RenderMode mode) {
-    return mode == RenderMode::MonoDlss ||
+    return mode == RenderMode::AerAfwDlss ||
         mode == RenderMode::StereoDlssSequential;
 }
 
 bool ModeUsesStereo(RenderMode mode) {
-    return mode == RenderMode::StereoNone ||
+    // Both launcher families now use Mode-3 geometry stereo. AER changes only
+    // producer/publication cadence, so native stereo remains available to all.
+    return mode == RenderMode::AerAfwNone ||
+        mode == RenderMode::AerAfwTaau ||
+        mode == RenderMode::AerAfwDlss ||
+        mode == RenderMode::StereoNone ||
         mode == RenderMode::StereoTaau ||
         mode == RenderMode::StereoDlssSequential;
 }
@@ -914,6 +945,9 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         }
         if (existing_version < 7) {
             MigrateConfigurationToV7(migrated);
+        }
+        if (existing_version < 8) {
+            MigrateConfigurationToV8(migrated);
         }
         return AtomicWriteWithBackup(paths.vr_ini, migrated.Serialize(), error);
     }
@@ -1055,17 +1089,28 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     }
 
     const int xr_mode = ReadInt(*vr, "openxr", "mode", 3);
+    const bool mode3_aer_presentation = ReadBool(
+        *vr, "openxr", "mode3_aer_presentation",
+        xr_mode == 1 || xr_mode == 2);
     const bool dual_probe = ReadBool(*vr, "engine", "dual_render_probe", true);
     const bool dual_start = ReadBool(*vr, "engine", "dual_render_start", true);
     const auto backend = ReadString(*vr, "engine", "temporal_backend", "none");
     const bool dlss_dlaa = ReadBool(*vr, "engine", "dlss_dlaa", false);
     const int aa_mode = ReadInt(*game, "PostProcess", "AAMode", 0);
     const bool allow_dlss = ReadBool(*game, "Rendering", "AllowDLSS", false);
-    if (const auto exact = ExactMode(xr_mode, dual_probe, dual_start, backend,
-            aa_mode, allow_dlss)) {
+    // Legacy Mode 1/2 is represented as Mode-3 AER in memory even if a user
+    // bypassed the V8 migration writer.
+    const bool legacy_aer_mode = xr_mode == 1 || xr_mode == 2;
+    const int launcher_xr_mode = legacy_aer_mode ? 3 : xr_mode;
+    const bool launcher_dual_probe = legacy_aer_mode ? true : dual_probe;
+    const bool launcher_dual_start = legacy_aer_mode ? true : dual_start;
+    if (const auto exact = ExactMode(
+            launcher_xr_mode, launcher_dual_probe, launcher_dual_start,
+            mode3_aer_presentation, backend, aa_mode, allow_dlss)) {
         result.state.mode = *exact;
     } else {
-        result.state.mode = BestEffortMode(xr_mode, backend);
+        result.state.mode = BestEffortMode(
+            xr_mode, mode3_aer_presentation, backend);
         result.warning = L"The current AA/stereo settings are inconsistent. "
             L"The closest mode is displayed; no files are changed until Save.";
     }
@@ -1161,6 +1206,8 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
 
     const auto& mode = SettingsForMode(state.mode);
     vr_ini.Set("openxr", "mode", std::to_string(mode.openxr_mode));
+    vr_ini.Set("openxr", "mode3_aer_presentation",
+        mode.mode3_aer_presentation ? "1" : "0");
     vr_ini.Set("openxr", "render_width", std::to_string(state.width));
     vr_ini.Set("openxr", "render_height", std::to_string(state.height));
     // Native asymmetric geometry is independent from the presentation route.

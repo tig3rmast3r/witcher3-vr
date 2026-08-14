@@ -189,6 +189,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         const auto expected = w3vr::SettingsForMode(state.mode);
         Require(vr.Get("openxr", "mode") == std::to_string(expected.openxr_mode),
             "wrong OpenXR mode");
+        Require(vr.Get("openxr", "mode3_aer_presentation") ==
+            std::string(expected.mode3_aer_presentation ? "1" : "0"),
+            "wrong reversible Mode-3 AER flag");
         Require(vr.Get("engine", "temporal_backend") == expected.temporal_backend,
             "wrong temporal backend");
         const bool expected_dlaa =
@@ -263,7 +266,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "manual F10 HUD scale must remain independently tuned");
         Require(vr.Get("openxr", "cinema_5x4") == "1",
             "fixed cinema framing flag missing");
-        Require(vr.Get("meta", "config_version") == "7",
+        Require(vr.Get("meta", "config_version") == "8",
             "configuration version marker missing");
         Require(vr.Get("openxr", "cinema_full_vr") == "1",
             "automatic full-VR cutscene flag missing");
@@ -569,7 +572,7 @@ void TestDlssNearSquareResolutionCompatibility() {
 
     state.width = 2880;
     state.height = 2880;
-    state.mode = w3vr::RenderMode::MonoDlss;
+    state.mode = w3vr::RenderMode::AerAfwDlss;
     state.dlss_quality = 1;
     Require(w3vr::DlssNearSquareCompatibleWidth(state) == 2832,
         "mono scaled DLSS square resolution was not adjusted by 48 pixels");
@@ -610,25 +613,70 @@ void TestDlssNearSquareResolutionCompatibility() {
 }
 
 void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
-    Require(std::wstring(w3vr::ModeDisplayName(w3vr::RenderMode::MonoNone)) ==
-        L"Mono - No AA / FXAA", "mono No AA / FXAA label mismatch");
+    Require(std::wstring(w3vr::ModeDisplayName(w3vr::RenderMode::AerAfwNone)) ==
+        L"AER - No AA / FXAA", "AER No AA / FXAA label mismatch");
+    Require(std::wstring(w3vr::ModeDisplayName(w3vr::RenderMode::AerAfwTaau)) ==
+        L"AER - TAAU", "AER TAAU label mismatch");
+    Require(std::wstring(w3vr::ModeDisplayName(w3vr::RenderMode::AerAfwDlss)) ==
+        L"AER - DLSS", "AER DLSS label mismatch");
     Require(std::wstring(w3vr::ModeDisplayName(w3vr::RenderMode::StereoNone)) ==
         L"Stereo - No AA / FXAA", "stereo No AA / FXAA label mismatch");
     Require(std::wstring(w3vr::ModeDisplayName(
             w3vr::RenderMode::StereoDlssSequential)) ==
         L"Stereo - DLSS", "stereo DLSS label mismatch");
     Require(w3vr::SettingsForMode(w3vr::RenderMode::StereoNone).openxr_mode == 3 &&
+        !w3vr::SettingsForMode(
+            w3vr::RenderMode::StereoNone).mode3_aer_presentation &&
         w3vr::SettingsForMode(w3vr::RenderMode::StereoTaau).openxr_mode == 3 &&
+        !w3vr::SettingsForMode(
+            w3vr::RenderMode::StereoTaau).mode3_aer_presentation &&
         w3vr::SettingsForMode(
-            w3vr::RenderMode::StereoDlssSequential).openxr_mode == 3,
-        "all stereo modes must use OpenXR Mode 3");
-    Require(w3vr::SettingsForMode(w3vr::RenderMode::MonoNone).openxr_mode == 2 &&
-        w3vr::SettingsForMode(w3vr::RenderMode::MonoTaau).openxr_mode == 2 &&
-        w3vr::SettingsForMode(w3vr::RenderMode::MonoDlss).openxr_mode == 2,
-        "all mono modes must use OpenXR Mode 2");
+            w3vr::RenderMode::StereoDlssSequential).openxr_mode == 3 &&
+        !w3vr::SettingsForMode(
+            w3vr::RenderMode::StereoDlssSequential).mode3_aer_presentation,
+        "all Stereo modes must use strict OpenXR Mode 3");
+    const auto aer_none =
+        w3vr::SettingsForMode(w3vr::RenderMode::AerAfwNone);
+    const auto aer_taau =
+        w3vr::SettingsForMode(w3vr::RenderMode::AerAfwTaau);
+    const auto aer_dlss =
+        w3vr::SettingsForMode(w3vr::RenderMode::AerAfwDlss);
+    Require(aer_none.openxr_mode == 3 && aer_none.dual_render &&
+            aer_none.mode3_aer_presentation &&
+            std::string(aer_none.temporal_backend) == "none" &&
+            aer_none.aa_mode == 0 && !aer_none.allow_dlss,
+        "AER No AA must use Mode 3 with per-eye publication");
+    Require(aer_taau.openxr_mode == 3 && aer_taau.dual_render &&
+            aer_taau.mode3_aer_presentation &&
+            std::string(aer_taau.temporal_backend) == "taau" &&
+            aer_taau.aa_mode == 3 && !aer_taau.allow_dlss,
+        "AER TAAU must use Mode 3 with per-eye publication");
+    Require(aer_dlss.openxr_mode == 3 && aer_dlss.dual_render &&
+            aer_dlss.mode3_aer_presentation &&
+            std::string(aer_dlss.temporal_backend) == "dlss" &&
+            aer_dlss.aa_mode == 6 && aer_dlss.allow_dlss,
+        "AER DLSS must use Mode 3 with per-eye publication");
 
     WriteBaseFixtures(paths);
     std::wstring error;
+    auto legacy_vr = w3vr::IniDocument::Load(paths.vr_ini, error);
+    auto legacy_game = w3vr::IniDocument::Load(paths.game_settings, error);
+    Require(legacy_vr.has_value() && legacy_game.has_value(),
+        "legacy Mono fixture load failed");
+    legacy_vr->Set("openxr", "mode", "2");
+    legacy_vr->Set("engine", "temporal_backend", "none");
+    legacy_vr->Set("engine", "dual_render_probe", "0");
+    legacy_vr->Set("engine", "dual_render_start", "0");
+    legacy_game->Set("PostProcess", "AAMode", "0");
+    legacy_game->Set("Rendering", "AllowDLSS", "false");
+    Write(paths.vr_ini, legacy_vr->Serialize());
+    Write(paths.game_settings, legacy_game->Serialize());
+    const auto migrated_mono = w3vr::LoadConfiguration(paths);
+    Require(migrated_mono.warning.empty() &&
+            migrated_mono.state.mode == w3vr::RenderMode::AerAfwNone,
+        "legacy Mono mode must map cleanly to the matching Mode-3 AER slot");
+
+    WriteBaseFixtures(paths);
     auto game = w3vr::IniDocument::Load(paths.game_settings, error);
     Require(game.has_value(), "legacy Auto fixture load failed");
     game->Set("PostProcess", "DLSSQuality", "0");
@@ -684,7 +732,7 @@ void TestFallbackAndAtomicSave(const w3vr::ConfigPaths& paths) {
         "cinema fallback must match menu scale");
 
     w3vr::LauncherState state;
-    state.mode = w3vr::RenderMode::MonoTaau;
+    state.mode = w3vr::RenderMode::AerAfwTaau;
     state.width = 3072;
     state.height = 3216;
     std::wstring error;
@@ -717,9 +765,10 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[meta]\r\n"
-        "config_version=7\r\n"
+        "config_version=8\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
+        "mode3_aer_presentation=0\r\n"
         "render_width=2688\r\n"
         "render_height=2784\r\n"
         "native_stereo=0\r\n"
@@ -768,7 +817,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "migrated INI must not be reported as newly created");
     auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated.has_value(), "migrated INI could not be read");
-    Require(migrated->Get("meta", "config_version") == "7",
+    Require(migrated->Get("meta", "config_version") == "8",
         "old INI was not versioned");
     Require(migrated->Get("openxr", "native_stereo") == "0" &&
         migrated->Get("openxr", "fullscreen_projection") == "0" &&
@@ -777,10 +826,13 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(migrated->Get(
             "focus_projection", "shader_registry_enabled") == "0",
         "shader registry migration default missing");
-    Require(migrated->Get("openxr", "mode") == "2" &&
+    Require(migrated->Get("openxr", "mode") == "3" &&
+        migrated->Get("openxr", "mode3_aer_presentation") == "1" &&
+        migrated->Get("engine", "dual_render_probe") == "1" &&
+        migrated->Get("engine", "dual_render_start") == "1" &&
         migrated->Get("openxr", "render_width") == "3100" &&
         migrated->Get("openxr", "render_height") == "3200",
-        "migration changed mode or resolution");
+        "migration did not convert legacy Mono to Mode-3 AER cleanly");
     Require(migrated->Get("openxr", "cinema_5x4") == "1" &&
         migrated->Get("openxr", "cinema_render_stereo_strength") == "0.250" &&
         migrated->Get("openxr", "cinema_hud_stereo_shift_px") == "-72" &&
@@ -831,10 +883,10 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[engine]\r\n"
         "first_person_stationary_turn=0\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V2-to-V7 migration failed");
+        paths, defaults, created, error), "V2-to-V8 migration failed");
     auto migrated_v4 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_v4.has_value() &&
-        migrated_v4->Get("meta", "config_version") == "7" &&
+        migrated_v4->Get("meta", "config_version") == "8" &&
         migrated_v4->Get("openxr", "cinema_hud_stereo_shift_px") == "-91" &&
         migrated_v4->Get("openxr", "cinema_hud_scale") == "1.100" &&
         migrated_v4->Get("openxr", "full_vr_hud_stereo_shift_px") == "-26" &&
@@ -844,7 +896,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         migrated_v4->Get("engine", "first_person_stationary_turn") == "0" &&
         migrated_v4->Get(
             "focus_projection", "shader_registry_enabled") == "0",
-        "V7 migration changed the Full VR offset or missed registry/HUD defaults");
+        "V8 migration changed the Full VR offset or missed registry/HUD defaults");
 
     Write(paths.vr_ini,
         "[meta]\r\n"
@@ -854,14 +906,14 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "hud_vertical_scale=0.780\r\n"
         "custom_user_value=keep\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V3-to-V7 migration failed");
+        paths, defaults, created, error), "V3-to-V8 migration failed");
     auto migrated_from_v3 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v3.has_value() &&
-        migrated_from_v3->Get("meta", "config_version") == "7" &&
+        migrated_from_v3->Get("meta", "config_version") == "8" &&
         migrated_from_v3->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "hud_vertical_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "custom_user_value") == "keep",
-        "V3-to-V7 HUD migration damaged unrelated settings");
+        "V3-to-V8 HUD migration damaged unrelated settings");
 
     // V6 used fullscreen_projection as Native Stereo. Preserve that choice
     // under the dedicated key without opting the user into a new presenter.
@@ -871,13 +923,14 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[openxr]\r\n"
         "fullscreen_projection=1\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V6-to-V7 migration failed");
+        paths, defaults, created, error), "V6-to-V8 migration failed");
     auto migrated_from_v6 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v6.has_value() &&
-        migrated_from_v6->Get("meta", "config_version") == "7" &&
+        migrated_from_v6->Get("meta", "config_version") == "8" &&
         migrated_from_v6->Get("openxr", "native_stereo") == "1" &&
         migrated_from_v6->Get("openxr", "fullscreen_projection") == "0" &&
-        migrated_from_v6->Get("openxr", "alternate_presentation_resize") == "0",
+        migrated_from_v6->Get("openxr", "alternate_presentation_resize") == "0" &&
+        migrated_from_v6->Get("openxr", "mode3_aer_presentation") == "0",
         "V6 combined flag was not split safely");
 }
 
