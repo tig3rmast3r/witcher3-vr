@@ -56,7 +56,8 @@ enum ControlId {
     IdFirstPersonGamepadHeadFollow,
     IdFirstPersonSnapTurnDegrees,
     IdFirstPersonCombatExit,
-    IdFirstPersonStationaryTurn,
+    IdFirstPersonStrafe,
+    IdFirstPersonAnchorSmoothing,
     IdFastMovementTransitions,
     IdCinemaFullVr,
     IdSteadyIcons,
@@ -357,8 +358,10 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
             Item(IdFirstPersonSnapTurnDegrees), CB_GETCURSEL, 0, 0)));
     state.first_person_combat_exit = SendMessageW(
         Item(IdFirstPersonCombatExit), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    state.first_person_stationary_turn = SendMessageW(
-        Item(IdFirstPersonStationaryTurn), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.first_person_strafe = SendMessageW(
+        Item(IdFirstPersonStrafe), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.first_person_anchor_smoothing = SendMessageW(
+        Item(IdFirstPersonAnchorSmoothing), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.fast_movement_transitions = SendMessageW(
         Item(IdFastMovementTransitions), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_full_vr = SendMessageW(
@@ -666,8 +669,10 @@ void RestoreLauncherDefaults() {
         SnapTurnIndexFor(defaults.first_person_snap_turn_degrees), 0);
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         defaults.first_person_combat_exit ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(Item(IdFirstPersonStationaryTurn), BM_SETCHECK,
-        defaults.first_person_stationary_turn ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonStrafe), BM_SETCHECK,
+        defaults.first_person_strafe ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonAnchorSmoothing), BM_SETCHECK,
+        defaults.first_person_anchor_smoothing ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         defaults.fast_movement_transitions ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
@@ -809,8 +814,11 @@ void PopulateControls() {
     SendMessageW(Item(IdFirstPersonCombatExit), BM_SETCHECK,
         loaded.state.first_person_combat_exit
             ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(Item(IdFirstPersonStationaryTurn), BM_SETCHECK,
-        loaded.state.first_person_stationary_turn
+    SendMessageW(Item(IdFirstPersonStrafe), BM_SETCHECK,
+        loaded.state.first_person_strafe
+            ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdFirstPersonAnchorSmoothing), BM_SETCHECK,
+        loaded.state.first_person_anchor_smoothing
             ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         loaded.state.fast_movement_transitions
@@ -922,9 +930,13 @@ void CreateInterface(HWND window) {
         IdFirstPersonCombatExit);
 
     AddControl(L"BUTTON",
-        L"Turn body while stationary in First Person (Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 656, 590, 26,
-        IdFirstPersonStationaryTurn);
+        L"Strafe Movement in First Person",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 656, 310, 26,
+        IdFirstPersonStrafe);
+    AddControl(L"BUTTON",
+        L"Reduce Head Bobbing (First Person)",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 365, 656, 310, 26,
+        IdFirstPersonAnchorSmoothing);
 
     AddControl(L"BUTTON",
         L"Faster Movement Transitions",

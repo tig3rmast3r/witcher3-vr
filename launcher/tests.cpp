@@ -119,6 +119,9 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "first_person_hmd_body_follow=0\r\n"
         "first_person_combat_exit=0\r\n"
         "first_person_stationary_turn=1\r\n"
+        "first_person_strafe=0\r\n"
+        "first_person_anchor_smoothing=0\r\n"
+        "first_person_anchor_smoothing_seconds=0.125000\r\n"
         "streamline_ps93_learning_log=1\r\n"
         "unrelated_engine=42\r\n"
         "\r\n"
@@ -177,7 +180,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.first_person_gamepad_head_follow = true;
         state.first_person_snap_turn_degrees = 60;
         state.first_person_combat_exit = true;
-        state.first_person_stationary_turn = index % 2 != 0;
+        state.first_person_strafe = index % 2 != 0;
+        state.first_person_anchor_smoothing = index % 2 == 0;
         state.fast_movement_transitions = index % 2 == 0;
         state.native_stereo = true;
         state.fullscreen_projection = true;
@@ -274,7 +278,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             vr.Get("openxr", "cinema_5x4") ==
                 std::string(expected_five_four ? "1" : "0"),
             "Cinema aspect and compatibility mirror mismatch");
-        Require(vr.Get("meta", "config_version") == "9",
+        Require(vr.Get("meta", "config_version") == "10",
             "configuration version marker missing");
         Require(vr.Get("openxr", "cinema_full_vr") == "1",
             "automatic full-VR cutscene flag missing");
@@ -288,9 +292,17 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "first-person snap-turn angle missing");
         Require(vr.Get("engine", "first_person_combat_exit") == "1",
             "first-person combat-exit flag missing");
-        Require(vr.Get("engine", "first_person_stationary_turn") ==
-            std::string(state.first_person_stationary_turn ? "1" : "0"),
-            "first-person stationary-turn flag missing");
+        Require(!vr.Get("engine", "first_person_stationary_turn").has_value(),
+            "obsolete stationary-turn control was not removed");
+        Require(vr.Get("engine", "first_person_strafe") ==
+            std::string(state.first_person_strafe ? "1" : "0"),
+            "first-person strafe flag missing");
+        Require(vr.Get("engine", "first_person_anchor_smoothing") ==
+            std::string(state.first_person_anchor_smoothing ? "1" : "0"),
+            "first-person head-bobbing reduction flag missing");
+        Require(vr.Get("engine", "first_person_anchor_smoothing_seconds") ==
+            "0.125000",
+            "launcher overwrote the INI-only smoothing time");
         Require(vr.Get("debug", "logging_enabled") == "1",
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
@@ -348,9 +360,11 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "round-trip first-person snap-turn angle mismatch");
         Require(loaded.state.first_person_combat_exit,
             "round-trip first-person combat-exit mismatch");
-        Require(loaded.state.first_person_stationary_turn ==
-            state.first_person_stationary_turn,
-            "round-trip first-person stationary-turn mismatch");
+        Require(loaded.state.first_person_strafe == state.first_person_strafe,
+            "round-trip first-person strafe mismatch");
+        Require(loaded.state.first_person_anchor_smoothing ==
+            state.first_person_anchor_smoothing,
+            "round-trip first-person head-bobbing reduction mismatch");
         Require(loaded.state.cinema_hud_scale == state.cinema_hud_scale &&
             loaded.state.cinema_hud_convergence_offset ==
                 state.cinema_hud_convergence_offset,
@@ -417,8 +431,10 @@ void TestReleaseDefaults() {
         "vertical mouse/pad pitch must default to disabled");
     Require(defaults.first_person_combat_exit,
         "automatic combat camera switch must default to enabled");
-    Require(!defaults.first_person_stationary_turn,
-        "stationary first-person body turn must default to disabled");
+    Require(defaults.first_person_strafe,
+        "first-person strafe must default to enabled");
+    Require(defaults.first_person_anchor_smoothing,
+        "first-person head-bobbing reduction must default to enabled");
     Require(defaults.fast_movement_transitions,
         "faster movement transitions must default to enabled");
     Require(!defaults.native_stereo,
@@ -713,7 +729,8 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     vr->Remove("openxr", "steady_icons");
     vr->Remove("openxr", "vertical_pitch_enabled");
     vr->Remove("engine", "first_person_combat_exit");
-    vr->Remove("engine", "first_person_stationary_turn");
+    vr->Remove("engine", "first_person_strafe");
+    vr->Remove("engine", "first_person_anchor_smoothing");
     vr->Remove("debug", "logging_enabled");
     vr->Remove("debug", "runtime_diagnostics");
     Write(paths.vr_ini, vr->Serialize());
@@ -728,8 +745,10 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
         "missing vertical-pitch flag must default to disabled");
     Require(missing_flags.state.first_person_combat_exit,
         "missing combat-switch flag must default to enabled");
-    Require(!missing_flags.state.first_person_stationary_turn,
-        "missing stationary-turn flag must default to disabled");
+    Require(missing_flags.state.first_person_strafe,
+        "missing first-person strafe flag must default to enabled");
+    Require(missing_flags.state.first_person_anchor_smoothing,
+        "missing head-bobbing reduction flag must default to enabled");
     Require(missing_flags.state.fast_movement_transitions,
         "missing faster-transitions DLC flag must default to enabled");
     Require(!missing_flags.state.diagnostic_logging,
@@ -777,7 +796,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[meta]\r\n"
-        "config_version=9\r\n"
+        "config_version=10\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
         "mode3_aer_presentation=0\r\n"
@@ -798,7 +817,9 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
         "first_person_combat_exit=1\r\n"
-        "first_person_stationary_turn=0\r\n"
+        "first_person_strafe=1\r\n"
+        "first_person_anchor_smoothing=1\r\n"
+        "first_person_anchor_smoothing_seconds=0.200000\r\n"
         "[debug]\r\n"
         "logging_enabled=0\r\n"
         "runtime_diagnostics=0\r\n";
@@ -830,7 +851,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "migrated INI must not be reported as newly created");
     auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated.has_value(), "migrated INI could not be read");
-    Require(migrated->Get("meta", "config_version") == "9",
+    Require(migrated->Get("meta", "config_version") == "10",
         "old INI was not versioned");
     Require(migrated->Get("openxr", "native_stereo") == "0" &&
         migrated->Get("openxr", "fullscreen_projection") == "0" &&
@@ -856,7 +877,11 @@ void TestFirstRunConfiguration(const fs::path& root) {
         migrated->Get("openxr", "cinema_hud_scale") == "1.300" &&
         migrated->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated->Get("openxr", "hud_vertical_scale") == "1.000" &&
-        migrated->Get("engine", "first_person_stationary_turn") == "0",
+        !migrated->Get("engine", "first_person_stationary_turn").has_value() &&
+        migrated->Get("engine", "first_person_strafe") == "1" &&
+        migrated->Get("engine", "first_person_anchor_smoothing") == "1" &&
+        migrated->Get("engine", "first_person_anchor_smoothing_seconds") ==
+            "0.200000",
         "migration did not apply the validated release defaults");
     Require(migrated->Get("openxr", "cinema_full_vr") == "1",
         "migration changed the existing Full VR choice");
@@ -872,6 +897,10 @@ void TestFirstRunConfiguration(const fs::path& root) {
     migrated->Set("openxr", "hud_horizontal_scale", "0.900");
     migrated->Set("openxr", "hud_vertical_scale", "0.950");
     migrated->Set("focus_projection", "shader_registry_enabled", "1");
+    migrated->Set("engine", "first_person_strafe", "0");
+    migrated->Set("engine", "first_person_anchor_smoothing", "0");
+    migrated->Set("engine", "first_person_anchor_smoothing_seconds", "0.125000");
+    migrated->Remove("debug", "runtime_diagnostics");
     Write(paths.vr_ini, migrated->Serialize());
     Require(w3vr::EnsureVrConfiguration(
         paths, defaults, created, error), "versioned INI check failed");
@@ -881,8 +910,13 @@ void TestFirstRunConfiguration(const fs::path& root) {
         versioned->Get("openxr", "hud_horizontal_scale") == "0.900" &&
         versioned->Get("openxr", "hud_vertical_scale") == "0.950" &&
         versioned->Get(
-            "focus_projection", "shader_registry_enabled") == "1",
-        "current-version INI manual tuning was overwritten");
+            "focus_projection", "shader_registry_enabled") == "1" &&
+        versioned->Get("engine", "first_person_strafe") == "0" &&
+        versioned->Get("engine", "first_person_anchor_smoothing") == "0" &&
+        versioned->Get("engine", "first_person_anchor_smoothing_seconds") ==
+            "0.125000" &&
+        versioned->Get("debug", "runtime_diagnostics") == "0",
+        "current-version INI defaults were not materialized safely");
 
     Write(paths.vr_ini,
         "[meta]\r\n"
@@ -897,20 +931,24 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[engine]\r\n"
         "first_person_stationary_turn=0\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V2-to-V9 migration failed");
+        paths, defaults, created, error), "V2-to-V10 migration failed");
     auto migrated_v4 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_v4.has_value() &&
-        migrated_v4->Get("meta", "config_version") == "9" &&
+        migrated_v4->Get("meta", "config_version") == "10" &&
         migrated_v4->Get("openxr", "cinema_hud_stereo_shift_px") == "-91" &&
         migrated_v4->Get("openxr", "cinema_hud_scale") == "1.100" &&
         migrated_v4->Get("openxr", "full_vr_hud_stereo_shift_px") == "-26" &&
         migrated_v4->Get("openxr", "full_vr_hud_scale") == "1.000" &&
         migrated_v4->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_v4->Get("openxr", "hud_vertical_scale") == "1.000" &&
-        migrated_v4->Get("engine", "first_person_stationary_turn") == "0" &&
+        !migrated_v4->Get("engine", "first_person_stationary_turn").has_value() &&
+        migrated_v4->Get("engine", "first_person_strafe") == "1" &&
+        migrated_v4->Get("engine", "first_person_anchor_smoothing") == "1" &&
+        migrated_v4->Get("engine", "first_person_anchor_smoothing_seconds") ==
+            "0.200000" &&
         migrated_v4->Get(
             "focus_projection", "shader_registry_enabled") == "0",
-        "V9 migration changed the Full VR offset or missed registry/HUD defaults");
+        "V10 migration changed the Full VR offset or missed release defaults");
 
     Write(paths.vr_ini,
         "[meta]\r\n"
@@ -920,14 +958,14 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "hud_vertical_scale=0.780\r\n"
         "custom_user_value=keep\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V3-to-V9 migration failed");
+        paths, defaults, created, error), "V3-to-V10 migration failed");
     auto migrated_from_v3 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v3.has_value() &&
-        migrated_from_v3->Get("meta", "config_version") == "9" &&
+        migrated_from_v3->Get("meta", "config_version") == "10" &&
         migrated_from_v3->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "hud_vertical_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "custom_user_value") == "keep",
-        "V3-to-V9 HUD migration damaged unrelated settings");
+        "V3-to-V10 HUD migration damaged unrelated settings");
 
     // V6 used fullscreen_projection as Native Stereo. Preserve that choice
     // under the dedicated key without opting the user into a new presenter.
@@ -937,15 +975,39 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[openxr]\r\n"
         "fullscreen_projection=1\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V6-to-V9 migration failed");
+        paths, defaults, created, error), "V6-to-V10 migration failed");
     auto migrated_from_v6 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v6.has_value() &&
-        migrated_from_v6->Get("meta", "config_version") == "9" &&
+        migrated_from_v6->Get("meta", "config_version") == "10" &&
         migrated_from_v6->Get("openxr", "native_stereo") == "1" &&
         migrated_from_v6->Get("openxr", "fullscreen_projection") == "0" &&
         migrated_from_v6->Get("openxr", "alternate_presentation_resize") == "0" &&
         migrated_from_v6->Get("openxr", "mode3_aer_presentation") == "0",
         "V6 combined flag was not split safely");
+
+    // V9 is the last V1138 launcher schema. Remove its retired stationary
+    // switch while retaining every explicit V9531 First Person preference.
+    Write(paths.vr_ini,
+        "[meta]\r\n"
+        "config_version=9\r\n"
+        "[engine]\r\n"
+        "first_person_stationary_turn=0\r\n"
+        "first_person_strafe=0\r\n"
+        "first_person_anchor_smoothing=0\r\n"
+        "first_person_anchor_smoothing_seconds=0.125000\r\n");
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "V9-to-V10 migration failed");
+    auto migrated_from_v9 = w3vr::IniDocument::Load(paths.vr_ini, error);
+    Require(migrated_from_v9.has_value() &&
+        migrated_from_v9->Get("meta", "config_version") == "10" &&
+        !migrated_from_v9->Get(
+            "engine", "first_person_stationary_turn").has_value() &&
+        migrated_from_v9->Get("engine", "first_person_strafe") == "0" &&
+        migrated_from_v9->Get("engine", "first_person_anchor_smoothing") ==
+            "0" &&
+        migrated_from_v9->Get(
+            "engine", "first_person_anchor_smoothing_seconds") == "0.125000",
+        "V9-to-V10 migration changed explicit First Person preferences");
 
     // V8 exposed only cinema_5x4. Preserve an explicit off value as the new
     // 4:3 selection rather than silently returning it to the 5:4 default.
@@ -955,10 +1017,10 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[openxr]\r\n"
         "cinema_5x4=0\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V8-to-V9 migration failed");
+        paths, defaults, created, error), "V8-to-V10 migration failed");
     auto migrated_from_v8 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v8.has_value() &&
-        migrated_from_v8->Get("meta", "config_version") == "9" &&
+        migrated_from_v8->Get("meta", "config_version") == "10" &&
         migrated_from_v8->Get("openxr", "cinema_aspect") == "4x3" &&
         migrated_from_v8->Get("openxr", "cinema_5x4") == "0",
         "V8 Cinema framing choice was not migrated to 4:3");

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1138.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1139.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -110,6 +110,33 @@ if(BUILD_TESTING)
         "${W3VR_OPENXR_DIR}/include"
     )
     add_test(NAME renderer_eye_geometry COMMAND w3vr_openxr_eye_geometry_tests)
+
+    add_executable(w3vr_first_person_strafe_policy_tests
+        tests/first_person_strafe_policy_tests.cpp
+    )
+    add_test(
+        NAME first_person_strafe_policy
+        COMMAND w3vr_first_person_strafe_policy_tests
+    )
+
+    add_executable(w3vr_first_person_combat_lock_tests
+        tests/first_person_combat_lock_tests.cpp
+    )
+    target_include_directories(w3vr_first_person_combat_lock_tests PRIVATE src)
+    add_test(
+        NAME first_person_combat_lock
+        COMMAND w3vr_first_person_combat_lock_tests
+    )
+
+    add_executable(w3vr_first_person_anchor_smoothing_tests
+        tests/first_person_anchor_smoothing_tests.cpp
+    )
+    target_include_directories(
+        w3vr_first_person_anchor_smoothing_tests PRIVATE src)
+    add_test(
+        NAME first_person_anchor_smoothing
+        COMMAND w3vr_first_person_anchor_smoothing_tests
+    )
 endif()
 
 option(W3VR_BUILD_LAUNCHER "Build the Witcher 3 VR launcher" ON)

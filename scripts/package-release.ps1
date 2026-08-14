@@ -31,6 +31,15 @@ $thirdPartyNotices = Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md'
 $stateBridgeRoot = Join-Path $repositoryRoot 'support/modWitcher3VRStateBridge'
 $stateBridgeScript = Join-Path $stateBridgeRoot `
     'content/scripts/local/witcher3vr/first_person_state_bridge.ws'
+$firstPersonRoot = Join-Path $repositoryRoot 'support/modWitcher3VRFirstPerson'
+$firstPersonAimScript = Join-Path $firstPersonRoot `
+    'content/scripts/local/witcher3vr_first_person/first_person_aim.ws'
+$firstPersonHeadScript = Join-Path $firstPersonRoot `
+    'content/scripts/local/witcher3vr_first_person/native_head_provider.ws'
+$firstPersonStrafeScript = Join-Path $firstPersonRoot `
+    'content/scripts/local/witcher3vr_first_person/on_foot_strafe.ws'
+$firstPersonVisibilityScript = Join-Path $firstPersonRoot `
+    'content/scripts/local/witcher3vr_first_person/player_visibility.ws'
 $hudEditorRoot = Join-Path $repositoryRoot 'support/modWitcher3VRHUDEditor'
 $hudEditorScript = Join-Path $hudEditorRoot `
     'content/scripts/local/witcher3vr_hud_editor/hud_editor.ws'
@@ -65,6 +74,10 @@ foreach ($requiredFile in @(
         $license,
         $thirdPartyNotices,
         $stateBridgeScript,
+        $firstPersonAimScript,
+        $firstPersonHeadScript,
+        $firstPersonStrafeScript,
+        $firstPersonVisibilityScript,
         $hudEditorScript,
         $hudEditorXml,
         $movementDlcBundle,
@@ -111,6 +124,8 @@ try {
     New-Item -ItemType Directory -Path $modsStage | Out-Null
     Copy-Item -LiteralPath $stateBridgeRoot `
         -Destination (Join-Path $modsStage 'modWitcher3VRStateBridge') -Recurse
+    Copy-Item -LiteralPath $firstPersonRoot `
+        -Destination (Join-Path $modsStage 'modWitcher3VRFirstPerson') -Recurse
     Copy-Item -LiteralPath $hudEditorRoot `
         -Destination (Join-Path $modsStage 'modWitcher3VRHUDEditor') -Recurse
 
@@ -157,6 +172,14 @@ try {
         (Get-FileHash -LiteralPath $hudEditorScript -Algorithm SHA256).Hash
     $hudEditorXmlHash =
         (Get-FileHash -LiteralPath $hudEditorXml -Algorithm SHA256).Hash
+    $firstPersonAimHash =
+        (Get-FileHash -LiteralPath $firstPersonAimScript -Algorithm SHA256).Hash
+    $firstPersonHeadHash =
+        (Get-FileHash -LiteralPath $firstPersonHeadScript -Algorithm SHA256).Hash
+    $firstPersonStrafeHash =
+        (Get-FileHash -LiteralPath $firstPersonStrafeScript -Algorithm SHA256).Hash
+    $firstPersonVisibilityHash =
+        (Get-FileHash -LiteralPath $firstPersonVisibilityScript -Algorithm SHA256).Hash
     $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
     $manifestLines += "dll.sha256=$dllHash"
     $manifestLines += "launcher.sha256=$launcherHash"
@@ -165,6 +188,10 @@ try {
     $manifestLines += "movement_dlc_metadata.sha256=$movementDlcMetadataHash"
     $manifestLines += "hud_editor_script.sha256=$hudEditorScriptHash"
     $manifestLines += "hud_editor_xml.sha256=$hudEditorXmlHash"
+    $manifestLines += "first_person_aim.sha256=$firstPersonAimHash"
+    $manifestLines += "first_person_head.sha256=$firstPersonHeadHash"
+    $manifestLines += "first_person_strafe.sha256=$firstPersonStrafeHash"
+    $manifestLines += "first_person_visibility.sha256=$firstPersonVisibilityHash"
     $manifestLines += "archive.sha256=$archiveHash"
 
     $manifestPath = Join-Path $OutputDirectory "Witcher3VR-$normalizedVersion-SHA256.txt"

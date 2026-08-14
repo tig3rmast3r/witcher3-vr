@@ -25,7 +25,7 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {3, true, false, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 9;
+constexpr int kCurrentConfigVersion = 10;
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
 constexpr float kFullVrHudReferenceScale = 1.00f;
@@ -80,6 +80,7 @@ void RemoveObsoleteSettings(IniDocument& ini) {
     ini.Remove("openxr", "full_vr_subtitle_scale");
     ini.Remove("openxr", "cinema_subtitle_stereo_shift_px");
     ini.Remove("engine", "streamline_ps93_learning_log");
+    ini.Remove("engine", "first_person_stationary_turn");
 }
 
 void MigrateConfigurationToV2(IniDocument& ini) {
@@ -110,14 +111,10 @@ void MigrateConfigurationToV2(IniDocument& ini) {
 }
 
 void MigrateConfigurationToV3(IniDocument& ini) {
-    // V3 exposes the automatic Cinema3D HUD scale and makes the stationary
-    // first-person body turn optional. Seed only absent values so a V2 user's
-    // advanced INI tuning remains authoritative.
+    // V3 exposes the automatic Cinema3D HUD scale. Seed only absent values so
+    // a V2 user's advanced INI tuning remains authoritative.
     if (!ini.Get("openxr", "cinema_hud_scale").has_value()) {
         ini.Set("openxr", "cinema_hud_scale", "1.300");
-    }
-    if (!ini.Get("engine", "first_person_stationary_turn").has_value()) {
-        ini.Set("engine", "first_person_stationary_turn", "0");
     }
     RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", "3");
@@ -249,7 +246,7 @@ void MigrateConfigurationToV8(IniDocument& ini) {
         ini.Set("engine", "dual_render_start", "1");
     }
     RemoveObsoleteSettings(ini);
-    ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
+    ini.Set("meta", "config_version", "8");
 }
 
 std::string ReadString(const IniDocument& doc, const char* section,
@@ -280,6 +277,25 @@ void MigrateConfigurationToV9(IniDocument& ini) {
     ini.Set("openxr", "cinema_aspect", CinemaAspectIniValue(aspect));
     ini.Set("openxr", "cinema_5x4",
         aspect == CinemaAspect::FiveFour ? "1" : "0");
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "9");
+}
+
+void MigrateConfigurationToV10(IniDocument& ini) {
+    // V9531 makes idle stationary body rotation part of the safe First Person
+    // contract. Replace its obsolete user flag with the two controls that
+    // remain live, while preserving explicit choices and advanced smoothing.
+    if (!ini.Get("engine", "first_person_strafe").has_value()) {
+        ini.Set("engine", "first_person_strafe", "1");
+    }
+    if (!ini.Get("engine", "first_person_anchor_smoothing").has_value()) {
+        ini.Set("engine", "first_person_anchor_smoothing", "1");
+    }
+    if (!ini.Get(
+            "engine", "first_person_anchor_smoothing_seconds").has_value()) {
+        ini.Set(
+            "engine", "first_person_anchor_smoothing_seconds", "0.200000");
+    }
     RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
@@ -814,6 +830,35 @@ void IniDocument::Remove(const std::string& wanted_section,
     }
 }
 
+void IniDocument::FillMissingFrom(const IniDocument& defaults) {
+    // Materialize every template default without touching an existing value.
+    // This runs on every launcher start, including already-current INIs, so a
+    // newly introduced advanced renderer key never remains an invisible
+    // compile-time fallback.
+    std::string section;
+    for (const auto& line : defaults.lines_) {
+        const std::string trimmed = Trim(line.text);
+        if (trimmed.size() >= 2 && trimmed.front() == '[' &&
+            trimmed.back() == ']') {
+            section = Trim(trimmed.substr(1, trimmed.size() - 2));
+            continue;
+        }
+        if (section.empty() || trimmed.empty() || trimmed.front() == ';' ||
+            trimmed.front() == '#') {
+            continue;
+        }
+        const size_t equals = line.text.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        const std::string key = Trim(line.text.substr(0, equals));
+        if (key.empty() || Get(section, key).has_value()) {
+            continue;
+        }
+        Set(section, key, Trim(line.text.substr(equals + 1)));
+    }
+}
+
 std::string IniDocument::Serialize() const {
     std::string result;
     for (const auto& line : lines_) result += line.text + line.newline;
@@ -944,15 +989,13 @@ std::wstring HudEditorManualSetupInstructions(const ConfigPaths& paths) {
 bool EnsureVrConfiguration(const ConfigPaths& paths,
     const std::string& template_contents, bool& created, std::wstring& error) {
     created = false;
+    const auto defaults = IniDocument::FromText(template_contents);
     const DWORD attributes = GetFileAttributesW(paths.vr_ini.c_str());
     if (attributes != INVALID_FILE_ATTRIBUTES) {
         const auto existing = IniDocument::Load(paths.vr_ini, error);
         if (!existing) return false;
         const int existing_version = ReadInt(
             *existing, "meta", "config_version", 0);
-        if (existing_version >= kCurrentConfigVersion) {
-            return true;
-        }
         auto migrated = *existing;
         if (existing_version < 2) {
             MigrateConfigurationToV2(migrated);
@@ -978,7 +1021,19 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         if (existing_version < 9) {
             MigrateConfigurationToV9(migrated);
         }
-        return AtomicWriteWithBackup(paths.vr_ini, migrated.Serialize(), error);
+        if (existing_version < 10) {
+            MigrateConfigurationToV10(migrated);
+        }
+        // This is deliberately independent from version migration: extending
+        // the default template must heal a partial current-version INI on the
+        // very next launcher start, without overwriting manual tuning.
+        migrated.FillMissingFrom(defaults);
+        RemoveObsoleteSettings(migrated);
+        const auto serialized = migrated.Serialize();
+        if (serialized == existing->Serialize()) {
+            return true;
+        }
+        return AtomicWriteWithBackup(paths.vr_ini, serialized, error);
     }
     const DWORD lookup_error = GetLastError();
     if (lookup_error != ERROR_FILE_NOT_FOUND &&
@@ -990,7 +1045,7 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
     // First-run AA inheritance: keep the user's supported native AA choice,
     // but always initialize its stereo Mode 3 route. Unknown/unsupported AA
     // values deliberately fall back to the safest release default, No AA.
-    auto first_run = IniDocument::FromText(template_contents);
+    auto first_run = defaults;
     std::wstring game_error;
     if (const auto game = IniDocument::Load(paths.game_settings, game_error)) {
         const int aa_mode = ReadInt(*game, "PostProcess", "AAMode", 0);
@@ -1195,8 +1250,10 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         : 45;
     result.state.first_person_combat_exit = ReadBool(
         *vr, "engine", "first_person_combat_exit", true);
-    result.state.first_person_stationary_turn = ReadBool(
-        *vr, "engine", "first_person_stationary_turn", false);
+    result.state.first_person_strafe = ReadBool(
+        *vr, "engine", "first_person_strafe", true);
+    result.state.first_person_anchor_smoothing = ReadBool(
+        *vr, "engine", "first_person_anchor_smoothing", true);
     result.state.fast_movement_transitions = ReadBool(
         *game, "DLC", "DlcEnabled_movementinputfix", true);
     result.state.native_stereo = ReadBool(
@@ -1274,7 +1331,7 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "cinema_aspect",
         CinemaAspectIniValue(state.cinema_aspect));
     // Preserve the legacy key so older DLL checkpoints still interpret a
-    // launcher-authored 5:4 selection correctly. V1138 consumes cinema_aspect.
+    // launcher-authored 5:4 selection correctly. V1138+ consumes cinema_aspect.
     vr_ini.Set("openxr", "cinema_5x4",
         state.cinema_aspect == CinemaAspect::FiveFour ? "1" : "0");
     vr_ini.Set("openxr", "cinema_full_vr",
@@ -1300,8 +1357,10 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         std::to_string(snap_turn_degrees));
     vr_ini.Set("engine", "first_person_combat_exit",
         state.first_person_combat_exit ? "1" : "0");
-    vr_ini.Set("engine", "first_person_stationary_turn",
-        state.first_person_stationary_turn ? "1" : "0");
+    vr_ini.Set("engine", "first_person_strafe",
+        state.first_person_strafe ? "1" : "0");
+    vr_ini.Set("engine", "first_person_anchor_smoothing",
+        state.first_person_anchor_smoothing ? "1" : "0");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
     vr_ini.Set("engine", "dlss_dlaa", dlss_dlaa ? "1" : "0");
     // [DEBUG 1/2] One launcher switch owns the log writer and every bounded

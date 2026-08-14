@@ -39,6 +39,8 @@ as a runtime dependency.
 | Near-camera view | Working |
 | Experimental first-person exploration view | Available through `F11`, with adaptive on-foot and horse placement plus stationary view-following body rotation |
 | First-person snap turn and headset-based movement | Optional 30/45/60-degree gamepad snap turn with continuous HMD-directed movement |
+| First-person strafe/backpedal movement | Optional and enabled by default |
+| First-person head-bobbing reduction | Optional anchor smoothing, enabled by default |
 | First-person combat handoff | Optional automatic switch to third person in combat |
 | Faster movement transitions | Optional and enabled by default in both third and first person |
 | Cinema framing | Launcher-selectable 5:4 or 4:3; 5:4 default |
@@ -277,10 +279,14 @@ view remains detached from the body turn, and normal free look resumes as soon
 as locomotion begins. Combat, horse riding, swimming, diving, menus, Cinema
 Mode, and cutscenes are excluded from this behavior.
 
-**Turn body while stationary in First Person (Experimental)** controls this
-behavior independently and is disabled by default. Enable it when stationary
-body following suits the controller, animation mod, and locomotion setup;
-native first-person yaw remains in control while it is disabled.
+Stationary body turning is always enabled while the safe First Person state is
+active. **Strafe Movement in First Person** independently controls the validated
+strafe/backpedal movement policy and defaults to enabled.
+
+**Reduce Head Bobbing (First Person)** smooths only the lateral and vertical
+body anchor while preserving live depth, root and face-clearance correction. It
+defaults to enabled. Its response time remains an advanced INI-only value:
+`engine.first_person_anchor_smoothing_seconds`, default `0.200000` seconds.
 
 The launcher option **Auto switch to third person during combats (First Person
 Only)** automatically switches from First Person to Standard

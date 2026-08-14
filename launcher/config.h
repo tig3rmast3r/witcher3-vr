@@ -51,7 +51,8 @@ struct LauncherState {
     bool first_person_gamepad_head_follow{};
     int first_person_snap_turn_degrees{45};
     bool first_person_combat_exit{true};
-    bool first_person_stationary_turn{};
+    bool first_person_strafe{true};
+    bool first_person_anchor_smoothing{true};
     bool fast_movement_transitions{true};
     bool native_stereo{};
     bool fullscreen_projection{};
@@ -89,6 +90,7 @@ public:
     void Set(const std::string& section, const std::string& key,
         const std::string& value);
     void Remove(const std::string& section, const std::string& key);
+    void FillMissingFrom(const IniDocument& defaults);
     std::string Serialize() const;
 
 private:
