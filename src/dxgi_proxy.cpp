@@ -2401,6 +2401,13 @@ struct DlssGraphicsStateSnapshot {
     D3D12_GPU_DESCRIPTOR_HANDLE cbv_gpu_start{};
     UINT cbv_descriptor_count{};
     UINT cbv_descriptor_increment{};
+    // [FIX:NATIVE-FOCUS-DRAW-EYE-AUTHORITY V1134] Keep the resolved eye in
+    // the command-list recording epoch. Reset clears this together with every
+    // root binding, so automatic fire and the specialized smoke draw can share
+    // one authoritative result without carrying it into a reused list.
+    uint64_t native_focus_eye_present{UINT64_MAX};
+    uint64_t native_focus_eye_pair_id{};
+    uint32_t native_focus_eye{UINT32_MAX};
     bool valid{};
 };
 
@@ -2518,6 +2525,9 @@ std::atomic<bool> g_focus_fire_pipeline_overflow_logged{};
 std::atomic<uint64_t> g_focus_fire_pso_routes[2]{};
 std::atomic<uint64_t> g_focus_fire_pso_fallbacks{};
 std::atomic<uint32_t> g_focus_fire_pso_route_logs{};
+std::atomic<uint64_t> g_native_focus_eye_authority_routes[4]{};
+std::atomic<uint64_t> g_native_focus_eye_authority_failures{};
+std::atomic<uint32_t> g_native_focus_eye_authority_logs{};
 
 struct FocusProjectionShaderPair {
     uint64_t vs_hash{};
@@ -7783,9 +7793,48 @@ void create_focus_fire_horizontal_psos(
         static_cast<unsigned long long>(signature_hash[1]));
 }
 
+struct NativeFocusDrawEyeAuthority {
+    uint32_t eye{UINT32_MAX};
+    uint64_t pair_id{};
+    XrFovf fov{};
+    uint32_t route{}; // 1=recording cache, 2=exact camera, 3=recent pair.
+    float selected_distance{std::numeric_limits<float>::infinity()};
+    float separation_margin{};
+};
+
+bool resolve_real_smoke_cbv(
+    const DlssGraphicsStateSnapshot& state,
+    UINT descriptor_offset,
+    CbvDescriptorInfo& cbv);
+bool resolve_gpu_va(
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+    ResourceInfo& out,
+    size_t& offset,
+    ID3D12Resource*& resource_out);
+bool guarded_memcpy(void* destination, const void* source, size_t size);
+bool match_native_focus_draw_eye(
+    const std::array<float, 3>& camera_position,
+    uint64_t present,
+    NativeFocusDrawEyeAuthority& authority);
+bool resolve_focus_fire_b1_authority(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t present,
+    uint32_t& detected_contract,
+    int& eye,
+    float& estimated_x,
+    float& estimated_y,
+    uint32_t& authority_route);
+void store_native_focus_draw_eye(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t present,
+    uint32_t eye,
+    uint64_t pair_id);
+
 // Deferred command-list recording leaves the engine eye unset at these draws.
-// Resolve b12 and the first b1 matrix read-only at draw time. The metadata lock
-// is taken to completion and no constant buffer or resource is ever written.
+// No-AA still resolves the immutable b12 optical center directly. TAAU's b12
+// carries temporal jitter instead, so V1134 independently classifies b1 and
+// matches its camera position to the same per-eye temporal ledger used by the
+// specialized smoke path. No constant buffer or resource is ever written.
 ID3D12PipelineState* resolve_focus_fire_horizontal_draw_pso(
     ID3D12GraphicsCommandList* command_list,
     ID3D12PipelineState* original) {
@@ -8100,6 +8149,55 @@ ID3D12PipelineState* resolve_focus_fire_horizontal_draw_pso(
                 }
             }
         }
+    }
+
+    // [FIX:NATIVE-FOCUS-DRAW-EYE-AUTHORITY V1134] TAAU deliberately keeps
+    // center+jitter in shared TemporalAAData, so b12+0xD0 is near-zero jitter
+    // at these deferred transparent draws rather than an eye identifier. Read
+    // b1 independently, learn whether it still needs the immutable GS center,
+    // and use its camera position only when b12 did not already prove the eye.
+    const uint32_t current_b1_contract =
+        focus_fire->b1_center_contract.load(std::memory_order_acquire);
+    if (focus_eye < 0 && current_b1_contract != 2) {
+        uint32_t detected_contract{};
+        int matched_eye{-1};
+        float estimated_x{};
+        float estimated_y{};
+        uint32_t authority_route{};
+        if (resolve_focus_fire_b1_authority(
+                command_list, present, detected_contract, matched_eye,
+                estimated_x, estimated_y, authority_route)) {
+            if (detected_contract != 0) {
+                uint32_t expected{};
+                focus_fire->b1_center_contract.compare_exchange_strong(
+                    expected, detected_contract, std::memory_order_acq_rel);
+            }
+            const uint32_t resolved_contract =
+                focus_fire->b1_center_contract.load(
+                    std::memory_order_acquire);
+            if (detected_contract == 2) {
+                // Per-draw evidence that this b1 already contains the center
+                // must never receive the geometry-shader offset a second time,
+                // even if an earlier draw established the usual centered PSO
+                // contract.
+                stage = 9;
+            } else if (resolved_contract == 1 && matched_eye >= 0 &&
+                matched_eye <= 1) {
+                focus_eye = matched_eye;
+                center_x = focus_eye == 0
+                    ? kFocusFireEye0CenterX : kFocusFireEye1CenterX;
+                cache = DrawEyeCache{command_list, present, focus_eye};
+                stage = authority_route == 1
+                    ? 10u : (authority_route == 2 ? 11u : 12u);
+            } else if (resolved_contract == 2) {
+                stage = 9;
+            }
+        }
+    }
+
+    if (focus_eye >= 0 && focus_eye <= 1) {
+        store_native_focus_draw_eye(
+            command_list, present, static_cast<uint32_t>(focus_eye), 0);
     }
 
     ID3D12PipelineState* selected{};
@@ -9124,50 +9222,50 @@ bool resolve_real_smoke_cbv(
     return load_cbv_descriptor_smoke_nonblocking(cpu_handle, cbv);
 }
 
-bool select_real_smoke_offaxis_pipeline(
+bool load_native_focus_draw_eye(
     ID3D12GraphicsCommandList* command_list,
-    ID3D12PipelineState*& variant_pipeline) {
-    variant_pipeline = nullptr;
+    uint64_t present,
+    NativeFocusDrawEyeAuthority& authority) {
     const auto* state = access_dlss_graphics_state(command_list, false);
-    if (state == nullptr) {
+    if (state == nullptr || state->native_focus_eye_present != present ||
+        state->native_focus_eye > 1) {
         return false;
     }
-    CbvDescriptorInfo cbv{};
-    if (!resolve_real_smoke_cbv(*state, 1, cbv) ||
-        cbv.size_in_bytes < 0x24Cu) {
-        return false;
-    }
-    ResourceInfo resource_info{};
-    ID3D12Resource* resource{};
-    size_t resource_offset{};
-    std::array<float, 16> matrix{};
-    std::array<float, 3> camera_position{};
-    if (!resolve_gpu_va(
-            cbv.gpu_va, resource_info, resource_offset, resource) ||
-        resource_info.mapped == nullptr ||
-        resource_offset > resource_info.mapped_size ||
-        resource_info.mapped_size - resource_offset < 0x24Cu ||
-        !guarded_memcpy(matrix.data(),
-            static_cast<const uint8_t*>(resource_info.mapped) +
-                resource_offset, sizeof(matrix)) ||
-        !guarded_memcpy(camera_position.data(),
-            static_cast<const uint8_t*>(resource_info.mapped) +
-                resource_offset + 0x240, sizeof(camera_position))) {
-        return false;
-    }
-    for (const float value : matrix) {
-        if (!std::isfinite(value)) {
-            return false;
-        }
-    }
-    for (const float value : camera_position) {
-        if (!std::isfinite(value)) {
-            return false;
-        }
-    }
+    authority.eye = state->native_focus_eye;
+    authority.pair_id = state->native_focus_eye_pair_id;
+    authority.route = 1;
+    g_native_focus_eye_authority_routes[1].fetch_add(
+        1, std::memory_order_relaxed);
+    return true;
+}
 
-    const uint64_t present =
-        g_present_count.load(std::memory_order_relaxed);
+void store_native_focus_draw_eye(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t present,
+    uint32_t eye,
+    uint64_t pair_id) {
+    if (eye > 1) {
+        return;
+    }
+    auto* state = access_dlss_graphics_state(command_list, false);
+    if (state == nullptr) {
+        return;
+    }
+    if (pair_id == 0 && state->native_focus_eye_present == present &&
+        state->native_focus_eye == eye &&
+        state->native_focus_eye_pair_id != 0) {
+        return;
+    }
+    state->native_focus_eye_present = present;
+    state->native_focus_eye_pair_id = pair_id;
+    state->native_focus_eye = eye;
+}
+
+bool match_native_focus_draw_eye(
+    const std::array<float, 3>& camera_position,
+    uint64_t present,
+    NativeFocusDrawEyeAuthority& authority) {
+    authority = {};
     std::array<float, 2> best_distance{
         std::numeric_limits<float>::infinity(),
         std::numeric_limits<float>::infinity()};
@@ -9206,9 +9304,9 @@ bool select_real_smoke_offaxis_pipeline(
                     candidate.render_views[candidate_eye].fov;
             }
         }
-        // The current eye can reach this Draw before its exact temporal-ring
-        // entry is published. Preserve V1065's exact matcher first, then keep
-        // one coherent recent stereo pair as a timing-independent fallback.
+        // A deferred draw can precede publication of the current eye's exact
+        // temporal sample. In that case compare against one coherent recent
+        // pair, retaining the already validated bounded-distance guard.
         for (const auto& eye0 : g_engine_temporal_matrix_ring) {
             if (!eye0.corrected_valid || !eye0.render_views_valid ||
                 eye0.eye != 0 || eye0.pair_id == 0 ||
@@ -9242,35 +9340,211 @@ bool select_real_smoke_offaxis_pipeline(
             }
         }
     }
-    uint32_t eye =
-        best_distance[0] <= best_distance[1] ? 0u : 1u;
+
+    uint32_t eye = best_distance[0] <= best_distance[1] ? 0u : 1u;
     uint32_t other_eye = eye ^ 1u;
+    uint32_t route = 2;
     if (!(best_distance[eye] <= 0.0004f) ||
         !(best_distance[other_eye] - best_distance[eye] >= 0.001f) ||
         best_pair[eye] == 0) {
         eye = paired_distance[0] <= paired_distance[1] ? 0u : 1u;
         other_eye = eye ^ 1u;
-        if (paired_pair != 0 && paired_distance[eye] <= 0.0049f &&
-            paired_distance[other_eye] - paired_distance[eye] >= 0.0005f) {
-            best_distance = paired_distance;
-            best_pair[eye] = paired_pair;
-            best_fov[eye] = paired_fov[eye];
-        } else {
-            // A guessed cadence can apply the opposite eye's center and move
-            // the entire transparent draw out of view. If neither camera-
-            // position route is decisive, preserve the original engine draw.
+        if (paired_pair == 0 || paired_distance[eye] > 0.0049f ||
+            paired_distance[other_eye] - paired_distance[eye] < 0.0005f) {
+            g_native_focus_eye_authority_failures.fetch_add(
+                1, std::memory_order_relaxed);
             return false;
         }
+        best_distance = paired_distance;
+        best_pair[eye] = paired_pair;
+        best_fov[eye] = paired_fov[eye];
+        route = 3;
     }
+
     w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor descriptor{};
     if (!w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(
             best_fov[eye], 1, 1, descriptor) ||
         !std::isfinite(descriptor.center_ndc_x) ||
         !std::isfinite(descriptor.center_ndc_y)) {
+        g_native_focus_eye_authority_failures.fetch_add(
+            1, std::memory_order_relaxed);
         return false;
     }
-    variant_pipeline = g_real_smoke_center_pipelines[eye].load(
-        std::memory_order_acquire);
+    authority.eye = eye;
+    authority.pair_id = best_pair[eye];
+    authority.fov = best_fov[eye];
+    authority.route = route;
+    authority.selected_distance = best_distance[eye];
+    authority.separation_margin =
+        best_distance[other_eye] - best_distance[eye];
+    g_native_focus_eye_authority_routes[route].fetch_add(
+        1, std::memory_order_relaxed);
+    return true;
+}
+
+bool resolve_focus_fire_b1_authority(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t present,
+    uint32_t& detected_contract,
+    int& eye,
+    float& estimated_x,
+    float& estimated_y,
+    uint32_t& authority_route) {
+    detected_contract = 0;
+    eye = -1;
+    estimated_x = 0.0f;
+    estimated_y = 0.0f;
+    authority_route = 0;
+    const auto* state = access_dlss_graphics_state(command_list, false);
+    CbvDescriptorInfo cbv{};
+    if (state == nullptr || !resolve_real_smoke_cbv(*state, 1, cbv) ||
+        cbv.size_in_bytes < sizeof(float) * 16) {
+        return false;
+    }
+
+    ResourceInfo resource_info{};
+    ID3D12Resource* resource{};
+    size_t resource_offset{};
+    std::array<float, 16> matrix{};
+    if (!resolve_gpu_va(
+            cbv.gpu_va, resource_info, resource_offset, resource) ||
+        resource_info.mapped == nullptr ||
+        resource_offset > resource_info.mapped_size ||
+        resource_info.mapped_size - resource_offset < sizeof(matrix) ||
+        !guarded_memcpy(
+            matrix.data(),
+            static_cast<const uint8_t*>(resource_info.mapped) +
+                resource_offset,
+            sizeof(matrix)) ||
+        !std::all_of(matrix.begin(), matrix.end(), [](float value) {
+            return std::isfinite(value);
+        })) {
+        return false;
+    }
+
+    const float denominator = matrix[12] * matrix[12] +
+        matrix[13] * matrix[13] + matrix[14] * matrix[14];
+    if (denominator < 0.1f || denominator > 10.0f) {
+        return false;
+    }
+    estimated_x = (matrix[0] * matrix[12] + matrix[1] * matrix[13] +
+        matrix[2] * matrix[14]) / denominator;
+    estimated_y = (matrix[4] * matrix[12] + matrix[5] * matrix[13] +
+        matrix[6] * matrix[14]) / denominator;
+    if (fabsf(estimated_x) <= 0.06f && fabsf(estimated_y) <= 0.06f) {
+        detected_contract = 1;
+    } else if (
+        fabsf(fabsf(estimated_x) - fabsf(kFocusFireEye0CenterX)) <= 0.06f &&
+        fabsf(estimated_y - kFocusFireCenterY) <= 0.06f) {
+        detected_contract = 2;
+        eye = estimated_x > 0.0f ? 0 : 1;
+        store_native_focus_draw_eye(
+            command_list, present, static_cast<uint32_t>(eye), 0);
+        return true;
+    } else {
+        return true;
+    }
+
+    NativeFocusDrawEyeAuthority authority{};
+    if (load_native_focus_draw_eye(command_list, present, authority)) {
+        eye = static_cast<int>(authority.eye);
+        authority_route = authority.route;
+    } else if (cbv.size_in_bytes >= 0x24Cu &&
+        resource_offset <= resource_info.mapped_size &&
+        resource_info.mapped_size - resource_offset >= 0x24Cu) {
+        std::array<float, 3> camera_position{};
+        if (guarded_memcpy(
+                camera_position.data(),
+                static_cast<const uint8_t*>(resource_info.mapped) +
+                    resource_offset + 0x240,
+                sizeof(camera_position)) &&
+            std::all_of(
+                camera_position.begin(), camera_position.end(),
+                [](float value) { return std::isfinite(value); }) &&
+            match_native_focus_draw_eye(
+                camera_position, present, authority)) {
+            eye = static_cast<int>(authority.eye);
+            authority_route = authority.route;
+            store_native_focus_draw_eye(
+                command_list, present, authority.eye, authority.pair_id);
+        }
+    }
+
+    const uint32_t log_index = g_native_focus_eye_authority_logs.fetch_add(
+        1, std::memory_order_relaxed);
+    if (g_config.logging_enabled && log_index < 48) {
+        log_line(
+            "V1134 native focus draw-eye authority contract=%u eye=%d route=%u estimated=%.9g,%.9g pair=%llu distance=%.9g margin=%.9g cbv_size=%u command_list=%p present=%llu",
+            detected_contract, eye, authority_route,
+            estimated_x, estimated_y,
+            static_cast<unsigned long long>(authority.pair_id),
+            authority.selected_distance, authority.separation_margin,
+            cbv.size_in_bytes, command_list,
+            static_cast<unsigned long long>(present));
+    }
+    return true;
+}
+
+bool select_real_smoke_offaxis_pipeline(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12PipelineState*& variant_pipeline) {
+    variant_pipeline = nullptr;
+    const auto* state = access_dlss_graphics_state(command_list, false);
+    if (state == nullptr) {
+        return false;
+    }
+    const uint64_t present =
+        g_present_count.load(std::memory_order_relaxed);
+    NativeFocusDrawEyeAuthority authority{};
+    if (load_native_focus_draw_eye(command_list, present, authority)) {
+        variant_pipeline =
+            g_real_smoke_center_pipelines[authority.eye].load(
+                std::memory_order_acquire);
+        return variant_pipeline != nullptr;
+    }
+    CbvDescriptorInfo cbv{};
+    if (!resolve_real_smoke_cbv(*state, 1, cbv) ||
+        cbv.size_in_bytes < 0x24Cu) {
+        return false;
+    }
+    ResourceInfo resource_info{};
+    ID3D12Resource* resource{};
+    size_t resource_offset{};
+    std::array<float, 16> matrix{};
+    std::array<float, 3> camera_position{};
+    if (!resolve_gpu_va(
+            cbv.gpu_va, resource_info, resource_offset, resource) ||
+        resource_info.mapped == nullptr ||
+        resource_offset > resource_info.mapped_size ||
+        resource_info.mapped_size - resource_offset < 0x24Cu ||
+        !guarded_memcpy(matrix.data(),
+            static_cast<const uint8_t*>(resource_info.mapped) +
+                resource_offset, sizeof(matrix)) ||
+        !guarded_memcpy(camera_position.data(),
+            static_cast<const uint8_t*>(resource_info.mapped) +
+                resource_offset + 0x240, sizeof(camera_position))) {
+        return false;
+    }
+    for (const float value : matrix) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+    for (const float value : camera_position) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+
+    if (!match_native_focus_draw_eye(
+            camera_position, present, authority)) {
+        return false;
+    }
+    store_native_focus_draw_eye(
+        command_list, present, authority.eye, authority.pair_id);
+    variant_pipeline =
+        g_real_smoke_center_pipelines[authority.eye].load(
+            std::memory_order_acquire);
     return variant_pipeline != nullptr;
 }
 
@@ -32525,7 +32799,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1133 base=V1132 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 native_stereo_taau_trial=1 native_stereo_dlss=0 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1134 base=V1133 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 native_stereo_taau_trial=1 native_stereo_dlss=0 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
