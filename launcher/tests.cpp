@@ -163,6 +163,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.presentation_scale = 0.85f;
         state.menu_scale = 0.75f;
         state.cinema_scale = 1.1f;
+        state.cinema_aspect = index % 2 == 0
+            ? w3vr::CinemaAspect::FiveFour
+            : w3vr::CinemaAspect::FourThree;
         state.cinema_hud_scale = 1.5f;
         state.cinema_hud_convergence_offset = 7;
         state.full_vr_hud_scale = 1.25f;
@@ -264,9 +267,14 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "Full VR HUD scale/automatic convergence mismatch");
         Require(vr.Get("openxr", "manual_cinema_hud_scale") == "1.600",
             "manual F10 HUD scale must remain independently tuned");
-        Require(vr.Get("openxr", "cinema_5x4") == "1",
-            "fixed cinema framing flag missing");
-        Require(vr.Get("meta", "config_version") == "8",
+        const bool expected_five_four =
+            state.cinema_aspect == w3vr::CinemaAspect::FiveFour;
+        Require(vr.Get("openxr", "cinema_aspect") ==
+            std::string(expected_five_four ? "5x4" : "4x3") &&
+            vr.Get("openxr", "cinema_5x4") ==
+                std::string(expected_five_four ? "1" : "0"),
+            "Cinema aspect and compatibility mirror mismatch");
+        Require(vr.Get("meta", "config_version") == "9",
             "configuration version marker missing");
         Require(vr.Get("openxr", "cinema_full_vr") == "1",
             "automatic full-VR cutscene flag missing");
@@ -330,6 +338,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         }
         Require(loaded.state.cinema_full_vr,
             "round-trip automatic full-VR cutscene mismatch");
+        Require(loaded.state.cinema_aspect == state.cinema_aspect,
+            "round-trip Cinema aspect mismatch");
         Require(loaded.state.steady_icons,
             "round-trip steady-icons latency mismatch");
         Require(loaded.state.first_person_gamepad_head_follow,
@@ -399,6 +409,8 @@ void TestReleaseDefaults() {
         "Full VR cutscene HUD must default to size 1.0 at gameplay depth");
     Require(defaults.cinema_full_vr,
         "automatic Full VR cutscenes must default to enabled");
+    Require(defaults.cinema_aspect == w3vr::CinemaAspect::FiveFour,
+        "Cinema aspect must default to 5:4");
     Require(!defaults.steady_icons,
         "steady icons must default to disabled");
     Require(!defaults.vertical_pitch_enabled,
@@ -765,7 +777,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[meta]\r\n"
-        "config_version=8\r\n"
+        "config_version=9\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
         "mode3_aer_presentation=0\r\n"
@@ -776,6 +788,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "alternate_presentation_resize=0\r\n"
         "hud_horizontal_scale=1.000\r\n"
         "hud_vertical_scale=1.000\r\n"
+        "cinema_aspect=5x4\r\n"
         "cinema_5x4=1\r\n"
         "cinema_hud_scale=1.300\r\n"
         "manual_cinema_hud_scale=1.600\r\n"
@@ -817,7 +830,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "migrated INI must not be reported as newly created");
     auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated.has_value(), "migrated INI could not be read");
-    Require(migrated->Get("meta", "config_version") == "8",
+    Require(migrated->Get("meta", "config_version") == "9",
         "old INI was not versioned");
     Require(migrated->Get("openxr", "native_stereo") == "0" &&
         migrated->Get("openxr", "fullscreen_projection") == "0" &&
@@ -833,7 +846,8 @@ void TestFirstRunConfiguration(const fs::path& root) {
         migrated->Get("openxr", "render_width") == "3100" &&
         migrated->Get("openxr", "render_height") == "3200",
         "migration did not convert legacy Mono to Mode-3 AER cleanly");
-    Require(migrated->Get("openxr", "cinema_5x4") == "1" &&
+    Require(migrated->Get("openxr", "cinema_aspect") == "5x4" &&
+        migrated->Get("openxr", "cinema_5x4") == "1" &&
         migrated->Get("openxr", "cinema_render_stereo_strength") == "0.250" &&
         migrated->Get("openxr", "cinema_hud_stereo_shift_px") == "-72" &&
         migrated->Get("openxr", "manual_cinema_hud_scale") == "1.600" &&
@@ -883,10 +897,10 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[engine]\r\n"
         "first_person_stationary_turn=0\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V2-to-V8 migration failed");
+        paths, defaults, created, error), "V2-to-V9 migration failed");
     auto migrated_v4 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_v4.has_value() &&
-        migrated_v4->Get("meta", "config_version") == "8" &&
+        migrated_v4->Get("meta", "config_version") == "9" &&
         migrated_v4->Get("openxr", "cinema_hud_stereo_shift_px") == "-91" &&
         migrated_v4->Get("openxr", "cinema_hud_scale") == "1.100" &&
         migrated_v4->Get("openxr", "full_vr_hud_stereo_shift_px") == "-26" &&
@@ -896,7 +910,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         migrated_v4->Get("engine", "first_person_stationary_turn") == "0" &&
         migrated_v4->Get(
             "focus_projection", "shader_registry_enabled") == "0",
-        "V8 migration changed the Full VR offset or missed registry/HUD defaults");
+        "V9 migration changed the Full VR offset or missed registry/HUD defaults");
 
     Write(paths.vr_ini,
         "[meta]\r\n"
@@ -906,14 +920,14 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "hud_vertical_scale=0.780\r\n"
         "custom_user_value=keep\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V3-to-V8 migration failed");
+        paths, defaults, created, error), "V3-to-V9 migration failed");
     auto migrated_from_v3 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v3.has_value() &&
-        migrated_from_v3->Get("meta", "config_version") == "8" &&
+        migrated_from_v3->Get("meta", "config_version") == "9" &&
         migrated_from_v3->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "hud_vertical_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "custom_user_value") == "keep",
-        "V3-to-V8 HUD migration damaged unrelated settings");
+        "V3-to-V9 HUD migration damaged unrelated settings");
 
     // V6 used fullscreen_projection as Native Stereo. Preserve that choice
     // under the dedicated key without opting the user into a new presenter.
@@ -923,15 +937,40 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[openxr]\r\n"
         "fullscreen_projection=1\r\n");
     Require(w3vr::EnsureVrConfiguration(
-        paths, defaults, created, error), "V6-to-V8 migration failed");
+        paths, defaults, created, error), "V6-to-V9 migration failed");
     auto migrated_from_v6 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v6.has_value() &&
-        migrated_from_v6->Get("meta", "config_version") == "8" &&
+        migrated_from_v6->Get("meta", "config_version") == "9" &&
         migrated_from_v6->Get("openxr", "native_stereo") == "1" &&
         migrated_from_v6->Get("openxr", "fullscreen_projection") == "0" &&
         migrated_from_v6->Get("openxr", "alternate_presentation_resize") == "0" &&
         migrated_from_v6->Get("openxr", "mode3_aer_presentation") == "0",
         "V6 combined flag was not split safely");
+
+    // V8 exposed only cinema_5x4. Preserve an explicit off value as the new
+    // 4:3 selection rather than silently returning it to the 5:4 default.
+    Write(paths.vr_ini,
+        "[meta]\r\n"
+        "config_version=8\r\n"
+        "[openxr]\r\n"
+        "cinema_5x4=0\r\n");
+    Require(w3vr::EnsureVrConfiguration(
+        paths, defaults, created, error), "V8-to-V9 migration failed");
+    auto migrated_from_v8 = w3vr::IniDocument::Load(paths.vr_ini, error);
+    Require(migrated_from_v8.has_value() &&
+        migrated_from_v8->Get("meta", "config_version") == "9" &&
+        migrated_from_v8->Get("openxr", "cinema_aspect") == "4x3" &&
+        migrated_from_v8->Get("openxr", "cinema_5x4") == "0",
+        "V8 Cinema framing choice was not migrated to 4:3");
+    Write(paths.game_settings,
+        "[PostProcess]\r\n"
+        "AAMode=0\r\n"
+        "[Rendering]\r\n"
+        "AllowDLSS=false\r\n");
+    const auto loaded_four_three = w3vr::LoadConfiguration(paths);
+    Require(loaded_four_three.state.cinema_aspect ==
+            w3vr::CinemaAspect::FourThree,
+        "migrated 4:3 Cinema aspect was not loaded");
 }
 
 void TestVrBaselineAndRestore(const w3vr::ConfigPaths& paths) {

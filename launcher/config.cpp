@@ -25,7 +25,7 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {3, true, false, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 8;
+constexpr int kCurrentConfigVersion = 9;
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
 constexpr float kFullVrHudReferenceScale = 1.00f;
@@ -256,6 +256,32 @@ std::string ReadString(const IniDocument& doc, const char* section,
     const char* key, const char* fallback) {
     const auto raw = doc.Get(section, key);
     return raw ? Lower(Unquote(*raw)) : fallback;
+}
+
+CinemaAspect ReadCinemaAspect(const IniDocument& ini) {
+    const bool legacy_five_four = ReadBool(
+        ini, "openxr", "cinema_5x4", true);
+    const auto value = ReadString(
+        ini, "openxr", "cinema_aspect",
+        legacy_five_four ? "5x4" : "4x3");
+    return value == "4x3" || value == "4:3"
+        ? CinemaAspect::FourThree
+        : CinemaAspect::FiveFour;
+}
+
+const char* CinemaAspectIniValue(CinemaAspect aspect) {
+    return aspect == CinemaAspect::FourThree ? "4x3" : "5x4";
+}
+
+void MigrateConfigurationToV9(IniDocument& ini) {
+    // Replace the fixed Cinema framing flag with an explicit rational aspect.
+    // A V8 user's old boolean remains authoritative during this one-time move.
+    const auto aspect = ReadCinemaAspect(ini);
+    ini.Set("openxr", "cinema_aspect", CinemaAspectIniValue(aspect));
+    ini.Set("openxr", "cinema_5x4",
+        aspect == CinemaAspect::FiveFour ? "1" : "0");
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
 
 std::string FloatString(float value) {
@@ -949,6 +975,9 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         if (existing_version < 8) {
             MigrateConfigurationToV8(migrated);
         }
+        if (existing_version < 9) {
+            MigrateConfigurationToV9(migrated);
+        }
         return AtomicWriteWithBackup(paths.vr_ini, migrated.Serialize(), error);
     }
     const DWORD lookup_error = GetLastError();
@@ -1134,6 +1163,7 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     result.state.cinema_scale = std::clamp(
         ReadFloat(*vr, "openxr", "cinema_scale", result.state.menu_scale),
         0.3f, 1.5f);
+    result.state.cinema_aspect = ReadCinemaAspect(*vr);
     result.state.cinema_hud_scale = std::clamp(
         ReadFloat(*vr, "openxr", "cinema_hud_scale", 1.30f), 0.5f, 1.5f);
     result.state.cinema_hud_convergence_offset = std::clamp(
@@ -1241,9 +1271,12 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
             state.full_vr_hud_convergence_offset)));
     vr_ini.Set("openxr", "vertical_pitch_enabled",
         state.vertical_pitch_enabled ? "1" : "0");
-    // Cinema framing is intentionally fixed in the launcher. Keep the INI key
-    // because the renderer still consumes it and advanced users can inspect it.
-    vr_ini.Set("openxr", "cinema_5x4", "1");
+    vr_ini.Set("openxr", "cinema_aspect",
+        CinemaAspectIniValue(state.cinema_aspect));
+    // Preserve the legacy key so older DLL checkpoints still interpret a
+    // launcher-authored 5:4 selection correctly. V1138 consumes cinema_aspect.
+    vr_ini.Set("openxr", "cinema_5x4",
+        state.cinema_aspect == CinemaAspect::FiveFour ? "1" : "0");
     vr_ini.Set("openxr", "cinema_full_vr",
         state.cinema_full_vr ? "1" : "0");
     vr_ini.Set("openxr", "steady_icons", state.steady_icons ? "1" : "0");

@@ -123,7 +123,7 @@ struct Config {
     float hud_size{1.0f};
     float menu_scale{0.7f};
     float cinema_scale{0.7f};
-    bool cinema_5x4{false};
+    float cinema_aspect_ratio{5.0f / 4.0f};
     bool cinema_full_vr{false};
     bool steady_icons{false};
     float menu_distance{1.5f};
@@ -7010,13 +7010,21 @@ void load_config() {
             read_ini_float("openxr", "hud_size", 1.0f), 0.5f, 1.5f);
         g_config.menu_scale = std::clamp(
             read_ini_float("openxr", "menu_scale", 0.7f), 0.3f, 1.5f);
-        // [FIX:CINEMA-5X4 1/3] Load the optional framing workaround separately
-        // from cinema size so its visual trade-offs remain user-controlled.
+        // [FEATURE:CINEMA-ASPECT V1138 1/5] One exact rational owns the
+        // REDengine camera, anchored OpenXR panel and retained-HUD correction.
+        // The legacy boolean remains a read-only fallback for old INIs.
         g_config.cinema_scale = std::clamp(
             read_ini_float("openxr", "cinema_scale", g_config.menu_scale),
             0.3f, 1.5f);
-        g_config.cinema_5x4 = read_ini_bool(
-            "openxr", "cinema_5x4", false);
+        const bool legacy_cinema_5x4 = read_ini_bool(
+            "openxr", "cinema_5x4", true);
+        const auto cinema_aspect = read_ini_string(
+            "openxr", "cinema_aspect",
+            legacy_cinema_5x4 ? "5x4" : "4x3");
+        g_config.cinema_aspect_ratio =
+            cinema_aspect == "4x3" || cinema_aspect == "4:3"
+            ? 4.0f / 3.0f
+            : 5.0f / 4.0f;
         g_config.cinema_full_vr = read_ini_bool(
             "openxr", "cinema_full_vr", false);
         g_config.steady_icons = read_ini_bool(
@@ -7686,10 +7694,10 @@ IDxcBlob* compile_hud_composite_pixel_shader(
 
     char shader_source[4096]{};
     if (presentation_aspect > 0.1f) {
-        // [FIX:CINEMA-HUD-ASPECT 1/2] The normal cinema panel presents the
-        // portrait render texture on a 5:4 surface. Pre-compress only HUD X by
-        // source_aspect / 1.25; the later panel stretch then restores square
-        // HUD proportions while the already-correct 5:4 scene is untouched.
+        // [FEATURE:CINEMA-ASPECT V1138 4/5] The normal Cinema panel presents
+        // the portrait render texture on the selected rational surface.
+        // Pre-compress only HUD X by source_aspect / presentation_aspect; the
+        // later panel stretch restores square HUD proportions.
         sprintf_s(shader_source, R"(
 Texture2D<float4> scene_texture : register(t0);
 Texture2D<float4> hud_texture : register(t1);
@@ -14212,25 +14220,25 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
                 compile_hud_composite_pixel_shader(
                     g_config.cinema_hud_stereo_shift_px,
                     g_config.hud_size * g_config.manual_cinema_hud_scale,
-                    g_config.cinema_5x4 ? 5.0f / 4.0f : 0.0f);
+                    g_config.cinema_aspect_ratio);
             IDxcBlob* cinema_eye1_shader =
                 compile_hud_composite_pixel_shader(
                     -g_config.cinema_hud_stereo_shift_px,
                     g_config.hud_size * g_config.manual_cinema_hud_scale,
-                    g_config.cinema_5x4 ? 5.0f / 4.0f : 0.0f);
-            // Automatic Cinema keeps the established 5:4 compensation, then
+                    g_config.cinema_aspect_ratio);
+            // Automatic Cinema keeps the selected aspect compensation, then
             // enlarges the complete HUD composite by 30 percent. Manual F10
             // uses its independent INI scale in the Cinema variants above.
             IDxcBlob* auto_cinema_eye0_shader =
                 compile_hud_composite_pixel_shader(
                     g_config.cinema_hud_stereo_shift_px,
                     g_config.hud_size * 1.30f,
-                    g_config.cinema_5x4 ? 5.0f / 4.0f : 0.0f);
+                    g_config.cinema_aspect_ratio);
             IDxcBlob* auto_cinema_eye1_shader =
                 compile_hud_composite_pixel_shader(
                     -g_config.cinema_hud_stereo_shift_px,
                     g_config.hud_size * 1.30f,
-                    g_config.cinema_5x4 ? 5.0f / 4.0f : 0.0f);
+                    g_config.cinema_aspect_ratio);
             IDxcBlob* scene_shader = retained_hud_projection_route_configured()
                 ? compile_mode3_scene_only_pixel_shader()
                 : nullptr;
@@ -15208,7 +15216,7 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
         // [FIX:MODE1-CINEMA-HUD-GEOMETRY V12017 1/1] Mode 1 already presents
         // normal Cinema from an immutable stereo pair, but V12016 still gated
         // the matching HUD shift/scale PSOs to Mode 3. Admit the AER transport
-        // so No AA, TAAU and DLSS use the same per-eye convergence and 5:4
+        // so No AA, TAAU and DLSS use the same per-eye convergence and aspect
         // pre-compensation. Menu, loading and Full VR keep their old routes.
         const bool normal_stereo_cinema_hud = cinema_active &&
             (mode1_aer_transport_active() ||
@@ -23252,7 +23260,9 @@ void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data
 
 void install_engine_frame_builder_probe() {
     const bool cinema_frame_camera_needed =
-        g_config.cinema_5x4 || g_config.cinema_full_vr;
+        (std::isfinite(g_config.cinema_aspect_ratio) &&
+            g_config.cinema_aspect_ratio > 1.0f) ||
+        g_config.cinema_full_vr;
     if ((!g_config.engine_frame_builder_probe &&
             !g_engine_dual_render_active.load() &&
             !mode1_aer_transport_active() &&
@@ -26283,8 +26293,7 @@ bool prepare_cinema_frame_camera(
     int eye,
     bool stereo_transport,
     std::array<float, 512>& original_camera) {
-    if (frame_data == nullptr || eye < 0 || eye > 1 ||
-        !g_config.cinema_5x4) {
+    if (frame_data == nullptr || eye < 0 || eye > 1) {
         return false;
     }
 
@@ -26299,16 +26308,17 @@ bool prepare_cinema_frame_camera(
         return false;
     }
 
-    constexpr float kCinemaProjectionAspect = 5.0f / 4.0f;
-    // A normally rebuilt cinema camera already carries 5:4 here. The resumed
+    const float cinema_projection_aspect = g_config.cinema_aspect_ratio;
+    // A normally rebuilt cinema camera already carries the configured aspect.
+    // The resumed
     // post-fight scene is distinctive because frame_data keeps the old native
     // 16:9-ish descriptor and the view factory is not called again.
-    if (fabsf(original_camera[10] - kCinemaProjectionAspect) <= 0.001f) {
+    if (fabsf(original_camera[10] - cinema_projection_aspect) <= 0.001f) {
         return false;
     }
 
     std::array<float, 512> corrected = original_camera;
-    corrected[10] = kCinemaProjectionAspect;
+    corrected[10] = cinema_projection_aspect;
     const std::array<float, 12> base_camera{
         corrected[0], corrected[1], corrected[2],
         corrected[0xA0], corrected[0xA1], corrected[0xA2],
@@ -29148,7 +29158,7 @@ bool prepare_engine_per_eye_native_temporal_history(
 void __fastcall hook_engine_view_rebuild(float* view) {
     constexpr uintptr_t kViewFactoryReturnRva = 0x0162196D;
     constexpr uintptr_t kViewCopyRebuildReturnRva = 0x015FF863;
-    constexpr float kCinemaProjectionAspect = 5.0f / 4.0f;
+    const float cinema_projection_aspect = g_config.cinema_aspect_ratio;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto caller_rva = reinterpret_cast<uintptr_t>(_ReturnAddress()) - module;
     const auto present = g_present_count.load();
@@ -29444,7 +29454,6 @@ void __fastcall hook_engine_view_rebuild(float* view) {
     const float projection_aspect_before =
         projection_probe_candidate ? view[10] : 0.0f;
     const bool cinema_projection =
-        g_config.cinema_5x4 &&
         !native_loading_video &&
         g_cinema_mode_active.load(std::memory_order_relaxed) &&
         !automatic_full_vr_cutscene &&
@@ -30216,12 +30225,12 @@ void __fastcall hook_engine_view_rebuild(float* view) {
             view[14], std::memory_order_relaxed);
     }
 
-    // [FIX:CINEMA-5X4 2/3] Apply the same 5:4 aspect used by the OpenXR quad
-    // at the final camera boundary, after the optional HMD FOV calculation.
+    // [FEATURE:CINEMA-ASPECT V1138 2/5] Apply the same selected aspect used by
+    // the OpenXR panel at the final camera boundary, after optional HMD FOV.
     // This preserves automatic cinema exit detection while preventing either
     // the old 16:9 value or the gameplay HMD aspect from reaching the rebuild.
     if (cinema_projection) {
-        view[10] = kCinemaProjectionAspect;
+        view[10] = cinema_projection_aspect;
     }
 
     if (asymmetric_factory_pending != nullptr) {
@@ -35377,7 +35386,7 @@ void ensure_initialized() {
         // [FEATURE:PUREDARK-AFW-DLSS V12004 6/6] The identity line makes the
         // active AFW scope and fail-open base unambiguous in a bounded run.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1137 bases=V1136+V12050 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1138 bases=V1137 cinema_aspect_selectable=1 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 g_config.mode3_aer_presentation ? 1 : 0,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
@@ -35567,7 +35576,7 @@ float4 ps_main(PixelInput input) : SV_Target0 {
     } else {
         // Legacy fallback and the physical Cinema panel transform HUD pixels
         // around their own source center. Cinema may use a distinct X scale
-        // to preserve HUD proportions on the optional 5:4 panel.
+        // to preserve HUD proportions on the selected Cinema panel.
         float2 center = source_size * 0.5;
         coordinate = int2(
             (source_position - center) /
@@ -35760,7 +35769,7 @@ struct CinemaHudProjectionParameters {
     const XrPosef* panel_pose{};
     float panel_width{};
     float panel_height{};
-    bool use_5x4{};
+    float aspect_ratio{};
     bool automatic{};
 };
 
@@ -35860,8 +35869,10 @@ bool composite_mode3_hud_into_projection_image(
             cinema_parameters->panel_pose == nullptr ||
             !std::isfinite(cinema_parameters->panel_width) ||
             !std::isfinite(cinema_parameters->panel_height) ||
+            !std::isfinite(cinema_parameters->aspect_ratio) ||
             cinema_parameters->panel_width <= 0.01f ||
-            cinema_parameters->panel_height <= 0.01f)) {
+            cinema_parameters->panel_height <= 0.01f ||
+            cinema_parameters->aspect_ratio <= 1.0f)) {
         return false;
     }
     const int reference_left_eye_shift = cinema_projection
@@ -35961,12 +35972,12 @@ bool composite_mode3_hud_into_projection_image(
         static std::atomic<uint32_t> cinema_projection_hud_logs{};
         if (take_bounded_log_slot(cinema_projection_hud_logs, 4)) {
             log_line(
-                "Cinema retained HUD projection pair=%llu shift=%d size=%.3f panel=%.3fx%.3f aspect_5x4=%d automatic=%d",
+                "Cinema retained HUD projection pair=%llu shift=%d size=%.3f panel=%.3fx%.3f aspect=%.6f automatic=%d",
                 static_cast<unsigned long long>(scene_pair_id),
                 reference_left_eye_shift, hud_size,
                 cinema_parameters->panel_width,
                 cinema_parameters->panel_height,
-                cinema_parameters->use_5x4 ? 1 : 0,
+                cinema_parameters->aspect_ratio,
                 cinema_parameters->automatic ? 1 : 0);
         }
     } else if (headset_projection) {
@@ -36132,9 +36143,8 @@ bool composite_mode3_hud_into_projection_image(
             static_cast<float>(source_descs[eye].Width) /
             static_cast<float>(std::max<UINT>(
                 source_descs[eye].Height, 1));
-        const float hud_scale_x = cinema_projection &&
-                cinema_parameters->use_5x4
-            ? hud_size * source_aspect / 1.25f
+        const float hud_scale_x = cinema_projection
+            ? hud_size * source_aspect / cinema_parameters->aspect_ratio
             : hud_size;
         const float hud_scale_y = hud_size;
         uint32_t sampling_constants[8]{
@@ -39516,7 +39526,7 @@ void render_openxr_test_frame(
         }
         if (cinema_mode) {
             // [FIX:CINEMA-PROJECTION-AWARE-ASPECT 1/2] The first flat frame
-            // after a cinema transition has not yet received a 5:4 camera
+            // after a cinema transition has not yet received its selected-aspect camera
             // projection. Discard any projection inherited from the previous
             // scene so the quad cannot stretch that native frame.
             g_cinema_projection_last_present.store(
@@ -39694,7 +39704,7 @@ void render_openxr_test_frame(
     bool cinema_projection_panel_ready{};
     float cinema_projection_panel_width{};
     float cinema_projection_panel_height{};
-    bool cinema_projection_uses_5x4{};
+    float cinema_projection_aspect_ratio{};
     bool submitted = views_valid && frame_state.shouldRender;
     const uint64_t loading_video_scene_pair_floor =
         g_loading_video_scene_pair_floor.load(std::memory_order_acquire);
@@ -41682,8 +41692,10 @@ void render_openxr_test_frame(
                             current_present >= projection_last
                         ? current_present - projection_last
                         : UINT64_MAX;
-                    cinema_projection_uses_5x4 = g_config.cinema_5x4 &&
-                        projection_age <= kCinemaProjectionAspectMaxAge;
+                    cinema_projection_aspect_ratio =
+                        projection_age <= kCinemaProjectionAspectMaxAge
+                        ? g_config.cinema_aspect_ratio
+                        : 0.0f;
                     cinema_projection_panel_width =
                         1.6f * g_config.cinema_scale;
                     const float source_height_over_width = copy_width > 0
@@ -41692,8 +41704,9 @@ void render_openxr_test_frame(
                         : 1.0f;
                     cinema_projection_panel_height =
                         cinema_projection_panel_width *
-                        (cinema_projection_uses_5x4 ? 4.0f / 5.0f
-                                 : source_height_over_width);
+                        (cinema_projection_aspect_ratio > 1.0f
+                            ? 1.0f / cinema_projection_aspect_ratio
+                            : source_height_over_width);
                     cinema_projection_panel_ready =
                         render_anchored_cinema_projection(
                             swapchain, image_index,
@@ -42101,7 +42114,7 @@ void render_openxr_test_frame(
                 &cinema_projection_anchor,
                 cinema_projection_panel_width,
                 cinema_projection_panel_height,
-                cinema_projection_uses_5x4,
+                cinema_projection_aspect_ratio,
                 !manual_cinema};
             const bool hud_composited =
                 composite_mode3_hud_into_projection_image(
@@ -42311,16 +42324,19 @@ void render_openxr_test_frame(
             current_present >= cinema_projection_last
         ? current_present - cinema_projection_last
         : UINT64_MAX;
-    // [FIX:CINEMA-PROJECTION-AWARE-ASPECT 2/2] Use the 5:4 quad only while a
-    // recent REDengine camera has actually received the matching 1.25
-    // projection. Loading/movie frames without a 3D camera retain their native
-    // image ratio instead of being widened from 0.955 to 1.25.
+    // [FEATURE:CINEMA-ASPECT V1138 3/5] Use the selected ratio only while a
+    // recent REDengine camera has received the matching projection. Loading
+    // and movie frames without a 3D camera retain their native image ratio.
+    const float cinema_quad_aspect_ratio =
+        cinema_panel && !fullscreen_menu &&
+            cinema_projection_age <= kCinemaProjectionAspectMaxAge
+        ? g_config.cinema_aspect_ratio
+        : 0.0f;
     const bool cinema_projection_aspect_active =
-        cinema_panel && !fullscreen_menu && g_config.cinema_5x4 &&
-        cinema_projection_age <= kCinemaProjectionAspectMaxAge;
+        cinema_quad_aspect_ratio > 1.0f;
     const float presented_height_over_width =
         cinema_projection_aspect_active
-        ? 4.0f / 5.0f
+        ? 1.0f / cinema_quad_aspect_ratio
         : (menu_image_rect.extent.width > 0
             ? static_cast<float>(menu_image_rect.extent.height) /
                 static_cast<float>(menu_image_rect.extent.width)
@@ -42338,15 +42354,15 @@ void render_openxr_test_frame(
         : 0.0f;
     if (cinema_mode && current_present % 30 == 0) {
         log_taau_trace_line(
-            "Cinema aspect sample present=%llu forced=%d config_5x4=%d "
-            "active_5x4=%d projection_last=%llu projection_age=%llu "
+            "Cinema aspect sample present=%llu forced=%d configured=%.6f "
+            "active=%.6f projection_last=%llu projection_age=%llu "
             "rect=%d,%d %dx%d rect_aspect=%.6f "
-            "quad=%.4fx%.4f quad_aspect=%.6f target=1.250000 "
+            "quad=%.4fx%.4f quad_aspect=%.6f "
             "render=%ux%u",
             static_cast<unsigned long long>(current_present),
             manual_cinema ? 1 : 0,
-            g_config.cinema_5x4 ? 1 : 0,
-            cinema_projection_aspect_active ? 1 : 0,
+            g_config.cinema_aspect_ratio,
+            cinema_quad_aspect_ratio,
             static_cast<unsigned long long>(cinema_projection_last),
             static_cast<unsigned long long>(cinema_projection_age),
             menu_image_rect.offset.x, menu_image_rect.offset.y,
@@ -42413,8 +42429,8 @@ void render_openxr_test_frame(
             "OpenXR layer transition layer=%s mode=%d menu=%d cinema=%d "
             "submitted=%d should_render=%d views_valid=%d panel_ready=%d "
             "rect=%d,%d %dx%d rect_aspect=%.6f "
-            "quad=%.3fx%.3f quad_aspect=%.6f cinema_5x4=%d "
-            "active_5x4=%d projection_age=%llu "
+            "quad=%.3fx%.3f quad_aspect=%.6f cinema_aspect=%.6f "
+            "active_aspect=%.6f projection_age=%llu "
             "distance=%.3f scale=%.3f present=%llu",
             layer_name, g_config.openxr_mode, fullscreen_menu ? 1 : 0,
             cinema_mode ? 1 : 0, submitted ? 1 : 0,
@@ -42425,8 +42441,8 @@ void render_openxr_test_frame(
             source_rect_aspect,
             menu_layer.size.width, menu_layer.size.height,
             submitted_quad_aspect,
-            g_config.cinema_5x4 ? 1 : 0,
-            cinema_projection_aspect_active ? 1 : 0,
+            g_config.cinema_aspect_ratio,
+            cinema_quad_aspect_ratio,
             static_cast<unsigned long long>(cinema_projection_age),
             g_config.menu_distance, spatial_panel_scale,
             static_cast<unsigned long long>(current_present));

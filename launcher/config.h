@@ -16,6 +16,11 @@ enum class RenderMode {
     StereoDlssSequential,
 };
 
+enum class CinemaAspect {
+    FiveFour,
+    FourThree,
+};
+
 struct ModeSettings {
     int openxr_mode{};
     bool dual_render{};
@@ -34,6 +39,7 @@ struct LauncherState {
     float presentation_scale{1.0f};
     float menu_scale{0.85f};
     float cinema_scale{0.9f};
+    CinemaAspect cinema_aspect{CinemaAspect::FiveFour};
     float cinema_hud_scale{1.30f};
     int cinema_hud_convergence_offset{};
     float full_vr_hud_scale{1.00f};
