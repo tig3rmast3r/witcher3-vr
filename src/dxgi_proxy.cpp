@@ -373,13 +373,15 @@ bool effect_gpu_probe_available() {
 // [FIX:REAL-SMOKE-RELEASE-ROUTE V1070] The V1065-V1069 center correction is
 // rendering behavior, not a diagnostic probe. Keep the minimal CBV/upload
 // metadata authority alive for the native asymmetric route even when the
-// launcher disables Diagnostic Logging. V1124 extends this authority to TAAU.
+// launcher disables Diagnostic Logging. V1124 extends this authority to TAAU;
+// V1136 adds only sequential Stereo DLSS and still excludes Packed DLSS.
 bool real_smoke_center_fix_route_active() {
     return g_config.openxr_enabled &&
         g_config.native_stereo &&
         g_config.openxr_mode == 3 &&
         (g_config.temporal_backend == TemporalBackend::None ||
-            g_config.temporal_backend == TemporalBackend::Taau) &&
+            g_config.temporal_backend == TemporalBackend::Taau ||
+            g_config.temporal_backend == TemporalBackend::Dlss) &&
         g_config.hmd_freelook &&
         fabsf(g_config.presentation_scale - 1.0f) <= 0.0005f;
 }
@@ -1638,8 +1640,10 @@ constexpr bool kNativeAsymmetricNoAaTrialBuild = true;
 constexpr size_t kNativeAsymmetricPairSlotCount = 128;
 struct NativeAsymmetricPairSlot {
     std::atomic<uint64_t> pair_id{UINT64_MAX};
+    std::atomic<uint32_t> generation{UINT32_MAX};
     std::atomic<uint8_t> factory_mask{};
     std::atomic<uint8_t> temporal_mask{};
+    std::atomic<uint8_t> dlss_input_mask{};
     XrFovf fov[2]{};
 };
 std::array<NativeAsymmetricPairSlot, kNativeAsymmetricPairSlotCount>
@@ -1656,16 +1660,18 @@ std::atomic<uint32_t> g_native_asymmetric_frame_writer_logs{};
 std::atomic<uint32_t> g_native_asymmetric_frame_writer_failure_logs{};
 std::atomic<uint32_t> g_native_asymmetric_present_logs{};
 std::atomic<uint32_t> g_native_asymmetric_rejected_pair_logs{};
+std::atomic<uint32_t> g_native_asymmetric_dlss_input_logs{};
 
 bool native_asymmetric_noaa_route_active() {
-    // [TRIAL:NATIVE-STEREO-TAAU V1124] Reuse the validated native-asymmetric
-    // geometry ledger with TAAU while leaving both DLSS routes excluded. TAAU
-    // is the only new renderer variable in this build.
+    // [TRIAL:NATIVE-STEREO-DLSS V1136] Reuse the validated native-asymmetric
+    // geometry ledger with sequential Stereo DLSS. Packed DLSS remains a
+    // separate atlas/replay renderer and is deliberately excluded.
     return kNativeAsymmetricNoAaTrialBuild &&
         g_config.native_stereo &&
         g_config.openxr_mode == 3 &&
         (g_config.temporal_backend == TemporalBackend::None ||
-            g_config.temporal_backend == TemporalBackend::Taau) &&
+            g_config.temporal_backend == TemporalBackend::Taau ||
+            g_config.temporal_backend == TemporalBackend::Dlss) &&
         g_config.hmd_freelook &&
         std::fabs(g_config.presentation_scale - 1.0f) <= 0.0001f;
 }
@@ -1720,8 +1726,12 @@ bool initialize_native_asymmetric_pair(uint64_t pair_id) {
     auto& slot = g_native_asymmetric_pair_slots[
         pair_id % kNativeAsymmetricPairSlotCount];
     slot.pair_id.store(UINT64_MAX, std::memory_order_release);
+    slot.generation.store(
+        g_streamline_capture_generation.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
     slot.factory_mask.store(0, std::memory_order_relaxed);
     slot.temporal_mask.store(0, std::memory_order_relaxed);
+    slot.dlss_input_mask.store(0, std::memory_order_relaxed);
     slot.fov[0] = g_xr_views[0].fov;
     slot.fov[1] = g_xr_views[1].fov;
     slot.pair_id.store(pair_id, std::memory_order_release);
@@ -1774,8 +1784,10 @@ void reset_native_asymmetric_noaa_state() {
         std::scoped_lock slot_lock{g_native_asymmetric_pair_slot_mutex};
         for (auto& slot : g_native_asymmetric_pair_slots) {
             slot.pair_id.store(UINT64_MAX, std::memory_order_release);
+            slot.generation.store(UINT32_MAX, std::memory_order_relaxed);
             slot.factory_mask.store(0, std::memory_order_relaxed);
             slot.temporal_mask.store(0, std::memory_order_relaxed);
+            slot.dlss_input_mask.store(0, std::memory_order_relaxed);
         }
     }
 }
@@ -20413,12 +20425,23 @@ void __fastcall hook_engine_temporal_writer(
     // aligned the final resolve but detached terrain/material sampling from the
     // scene projection. V1130 removes the pair-FOV center only from the private
     // resolve CB10 using the runtime-proven pixel/texture-Y encoding.
-    constexpr uintptr_t kTaauCenteredTemporalWriterReturnRva = 0x01D87EC0;
-    const bool taau_center_already_applied =
-        temporal_backend_is_taau() &&
-        caller_rva == kTaauCenteredTemporalWriterReturnRva;
+    constexpr uintptr_t kCenteredTemporalWriterReturnRva = 0x01D87EC0;
+    // [TRIAL:NATIVE-STEREO-DLSS V1136] The later temporal writer receives an
+    // already-centered value on validated TAAU runs, but that property was
+    // previously hard-coded to the backend.  Detect the actual value instead:
+    // this preserves TAAU byte-for-byte and prevents a sequential DLSS caller
+    // from receiving the optical center twice.
+    const bool temporal_center_already_applied =
+        native_asymmetric_center_applied &&
+        (temporal_backend_is_taau() ||
+            g_config.temporal_backend == TemporalBackend::Dlss) &&
+        caller_rva == kCenteredTemporalWriterReturnRva &&
+        fabsf(value0 - native_asymmetric_descriptor.
+            redengine_center_offset_px_x) <= 1.0f &&
+        fabsf(value1 - native_asymmetric_descriptor.
+            redengine_center_offset_px_y) <= 1.0f;
     if (native_asymmetric_center_applied &&
-        !taau_center_already_applied) {
+        !temporal_center_already_applied) {
         routed_value0 +=
             native_asymmetric_descriptor.redengine_center_offset_px_x;
         routed_value1 +=
@@ -20590,7 +20613,7 @@ void __fastcall hook_engine_temporal_writer(
     }
     const bool taau_projection_center_preserved =
         !temporal_backend_is_taau() ||
-        (taau_center_already_applied &&
+        (temporal_center_already_applied &&
             fabsf(routed_value0 - native_asymmetric_descriptor.
                 redengine_center_offset_px_x) <= 0.0001f &&
             fabsf(routed_value1 - native_asymmetric_descriptor.
@@ -31407,6 +31430,229 @@ NVSDK_NGX_Handle* lookup_packed_dlss_handle(
         : g_packed_dlss_primary_handle;
 }
 
+struct NativeAsymmetricDlssJitterOverride {
+    bool required{};
+    bool valid{};
+    bool applied{};
+    bool source_was_centered{};
+    uint32_t reason{};
+    uint64_t pair_id{UINT64_MAX};
+    uint32_t generation{UINT32_MAX};
+    uint32_t eye{UINT32_MAX};
+    uint8_t factory_mask{};
+    uint8_t temporal_mask{};
+    float original_x{};
+    float original_y{};
+    float pure_x{};
+    float pure_y{};
+    float center_x{};
+    float center_y{};
+    uint32_t extent_width{};
+    uint32_t extent_height{};
+};
+
+// [TRIAL:NATIVE-STEREO-DLSS V1136] REDengine's shared temporal writer must
+// keep center+jitter so its off-axis projection and world consumers agree.
+// NGX, however, consumes a private pure sub-pixel jitter. Convert only at the
+// final evaluate boundary, using the exact pair FOV and NGX MV scale, and leave
+// every Streamline constant, native motion vector and per-eye history intact.
+bool prepare_native_asymmetric_dlss_jitter_override(
+    const NVSDK_NGX_Parameter* parameters,
+    uint64_t pair_id,
+    uint32_t eye,
+    NativeAsymmetricDlssJitterOverride& override_state) {
+    override_state = {};
+    override_state.pair_id = pair_id;
+    override_state.eye = eye;
+    if (!native_asymmetric_noaa_route_active() ||
+        g_config.temporal_backend != TemporalBackend::Dlss ||
+        parameters == nullptr || eye > 1 || pair_id == 0 ||
+        pair_id == UINT64_MAX) {
+        override_state.reason = 1;
+        return false;
+    }
+
+    auto* pair_slot = native_asymmetric_pair_slot(pair_id);
+    if (pair_slot == nullptr) {
+        // Symmetric warm-up pairs intentionally have no slot and need no
+        // correction or publication bit.
+        override_state.reason = 2;
+        return false;
+    }
+    override_state.required = true;
+    override_state.generation = pair_slot->generation.load(
+        std::memory_order_acquire);
+    override_state.factory_mask = pair_slot->factory_mask.load(
+        std::memory_order_acquire);
+    override_state.temporal_mask = pair_slot->temporal_mask.load(
+        std::memory_order_acquire);
+    const uint32_t current_generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    const uint8_t eye_bit = static_cast<uint8_t>(1u << eye);
+    if (override_state.generation != current_generation ||
+        (override_state.factory_mask & eye_bit) == 0 ||
+        (override_state.temporal_mask & eye_bit) == 0) {
+        override_state.reason = 3;
+        return false;
+    }
+
+    float mv_scale_x{};
+    float mv_scale_y{};
+    unsigned subrect_width{};
+    unsigned subrect_height{};
+    const bool parameters_valid =
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_Jitter_Offset_X,
+            &override_state.original_x)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_Jitter_Offset_Y,
+            &override_state.original_y)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_MV_Scale_X, &mv_scale_x)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_MV_Scale_Y, &mv_scale_y));
+    parameters->Get(
+        NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+        &subrect_width);
+    parameters->Get(
+        NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+        &subrect_height);
+    if (!parameters_valid || !std::isfinite(override_state.original_x) ||
+        !std::isfinite(override_state.original_y) ||
+        !std::isfinite(mv_scale_x) || !std::isfinite(mv_scale_y)) {
+        override_state.reason = 4;
+        return false;
+    }
+
+    const float extent_x = fabsf(mv_scale_x);
+    const float extent_y = fabsf(mv_scale_y);
+    if (extent_x < 256.0f || extent_x > 8192.0f ||
+        extent_y < 256.0f || extent_y > 8192.0f) {
+        override_state.reason = 5;
+        return false;
+    }
+    override_state.extent_width = static_cast<uint32_t>(extent_x + 0.5f);
+    override_state.extent_height = static_cast<uint32_t>(extent_y + 0.5f);
+    const bool integral_extent =
+        fabsf(extent_x - static_cast<float>(override_state.extent_width)) <=
+            0.01f &&
+        fabsf(extent_y - static_cast<float>(override_state.extent_height)) <=
+            0.01f;
+    const bool subrect_matches =
+        (subrect_width == 0 ||
+            fabsf(extent_x - static_cast<float>(subrect_width)) <= 1.0f) &&
+        (subrect_height == 0 ||
+            fabsf(extent_y - static_cast<float>(subrect_height)) <= 1.0f);
+    if (!integral_extent || !subrect_matches) {
+        override_state.reason = 6;
+        return false;
+    }
+
+    XrFovf pair_fov{};
+    w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor descriptor{};
+    if (!snapshot_native_asymmetric_pair_fov(
+            pair_id, eye, pair_fov) ||
+        !w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(
+            pair_fov, override_state.extent_width,
+            override_state.extent_height, descriptor) ||
+        pair_slot->pair_id.load(std::memory_order_acquire) != pair_id ||
+        pair_slot->generation.load(std::memory_order_acquire) !=
+            override_state.generation) {
+        override_state.reason = 7;
+        return false;
+    }
+    override_state.center_x = descriptor.redengine_center_offset_px_x;
+    override_state.center_y = descriptor.redengine_center_offset_px_y;
+    const float centered_residual_x =
+        override_state.original_x - override_state.center_x;
+    const float centered_residual_y =
+        override_state.original_y + override_state.center_y;
+    const bool centered_input =
+        fabsf(centered_residual_x) <= 1.0f &&
+        fabsf(centered_residual_y) <= 1.0f;
+    const bool already_pure = fabsf(override_state.original_x) <= 1.0f &&
+        fabsf(override_state.original_y) <= 1.0f;
+    if (centered_input) {
+        override_state.pure_x = centered_residual_x;
+        override_state.pure_y = centered_residual_y;
+        override_state.source_was_centered = true;
+    } else if (already_pure) {
+        override_state.pure_x = override_state.original_x;
+        override_state.pure_y = override_state.original_y;
+    } else {
+        override_state.reason = 8;
+        return false;
+    }
+
+    auto* mutable_parameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
+    mutable_parameters->Set(
+        NVSDK_NGX_Parameter_Jitter_Offset_X, override_state.pure_x);
+    mutable_parameters->Set(
+        NVSDK_NGX_Parameter_Jitter_Offset_Y, override_state.pure_y);
+    float readback_x{};
+    float readback_y{};
+    const bool write_verified =
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_Jitter_Offset_X, &readback_x)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_Jitter_Offset_Y, &readback_y)) &&
+        fabsf(readback_x - override_state.pure_x) <= 0.000001f &&
+        fabsf(readback_y - override_state.pure_y) <= 0.000001f;
+    if (!write_verified) {
+        mutable_parameters->Set(
+            NVSDK_NGX_Parameter_Jitter_Offset_X, override_state.original_x);
+        mutable_parameters->Set(
+            NVSDK_NGX_Parameter_Jitter_Offset_Y, override_state.original_y);
+        override_state.reason = 9;
+        return false;
+    }
+    override_state.applied = true;
+    override_state.valid = true;
+    return true;
+}
+
+bool restore_native_asymmetric_dlss_jitter_override(
+    const NVSDK_NGX_Parameter* parameters,
+    const NativeAsymmetricDlssJitterOverride& override_state) {
+    if (!override_state.applied || parameters == nullptr) {
+        return false;
+    }
+    auto* mutable_parameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
+    mutable_parameters->Set(
+        NVSDK_NGX_Parameter_Jitter_Offset_X, override_state.original_x);
+    mutable_parameters->Set(
+        NVSDK_NGX_Parameter_Jitter_Offset_Y, override_state.original_y);
+    float readback_x{};
+    float readback_y{};
+    return NVSDK_NGX_SUCCEED(parameters->Get(
+               NVSDK_NGX_Parameter_Jitter_Offset_X, &readback_x)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_Jitter_Offset_Y, &readback_y)) &&
+        fabsf(readback_x - override_state.original_x) <= 0.000001f &&
+        fabsf(readback_y - override_state.original_y) <= 0.000001f;
+}
+
+bool commit_native_asymmetric_dlss_input(
+    const NativeAsymmetricDlssJitterOverride& override_state) {
+    if (!override_state.valid || override_state.eye > 1) {
+        return false;
+    }
+    std::scoped_lock slot_lock{g_native_asymmetric_pair_slot_mutex};
+    auto& pair_slot = g_native_asymmetric_pair_slots[
+        override_state.pair_id % kNativeAsymmetricPairSlotCount];
+    const uint8_t eye_bit = static_cast<uint8_t>(1u << override_state.eye);
+    if (pair_slot.pair_id.load(std::memory_order_acquire) !=
+            override_state.pair_id ||
+        pair_slot.generation.load(std::memory_order_acquire) !=
+            override_state.generation ||
+        (pair_slot.factory_mask.load(std::memory_order_acquire) & eye_bit) == 0 ||
+        (pair_slot.temporal_mask.load(std::memory_order_acquire) & eye_bit) == 0) {
+        return false;
+    }
+    pair_slot.dlss_input_mask.fetch_or(eye_bit, std::memory_order_release);
+    return true;
+}
+
 void audit_asymmetric_ngx_entry_after_evaluation(
     ID3D12GraphicsCommandList* command_list,
     const NVSDK_NGX_Handle* handle,
@@ -32049,6 +32295,24 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature(
     PFN_NVSDK_NGX_ProgressCallback callback) {
     g_ngx_dlss_evaluate_calls.fetch_add(1, std::memory_order_relaxed);
     const uint32_t asymmetric_entry_eye = streamline_eye();
+    // [TRIAL:NATIVE-STEREO-DLSS V1136] A deferred NGX command may execute after
+    // the REDengine render TLS has advanced.  Only the command-scoped Streamline
+    // tag is exact enough to authorize a private jitter conversion; never fall
+    // back to the current render pair/eye.
+    const bool native_dlss_exact_command_tag =
+        g_streamline_dlss_pair_id != 0 &&
+        g_streamline_dlss_pair_id != UINT64_MAX &&
+        g_streamline_forced_eye >= 0 && g_streamline_forced_eye <= 1;
+    const uint64_t native_dlss_pair = native_dlss_exact_command_tag
+        ? g_streamline_dlss_pair_id
+        : UINT64_MAX;
+    const uint32_t native_dlss_eye = native_dlss_exact_command_tag
+        ? static_cast<uint32_t>(g_streamline_forced_eye)
+        : UINT32_MAX;
+    NativeAsymmetricDlssJitterOverride native_dlss_jitter{};
+    prepare_native_asymmetric_dlss_jitter_override(
+        parameters, native_dlss_pair, native_dlss_eye,
+        native_dlss_jitter);
     AsymmetricNgxEntryAuditScope asymmetric_entry_audit{
         command_list, handle, parameters,
         g_streamline_dlss_pair_id, asymmetric_entry_eye,
@@ -32059,8 +32323,55 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature(
         asymmetric_authority_audit_active() && parameters != nullptr &&
             g_engine_dual_render_active.load(std::memory_order_acquire) &&
             g_engine_menu_state.load(std::memory_order_relaxed) == 0};
-    return hook_ngx_evaluate_feature_impl(
+    const auto result = hook_ngx_evaluate_feature_impl(
         command_list, handle, parameters, callback);
+    const bool native_dlss_restore_ok =
+        restore_native_asymmetric_dlss_jitter_override(
+            parameters, native_dlss_jitter);
+    const bool native_dlss_committed =
+        result == NVSDK_NGX_Result_Success && native_dlss_restore_ok &&
+        commit_native_asymmetric_dlss_input(native_dlss_jitter);
+    if (native_dlss_jitter.required && g_config.runtime_diagnostics) {
+        const uint32_t log_index =
+            g_native_asymmetric_dlss_input_logs.fetch_add(
+                1, std::memory_order_relaxed);
+        if (log_index < 64) {
+            auto* pair_slot = native_asymmetric_pair_slot(
+                native_dlss_jitter.pair_id);
+            const uint8_t input_mask = pair_slot != nullptr
+                ? pair_slot->dlss_input_mask.load(std::memory_order_acquire)
+                : 0;
+            log_line(
+                "V1136 native DLSS private jitter sample=%u pair=%llu "
+                "generation=%u eye=%u valid=%u centered=%u reason=%u "
+                "source=%.9g,%.9g center=%.9g,%.9g pure=%.9g,%.9g "
+                "extent=%ux%u factory_mask=0x%X temporal_mask=0x%X "
+                "input_mask=0x%X result=0x%08X restored=%u committed=%u",
+                log_index,
+                static_cast<unsigned long long>(
+                    native_dlss_jitter.pair_id),
+                native_dlss_jitter.generation,
+                native_dlss_jitter.eye,
+                native_dlss_jitter.valid ? 1u : 0u,
+                native_dlss_jitter.source_was_centered ? 1u : 0u,
+                native_dlss_jitter.reason,
+                native_dlss_jitter.original_x,
+                native_dlss_jitter.original_y,
+                native_dlss_jitter.center_x,
+                native_dlss_jitter.center_y,
+                native_dlss_jitter.pure_x,
+                native_dlss_jitter.pure_y,
+                native_dlss_jitter.extent_width,
+                native_dlss_jitter.extent_height,
+                native_dlss_jitter.factory_mask,
+                native_dlss_jitter.temporal_mask,
+                input_mask,
+                static_cast<unsigned>(result),
+                native_dlss_restore_ok ? 1u : 0u,
+                native_dlss_committed ? 1u : 0u);
+        }
+    }
+    return result;
 }
 
 NVSDK_NGX_Result NVSDK_CONV hook_ngx_create_feature(
@@ -32826,7 +33137,7 @@ void ensure_initialized() {
         // V1117 completes V1116's post-video automatic Full-VR bootstrap by
         // arming the final-frame HMD camera when the view factory is skipped.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1135 base=V1134 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 native_stereo_taau_trial=1 native_stereo_dlss=0 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1136 base=V1135 native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 native_stereo_taau_trial=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 djules_crosshair_cheap_reject=absent animated_culling_cheap_reject=absent producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 hud_profile_key=F7 renderer_f5_f7_polling=0 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 tiled_capture_code=0 tiled_test_hotkeys=0 clean_native_mvec_history=1 native_mvec_passthrough=1 analytic_mvec_pipeline=0 mvec_readback=0 diagnostic_motion_overlay=absent per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 focus_projection_shader_registry_enabled() ? 1 : 0);
         }
     });
@@ -35596,12 +35907,25 @@ bool update_packed_eye_cache() {
     const uint8_t native_temporal_mask = native_pair != nullptr
         ? native_pair->temporal_mask.load(std::memory_order_acquire)
         : 0;
+    const uint8_t native_dlss_input_mask = native_pair != nullptr
+        ? native_pair->dlss_input_mask.load(std::memory_order_acquire)
+        : 0;
+    const uint32_t native_pair_generation = native_pair != nullptr
+        ? native_pair->generation.load(std::memory_order_acquire)
+        : UINT32_MAX;
+    const bool native_dlss_input_required =
+        native_asymmetric_noaa_route_active() &&
+        g_config.temporal_backend == TemporalBackend::Dlss;
+    const bool native_dlss_input_complete =
+        !native_dlss_input_required ||
+        (native_dlss_input_mask == 0x3u &&
+            native_pair_generation == generation);
     const bool native_pair_complete =
         captured_native_eye0 && captured_native_eye1 &&
         accepted_slots[0]->render_view_valid &&
         accepted_slots[1]->render_view_valid &&
         native_pair != nullptr && native_factory_mask == 0x3u &&
-        native_temporal_mask == 0x3u &&
+        native_temporal_mask == 0x3u && native_dlss_input_complete &&
         native_pair->pair_id.load(std::memory_order_acquire) == accepted_pair;
     if (native_pair != nullptr || captured_native_source) {
         if (!native_pair_complete) {
@@ -35613,15 +35937,18 @@ bool update_packed_eye_cache() {
                     1, std::memory_order_relaxed);
             if (g_config.runtime_diagnostics && log_index < 32) {
                 log_line(
-                    "V1046 native asymmetric pair rejected sample=%u "
+                    "V1136 native asymmetric pair rejected sample=%u "
                     "pair=%llu captured=%d,%d slot=%d "
-                    "factory_mask=0x%X temporal_mask=0x%X",
+                    "factory_mask=0x%X temporal_mask=0x%X "
+                    "dlss_input_mask=0x%X generation=%u/%u",
                     log_index,
                     static_cast<unsigned long long>(accepted_pair),
                     captured_native_eye0 ? 1 : 0,
                     captured_native_eye1 ? 1 : 0,
                     native_pair != nullptr ? 1 : 0,
-                    native_factory_mask, native_temporal_mask);
+                    native_factory_mask, native_temporal_mask,
+                    native_dlss_input_mask, native_pair_generation,
+                    generation);
             }
             return false;
         }
