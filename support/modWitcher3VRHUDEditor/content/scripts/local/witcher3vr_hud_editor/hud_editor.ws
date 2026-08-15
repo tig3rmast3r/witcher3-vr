@@ -1,9 +1,22 @@
 // Witcher3VR per-panel HUD editor - isolated clean-room prototype.
 //
-// This script intentionally does not register or transform SubtitlesModule,
-// DialogModule, InteractionsModule, EnemyFocusModule, OnelinersModule, or
-// RadialMenuModule. Marker projection and the existing cutscene HUD zoom stay
-// outside this mod.
+// SubtitlesModule and DialogModule are scale-only editor panels with guarded
+// examples that never enter real story-scene or menu state. Their local scale
+// multiplies vanilla UI scale; renderer-owned Cinema3D/Full VR zoom remains an
+// independent outer multiplier. InteractionsModule,
+// EnemyFocusModule, OnelinersModule, RadialMenuModule, marker projection and
+// crosshair remain outside this mod.
+
+function W3VRHudEditor_LogicalPanelCount(): int
+{
+  return 22;
+}
+
+function W3VRHudEditor_LiveModuleCount(): int
+{
+  // Tutorial Messages is the one logical panel without a HUD-module root.
+  return 21;
+}
 
 function W3VRHudEditor_DebugChannel(): name
 {
@@ -12,7 +25,7 @@ function W3VRHudEditor_DebugChannel(): name
 
 function W3VRHudEditor_Version(): string
 {
-  return "V956";
+  return "V1140";
 }
 
 function W3VRHudEditor_DebugEnabled(): bool
@@ -161,6 +174,7 @@ class W3VRHudEditorSlot
   var xVar: name;
   var yVar: name;
   var scaleVar: name;
+  var scaleOnly: bool;
   var module: CR4HudModuleBase;
 
   var vrX: float;
@@ -183,12 +197,13 @@ class W3VRHudEditorSlot
     inXVar: name,
     inYVar: name,
     inScaleVar: name,
-    inForceVisibleWhileSelected: bool
+    inForceVisibleWhileSelected: bool,
+    optional inScaleOnly: bool
   )
   {
     ConfigureDescriptor(
       inModuleName, inDisplayName, inXVar, inYVar, inScaleVar,
-      inForceVisibleWhileSelected
+      inForceVisibleWhileSelected, inScaleOnly
     );
     BindModule(inModule);
   }
@@ -199,7 +214,8 @@ class W3VRHudEditorSlot
     inXVar: name,
     inYVar: name,
     inScaleVar: name,
-    inForceVisibleWhileSelected: bool
+    inForceVisibleWhileSelected: bool,
+    optional inScaleOnly: bool
   )
   {
     moduleName = inModuleName;
@@ -208,6 +224,7 @@ class W3VRHudEditorSlot
     yVar = inYVar;
     scaleVar = inScaleVar;
     forceVisibleWhileSelected = inForceVisibleWhileSelected;
+    scaleOnly = inScaleOnly;
 
     vrX = 0.0f;
     vrY = 0.0f;
@@ -462,6 +479,8 @@ class W3VRHudEditorController
     AddDescriptor("TimeLapseModule", "Time Lapse", 'TimeLapseX', 'TimeLapseY', 'TimeLapseScale', true);
     AddDescriptor("TimeLeftModule", "Time Remaining", 'TimeLeftX', 'TimeLeftY', 'TimeLeftScale', true);
     AddDescriptor("TutorialPopup", "Tutorial Messages", 'TutorialX', 'TutorialY', 'TutorialScale', true);
+    AddDescriptor("SubtitlesModule", "Gameplay Subtitles Size", 'SubtitlesX', 'SubtitlesY', 'SubtitlesScale', false, true);
+    AddDescriptor("DialogModule", "Cutscene Text and Dialog Choices Size", 'DialogX', 'DialogY', 'DialogScale', false, true);
   }
 
   private function AddDescriptor(
@@ -470,7 +489,8 @@ class W3VRHudEditorController
     xVar: name,
     yVar: name,
     scaleVar: name,
-    forceVisibleWhileSelected: bool
+    forceVisibleWhileSelected: bool,
+    optional scaleOnly: bool
   )
   {
     var slot: W3VRHudEditorSlot;
@@ -483,7 +503,7 @@ class W3VRHudEditorController
     slot = new W3VRHudEditorSlot in hud;
     slot.ConfigureDescriptor(
       moduleName, displayName, xVar, yVar, scaleVar,
-      forceVisibleWhileSelected
+      forceVisibleWhileSelected, scaleOnly
     );
     slots.PushBack(slot);
   }
@@ -507,7 +527,8 @@ class W3VRHudEditorController
     // Capture the live module reference while vanilla publishes it. On this
     // runtime route CHud.GetHudModule() returns NULL even after loading, while
     // CR4ScriptedHud.AddHudModuleReference() still receives every real module.
-    // Dialog, subtitles, markers, radial menu and crosshair stay excluded.
+    // Dialog/subtitle roots are admitted as scale-only panels. Markers,
+    // interactions, oneliners, radial menu and crosshair stay excluded.
     if ((CR4HudModuleControlsFeedback)module)
       AddSlot(module, "ControlsFeedbackModule", "Controls Feedback", 'ControlsFeedbackX', 'ControlsFeedbackY', 'ControlsFeedbackScale', true);
     else if ((CR4HudModuleHorseStaminaBar)module)
@@ -546,11 +567,16 @@ class W3VRHudEditorController
       AddSlot(module, "TimeLapseModule", "Time Lapse", 'TimeLapseX', 'TimeLapseY', 'TimeLapseScale', true);
     else if ((CR4HudModuleTimeLeft)module)
       AddSlot(module, "TimeLeftModule", "Time Remaining", 'TimeLeftX', 'TimeLeftY', 'TimeLeftScale', true);
+    else if ((CR4HudModuleSubtitles)module)
+      AddSlot(module, "SubtitlesModule", "Gameplay Subtitles Size", 'SubtitlesX', 'SubtitlesY', 'SubtitlesScale', false, true);
+    else if ((CR4HudModuleDialog)module)
+      AddSlot(module, "DialogModule", "Cutscene Text and Dialog Choices Size", 'DialogX', 'DialogY', 'DialogScale', false, true);
 
     if (GetLiveModuleCount() != beforeCount)
     {
       W3VRHudEditor_Trace(
-        "capture live=" + IntToString(GetLiveModuleCount()) + "/19" +
+        "capture live=" + IntToString(GetLiveModuleCount()) + "/" +
+        IntToString(W3VRHudEditor_LiveModuleCount()) +
         " missing=" + GetMissingModuleName(),
         false
       );
@@ -561,7 +587,8 @@ class W3VRHudEditorController
         RefreshAllManagedModules();
         W3VRHudEditor_Trace(
           "module became available | live=" +
-          IntToString(GetLiveModuleCount()) + "/19",
+          IntToString(GetLiveModuleCount()) + "/" +
+          IntToString(W3VRHudEditor_LiveModuleCount()),
           true
         );
       }
@@ -591,7 +618,8 @@ class W3VRHudEditorController
     {
       W3VRHudEditor_Trace(
         "capture live=" + IntToString(GetLiveModuleCount()) +
-        "/19 last=AreaInfoModule missing=" + GetMissingModuleName() +
+        "/" + IntToString(W3VRHudEditor_LiveModuleCount()) +
+        " last=AreaInfoModule missing=" + GetMissingModuleName() +
         " via=AreaInfo.OnConfigUI",
         false
       );
@@ -602,7 +630,8 @@ class W3VRHudEditorController
         RefreshAllManagedModules();
         W3VRHudEditor_Trace(
           "AreaInfoModule became available dynamically | live=" +
-          IntToString(GetLiveModuleCount()) + "/19",
+          IntToString(GetLiveModuleCount()) + "/" +
+          IntToString(W3VRHudEditor_LiveModuleCount()),
           true
         );
         return;
@@ -617,9 +646,9 @@ class W3VRHudEditorController
       return;
     }
 
-    // All 20 logical panels exist before their Flash modules/popups. Hidden or lazy
+    // Every logical panel exists before its Flash module/popup. Hidden or lazy
     // runtime modules bind later without blocking offline configuration.
-    if (slots.Size() != 20)
+    if (slots.Size() != W3VRHudEditor_LogicalPanelCount())
     {
       return;
     }
@@ -635,8 +664,10 @@ class W3VRHudEditorController
     initialized = true;
     RefreshAllManagedModules();
     W3VRHudEditor_Trace(
-      "panels-ready 20/20 | hud-live=" +
-      IntToString(GetLiveModuleCount()) + "/19",
+      "panels-ready " + IntToString(W3VRHudEditor_LogicalPanelCount()) +
+      "/" + IntToString(W3VRHudEditor_LogicalPanelCount()) +
+      " | hud-live=" + IntToString(GetLiveModuleCount()) + "/" +
+      IntToString(W3VRHudEditor_LiveModuleCount()),
       true
     );
   }
@@ -648,7 +679,8 @@ class W3VRHudEditorController
     xVar: name,
     yVar: name,
     scaleVar: name,
-    forceVisibleWhileSelected: bool
+    forceVisibleWhileSelected: bool,
+    optional scaleOnly: bool
   )
   {
     var i: int;
@@ -677,7 +709,8 @@ class W3VRHudEditorController
       xVar,
       yVar,
       scaleVar,
-      forceVisibleWhileSelected
+      forceVisibleWhileSelected,
+      scaleOnly
     );
     slots.PushBack(slot);
   }
@@ -781,6 +814,8 @@ class W3VRHudEditorController
     if (!HasLiveSlot("DamagedItemsModule")) return "DamagedItemsModule";
     if (!HasLiveSlot("TimeLapseModule")) return "TimeLapseModule";
     if (!HasLiveSlot("TimeLeftModule")) return "TimeLeftModule";
+    if (!HasLiveSlot("SubtitlesModule")) return "SubtitlesModule";
+    if (!HasLiveSlot("DialogModule")) return "DialogModule";
     return "none";
   }
 
@@ -856,8 +891,10 @@ class W3VRHudEditorController
 
       W3VRHudEditor_Trace(
         "tick-state " + stateLabel +
-        " panels=" + IntToString(slots.Size()) + "/20" +
-        " hud-live=" + IntToString(GetLiveModuleCount()) + "/19" +
+        " panels=" + IntToString(slots.Size()) + "/" +
+        IntToString(W3VRHudEditor_LogicalPanelCount()) +
+        " hud-live=" + IntToString(GetLiveModuleCount()) + "/" +
+        IntToString(W3VRHudEditor_LiveModuleCount()) +
         " context=" + NameToString(theInput.GetContext()),
         false
       );
@@ -871,7 +908,9 @@ class W3VRHudEditorController
     {
       W3VRHudEditor_Trace(
         "hook-bound panels=" + IntToString(slots.Size()) +
-        "/20 hud-live=" + IntToString(GetLiveModuleCount()) + "/19",
+        "/" + IntToString(W3VRHudEditor_LogicalPanelCount()) +
+        " hud-live=" + IntToString(GetLiveModuleCount()) + "/" +
+        IntToString(W3VRHudEditor_LiveModuleCount()),
         true
       );
       runtimeHookProbeShown = true;
@@ -880,8 +919,11 @@ class W3VRHudEditorController
     if (initialized && !registryReadyProbeShown && thePlayer)
     {
       thePlayer.DisplayHudMessage(
-        "W3VR HUD Editor ready | panels 20/20 | HUD live " +
-        IntToString(GetLiveModuleCount()) + "/19 | context " +
+        "W3VR HUD Editor ready | panels " +
+        IntToString(W3VRHudEditor_LogicalPanelCount()) + "/" +
+        IntToString(W3VRHudEditor_LogicalPanelCount()) + " | HUD live " +
+        IntToString(GetLiveModuleCount()) + "/" +
+        IntToString(W3VRHudEditor_LiveModuleCount()) + " | context " +
         NameToString(theInput.GetContext())
       );
       registryReadyProbeShown = true;
@@ -900,8 +942,10 @@ class W3VRHudEditorController
       {
         thePlayer.DisplayHudMessage(
           "W3VR HUD Editor | Insert received, panels waiting " +
-          IntToString(slots.Size()) + "/20 | hud-live=" +
-          IntToString(GetLiveModuleCount()) + "/19 | missing=" +
+          IntToString(slots.Size()) + "/" +
+          IntToString(W3VRHudEditor_LogicalPanelCount()) + " | hud-live=" +
+          IntToString(GetLiveModuleCount()) + "/" +
+          IntToString(W3VRHudEditor_LiveModuleCount()) + " | missing=" +
           GetMissingModuleName()
         );
       }
@@ -1312,6 +1356,8 @@ class W3VRHudEditorController
     var consoleModule: CR4HudModuleConsole;
     var journalModule: CR4HudModuleJournalUpdate;
     var areaModule: CR4HudModuleAreaInfo;
+    var subtitlesModule: CR4HudModuleSubtitles;
+    var dialogModule: CR4HudModuleDialog;
 
     if (!slot)
     {
@@ -1353,6 +1399,22 @@ class W3VRHudEditorController
         areaModule.W3VRHudEditorShowPreview();
       }
     }
+    else if (slot.moduleName == "SubtitlesModule")
+    {
+      subtitlesModule = (CR4HudModuleSubtitles)slot.module;
+      if (subtitlesModule)
+      {
+        subtitlesModule.W3VRHudEditorShowPreview();
+      }
+    }
+    else if (slot.moduleName == "DialogModule")
+    {
+      dialogModule = (CR4HudModuleDialog)slot.module;
+      if (dialogModule)
+      {
+        dialogModule.W3VRHudEditorShowPreview();
+      }
+    }
   }
 
   private function HideConditionalPreview(slot: W3VRHudEditorSlot)
@@ -1360,6 +1422,8 @@ class W3VRHudEditorController
     var consoleModule: CR4HudModuleConsole;
     var journalModule: CR4HudModuleJournalUpdate;
     var areaModule: CR4HudModuleAreaInfo;
+    var subtitlesModule: CR4HudModuleSubtitles;
+    var dialogModule: CR4HudModuleDialog;
 
     if (!slot)
     {
@@ -1399,6 +1463,22 @@ class W3VRHudEditorController
       if (areaModule)
       {
         areaModule.W3VRHudEditorHidePreview();
+      }
+    }
+    else if (slot.moduleName == "SubtitlesModule")
+    {
+      subtitlesModule = (CR4HudModuleSubtitles)slot.module;
+      if (subtitlesModule)
+      {
+        subtitlesModule.W3VRHudEditorHidePreview();
+      }
+    }
+    else if (slot.moduleName == "DialogModule")
+    {
+      dialogModule = (CR4HudModuleDialog)slot.module;
+      if (dialogModule)
+      {
+        dialogModule.W3VRHudEditorHidePreview();
       }
     }
   }
@@ -1497,6 +1577,15 @@ class W3VRHudEditorController
     slot = GetSelectedSlot();
     if (!slot)
     {
+      return;
+    }
+
+    // Dialog and subtitle roots are full-screen ScaleOnly containers. Moving
+    // those roots would fight their internal line/choice layout; V1140 owns
+    // only their multiplicative text size.
+    if (slot.scaleOnly)
+    {
+      ShowEditorLabel();
       return;
     }
 
@@ -1749,10 +1838,21 @@ class W3VRHudEditorController
     message =
       "W3VR HUD Editor [" + profileName + "] " +
       IntToString(selectedIndex + 1) + "/" + IntToString(slots.Size()) +
-      " - " + slot.displayName +
-      " | X " + FloatToString(slot.GetX(activeProfile)) +
-      " Y " + FloatToString(slot.GetY(activeProfile)) +
-      " Scale " + FloatToString(slot.GetScale(activeProfile));
+      " - " + slot.displayName;
+
+    if (slot.scaleOnly)
+    {
+      message +=
+        " | Scale " + FloatToString(slot.GetScale(activeProfile)) +
+        " | SIZE ONLY - cutscene zoom preserved";
+    }
+    else
+    {
+      message +=
+        " | X " + FloatToString(slot.GetX(activeProfile)) +
+        " Y " + FloatToString(slot.GetY(activeProfile)) +
+        " Scale " + FloatToString(slot.GetScale(activeProfile));
+    }
 
     if (!IsSlotLive(slot))
     {
@@ -1793,6 +1893,11 @@ class W3VRHudEditorController
       availability = "OFFLINE";
     }
 
+    if (slot.scaleOnly)
+    {
+      availability += " | SCALE ONLY";
+    }
+
     thePlayer.DisplayHudMessage(
       "HUD panel " + IntToString(selectedIndex + 1) + "/" +
       IntToString(slots.Size()) + " | " + slot.displayName +
@@ -1827,22 +1932,32 @@ class W3VRHudEditorController
 
     for (i = 0; i < slots.Size(); i += 1)
     {
-      slots[i].vrX = ReadConfigFloat(
-        config, 'W3VRHudEditorVR', slots[i].xVar, 0.0f
-      );
-      slots[i].vrY = ReadConfigFloat(
-        config, 'W3VRHudEditorVR', slots[i].yVar, 0.0f
-      );
+      if (slots[i].scaleOnly)
+      {
+        slots[i].vrX = 0.0f;
+        slots[i].vrY = 0.0f;
+        slots[i].cinemaX = 0.0f;
+        slots[i].cinemaY = 0.0f;
+      }
+      else
+      {
+        slots[i].vrX = ReadConfigFloat(
+          config, 'W3VRHudEditorVR', slots[i].xVar, 0.0f
+        );
+        slots[i].vrY = ReadConfigFloat(
+          config, 'W3VRHudEditorVR', slots[i].yVar, 0.0f
+        );
+        slots[i].cinemaX = ReadConfigFloat(
+          config, 'W3VRHudEditorCinema3D', slots[i].xVar, 0.0f
+        );
+        slots[i].cinemaY = ReadConfigFloat(
+          config, 'W3VRHudEditorCinema3D', slots[i].yVar, 0.0f
+        );
+      }
+
       slots[i].vrScale = ClampScale(ReadConfigFloat(
         config, 'W3VRHudEditorVR', slots[i].scaleVar, 1.0f
       ));
-
-      slots[i].cinemaX = ReadConfigFloat(
-        config, 'W3VRHudEditorCinema3D', slots[i].xVar, 0.0f
-      );
-      slots[i].cinemaY = ReadConfigFloat(
-        config, 'W3VRHudEditorCinema3D', slots[i].yVar, 0.0f
-      );
       slots[i].cinemaScale = ClampScale(ReadConfigFloat(
         config, 'W3VRHudEditorCinema3D', slots[i].scaleVar, 1.0f
       ));
@@ -1885,12 +2000,15 @@ class W3VRHudEditorController
       groupName = 'W3VRHudEditorVR';
     }
 
-    config.SetVarValue(
-      groupName, slot.xVar, FloatToString(slot.GetX(profile))
-    );
-    config.SetVarValue(
-      groupName, slot.yVar, FloatToString(slot.GetY(profile))
-    );
+    if (!slot.scaleOnly)
+    {
+      config.SetVarValue(
+        groupName, slot.xVar, FloatToString(slot.GetX(profile))
+      );
+      config.SetVarValue(
+        groupName, slot.yVar, FloatToString(slot.GetY(profile))
+      );
+    }
     config.SetVarValue(
       groupName, slot.scaleVar, FloatToString(slot.GetScale(profile))
     );
@@ -1977,6 +2095,12 @@ var w3vr_hud_editor_preview_next_refresh: float;
 var w3vr_hud_editor_preview_active: bool;
 
 @addField(CR4HudModuleAreaInfo)
+var w3vr_hud_editor_preview_active: bool;
+
+@addField(CR4HudModuleSubtitles)
+var w3vr_hud_editor_preview_active: bool;
+
+@addField(CR4HudModuleDialog)
 var w3vr_hud_editor_preview_active: bool;
 
 @addField(CR4TutorialPopup)
@@ -2129,6 +2253,117 @@ function W3VRHudEditorHidePreview()
   }
   this.ShowElement(false, true);
   this.w3vr_hud_editor_preview_active = false;
+}
+
+@addMethod(CR4HudModuleSubtitles)
+function W3VRHudEditorShowPreview()
+{
+  if (this.w3vr_hud_editor_preview_active)
+  {
+    if (theGame.IsDialogOrCutscenePlaying())
+    {
+      // The private high-range ID lets us remove only our own sample while
+      // story-scene text takes authority.
+      this.OnSubtitleRemoved(2000001140);
+      this.w3vr_hud_editor_preview_active = false;
+    }
+    else if (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
+    {
+      this.W3VRHudEditorHidePreview();
+    }
+    return;
+  }
+  if (
+    theGame.IsDialogOrCutscenePlaying() ||
+    (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
+  )
+  {
+    return;
+  }
+
+  this.OnSubtitleAdded(
+    2000001140,
+    "Geralt",
+    "HUD EDITOR - GAMEPLAY SUBTITLE EXAMPLE",
+    false
+  );
+  this.w3vr_hud_editor_preview_active = true;
+}
+
+@addMethod(CR4HudModuleSubtitles)
+function W3VRHudEditorHidePreview()
+{
+  if (!this.w3vr_hud_editor_preview_active)
+  {
+    return;
+  }
+  this.OnSubtitleRemoved(2000001140);
+  this.w3vr_hud_editor_preview_active = false;
+}
+
+@addMethod(CR4HudModuleDialog)
+function W3VRHudEditorShowPreview()
+{
+  var choices: array<SSceneChoice>;
+  var choice: SSceneChoice;
+
+  if (this.w3vr_hud_editor_preview_active)
+  {
+    if (theGame.IsDialogOrCutscenePlaying())
+    {
+      // A real scene may already have replaced our Flash data. Relinquish the
+      // flag without hiding or clearing anything owned by that scene.
+      this.w3vr_hud_editor_preview_active = false;
+    }
+    else if (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
+    {
+      this.W3VRHudEditorHidePreview();
+    }
+    return;
+  }
+  if (
+    theGame.IsDialogOrCutscenePlaying() ||
+    (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
+  )
+  {
+    return;
+  }
+
+  // Call the internal Flash population path directly: unlike
+  // OnDialogChoicesSet(), this does not request a cursor, change analog input,
+  // or send any story-scene signal.
+  this.OnDialogSentenceSet(
+    "HUD EDITOR - CUTSCENE SUBTITLE EXAMPLE", false
+  );
+  choice.description = "HUD EDITOR - DIALOG CHOICE EXAMPLE";
+  choice.emphasised = true;
+  choice.previouslyChoosen = false;
+  choice.disabled = false;
+  choices.PushBack(choice);
+  this.m_fxSetAlternativeDialogOptionView.InvokeSelfOneArg(
+    FlashArgBool(false)
+  );
+  this.SendDialogChoicesToUI(choices, false);
+  this.w3vr_hud_editor_preview_active = true;
+}
+
+@addMethod(CR4HudModuleDialog)
+function W3VRHudEditorHidePreview()
+{
+  var choices: array<SSceneChoice>;
+
+  if (!this.w3vr_hud_editor_preview_active)
+  {
+    return;
+  }
+  this.w3vr_hud_editor_preview_active = false;
+  if (theGame.IsDialogOrCutscenePlaying())
+  {
+    return;
+  }
+
+  this.OnDialogSentenceHide();
+  this.SendDialogChoicesToUI(choices, false);
 }
 
 @wrapMethod(CR4ScriptedHud)

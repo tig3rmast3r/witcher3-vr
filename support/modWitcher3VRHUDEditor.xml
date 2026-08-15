@@ -3,7 +3,7 @@
   <Group id="W3VRHudEditorSettings" displayName="Witcher3VR HUD Editor data">
     <PresetsArray>
       <Preset id="0" displayName="Defaults">
-        <Entry varId="SchemaVersion" value="1"/>
+        <Entry varId="SchemaVersion" value="2"/>
       </Preset>
     </PresetsArray>
     <VisibleVars>
@@ -34,6 +34,8 @@
         <Entry varId="TimeLapseX" value="-408.704"/><Entry varId="TimeLapseY" value="0"/><Entry varId="TimeLapseScale" value="1"/>
         <Entry varId="TimeLeftX" value="25.625"/><Entry varId="TimeLeftY" value="276.336"/><Entry varId="TimeLeftScale" value="0.8"/>
         <Entry varId="TutorialX" value="563.94"/><Entry varId="TutorialY" value="363.736"/><Entry varId="TutorialScale" value="1"/>
+        <Entry varId="SubtitlesScale" value="1"/>
+        <Entry varId="DialogScale" value="1"/>
       </Preset>
     </PresetsArray>
     <VisibleVars>
@@ -57,6 +59,8 @@
       <Var id="TimeLapseX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLapseY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLapseScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
       <Var id="TimeLeftX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLeftY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLeftScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
       <Var id="TutorialX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TutorialY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TutorialScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="SubtitlesScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="DialogScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
     </VisibleVars>
   </Group>
 
@@ -83,6 +87,8 @@
         <Entry varId="TimeLapseX" value="0"/><Entry varId="TimeLapseY" value="0"/><Entry varId="TimeLapseScale" value="1"/>
         <Entry varId="TimeLeftX" value="0"/><Entry varId="TimeLeftY" value="0"/><Entry varId="TimeLeftScale" value="1"/>
         <Entry varId="TutorialX" value="0"/><Entry varId="TutorialY" value="0"/><Entry varId="TutorialScale" value="1"/>
+        <Entry varId="SubtitlesScale" value="1"/>
+        <Entry varId="DialogScale" value="1"/>
       </Preset>
     </PresetsArray>
     <VisibleVars>
@@ -106,6 +112,8 @@
       <Var id="TimeLapseX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLapseY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLapseScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
       <Var id="TimeLeftX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TimeLeftY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TimeLeftScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
       <Var id="TutorialX" displayName="X" displayType="SLIDER;-3840;3840;7680" visibilityCondition="hideAlways"/><Var id="TutorialY" displayName="Y" displayType="SLIDER;-2160;2160;4320" visibilityCondition="hideAlways"/><Var id="TutorialScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="SubtitlesScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
+      <Var id="DialogScale" displayName="Scale" displayType="SLIDER;0.1;5;490" visibilityCondition="hideAlways"/>
     </VisibleVars>
   </Group>
   <Group id="W3VRHudEditorDebug" displayName="Witcher3VR HUD Editor diagnostics">

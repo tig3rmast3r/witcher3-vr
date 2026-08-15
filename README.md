@@ -258,6 +258,14 @@ and every line that must be added.
 | `X` | Reset the active profile to `X=0`, `Y=0`, scale `1.0` |
 | `F7` | Manually switch between VR and Cinema3D banks; the editor may be open or closed |
 
+`Gameplay Subtitles Size` and `Cutscene Text and Dialog Choices Size` are
+scale-only panels: the mouse wheel changes their local size, while the arrow
+keys intentionally leave their full-screen layout untouched. Selecting either
+panel shows a guarded example. The dialog example uses the internal Flash-data
+path and never requests a cursor, changes input mode, or sends a story-scene
+choice; previews are suppressed whenever a real dialog, cutscene, or menu owns
+the UI.
+
 Profile selection remains manual; the renderer does not switch the HUD bank
 automatically. `F7` works both inside and outside HUD editing mode.
 
@@ -313,7 +321,9 @@ cutscenes. Their convergence sliders are small offsets around an automatic base:
 Cinema3D follows its authored scale, while Full VR preserves the same physical
 text depth as its size changes. Full VR defaults to size `1.00`. The displayed
 value shows `offset / final convergence`. Manual `F10` Cinema keeps its
-independent advanced HUD-size setting.
+independent advanced HUD-size setting. These cutscene controls remain outer
+multipliers on the HUD Editor subtitle/dialog scale, so their zoom transitions
+and animation are preserved.
 
 Cinema Mode can also be used as a temporary workaround for sections that do
 not render correctly or are difficult to play in VR.
