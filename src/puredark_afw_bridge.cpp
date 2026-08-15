@@ -13,6 +13,11 @@ namespace {
 constexpr size_t kSetupTextureDescVtableSlot = 14;
 constexpr size_t kCreateTextureVtableSlot = 16;
 constexpr size_t kCopyTextureVtableSlot = 20;
+constexpr size_t kBeginCommandListVtableSlot = 0;
+constexpr size_t kEndCommandListVtableSlot = 1;
+using BeginCommandListFn = ID3D12GraphicsCommandList*(__fastcall*)(
+    D3D12RendererApi*, int);
+using EndCommandListFn = void(__fastcall*)(D3D12RendererApi*, int);
 using SetupTextureDescFn = void(__fastcall*)(
     D3D12RendererApi*, TextureDesc&);
 using CreateTextureFn = bool(__fastcall*)(
@@ -179,6 +184,46 @@ bool Bridge::create_texture(
     if (texture_desc.initial_state != initial_state) {
         texture_desc.initial_state = initial_state;
     }
+    error.clear();
+    return true;
+}
+
+ID3D12GraphicsCommandList* Bridge::begin_command_list(
+    int index, std::wstring& error) const {
+    if (!loaded() || renderer_api_ == nullptr) {
+        error = L"PureDark device is not initialized";
+        return nullptr;
+    }
+    void** vtable = *reinterpret_cast<void***>(renderer_api_);
+    if (vtable == nullptr ||
+        vtable[kBeginCommandListVtableSlot] == nullptr) {
+        error = L"PureDark D3D12RendererAPI has no BeginCommandList entry";
+        return nullptr;
+    }
+    const auto begin_command_list = reinterpret_cast<BeginCommandListFn>(
+        vtable[kBeginCommandListVtableSlot]);
+    auto* command_list = begin_command_list(renderer_api_, index);
+    if (command_list == nullptr) {
+        error = L"PureDark BeginCommandList returned null";
+        return nullptr;
+    }
+    error.clear();
+    return command_list;
+}
+
+bool Bridge::end_command_list(int index, std::wstring& error) const {
+    if (!loaded() || renderer_api_ == nullptr) {
+        error = L"PureDark device is not initialized";
+        return false;
+    }
+    void** vtable = *reinterpret_cast<void***>(renderer_api_);
+    if (vtable == nullptr || vtable[kEndCommandListVtableSlot] == nullptr) {
+        error = L"PureDark D3D12RendererAPI has no EndCommandList entry";
+        return false;
+    }
+    const auto end_command_list = reinterpret_cast<EndCommandListFn>(
+        vtable[kEndCommandListVtableSlot]);
+    end_command_list(renderer_api_, index);
     error.clear();
     return true;
 }

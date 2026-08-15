@@ -152,6 +152,9 @@ public:
         const FrameWarpInitParams& params,
         EyeFrameBuffers& frame_buffers,
         std::wstring& error) const;
+    ID3D12GraphicsCommandList* begin_command_list(
+        int index, std::wstring& error) const;
+    bool end_command_list(int index, std::wstring& error) const;
     bool setup_texture_desc(
         TextureDesc& texture_desc, std::wstring& error) const;
     bool create_texture(

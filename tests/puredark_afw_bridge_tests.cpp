@@ -106,6 +106,13 @@ int wmain(int argc, wchar_t** argv) {
             std::fwprintf(stderr, L"AFW InitDevice probe failed: %ls\n", error.c_str());
             return 1;
         }
+        if (bridge.begin_command_list(0, error) == nullptr ||
+            !bridge.end_command_list(0, error)) {
+            std::fwprintf(
+                stderr, L"AFW owned command-list probe failed: %ls\n",
+                error.c_str());
+            return 1;
+        }
 
         ComPtr<ID3D12Resource> texture;
         if (!make_probe_texture(device.Get(), texture)) {

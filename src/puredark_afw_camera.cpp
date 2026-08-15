@@ -211,6 +211,87 @@ bool build_camera_data_from_streamline(
     return true;
 }
 
+bool apply_source_eye_projection_center(
+    const EyeProjectionGeometry& source_geometry,
+    CameraData& camera_data,
+    std::wstring& error) {
+    if (!std::isfinite(source_geometry.horizontal_tangent_span) ||
+        !std::isfinite(source_geometry.vertical_tangent_span) ||
+        !std::isfinite(source_geometry.center_ndc_x) ||
+        !std::isfinite(source_geometry.center_ndc_y) ||
+        source_geometry.horizontal_tangent_span <= 0.01f ||
+        source_geometry.vertical_tangent_span <= 0.01f ||
+        std::fabs(source_geometry.center_ndc_x) > 1.0f ||
+        std::fabs(source_geometry.center_ndc_y) > 1.0f ||
+        !finite_values(camera_data.source_view_to_clip.values, 16)) {
+        error = L"PureDark source-eye projection center is invalid";
+        return false;
+    }
+
+    auto source = camera_data.source_view_to_clip;
+    source.values[8] += source_geometry.center_ndc_x;
+    source.values[9] += source_geometry.center_ndc_y;
+    Matrix4x4 source_inverse{};
+    if (!finite_values(source.values, 16) ||
+        !invert_4x4(source, source_inverse)) {
+        error = L"PureDark source-eye projection is singular";
+        return false;
+    }
+    camera_data.source_view_to_clip = source;
+    camera_data.source_clip_to_view = source_inverse;
+    error.clear();
+    return true;
+}
+
+bool retarget_destination_eye_projection(
+    const EyeProjectionGeometry& source_geometry,
+    const EyeProjectionGeometry& destination_geometry,
+    CameraData& camera_data,
+    std::wstring& error) {
+    const auto valid_geometry = [](const EyeProjectionGeometry& geometry) {
+        return std::isfinite(geometry.horizontal_tangent_span) &&
+            std::isfinite(geometry.vertical_tangent_span) &&
+            std::isfinite(geometry.center_ndc_x) &&
+            std::isfinite(geometry.center_ndc_y) &&
+            geometry.horizontal_tangent_span > 0.01f &&
+            geometry.vertical_tangent_span > 0.01f &&
+            std::fabs(geometry.center_ndc_x) <= 1.0f &&
+            std::fabs(geometry.center_ndc_y) <= 1.0f;
+    };
+    if (!valid_geometry(source_geometry) ||
+        !valid_geometry(destination_geometry) ||
+        !finite_values(camera_data.source_view_to_clip.values, 16)) {
+        error = L"PureDark source or destination eye projection is invalid";
+        return false;
+    }
+
+    auto destination = camera_data.source_view_to_clip;
+    destination.values[0] *=
+        source_geometry.horizontal_tangent_span /
+        destination_geometry.horizontal_tangent_span;
+    destination.values[5] *=
+        source_geometry.vertical_tangent_span /
+        destination_geometry.vertical_tangent_span;
+    destination.values[8] +=
+        destination_geometry.center_ndc_x - source_geometry.center_ndc_x;
+    destination.values[9] +=
+        destination_geometry.center_ndc_y - source_geometry.center_ndc_y;
+    if (!finite_values(destination.values, 16)) {
+        error = L"PureDark destination projection contains non-finite values";
+        return false;
+    }
+
+    Matrix4x4 destination_inverse{};
+    if (!invert_4x4(destination, destination_inverse)) {
+        error = L"PureDark destination projection is singular";
+        return false;
+    }
+    camera_data.destination_view_to_clip = destination;
+    camera_data.destination_clip_to_view = destination_inverse;
+    error.clear();
+    return true;
+}
+
 bool rebase_parallel_eye_pose(
     const ParallelEyePose& captured_source,
     const ParallelEyePose& captured_destination,

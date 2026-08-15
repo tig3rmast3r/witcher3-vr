@@ -423,6 +423,59 @@ bool mode3_aer_presentation_active() {
         g_config.mode3_aer_presentation;
 }
 
+bool puredark_afw_mode3_aer_noaa_route_configured() {
+    // V12051 keeps the first canonical Mode-3 port deliberately narrow:
+    // one natural No-AA AER producer, no menu/Cinema path and no strict
+    // Stereo behavior change. The hidden PureDark INI remains the A/B gate.
+    return g_config.openxr_enabled && g_config.puredark_afw_enabled &&
+        mode3_aer_presentation_active() &&
+        g_config.temporal_backend == TemporalBackend::None &&
+        g_config.hmd_freelook &&
+        std::fabs(g_config.engine_factory_stereo_offset) > 0.00001f;
+}
+
+bool puredark_afw_mode3_aer_taau_route_configured() {
+    // [FEATURE:PUREDARK-AFW-MODE3-TAAU V12055 1/8] TAAU exposes the exact
+    // Depth, motion-vector and CB10 identity on one native resolve command
+    // list. Keep this producer route independent from the No-AA resource
+    // discovery trial and from the legacy Mode-1/DLSS integration.
+    return g_config.openxr_enabled && g_config.puredark_afw_enabled &&
+        mode3_aer_presentation_active() &&
+        g_config.temporal_backend == TemporalBackend::Taau &&
+        g_config.hmd_freelook &&
+        std::fabs(g_config.engine_factory_stereo_offset) > 0.00001f;
+}
+
+bool puredark_afw_mode3_aer_dlss_route_configured() {
+    // [FEATURE:PUREDARK-AFW-MODE3-DLSS-POSITIVE-CONTROL V12061 1/8]
+    // Port the validated V12016 Mode-1 producer contract without routing
+    // DLSS through the native No-AA/TAAU discovery path. NGX supplies the
+    // exact Depth/MVec/camera bundle and OpenXR records the generated peer.
+    return g_config.openxr_enabled && g_config.puredark_afw_enabled &&
+        mode3_aer_presentation_active() &&
+        g_config.temporal_backend == TemporalBackend::Dlss &&
+        g_config.hmd_freelook &&
+        std::fabs(g_config.engine_factory_stereo_offset) > 0.00001f;
+}
+
+bool puredark_afw_mode3_aer_route_configured() {
+    // [FIX:PUREDARK-AFW-NATIVE-FAIL-OPEN V12078 1/1] The latest TAAU run
+    // proved that the first owned-list AFW publication can poison the
+    // following XR command list (Close returns E_INVALIDARG), leaving the
+    // acquired projection image black even though AFW keeps producing.
+    // Keep No-AA/TAAU on their validated native AER transport while the owned
+    // transaction is repaired. DLSS remains enabled through its independent
+    // shared-XR-list route and therefore still tests V12077's destination-eye
+    // projection. This makes an accidental backend selection fail open rather
+    // than suppressing the visible pair.
+    return false;
+}
+
+bool puredark_afw_mode3_aer_any_route_configured() {
+    return puredark_afw_mode3_aer_route_configured() ||
+        puredark_afw_mode3_aer_dlss_route_configured();
+}
+
 bool retained_hud_projection_route_active() {
     return mode3_stereo_transport_active() ||
         mode1_dlss_retained_hud_route_active();
@@ -813,16 +866,16 @@ bool g_stereo_eye_cache_initialized[2]{};
 XrView g_stereo_eye_cache_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 bool g_stereo_eye_cache_view_valid[2]{};
 
-// [FEATURE:PUREDARK-AFW-DLSS V12004 1/6] PureDark is deliberately isolated
-// to Mode 1 + normal DLSS. Streamline publishes immutable per-render camera
-// metadata, the NGX hook freezes Depth/MVec on the game's command list, and
-// Present consumes only an exact eye/pair match. Any incomplete contract falls
-// through to V12003's validated alternating-eye cache.
+// PureDark keeps one shared ABI/resource implementation. Legacy Mode 1 DLSS
+// freezes inputs at NGX submission; V12053 freezes Mode-3 AER No-AA inputs on
+// the exact final-PRESENT producer list before OpenXR publication.
 struct PuredarkAfwCameraSnapshot {
     w3vr::puredark_afw::CameraData camera{};
     std::array<XrView, 2> render_views{{
         {XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
     XrView exact_render_view{XR_TYPE_VIEW};
+    float motion_scale[2]{};
+    uint64_t capture_present{};
     uint64_t pair_id{};
     uint32_t generation{};
     uint32_t eye{UINT32_MAX};
@@ -867,11 +920,12 @@ struct PuredarkAfwPresentResult {
 // the producer clock. Keep camera snapshots as a small immutable history, and
 // keep every AFW input bundle private until the command list which writes its
 // depth/MVec copies and DLSS output has actually been submitted to the game
-// queue. Three slots preserve V12015's two per-eye capture allocations plus
-// one producer-overlap slot without allocating a color copy: the submitted
-// bundle itself authorizes the current final backbuffer.
+// queue. V12064 retains the short same-eye bursts observed in V12063, while
+// V12065 measures its one-Present delay from immutable publication age. Six
+// slots cover one recording producer, up to two ready producers and three
+// XR-fenced consumers.
 constexpr size_t kPuredarkAfwCameraHistorySize = 32;
-constexpr size_t kPuredarkAfwBundleRingSize = 3;
+constexpr size_t kPuredarkAfwBundleRingSize = 6;
 
 enum class PuredarkAfwBundleState : uint8_t {
     Free,
@@ -886,6 +940,7 @@ struct PuredarkAfwBundleSlot {
     PuredarkAfwInputSnapshot input{};
     uint64_t route_epoch{};
     uint64_t submission_serial{};
+    uint64_t ready_present{UINT64_MAX};
     uint64_t retire_fence{};
     PuredarkAfwBundleState state{PuredarkAfwBundleState::Free};
 };
@@ -911,9 +966,22 @@ std::atomic<bool> g_puredark_afw_pending_submission_ready{};
 uint32_t g_puredark_afw_bundle_write_cursor{};
 uint32_t g_puredark_afw_ready_bundle{UINT32_MAX};
 uint32_t g_puredark_afw_consuming_bundle{UINT32_MAX};
+// [FIX:PUREDARK-AFW-MODE3-DLSS-INPUT-FIFO V12064 1/8] The legacy routes keep
+// the single newest-ready authority above. Mode-3 DLSS instead retains exact
+// submitted producers until the alternating AFW consumer selects them.
+std::deque<uint32_t> g_puredark_afw_mode3_dlss_ready_queue{};
+uint32_t g_mode3_afw_selected_bundle_slot{UINT32_MAX};
+std::atomic<uint64_t> g_mode3_afw_fifo_published{};
+std::atomic<uint64_t> g_mode3_afw_fifo_selected{};
+std::atomic<uint64_t> g_mode3_afw_fifo_waits{};
+std::atomic<uint64_t> g_mode3_afw_fifo_discards{};
 std::atomic<uint64_t> g_puredark_afw_route_epoch{1};
 std::atomic<uint64_t> g_puredark_afw_submission_serial{};
 std::atomic<bool> g_puredark_afw_steady_active{};
+// [DEBUG:PUREDARK-AFW-VISUAL-F6 V12052 1/3] PureDark already exposes a
+// visual warp diagnostic in its Evaluate ABI. Keep it opt-in and process-local
+// so ordinary AFW output is byte-for-byte unchanged until the user presses F6.
+std::atomic<bool> g_puredark_afw_visual_debug{};
 std::atomic<uint64_t> g_puredark_afw_recorded_candidates{};
 std::atomic<uint64_t> g_puredark_afw_submitted_candidates{};
 std::atomic<uint64_t> g_puredark_afw_ready_candidates{};
@@ -933,6 +1001,28 @@ std::atomic<uint32_t> g_puredark_afw_capture_logs{};
 std::atomic<uint32_t> g_puredark_afw_present_logs{};
 std::atomic<uint32_t> g_puredark_afw_failure_logs{};
 std::atomic<uint32_t> g_puredark_afw_pose_logs{};
+std::atomic<uint64_t> g_puredark_afw_noaa_tag_present[2]{};
+// [FIX:PUREDARK-AFW-NOAA-NATIVE-INPUTS V12054 1/6] No AA does not call
+// slSetTag for Depth/MVec. Keep a tiny registry of REDengine's native depth and
+// velocity candidates and associate their last completed transition with the
+// command list/present that actually wrote them. The final backbuffer barrier
+// can then select inputs from its own producer list instead of a global guess.
+constexpr size_t kPuredarkAfwNoaaNativeSourceCapacity = 16;
+struct PuredarkAfwNoaaNativeSource {
+    std::atomic<ID3D12Resource*> resource{};
+    std::atomic<uint32_t> state{UINT32_MAX};
+    std::atomic<ID3D12GraphicsCommandList*> command_list{};
+    std::atomic<uint64_t> present{UINT64_MAX};
+    std::atomic<uint64_t> transition_serial{};
+};
+std::array<PuredarkAfwNoaaNativeSource,
+    kPuredarkAfwNoaaNativeSourceCapacity>
+    g_puredark_afw_noaa_depth_sources{};
+std::array<PuredarkAfwNoaaNativeSource,
+    kPuredarkAfwNoaaNativeSourceCapacity>
+    g_puredark_afw_noaa_motion_sources{};
+std::atomic<uint64_t> g_puredark_afw_noaa_native_transition_serial{};
+std::atomic<uint32_t> g_puredark_afw_noaa_native_source_logs{};
 ID3D12Resource* g_packed_present_cache[2]{};
 bool g_packed_present_cache_valid{};
 XrView g_packed_present_cache_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
@@ -999,6 +1089,29 @@ uint32_t g_mode3_aer_presentation_generation{};
 bool g_mode3_aer_packed_eye_initialized[2]{};
 bool g_mode3_aer_packed_eye_valid[2]{};
 bool g_mode3_aer_packed_native_eye[2]{};
+bool g_mode3_aer_packed_eye_generated[2]{};
+uint32_t g_mode3_aer_last_promoted_mask{};
+uint64_t g_mode3_aer_last_promoted_pair[2]{};
+uint32_t g_mode3_aer_last_promoted_generation{};
+uint64_t g_mode3_aer_last_promotion_present{UINT64_MAX};
+// [FIX:PUREDARK-AFW-MODE3-DLSS-SEQUENCED-PAIR V12063 1/7] PureDark's AFR
+// integration assumes that real-eye inputs alternate. REDengine/NGX can submit
+// the same physical eye twice around a Present boundary, so keep the last
+// complete generated pair in the otherwise-unused sequential cache and admit
+// only a monotonic opposite-eye producer. Projection consumes this immutable
+// pair one Present later instead of exposing a mixed or duplicate-eye update.
+bool g_mode3_afw_sequenced_pair_valid{};
+uint32_t g_mode3_afw_sequenced_generation{};
+uint64_t g_mode3_afw_sequenced_pair{};
+uint32_t g_mode3_afw_last_real_eye{UINT32_MAX};
+uint64_t g_mode3_afw_sequenced_accepts{};
+uint64_t g_mode3_afw_sequenced_holds{};
+// [FIX:PUREDARK-AFW-MODE3-DLSS-NATURAL-CLOCK V12066 1/4] DXGI Present is
+// allowed to outpace or repeat REDengine's canonical gameplay frame. Advance
+// the AER identity only when that real frame reaches its accepted builder;
+// auxiliary factories retain the pending identity and cannot perturb parity.
+std::atomic<uint64_t> g_mode3_afw_natural_render_ordinal{UINT64_MAX};
+std::atomic<uint32_t> g_mode3_afw_natural_clock_logs{};
 uint64_t g_packed_last_accepted_present{UINT64_MAX};
 uint64_t g_openxr_last_projection_submit_present{UINT64_MAX};
 std::atomic<bool> g_packed_runtime_ready{};
@@ -1011,6 +1124,14 @@ std::atomic<uint64_t> g_packed_left_updates{};
 std::atomic<uint64_t> g_packed_right_updates{};
 std::atomic<uint64_t> g_packed_pairs_submitted{};
 
+void reset_mode3_afw_sequenced_pair_state(uint32_t generation) {
+    g_mode3_afw_sequenced_pair_valid = false;
+    g_mode3_afw_sequenced_generation = generation;
+    g_mode3_afw_sequenced_pair = 0;
+    g_mode3_afw_last_real_eye = UINT32_MAX;
+    g_mode3_afw_selected_bundle_slot = UINT32_MAX;
+}
+
 void reset_mode3_aer_presentation_state(
     uint32_t generation,
     bool resources_recreated) {
@@ -1018,11 +1139,22 @@ void reset_mode3_aer_presentation_state(
     for (uint32_t eye = 0; eye < 2; ++eye) {
         g_mode3_aer_packed_eye_valid[eye] = false;
         g_mode3_aer_packed_native_eye[eye] = false;
+        g_mode3_aer_packed_eye_generated[eye] = false;
         if (resources_recreated) {
             // Newly allocated packed resources start in COPY_DEST. Logical
             // boundaries preserve COPY_SOURCE once an eye has been published.
             g_mode3_aer_packed_eye_initialized[eye] = false;
         }
+    }
+    g_mode3_aer_last_promoted_mask = 0;
+    g_mode3_aer_last_promoted_pair[0] = 0;
+    g_mode3_aer_last_promoted_pair[1] = 0;
+    g_mode3_aer_last_promoted_generation = generation;
+    g_mode3_aer_last_promotion_present = UINT64_MAX;
+    reset_mode3_afw_sequenced_pair_state(generation);
+    if (puredark_afw_mode3_aer_dlss_route_configured()) {
+        g_mode3_afw_natural_render_ordinal.store(
+            UINT64_MAX, std::memory_order_release);
     }
 }
 
@@ -1225,6 +1357,7 @@ PresentationProjectionScales presentation_projection_scales(
 
 bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc);
 bool update_packed_eye_cache();
+void capture_puredark_afw_mode3_noaa_camera(const void* constants);
 void mark_engine_pair_output_captured(uint64_t pair_id, uint32_t eye);
 bool capture_streamline_output(ID3D12GraphicsCommandList* command_list, D3D12_RESOURCE_STATES source_state);
 std::vector<PuredarkAfwPendingSubmission>
@@ -5392,7 +5525,8 @@ void log_line(const char* fmt, ...) {
 }
 
 bool puredark_afw_dlss_route_active() {
-    return mode1_afw_retained_hud_route_configured();
+    return mode1_afw_retained_hud_route_configured() ||
+        puredark_afw_mode3_aer_dlss_route_configured();
 }
 
 std::wstring puredark_afw_plugin_path() {
@@ -5505,6 +5639,152 @@ bool ensure_puredark_afw_capture_texture_locked(
     return true;
 }
 
+void register_puredark_afw_mode3_noaa_native_source(
+    ID3D12Resource* resource,
+    bool depth_source) {
+    if (!puredark_afw_mode3_aer_noaa_route_configured() ||
+        resource == nullptr) {
+        return;
+    }
+    auto& sources = depth_source
+        ? g_puredark_afw_noaa_depth_sources
+        : g_puredark_afw_noaa_motion_sources;
+    for (auto& source : sources) {
+        if (source.resource.load(std::memory_order_acquire) == resource) {
+            return;
+        }
+    }
+    for (size_t index = 0; index < sources.size(); ++index) {
+        auto& source = sources[index];
+        ID3D12Resource* expected{};
+        if (!source.resource.compare_exchange_strong(
+                expected, resource, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            continue;
+        }
+        resource->AddRef();
+        const auto desc = resource->GetDesc();
+        if (take_bounded_log_slot(
+                g_puredark_afw_noaa_native_source_logs, 32)) {
+            log_line(
+                "V12054 AFW No-AA native source registered type=%s slot=%zu resource=%p size=%llux%u format=%u flags=0x%X",
+                depth_source ? "depth" : "motion", index, resource,
+                static_cast<unsigned long long>(desc.Width), desc.Height,
+                static_cast<unsigned>(desc.Format),
+                static_cast<unsigned>(desc.Flags));
+        }
+        return;
+    }
+    log_puredark_afw_failure(
+        "noaa_native_registry", L"native No-AA input registry is full");
+}
+
+void track_puredark_afw_mode3_noaa_native_transitions(
+    ID3D12GraphicsCommandList* command_list,
+    UINT num_barriers,
+    const D3D12_RESOURCE_BARRIER* barriers) {
+    if (!puredark_afw_mode3_aer_noaa_route_configured() ||
+        command_list == nullptr || barriers == nullptr) {
+        return;
+    }
+    const uint64_t present =
+        g_present_count.load(std::memory_order_relaxed);
+    const auto track_sources = [&](auto& sources,
+                                   const D3D12_RESOURCE_BARRIER& barrier) {
+        for (auto& source : sources) {
+            if (source.resource.load(std::memory_order_acquire) !=
+                    barrier.Transition.pResource) {
+                continue;
+            }
+            source.state.store(
+                static_cast<uint32_t>(barrier.Transition.StateAfter),
+                std::memory_order_relaxed);
+            source.command_list.store(command_list, std::memory_order_relaxed);
+            source.present.store(present, std::memory_order_relaxed);
+            source.transition_serial.store(
+                g_puredark_afw_noaa_native_transition_serial.fetch_add(
+                    1, std::memory_order_relaxed) + 1,
+                std::memory_order_release);
+            break;
+        }
+    };
+    for (UINT index = 0; index < num_barriers; ++index) {
+        const auto& barrier = barriers[index];
+        if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+            barrier.Transition.pResource == nullptr ||
+            barrier.Flags == D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY ||
+            barrier.Transition.Subresource !=
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+            continue;
+        }
+        track_sources(g_puredark_afw_noaa_depth_sources, barrier);
+        track_sources(g_puredark_afw_noaa_motion_sources, barrier);
+    }
+}
+
+struct PuredarkAfwNoaaNativeInputs {
+    ID3D12Resource* depth{};
+    ID3D12Resource* motion_vectors{};
+    D3D12_RESOURCE_STATES depth_state{};
+    D3D12_RESOURCE_STATES motion_state{};
+};
+
+bool select_puredark_afw_mode3_noaa_native_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    PuredarkAfwNoaaNativeInputs& selected) {
+    selected = {};
+    if (command_list == nullptr) {
+        return false;
+    }
+    const uint64_t present =
+        g_present_count.load(std::memory_order_relaxed);
+    const auto select_source = [&](auto& sources,
+                                   ID3D12Resource*& resource,
+                                   D3D12_RESOURCE_STATES& state) {
+        uint64_t newest_serial{};
+        for (auto& source : sources) {
+            const uint64_t serial_before = source.transition_serial.load(
+                std::memory_order_acquire);
+            if (serial_before == 0 || serial_before <= newest_serial) {
+                continue;
+            }
+            auto* candidate = source.resource.load(std::memory_order_acquire);
+            const uint32_t candidate_state = source.state.load(
+                std::memory_order_relaxed);
+            auto* candidate_list = source.command_list.load(
+                std::memory_order_relaxed);
+            const uint64_t candidate_present = source.present.load(
+                std::memory_order_relaxed);
+            const uint64_t serial_after = source.transition_serial.load(
+                std::memory_order_acquire);
+            if (serial_before != serial_after || candidate == nullptr ||
+                candidate_state == UINT32_MAX ||
+                candidate_list != command_list ||
+                candidate_present != present) {
+                continue;
+            }
+            resource = candidate;
+            state = static_cast<D3D12_RESOURCE_STATES>(candidate_state);
+            newest_serial = serial_after;
+        }
+        return resource != nullptr;
+    };
+    if (!select_source(
+            g_puredark_afw_noaa_depth_sources,
+            selected.depth, selected.depth_state) ||
+        !select_source(
+            g_puredark_afw_noaa_motion_sources,
+            selected.motion_vectors, selected.motion_state)) {
+        return false;
+    }
+    const auto depth_desc = selected.depth->GetDesc();
+    const auto motion_desc = selected.motion_vectors->GetDesc();
+    return depth_desc.Width == motion_desc.Width &&
+        depth_desc.Height == motion_desc.Height &&
+        depth_desc.Width >= 256 && depth_desc.Width <= 8192 &&
+        depth_desc.Height >= 256 && depth_desc.Height <= 8192;
+}
+
 bool current_puredark_afw_direct_route_tag(
     uint32_t routed_eye,
     EngineFrameTag& route_tag) {
@@ -5554,6 +5834,9 @@ void capture_puredark_afw_camera(
         baseline = std::fabs(g_config.engine_factory_stereo_offset);
     }
     PuredarkAfwCameraSnapshot captured{};
+    std::array<XrView, 2> aer_reference_views{{
+        {XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    bool aer_reference_views_valid{};
     std::wstring error;
     if (!w3vr::puredark_afw::build_camera_data_from_streamline(
             static_cast<const float*>(constants), 102, routed_eye,
@@ -5561,12 +5844,102 @@ void capture_puredark_afw_camera(
         log_puredark_afw_failure("camera", error);
         return;
     }
+
+    // [FIX:PUREDARK-AFW-AER-DIRECT-PEER-FOV V12080 1/1]
+    // `capture_puredark_afw_dlss_inputs` consumes this exact route-tagged
+    // camera producer. Mode-3 AER has no same-tick Stereo pair ledger, so use
+    // the exact routed source FOV and the immutable recentered peer-eye rig.
+    // Depth, MVec, scale and command ordering remain the exact NGX inputs.
+    if (puredark_afw_mode3_aer_dlss_route_configured() &&
+        native_asymmetric_noaa_route_active()) {
+        const uint32_t destination_eye = 1u - routed_eye;
+        const XrFovf source_fov = route_tag.render_view.fov;
+        XrFovf destination_fov{};
+        {
+            std::scoped_lock pose_lock{g_hmd_pose_snapshot_mutex};
+            if (g_hmd_center_valid.load(std::memory_order_acquire) &&
+                g_hmd_pose_valid.load(std::memory_order_acquire)) {
+                aer_reference_views = {
+                    g_hmd_center_views[0], g_hmd_center_views[1]};
+                destination_fov =
+                    aer_reference_views[destination_eye].fov;
+                aer_reference_views_valid = true;
+            }
+        }
+        w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor
+            source_projection{};
+        w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor
+            destination_projection{};
+        if (!aer_reference_views_valid ||
+            !w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(
+                source_fov, 1, 1, source_projection) ||
+            !w3vr::openxr_eye_geometry::derive_asymmetric_projection_descriptor(
+                destination_fov, 1, 1, destination_projection) ||
+            !w3vr::puredark_afw::apply_source_eye_projection_center(
+                {
+                    source_projection.horizontal_tangent_span,
+                    source_projection.vertical_tangent_span,
+                    source_projection.center_ndc_x,
+                    source_projection.center_ndc_y},
+                captured.camera, error) ||
+            !w3vr::puredark_afw::retarget_destination_eye_projection(
+                {
+                    source_projection.horizontal_tangent_span,
+                    source_projection.vertical_tangent_span,
+                    source_projection.center_ndc_x,
+                    source_projection.center_ndc_y},
+                {
+                    destination_projection.horizontal_tangent_span,
+                    destination_projection.vertical_tangent_span,
+                    destination_projection.center_ndc_x,
+                    destination_projection.center_ndc_y},
+                captured.camera, error)) {
+            log_puredark_afw_failure(
+                "direct_dlss_destination_projection", error.empty()
+                    ? L"no valid AER source/peer-eye FOV for PureDark"
+                    : error);
+            return;
+        }
+        if (g_config.runtime_diagnostics) {
+            static std::atomic<uint32_t> projection_logs{};
+            if (take_bounded_log_slot(projection_logs, 32)) {
+                log_line(
+                    "V12081 AFW absolute asymmetric camera pair=%llu source_eye=%u destination_eye=%u source_center=%.9g,%.9g source_matrix=%.9g,%.9g destination_center=%.9g,%.9g destination_matrix=%.9g,%.9g source_span=%.9g,%.9g destination_span=%.9g,%.9g source_position=%.9g,%.9g,%.9g destination_position=%.9g,%.9g,%.9g baseline=%.9g authority=route_source_recentered_peer",
+                    static_cast<unsigned long long>(route_tag.pair_id),
+                    routed_eye, destination_eye,
+                    source_projection.center_ndc_x,
+                    source_projection.center_ndc_y,
+                    captured.camera.source_view_to_clip.values[8],
+                    captured.camera.source_view_to_clip.values[9],
+                    destination_projection.center_ndc_x,
+                    destination_projection.center_ndc_y,
+                    captured.camera.destination_view_to_clip.values[8],
+                    captured.camera.destination_view_to_clip.values[9],
+                    source_projection.horizontal_tangent_span,
+                    source_projection.vertical_tangent_span,
+                    destination_projection.horizontal_tangent_span,
+                    destination_projection.vertical_tangent_span,
+                    captured.camera.source_view_to_world.values[12],
+                    captured.camera.source_view_to_world.values[13],
+                    captured.camera.source_view_to_world.values[14],
+                    captured.camera.destination_view_to_world.values[12],
+                    captured.camera.destination_view_to_world.values[13],
+                    captured.camera.destination_view_to_world.values[14],
+                    baseline);
+            }
+        }
+    }
     captured.pair_id = route_tag.pair_id;
     captured.generation = route_tag.generation;
     captured.eye = routed_eye;
+    captured.capture_present =
+        g_present_count.load(std::memory_order_relaxed);
     captured.exact_render_view = route_tag.render_view;
     captured.exact_render_view_valid = true;
-    if (g_xr_views.size() >= 2 && g_hmd_pose_valid.load(
+    if (aer_reference_views_valid) {
+        captured.render_views = aer_reference_views;
+        captured.render_views_valid = true;
+    } else if (g_xr_views.size() >= 2 && g_hmd_pose_valid.load(
             std::memory_order_acquire)) {
         captured.render_views = {g_xr_views[0], g_xr_views[1]};
         captured.render_views_valid = true;
@@ -5663,6 +6036,8 @@ int32_t capture_puredark_afw_dlss_inputs(
             completed_fence >= slot.retire_fence) {
             slot.state = PuredarkAfwBundleState::Free;
             slot.input.valid = false;
+            slot.submission_serial = 0;
+            slot.ready_present = UINT64_MAX;
             slot.retire_fence = 0;
         }
         if (slot.state == PuredarkAfwBundleState::Free) {
@@ -5685,6 +6060,7 @@ int32_t capture_puredark_afw_dlss_inputs(
     slot.route_epoch =
         g_puredark_afw_route_epoch.load(std::memory_order_acquire);
     slot.submission_serial = 0;
+    slot.ready_present = UINT64_MAX;
     slot.retire_fence = 0;
     auto retained_depth = slot.input.depth;
     auto retained_motion_vectors = slot.input.motion_vectors;
@@ -5766,6 +6142,397 @@ int32_t capture_puredark_afw_dlss_inputs(
             captured.motion_scale[0], captured.motion_scale[1]);
     }
     return static_cast<int32_t>(bundle_slot);
+}
+
+// [FIX:PUREDARK-AFW-NOAA-PRODUCER-BUNDLE V12053 1/6] Streamline constants
+// and tags are recorded ahead of the final backbuffer. Freeze Depth/MVec on
+// the final-PRESENT command list carrying the exact Mode-3 eye/pair instead of
+// trying to join their mutable global resources later in OpenXR.
+bool capture_puredark_afw_mode3_noaa_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    const EngineFrameTag& route_tag,
+    const D3D12_RESOURCE_DESC& output_desc) {
+    if (!puredark_afw_mode3_aer_noaa_route_configured() ||
+        command_list == nullptr || route_tag.eye > 1 ||
+        route_tag.pair_id == 0 || route_tag.pair_id == UINT64_MAX ||
+        route_tag.generation != g_streamline_capture_generation.load(
+            std::memory_order_acquire) ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        g_cinema_mode_active.load(std::memory_order_relaxed) ||
+        g_engine_loading_screen_video_active.load(
+            std::memory_order_acquire)) {
+        return false;
+    }
+
+    // [FIX:PUREDARK-AFW-NOAA-NATIVE-INPUTS V12054 3/6] The final producer
+    // list owns the native velocity/depth transitions even though No AA never
+    // publishes Streamline resource tags. Require both resources to have made
+    // a complete transition on this exact command list and Present.
+    PuredarkAfwNoaaNativeInputs native_inputs{};
+    if (!select_puredark_afw_mode3_noaa_native_inputs(
+            command_list, native_inputs)) {
+        log_puredark_afw_failure(
+            "noaa_producer_native_inputs",
+            L"final No-AA producer has no same-list native Depth/MVec pair");
+        return false;
+    }
+    auto* depth = native_inputs.depth;
+    auto* motion_vectors = native_inputs.motion_vectors;
+
+    const auto depth_desc = depth->GetDesc();
+    const auto motion_desc = motion_vectors->GetDesc();
+    if (motion_desc.Width == 0 || motion_desc.Height == 0 ||
+        output_desc.Width == 0 || output_desc.Height == 0) {
+        log_puredark_afw_failure(
+            "noaa_producer_extent", L"No-AA producer extent is invalid");
+        return false;
+    }
+
+    std::scoped_lock lock{g_puredark_afw_mutex};
+    const auto camera_found = std::find_if(
+        g_puredark_afw_camera_history.rbegin(),
+        g_puredark_afw_camera_history.rend(),
+        [&](const PuredarkAfwCameraSnapshot& camera) {
+            return camera.valid && camera.eye == route_tag.eye &&
+                camera.pair_id == route_tag.pair_id &&
+                camera.generation == route_tag.generation &&
+                camera.render_views_valid &&
+                camera.exact_render_view_valid;
+        });
+    if (camera_found == g_puredark_afw_camera_history.rend()) {
+        log_puredark_afw_failure(
+            "noaa_producer_camera",
+            L"final No-AA producer has no exact camera snapshot");
+        return false;
+    }
+
+    uint32_t bundle_slot = UINT32_MAX;
+    const uint64_t completed_fence = g_xr_fence != nullptr
+        ? g_xr_fence->GetCompletedValue()
+        : 0;
+    for (size_t attempt = 0; attempt < kPuredarkAfwBundleRingSize;
+         ++attempt) {
+        const uint32_t candidate = static_cast<uint32_t>(
+            (g_puredark_afw_bundle_write_cursor + attempt) %
+            kPuredarkAfwBundleRingSize);
+        auto& candidate_slot = g_puredark_afw_bundle_ring[candidate];
+        if (candidate_slot.state == PuredarkAfwBundleState::InFlight &&
+            candidate_slot.retire_fence != 0 &&
+            completed_fence >= candidate_slot.retire_fence) {
+            candidate_slot.state = PuredarkAfwBundleState::Free;
+            candidate_slot.input.valid = false;
+            candidate_slot.submission_serial = 0;
+            candidate_slot.ready_present = UINT64_MAX;
+            candidate_slot.retire_fence = 0;
+        }
+        if (candidate_slot.state == PuredarkAfwBundleState::Free) {
+            bundle_slot = candidate;
+            g_puredark_afw_bundle_write_cursor =
+                (candidate + 1) % kPuredarkAfwBundleRingSize;
+            break;
+        }
+    }
+    if (bundle_slot >= kPuredarkAfwBundleRingSize) {
+        g_puredark_afw_slot_starvation.fetch_add(
+            1, std::memory_order_relaxed);
+        log_puredark_afw_failure(
+            "noaa_producer_ring", L"no retired No-AA producer bundle slot");
+        return false;
+    }
+
+    auto& slot = g_puredark_afw_bundle_ring[bundle_slot];
+    auto retained_depth = slot.input.depth;
+    auto retained_motion_vectors = slot.input.motion_vectors;
+    slot.input = {};
+    slot.input.depth = retained_depth;
+    slot.input.motion_vectors = retained_motion_vectors;
+    slot.state = PuredarkAfwBundleState::Recording;
+    slot.route_epoch =
+        g_puredark_afw_route_epoch.load(std::memory_order_acquire);
+    slot.submission_serial = 0;
+    slot.ready_present = UINT64_MAX;
+    slot.retire_fence = 0;
+    auto& captured = slot.input;
+    std::wstring error;
+    if (!ensure_puredark_afw_device_locked(error) ||
+        !ensure_puredark_afw_capture_texture_locked(
+            depth_desc, captured.depth, error) ||
+        !ensure_puredark_afw_capture_texture_locked(
+            motion_desc, captured.motion_vectors, error)) {
+        slot.state = PuredarkAfwBundleState::Free;
+        log_puredark_afw_failure("noaa_producer_resources", error);
+        return false;
+    }
+
+    w3vr::puredark_afw::TextureDesc depth_source{};
+    depth_source.texture = depth;
+    depth_source.initial_state = native_inputs.depth_state;
+    w3vr::puredark_afw::TextureDesc motion_source{};
+    motion_source.texture = motion_vectors;
+    motion_source.initial_state = native_inputs.motion_state;
+    const D3D12_BOX depth_box{
+        0, 0, 0, static_cast<UINT>(depth_desc.Width),
+        depth_desc.Height, 1};
+    const D3D12_BOX motion_box{
+        0, 0, 0, static_cast<UINT>(motion_desc.Width),
+        motion_desc.Height, 1};
+    if (!g_puredark_afw_bridge->copy_texture(
+            command_list, captured.depth, depth_source,
+            depth_box, 0, 0, error) ||
+        !g_puredark_afw_bridge->copy_texture(
+            command_list, captured.motion_vectors, motion_source,
+            motion_box, 0, 0, error)) {
+        slot.state = PuredarkAfwBundleState::Free;
+        log_puredark_afw_failure("noaa_producer_copy", error);
+        return false;
+    }
+
+    captured.camera = camera_found->camera;
+    captured.render_views = camera_found->render_views;
+    captured.render_views_valid = true;
+    captured.exact_render_view = camera_found->exact_render_view;
+    captured.exact_render_view_valid = true;
+    captured.motion_scale[0] = camera_found->motion_scale[0] *
+        static_cast<float>(output_desc.Width) /
+        static_cast<float>(motion_desc.Width);
+    captured.motion_scale[1] = camera_found->motion_scale[1] *
+        static_cast<float>(output_desc.Height) /
+        static_cast<float>(motion_desc.Height);
+    captured.pair_id = route_tag.pair_id;
+    captured.generation = route_tag.generation;
+    captured.eye = route_tag.eye;
+    captured.valid = true;
+    slot.state = PuredarkAfwBundleState::PendingSubmission;
+
+    PuredarkAfwPendingSubmission submission{};
+    submission.bundle_slot = bundle_slot;
+    submission.generation = route_tag.generation;
+    submission.eye = route_tag.eye;
+    submission.pair_id = route_tag.pair_id;
+    submission.route_epoch = slot.route_epoch;
+    submission.exact_identity = true;
+    submission.bundle_ready = true;
+    g_puredark_afw_pending_submissions[
+        static_cast<ID3D12CommandList*>(command_list)].push_back(submission);
+    g_puredark_afw_pending_submission_ready.store(
+        true, std::memory_order_release);
+    g_puredark_afw_recorded_candidates.fetch_add(
+        1, std::memory_order_relaxed);
+    if (take_bounded_log_slot(g_puredark_afw_capture_logs, 24)) {
+        log_line(
+            "V12054 AFW No-AA producer bundle source=native_transition slot=%u pair=%llu eye=%u generation=%u depth=%llux%u:%u:0x%X mvec=%llux%u:%u:0x%X scale=%.6f,%.6f present=%llu",
+            bundle_slot,
+            static_cast<unsigned long long>(route_tag.pair_id),
+            route_tag.eye, route_tag.generation,
+            static_cast<unsigned long long>(depth_desc.Width),
+            depth_desc.Height, static_cast<unsigned>(depth_desc.Format),
+            static_cast<unsigned>(native_inputs.depth_state),
+            static_cast<unsigned long long>(motion_desc.Width),
+            motion_desc.Height, static_cast<unsigned>(motion_desc.Format),
+            static_cast<unsigned>(native_inputs.motion_state),
+            captured.motion_scale[0], captured.motion_scale[1],
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
+    return true;
+}
+
+// [FEATURE:PUREDARK-AFW-MODE3-TAAU V12055 2/8] Freeze TAAU's native inputs
+// before the private motion-vector correction changes them. Both resources
+// and the immutable AER identity come from this exact resolve command list;
+// ExecuteCommandLists remains the publication boundary.
+bool capture_puredark_afw_mode3_taau_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    const ResourceDescriptorInfo& depth,
+    const ResourceDescriptorInfo& motion_vectors,
+    const D3D12_RESOURCE_DESC& output_desc,
+    uint32_t generation,
+    uint32_t eye,
+    uint64_t pair_id) {
+    if (!puredark_afw_mode3_aer_taau_route_configured() ||
+        command_list == nullptr || depth.resource == nullptr ||
+        motion_vectors.resource == nullptr || eye > 1 || pair_id == 0 ||
+        pair_id == UINT64_MAX || generation !=
+            g_streamline_capture_generation.load(std::memory_order_acquire) ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        g_cinema_mode_active.load(std::memory_order_relaxed) ||
+        g_engine_loading_screen_video_active.load(
+            std::memory_order_acquire)) {
+        return false;
+    }
+
+    const auto depth_desc = depth.resource->GetDesc();
+    const auto motion_desc = motion_vectors.resource->GetDesc();
+    if (depth_desc.Width == 0 || depth_desc.Height == 0 ||
+        motion_desc.Width == 0 || motion_desc.Height == 0 ||
+        output_desc.Width == 0 || output_desc.Height == 0) {
+        log_puredark_afw_failure(
+            "taau_producer_extent", L"TAAU producer extent is invalid");
+        return false;
+    }
+
+    std::scoped_lock lock{g_puredark_afw_mutex};
+    const auto camera_found = std::find_if(
+        g_puredark_afw_camera_history.rbegin(),
+        g_puredark_afw_camera_history.rend(),
+        [&](const PuredarkAfwCameraSnapshot& camera) {
+            return camera.valid && camera.eye == eye &&
+                camera.pair_id == pair_id &&
+                camera.generation == generation &&
+                camera.render_views_valid &&
+                camera.exact_render_view_valid;
+        });
+    if (camera_found == g_puredark_afw_camera_history.rend()) {
+        log_puredark_afw_failure(
+            "taau_producer_camera",
+            L"TAAU resolve has no exact camera snapshot");
+        return false;
+    }
+
+    // A replay of the same resolve must not allocate another slot or replace
+    // its already submitted authority.
+    for (const auto& existing : g_puredark_afw_bundle_ring) {
+        if (existing.state != PuredarkAfwBundleState::Free &&
+            existing.input.valid && existing.input.eye == eye &&
+            existing.input.pair_id == pair_id &&
+            existing.input.generation == generation) {
+            return true;
+        }
+    }
+
+    uint32_t bundle_slot = UINT32_MAX;
+    const uint64_t completed_fence = g_xr_fence != nullptr
+        ? g_xr_fence->GetCompletedValue()
+        : 0;
+    for (size_t attempt = 0; attempt < kPuredarkAfwBundleRingSize;
+         ++attempt) {
+        const uint32_t candidate = static_cast<uint32_t>(
+            (g_puredark_afw_bundle_write_cursor + attempt) %
+            kPuredarkAfwBundleRingSize);
+        auto& candidate_slot = g_puredark_afw_bundle_ring[candidate];
+        if (candidate_slot.state == PuredarkAfwBundleState::InFlight &&
+            candidate_slot.retire_fence != 0 &&
+            completed_fence >= candidate_slot.retire_fence) {
+            candidate_slot.state = PuredarkAfwBundleState::Free;
+            candidate_slot.input.valid = false;
+            candidate_slot.submission_serial = 0;
+            candidate_slot.ready_present = UINT64_MAX;
+            candidate_slot.retire_fence = 0;
+        }
+        if (candidate_slot.state == PuredarkAfwBundleState::Free) {
+            bundle_slot = candidate;
+            g_puredark_afw_bundle_write_cursor =
+                (candidate + 1) % kPuredarkAfwBundleRingSize;
+            break;
+        }
+    }
+    if (bundle_slot >= kPuredarkAfwBundleRingSize) {
+        g_puredark_afw_slot_starvation.fetch_add(
+            1, std::memory_order_relaxed);
+        log_puredark_afw_failure(
+            "taau_producer_ring", L"no retired TAAU producer bundle slot");
+        return false;
+    }
+
+    auto& slot = g_puredark_afw_bundle_ring[bundle_slot];
+    auto retained_depth = slot.input.depth;
+    auto retained_motion_vectors = slot.input.motion_vectors;
+    slot.input = {};
+    slot.input.depth = retained_depth;
+    slot.input.motion_vectors = retained_motion_vectors;
+    slot.state = PuredarkAfwBundleState::Recording;
+    slot.route_epoch =
+        g_puredark_afw_route_epoch.load(std::memory_order_acquire);
+    slot.submission_serial = 0;
+    slot.ready_present = UINT64_MAX;
+    slot.retire_fence = 0;
+    auto& captured = slot.input;
+    std::wstring error;
+    if (!ensure_puredark_afw_device_locked(error) ||
+        !ensure_puredark_afw_capture_texture_locked(
+            depth_desc, captured.depth, error) ||
+        !ensure_puredark_afw_capture_texture_locked(
+            motion_desc, captured.motion_vectors, error)) {
+        slot.state = PuredarkAfwBundleState::Free;
+        log_puredark_afw_failure("taau_producer_resources", error);
+        return false;
+    }
+
+    w3vr::puredark_afw::TextureDesc depth_source{};
+    depth_source.texture = depth.resource;
+    depth_source.initial_state =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    w3vr::puredark_afw::TextureDesc motion_source{};
+    motion_source.texture = motion_vectors.resource;
+    // The native resolve route itself transitions this exact source from
+    // COMMON before snapshotting/correcting it below.
+    motion_source.initial_state = D3D12_RESOURCE_STATE_COMMON;
+    const D3D12_BOX depth_box{
+        0, 0, 0, static_cast<UINT>(depth_desc.Width),
+        depth_desc.Height, 1};
+    const D3D12_BOX motion_box{
+        0, 0, 0, static_cast<UINT>(motion_desc.Width),
+        motion_desc.Height, 1};
+    if (!g_puredark_afw_bridge->copy_texture(
+            command_list, captured.depth, depth_source,
+            depth_box, 0, 0, error) ||
+        !g_puredark_afw_bridge->copy_texture(
+            command_list, captured.motion_vectors, motion_source,
+            motion_box, 0, 0, error)) {
+        slot.state = PuredarkAfwBundleState::Free;
+        log_puredark_afw_failure("taau_producer_copy", error);
+        return false;
+    }
+
+    captured.camera = camera_found->camera;
+    captured.render_views = camera_found->render_views;
+    captured.render_views_valid = true;
+    captured.exact_render_view = camera_found->exact_render_view;
+    captured.exact_render_view_valid = true;
+    captured.motion_scale[0] = camera_found->motion_scale[0] *
+        static_cast<float>(output_desc.Width) /
+        static_cast<float>(motion_desc.Width);
+    captured.motion_scale[1] = camera_found->motion_scale[1] *
+        static_cast<float>(output_desc.Height) /
+        static_cast<float>(motion_desc.Height);
+    captured.pair_id = pair_id;
+    captured.generation = generation;
+    captured.eye = eye;
+    captured.valid = true;
+    slot.state = PuredarkAfwBundleState::PendingSubmission;
+
+    PuredarkAfwPendingSubmission submission{};
+    submission.bundle_slot = bundle_slot;
+    submission.generation = generation;
+    submission.eye = eye;
+    submission.pair_id = pair_id;
+    submission.route_epoch = slot.route_epoch;
+    submission.exact_identity = true;
+    submission.bundle_ready = true;
+    g_puredark_afw_pending_submissions[
+        static_cast<ID3D12CommandList*>(command_list)].push_back(submission);
+    g_puredark_afw_pending_submission_ready.store(
+        true, std::memory_order_release);
+    g_puredark_afw_recorded_candidates.fetch_add(
+        1, std::memory_order_relaxed);
+    if (take_bounded_log_slot(g_puredark_afw_capture_logs, 24)) {
+        log_line(
+            "V12055 AFW TAAU producer bundle slot=%u pair=%llu eye=%u generation=%u depth=%llux%u:%u:0x%X mvec=%llux%u:%u:0x%X output=%llux%u:%u scale=%.6f,%.6f present=%llu",
+            bundle_slot, static_cast<unsigned long long>(pair_id), eye,
+            generation,
+            static_cast<unsigned long long>(depth_desc.Width),
+            depth_desc.Height, static_cast<unsigned>(depth.format),
+            static_cast<unsigned>(depth_source.initial_state),
+            static_cast<unsigned long long>(motion_desc.Width),
+            motion_desc.Height, static_cast<unsigned>(motion_vectors.format),
+            static_cast<unsigned>(motion_source.initial_state),
+            static_cast<unsigned long long>(output_desc.Width),
+            output_desc.Height, static_cast<unsigned>(output_desc.Format),
+            captured.motion_scale[0], captured.motion_scale[1],
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
+    return true;
 }
 
 void finalize_puredark_afw_dlss_submission(
@@ -5921,16 +6688,30 @@ void reset_puredark_afw_publication_state() {
     g_puredark_afw_route_epoch.fetch_add(1, std::memory_order_acq_rel);
     g_puredark_afw_steady_active.store(false, std::memory_order_release);
     std::scoped_lock lock{g_puredark_afw_mutex};
-    if (g_puredark_afw_ready_bundle < kPuredarkAfwBundleRingSize) {
-        auto& ready =
-            g_puredark_afw_bundle_ring[g_puredark_afw_ready_bundle];
-        if (ready.state == PuredarkAfwBundleState::Ready) {
-            ready.state = PuredarkAfwBundleState::Free;
-            ready.input.valid = false;
+    // [FIX:PUREDARK-AFW-MODE3-DLSS-INPUT-FIFO V12064 2/8] Revoke every
+    // unconsumed ready producer at a logical route boundary. Recording and
+    // submitted/in-flight slots retain their existing epoch/fence lifecycle.
+    for (auto& ready : g_puredark_afw_bundle_ring) {
+        if (ready.state != PuredarkAfwBundleState::Ready) {
+            continue;
         }
+        ready.state = PuredarkAfwBundleState::Free;
+        ready.input.valid = false;
+        ready.submission_serial = 0;
+        ready.ready_present = UINT64_MAX;
     }
     g_puredark_afw_ready_bundle = UINT32_MAX;
+    g_puredark_afw_mode3_dlss_ready_queue.clear();
+    g_mode3_afw_selected_bundle_slot = UINT32_MAX;
     g_puredark_afw_camera_history.clear();
+    g_puredark_afw_noaa_tag_present[0].store(
+        0, std::memory_order_release);
+    g_puredark_afw_noaa_tag_present[1].store(
+        0, std::memory_order_release);
+    if (puredark_afw_mode3_aer_dlss_route_configured()) {
+        reset_mode3_afw_sequenced_pair_state(
+            g_streamline_capture_generation.load(std::memory_order_acquire));
+    }
 }
 
 void finish_puredark_afw_xr_bundle(
@@ -5950,6 +6731,8 @@ void finish_puredark_afw_xr_bundle(
         } else {
             slot.state = PuredarkAfwBundleState::Free;
             slot.input.valid = false;
+            slot.submission_serial = 0;
+            slot.ready_present = UINT64_MAX;
             slot.retire_fence = 0;
         }
     }
@@ -6094,6 +6877,8 @@ bool evaluate_puredark_afw_present(
     evaluate.ignore_motion_threshold = 2.5f;
     evaluate.is_hudless_color = true;
     evaluate.motion_vectors_type = w3vr::puredark_afw::Normal;
+    evaluate.debug = g_puredark_afw_visual_debug.load(
+        std::memory_order_relaxed);
     evaluate.use_uint64 = false;
     if (!g_puredark_afw_bridge->evaluate(evaluate, error)) {
         log_puredark_afw_failure("evaluate", error);
@@ -6140,6 +6925,561 @@ bool evaluate_puredark_afw_present(
     return true;
 }
 
+// [FEATURE:PUREDARK-AFW-MODE3-TAAU V12055 5/8] OpenXR consumes only a bundle
+// copied and submitted by the exact natural producer. No AA obtains it at the
+// final backbuffer; TAAU obtains it at the exact native resolve. Both add the
+// real packed color and Evaluate on PureDark's own list, submitted before the
+// XR projection list on the same queue.
+bool evaluate_puredark_afw_mode3_noaa(
+    ID3D12Resource* source_color,
+    ID3D12Resource* destination_color,
+    const D3D12_RESOURCE_DESC& source_desc,
+    uint32_t generation,
+    uint32_t real_eye,
+    uint64_t pair_id,
+    uint64_t present_count,
+    uint32_t command_context_index,
+    PuredarkAfwPresentResult& result) {
+    result = {};
+    if (!puredark_afw_mode3_aer_route_configured() ||
+        source_color == nullptr || destination_color == nullptr ||
+        source_color == destination_color || real_eye > 1 || pair_id == 0 ||
+        pair_id == UINT64_MAX || command_context_index > INT_MAX ||
+        generation != g_streamline_capture_generation.load(
+            std::memory_order_acquire)) {
+        return false;
+    }
+    const float cant_degrees =
+        g_runtime_eye_cant_degrees.load(std::memory_order_relaxed);
+    if (std::isfinite(cant_degrees) && std::fabs(cant_degrees) > 0.25f) {
+        log_puredark_afw_failure(
+            "mode3_aer_runtime_cant",
+            L"canted-eye AFW camera is not implemented");
+        return false;
+    }
+
+    std::scoped_lock lock{g_puredark_afw_mutex};
+    if (g_puredark_afw_ready_bundle >= kPuredarkAfwBundleRingSize ||
+        g_puredark_afw_consuming_bundle < kPuredarkAfwBundleRingSize) {
+        log_puredark_afw_failure(
+            "mode3_aer_producer_ready",
+            L"no exact submitted Mode-3 AER bundle is ready");
+        return false;
+    }
+    const uint32_t bundle_slot = g_puredark_afw_ready_bundle;
+    auto& slot = g_puredark_afw_bundle_ring[bundle_slot];
+    auto& captured = slot.input;
+    if (slot.state != PuredarkAfwBundleState::Ready ||
+        !captured.valid || captured.eye != real_eye ||
+        captured.pair_id != pair_id || captured.generation != generation ||
+        !captured.render_views_valid ||
+        !captured.exact_render_view_valid ||
+        slot.submission_serial == 0 ||
+        captured.depth.texture == nullptr ||
+        captured.motion_vectors.texture == nullptr) {
+        log_puredark_afw_failure(
+            "mode3_aer_producer_identity",
+            L"submitted Mode-3 AER bundle does not match the promoted eye/pair");
+        return false;
+    }
+
+    std::wstring error;
+    if (!ensure_puredark_afw_device_locked(error) ||
+        !initialize_puredark_afw_frame_buffers_locked(
+            source_desc, error)) {
+        log_puredark_afw_failure("mode3_aer_resources", error);
+        return false;
+    }
+
+    g_puredark_afw_ready_bundle = UINT32_MAX;
+    slot.state = PuredarkAfwBundleState::Consuming;
+    g_puredark_afw_consuming_bundle = bundle_slot;
+    const auto depth_desc = captured.depth.texture->GetDesc();
+    const auto motion_desc = captured.motion_vectors.texture->GetDesc();
+    auto input =
+        g_puredark_afw_eye_buffers.eye_frame_buffers[real_eye];
+    // [FIX:PUREDARK-AFW-OWNED-COMMAND-LIST V12056 1/3] PureDark's reference
+    // integration records the color copy and EvaluateFrameWarp between its
+    // own BeginCommandList/EndCommandList calls. Keeping that work off the XR
+    // projection list means an invalid/private plugin command can never poison
+    // the list which submits the OpenXR menu and projection layer. End submits
+    // this list to the same game queue before the XR list, so the generated
+    // texture is nevertheless ready when OpenXR samples it.
+    const int afw_command_context_index = static_cast<int>(
+        command_context_index);
+    auto* afw_command_list = g_puredark_afw_bridge->begin_command_list(
+        afw_command_context_index, error);
+    if (afw_command_list == nullptr) {
+        log_puredark_afw_failure("mode3_aer_begin", error);
+        return false;
+    }
+    const auto end_afw_command_list = [&]() {
+        std::wstring end_error;
+        const bool ended = g_puredark_afw_bridge->end_command_list(
+            afw_command_context_index, end_error);
+        if (!ended) {
+            log_puredark_afw_failure("mode3_aer_end", end_error);
+        }
+        return ended;
+    };
+    w3vr::puredark_afw::TextureDesc color_source{};
+    color_source.texture = source_color;
+    color_source.initial_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    const D3D12_BOX color_box{
+        0, 0, 0, static_cast<UINT>(source_desc.Width),
+        source_desc.Height, 1};
+    if (!g_puredark_afw_bridge->copy_texture(
+            afw_command_list, input.color, color_source,
+            color_box, 0, 0, error)) {
+        end_afw_command_list();
+        log_puredark_afw_failure("mode3_aer_color_copy", error);
+        return false;
+    }
+    input.depth = captured.depth;
+    input.motion_vectors = captured.motion_vectors;
+
+    auto camera = captured.camera;
+    w3vr::puredark_afw::FrameWarpEvaluateParams evaluate{};
+    evaluate.command_list = afw_command_list;
+    evaluate.input_eye_frame_buffer = &input;
+    evaluate.motion_scale[0] = captured.motion_scale[0];
+    evaluate.motion_scale[1] = captured.motion_scale[1];
+    evaluate.mode = w3vr::puredark_afw::AlternateEyeWarping;
+    evaluate.eye_index = static_cast<w3vr::puredark_afw::EyeIndex>(real_eye);
+    evaluate.camera_data = &camera;
+    evaluate.clear_before_warping = false;
+    evaluate.ignore_motion_threshold = 2.5f;
+    evaluate.is_hudless_color = true;
+    evaluate.motion_vectors_type = w3vr::puredark_afw::Normal;
+    evaluate.debug = g_puredark_afw_visual_debug.load(
+        std::memory_order_relaxed);
+    evaluate.use_uint64 = false;
+    if (!g_puredark_afw_bridge->evaluate(evaluate, error)) {
+        end_afw_command_list();
+        log_puredark_afw_failure("mode3_aer_evaluate", error);
+        return false;
+    }
+
+    if (evaluate.output_eye_frame_buffer == nullptr ||
+        evaluate.output_eye_frame_buffer->color.texture == nullptr) {
+        end_afw_command_list();
+        log_puredark_afw_failure(
+            "mode3_aer_output", L"PureDark returned no synthesized texture");
+        return false;
+    }
+    const auto synthesized = evaluate.output_eye_frame_buffer->color;
+    const auto synthesized_desc = synthesized.texture->GetDesc();
+    if (synthesized_desc.Width != source_desc.Width ||
+        synthesized_desc.Height != source_desc.Height ||
+        synthesized_desc.Format != source_desc.Format) {
+        end_afw_command_list();
+        log_puredark_afw_failure(
+            "mode3_aer_output",
+            L"synthesized texture does not match Mode-3 cache");
+        return false;
+    }
+    const auto destination_desc = destination_color->GetDesc();
+    if (destination_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        synthesized_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        destination_desc.Width != synthesized_desc.Width ||
+        destination_desc.Height != synthesized_desc.Height ||
+        destination_desc.Format != synthesized_desc.Format ||
+        destination_desc.SampleDesc.Count != synthesized_desc.SampleDesc.Count ||
+        destination_desc.SampleDesc.Quality !=
+            synthesized_desc.SampleDesc.Quality) {
+        end_afw_command_list();
+        log_puredark_afw_failure(
+            "mode3_aer_owned_publish",
+            L"generated output does not match the destination eye cache");
+        return false;
+    }
+
+    // [FIX:PUREDARK-AFW-OWNED-PUBLICATION V12058 1/3] Keep the complete AFW
+    // transaction on the command list owned by PureDark. Its renderer performs
+    // the same state-preserving subresource copy used by the beta.5 reference
+    // integration. The normal XR list will see only the already-proven packed
+    // cache resources and can no longer be invalidated by an AFW resource.
+    w3vr::puredark_afw::TextureDesc destination{};
+    destination.texture = destination_color;
+    destination.initial_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    auto synthesized_source = synthesized;
+    const D3D12_BOX synthesized_box{
+        0, 0, 0, static_cast<UINT>(synthesized_desc.Width),
+        synthesized_desc.Height, 1};
+    if (!g_puredark_afw_bridge->copy_texture(
+            afw_command_list, destination, synthesized_source,
+            synthesized_box, 0, 0, error)) {
+        end_afw_command_list();
+        log_puredark_afw_failure("mode3_aer_owned_publish", error);
+        return false;
+    }
+    if (!end_afw_command_list()) {
+        return false;
+    }
+
+    result.synthesized_color = synthesized;
+    result.render_views = captured.render_views;
+    result.render_views_valid = captured.render_views_valid;
+    result.exact_render_view = captured.exact_render_view;
+    result.exact_render_view_valid = captured.exact_render_view_valid;
+    result.pair_id = pair_id;
+    result.generation = generation;
+    result.real_eye = real_eye;
+    result.synthesized_eye = 1u - real_eye;
+    result.bundle_slot = bundle_slot;
+    result.submission_serial = slot.submission_serial;
+    result.valid = true;
+    g_puredark_afw_consumed_candidates.fetch_add(
+        1, std::memory_order_relaxed);
+    if (take_bounded_log_slot(g_puredark_afw_present_logs, 32)) {
+        log_line(
+                "V12058 AFW Mode-3 AER evaluated+copied backend=%s submitted_bundle=%u context=%u present=%llu pair=%llu real_eye=%u synthesized_eye=%u depth=%llux%u:%u mvec=%llux%u:%u scale=%.6f,%.6f",
+            temporal_backend_name(),
+            bundle_slot,
+            command_context_index,
+            static_cast<unsigned long long>(present_count),
+            static_cast<unsigned long long>(pair_id), real_eye,
+            result.synthesized_eye,
+            static_cast<unsigned long long>(depth_desc.Width),
+            depth_desc.Height, static_cast<unsigned>(depth_desc.Format),
+            static_cast<unsigned long long>(motion_desc.Width),
+            motion_desc.Height, static_cast<unsigned>(motion_desc.Format),
+            captured.motion_scale[0], captured.motion_scale[1]);
+    }
+    return true;
+}
+
+bool publish_puredark_afw_mode3_noaa(
+    const PuredarkAfwPresentResult& result) {
+    if (!puredark_afw_mode3_aer_route_configured() ||
+        !result.valid ||
+        result.real_eye > 1 || result.synthesized_eye > 1 ||
+        result.real_eye == result.synthesized_eye ||
+        result.pair_id == 0 ||
+        result.generation != g_mode3_aer_presentation_generation ||
+        g_packed_eye_version[result.real_eye] != result.pair_id ||
+        g_packed_present_cache[result.synthesized_eye] == nullptr ||
+        result.synthesized_color.texture == nullptr) {
+        return false;
+    }
+
+    // [FIX:PUREDARK-AFW-OWNED-PUBLICATION V12058 2/3] GPU publication was
+    // already recorded and submitted inside PureDark's EndCommandList. This
+    // function commits only the CPU-side packed-cache identity and views.
+    const uint32_t synthesized_eye = result.synthesized_eye;
+    g_packed_eye_version[synthesized_eye] = result.pair_id;
+    g_packed_present_cache_views[synthesized_eye] =
+        result.render_views[synthesized_eye];
+    g_packed_present_cache_view_valid[synthesized_eye] =
+        result.render_views_valid;
+    g_mode3_aer_packed_eye_valid[synthesized_eye] = true;
+    g_mode3_aer_packed_eye_generated[synthesized_eye] = true;
+    g_mode3_aer_packed_native_eye[synthesized_eye] =
+        g_mode3_aer_packed_native_eye[result.real_eye];
+    g_packed_present_cache_native_asymmetric =
+        g_mode3_aer_packed_native_eye[0] &&
+        g_mode3_aer_packed_native_eye[1];
+    g_packed_present_cache_valid = true;
+    g_packed_last_accepted_present =
+        g_present_count.load(std::memory_order_relaxed);
+    g_packed_runtime_ready.store(true, std::memory_order_release);
+    if (g_config.runtime_diagnostics) {
+        static std::atomic<uint32_t> publication_logs{};
+        if (take_bounded_log_slot(publication_logs, 64)) {
+            log_line(
+                "V12058 AFW Mode-3 AER committed backend=%s pair=%llu real_eye=%u synthesized_eye=%u visible=%llu/%llu present=%llu",
+            temporal_backend_name(),
+            static_cast<unsigned long long>(result.pair_id),
+                result.real_eye, result.synthesized_eye,
+                static_cast<unsigned long long>(g_packed_eye_version[0]),
+                static_cast<unsigned long long>(g_packed_eye_version[1]),
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)));
+        }
+    }
+    return true;
+}
+
+// [FEATURE:PUREDARK-AFW-MODE3-DLSS-POSITIVE-CONTROL V12061 2/8]
+// This is the V12016 transaction applied to Mode 3's natural packed eye:
+// color copy, EvaluateFrameWarp and peer publication all remain on the one XR
+// list. The exact NGX producer bundle supplies Depth, R16G16_FLOAT MVec and
+// camera provenance; no Present-parity identity is invented here.
+bool evaluate_puredark_afw_mode3_dlss(
+    ID3D12GraphicsCommandList* command_list,
+    ID3D12Resource* source_color,
+    const D3D12_RESOURCE_DESC& source_desc,
+    uint32_t generation,
+    uint32_t real_eye,
+    uint64_t pair_id,
+    uint64_t present_count,
+    PuredarkAfwPresentResult& result) {
+    result = {};
+    if (!puredark_afw_mode3_aer_dlss_route_configured() ||
+        command_list == nullptr || source_color == nullptr ||
+        real_eye > 1 || pair_id == 0 || pair_id == UINT64_MAX ||
+        generation != g_streamline_capture_generation.load(
+            std::memory_order_acquire)) {
+        return false;
+    }
+    const float cant_degrees =
+        g_runtime_eye_cant_degrees.load(std::memory_order_relaxed);
+    if (std::isfinite(cant_degrees) && std::fabs(cant_degrees) > 0.25f) {
+        log_puredark_afw_failure(
+            "mode3_dlss_runtime_cant",
+            L"canted-eye AFW camera is not implemented");
+        return false;
+    }
+
+    std::scoped_lock lock{g_puredark_afw_mutex};
+    if (g_mode3_afw_selected_bundle_slot >=
+            kPuredarkAfwBundleRingSize ||
+        g_puredark_afw_consuming_bundle < kPuredarkAfwBundleRingSize) {
+        log_puredark_afw_failure(
+            "mode3_dlss_producer_ready",
+            L"no exact queued Mode-3 DLSS bundle is selected");
+        return false;
+    }
+    const uint32_t bundle_slot = g_mode3_afw_selected_bundle_slot;
+    auto& slot = g_puredark_afw_bundle_ring[bundle_slot];
+    auto& captured = slot.input;
+    if (slot.state != PuredarkAfwBundleState::Ready ||
+        !captured.valid || captured.eye != real_eye ||
+        captured.pair_id != pair_id || captured.generation != generation ||
+        !captured.render_views_valid ||
+        !captured.exact_render_view_valid ||
+        slot.submission_serial == 0 ||
+        captured.depth.texture == nullptr ||
+        captured.motion_vectors.texture == nullptr) {
+        log_puredark_afw_failure(
+            "mode3_dlss_producer_identity",
+            L"submitted NGX bundle does not match the promoted eye/pair");
+        return false;
+    }
+
+    std::wstring error;
+    if (!ensure_puredark_afw_device_locked(error) ||
+        !initialize_puredark_afw_frame_buffers_locked(
+            source_desc, error)) {
+        log_puredark_afw_failure("mode3_dlss_resources", error);
+        return false;
+    }
+
+    const auto queued = std::find(
+        g_puredark_afw_mode3_dlss_ready_queue.begin(),
+        g_puredark_afw_mode3_dlss_ready_queue.end(), bundle_slot);
+    if (queued == g_puredark_afw_mode3_dlss_ready_queue.end()) {
+        log_puredark_afw_failure(
+            "mode3_dlss_producer_ready",
+            L"selected Mode-3 DLSS bundle left the input FIFO");
+        return false;
+    }
+    g_puredark_afw_mode3_dlss_ready_queue.erase(queued);
+    g_mode3_afw_selected_bundle_slot = UINT32_MAX;
+    slot.state = PuredarkAfwBundleState::Consuming;
+    g_puredark_afw_consuming_bundle = bundle_slot;
+    const uint64_t selected_count = g_mode3_afw_fifo_selected.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (g_config.runtime_diagnostics &&
+        (selected_count <= 32 || (selected_count % 240) == 0)) {
+        log_line(
+            "V12065 AFW input FIFO consumed count=%llu present=%llu slot=%u eye=%u pair=%llu generation=%u remaining=%zu ready_present=%llu age=%llu",
+            static_cast<unsigned long long>(selected_count),
+            static_cast<unsigned long long>(present_count), bundle_slot,
+            real_eye, static_cast<unsigned long long>(pair_id), generation,
+            g_puredark_afw_mode3_dlss_ready_queue.size(),
+            static_cast<unsigned long long>(slot.ready_present),
+            static_cast<unsigned long long>(
+                present_count - slot.ready_present));
+    }
+    const auto depth_desc = captured.depth.texture->GetDesc();
+    const auto motion_desc = captured.motion_vectors.texture->GetDesc();
+    auto input = g_puredark_afw_eye_buffers.eye_frame_buffers[real_eye];
+    w3vr::puredark_afw::TextureDesc color_source{};
+    color_source.texture = source_color;
+    color_source.initial_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    const D3D12_BOX color_box{
+        0, 0, 0, static_cast<UINT>(source_desc.Width),
+        source_desc.Height, 1};
+    if (!g_puredark_afw_bridge->copy_texture(
+            command_list, input.color, color_source,
+            color_box, 0, 0, error)) {
+        log_puredark_afw_failure("mode3_dlss_color_copy", error);
+        return false;
+    }
+    input.depth = captured.depth;
+    input.motion_vectors = captured.motion_vectors;
+
+    auto camera = captured.camera;
+    w3vr::puredark_afw::FrameWarpEvaluateParams evaluate{};
+    evaluate.command_list = command_list;
+    evaluate.input_eye_frame_buffer = &input;
+    evaluate.motion_scale[0] = captured.motion_scale[0];
+    evaluate.motion_scale[1] = captured.motion_scale[1];
+    // [FIX:PUREDARK-AFW-MODE3-DLSS-COMBINED-WARPING V12062 1/2]
+    // beta.5 defaults to CombinedWarping. Its previous-frame component is the
+    // one isolated parameter intended to stabilize temporal/head-rotation
+    // reprojection in addition to generating the spatial peer eye.
+    evaluate.mode = w3vr::puredark_afw::CombinedWarping;
+    evaluate.eye_index = static_cast<w3vr::puredark_afw::EyeIndex>(real_eye);
+    evaluate.camera_data = &camera;
+    evaluate.clear_before_warping = false;
+    evaluate.ignore_motion_threshold = 2.5f;
+    evaluate.is_hudless_color = true;
+    evaluate.motion_vectors_type = w3vr::puredark_afw::Normal;
+    evaluate.debug = g_puredark_afw_visual_debug.load(
+        std::memory_order_relaxed);
+    evaluate.use_uint64 = false;
+    if (!g_puredark_afw_bridge->evaluate(evaluate, error)) {
+        log_puredark_afw_failure("mode3_dlss_evaluate", error);
+        return false;
+    }
+    if (evaluate.output_eye_frame_buffer == nullptr ||
+        evaluate.output_eye_frame_buffer->color.texture == nullptr) {
+        log_puredark_afw_failure(
+            "mode3_dlss_output", L"PureDark returned no synthesized texture");
+        return false;
+    }
+
+    const auto synthesized = evaluate.output_eye_frame_buffer->color;
+    const auto synthesized_desc = synthesized.texture->GetDesc();
+    if (synthesized_desc.Width != source_desc.Width ||
+        synthesized_desc.Height != source_desc.Height ||
+        synthesized_desc.Format != source_desc.Format) {
+        log_puredark_afw_failure(
+            "mode3_dlss_output",
+            L"synthesized texture does not match Mode-3 DLSS cache");
+        return false;
+    }
+
+    result.synthesized_color = synthesized;
+    result.render_views = captured.render_views;
+    result.render_views_valid = captured.render_views_valid;
+    result.exact_render_view = captured.exact_render_view;
+    result.exact_render_view_valid = captured.exact_render_view_valid;
+    result.pair_id = pair_id;
+    result.generation = generation;
+    result.real_eye = real_eye;
+    result.synthesized_eye = 1u - real_eye;
+    result.bundle_slot = bundle_slot;
+    result.submission_serial = slot.submission_serial;
+    result.valid = true;
+    g_puredark_afw_consumed_candidates.fetch_add(
+        1, std::memory_order_relaxed);
+    if (take_bounded_log_slot(g_puredark_afw_present_logs, 32)) {
+        log_line(
+            "V12061 AFW Mode-3 DLSS evaluated submitted_bundle=%u present=%llu pair=%llu real_eye=%u synthesized_eye=%u depth=%llux%u:%u mvec=%llux%u:%u scale=%.6f,%.6f",
+            bundle_slot,
+            static_cast<unsigned long long>(present_count),
+            static_cast<unsigned long long>(pair_id), real_eye,
+            result.synthesized_eye,
+            static_cast<unsigned long long>(depth_desc.Width),
+            depth_desc.Height, static_cast<unsigned>(depth_desc.Format),
+            static_cast<unsigned long long>(motion_desc.Width),
+            motion_desc.Height, static_cast<unsigned>(motion_desc.Format),
+            captured.motion_scale[0], captured.motion_scale[1]);
+    }
+    return true;
+}
+
+bool publish_puredark_afw_mode3_dlss(
+    ID3D12GraphicsCommandList* command_list,
+    const PuredarkAfwPresentResult& result) {
+    if (!puredark_afw_mode3_aer_dlss_route_configured() ||
+        command_list == nullptr || !result.valid ||
+        result.real_eye > 1 || result.synthesized_eye > 1 ||
+        result.real_eye == result.synthesized_eye ||
+        result.pair_id == 0 ||
+        result.generation != g_mode3_aer_presentation_generation ||
+        g_packed_eye_version[result.real_eye] != result.pair_id ||
+        g_packed_present_cache[result.synthesized_eye] == nullptr ||
+        result.synthesized_color.texture == nullptr) {
+        return false;
+    }
+
+    auto* destination = g_packed_present_cache[result.synthesized_eye];
+    auto* synthesized = result.synthesized_color.texture;
+    const auto destination_desc = destination->GetDesc();
+    const auto synthesized_desc = synthesized->GetDesc();
+    if (destination_desc.Dimension != synthesized_desc.Dimension ||
+        destination_desc.Width != synthesized_desc.Width ||
+        destination_desc.Height != synthesized_desc.Height ||
+        destination_desc.Format != synthesized_desc.Format ||
+        destination_desc.SampleDesc.Count != synthesized_desc.SampleDesc.Count ||
+        destination_desc.SampleDesc.Quality !=
+            synthesized_desc.SampleDesc.Quality) {
+        log_puredark_afw_failure(
+            "mode3_dlss_publish",
+            L"generated output does not match the destination eye cache");
+        return false;
+    }
+
+    const bool transition_synthesized =
+        result.synthesized_color.initial_state !=
+            D3D12_RESOURCE_STATE_COPY_SOURCE;
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    UINT barrier_count{};
+    if (transition_synthesized) {
+        auto& barrier = barriers[barrier_count++];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = synthesized;
+        barrier.Transition.StateBefore =
+            result.synthesized_color.initial_state;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    auto& destination_to_copy = barriers[barrier_count++];
+    destination_to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    destination_to_copy.Transition.pResource = destination;
+    destination_to_copy.Transition.StateBefore =
+        D3D12_RESOURCE_STATE_COPY_SOURCE;
+    destination_to_copy.Transition.StateAfter =
+        D3D12_RESOURCE_STATE_COPY_DEST;
+    destination_to_copy.Transition.Subresource =
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    command_list->ResourceBarrier(barrier_count, barriers);
+    command_list->CopyResource(destination, synthesized);
+    for (UINT index = 0; index < barrier_count; ++index) {
+        std::swap(
+            barriers[index].Transition.StateBefore,
+            barriers[index].Transition.StateAfter);
+    }
+    command_list->ResourceBarrier(barrier_count, barriers);
+
+    const uint32_t synthesized_eye = result.synthesized_eye;
+    g_packed_eye_version[synthesized_eye] = result.pair_id;
+    g_packed_present_cache_views[synthesized_eye] =
+        result.render_views[synthesized_eye];
+    g_packed_present_cache_view_valid[synthesized_eye] =
+        result.render_views_valid;
+    g_mode3_aer_packed_eye_valid[synthesized_eye] = true;
+    g_mode3_aer_packed_eye_generated[synthesized_eye] = true;
+    g_mode3_aer_packed_native_eye[synthesized_eye] =
+        g_mode3_aer_packed_native_eye[result.real_eye];
+    g_packed_present_cache_native_asymmetric =
+        g_mode3_aer_packed_native_eye[0] &&
+        g_mode3_aer_packed_native_eye[1];
+    g_packed_present_cache_valid = true;
+    g_packed_last_accepted_present =
+        g_present_count.load(std::memory_order_relaxed);
+    g_packed_runtime_ready.store(true, std::memory_order_release);
+    if (g_config.runtime_diagnostics) {
+        static std::atomic<uint32_t> publication_logs{};
+        if (take_bounded_log_slot(publication_logs, 64)) {
+            log_line(
+                "V12061 AFW Mode-3 DLSS published pair=%llu real_eye=%u synthesized_eye=%u visible=%llu/%llu present=%llu",
+                static_cast<unsigned long long>(result.pair_id),
+                result.real_eye, result.synthesized_eye,
+                static_cast<unsigned long long>(g_packed_eye_version[0]),
+                static_cast<unsigned long long>(g_packed_eye_version[1]),
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)));
+        }
+    }
+    return true;
+}
+
 // [FIX:PUREDARK-AFW-PRODUCER-PUBLICATION V12016 4/8] The submitted producer
 // bundle is the image authority. Rebase its peer view without comparing it to
 // the unrelated DXGI Present parity.
@@ -6157,7 +7497,7 @@ bool apply_puredark_afw_producer_view_authority(
         result.bundle_slot >= kPuredarkAfwBundleRingSize) {
         log_puredark_afw_failure(
             "direct_view_identity",
-            L"submitted DLSS producer view has invalid generation/eye/pair");
+            L"submitted producer view has invalid generation/eye/pair");
         return false;
     }
 
@@ -8188,7 +9528,8 @@ void STDMETHODCALLTYPE hook_create_srv(
             dest_descriptor.ptr, resource,
             desc != nullptr ? desc->Format : resource_desc.Format);
     }
-    if (!taau_metadata_hooks_needed() && !effect_gpu_probe_available()) {
+    if (!taau_metadata_hooks_needed() && !effect_gpu_probe_available() &&
+        !puredark_afw_mode3_aer_noaa_route_configured()) {
         return;
     }
     const bool taau_motion_candidate = desc != nullptr &&
@@ -8206,6 +9547,15 @@ void STDMETHODCALLTYPE hook_create_srv(
              resource_desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)) &&
         (resource_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
     const bool taau_bootstrap_candidate = taau_motion_candidate || taau_depth_candidate;
+    // [FIX:PUREDARK-AFW-NOAA-NATIVE-INPUTS V12054 2/6] These strict formats
+    // are the same REDengine native inputs consumed by TAAU/DLSS, but they are
+    // still created in No-AA mode. Register their resource identity without
+    // enabling any TAAU compute or diagnostic hook.
+    if (taau_bootstrap_candidate &&
+        puredark_afw_mode3_aer_noaa_route_configured()) {
+        register_puredark_afw_mode3_noaa_native_source(
+            resource, taau_depth_candidate);
+    }
     // V12036's broad descriptor bootstrap was not part of the Mode-3 fix.
     // Preserve it byte-for-behavior for legacy Mode 1/4, but restore Mode 3 to
     // its targeted Depth/MVec/runtime registry.
@@ -12979,7 +14329,8 @@ void install_reverse_hooks() {
         g_config.openxr_mode == 4 &&
         g_config.temporal_backend == TemporalBackend::None;
     const bool puredark_afw_execute_publication =
-        mode1_afw_retained_hud_route_configured();
+        mode1_afw_retained_hud_route_configured() ||
+        puredark_afw_mode3_aer_any_route_configured();
     const bool mode1_dlss_cache_execute_publication =
         mode1_dlss_submitted_cache_route_active();
 
@@ -13490,11 +14841,16 @@ void publish_puredark_afw_submissions(
     const uint32_t current_generation =
         g_streamline_capture_generation.load(std::memory_order_acquire);
     const bool gameplay_active =
-        mode1_afw_retained_hud_route_configured() &&
+        (mode1_afw_retained_hud_route_configured() ||
+            puredark_afw_mode3_aer_any_route_configured()) &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
         !g_cinema_mode_active.load(std::memory_order_relaxed) &&
         !g_engine_loading_screen_video_active.load(
             std::memory_order_acquire);
+    const bool mode3_dlss_fifo =
+        puredark_afw_mode3_aer_dlss_route_configured();
+    const uint64_t publish_present =
+        g_present_count.load(std::memory_order_relaxed);
 
     std::scoped_lock lock{g_puredark_afw_mutex};
     for (const auto& submission : pending) {
@@ -13502,10 +14858,10 @@ void publish_puredark_afw_submissions(
             g_puredark_afw_submitted_candidates.fetch_add(
                 1, std::memory_order_relaxed) + 1;
 
-        // Every successful exact or inexact DLSS command supersedes the
-        // previous final backbuffer. Never let an older ready tag authorize
-        // pixels written by this newer submitted command.
-        if (g_puredark_afw_ready_bundle <
+        // Legacy routes retain newest-only authority. Mode-3 DLSS keeps every
+        // exact submitted producer in its bounded resource-backed FIFO; a
+        // newer eye must not destroy the opposite eye AFW has not consumed.
+        if (!mode3_dlss_fifo && g_puredark_afw_ready_bundle <
                 kPuredarkAfwBundleRingSize) {
             auto& previous = g_puredark_afw_bundle_ring[
                 g_puredark_afw_ready_bundle];
@@ -13514,7 +14870,9 @@ void publish_puredark_afw_submissions(
                 previous.input.valid = false;
             }
         }
-        g_puredark_afw_ready_bundle = UINT32_MAX;
+        if (!mode3_dlss_fifo) {
+            g_puredark_afw_ready_bundle = UINT32_MAX;
+        }
 
         bool published{};
         if (submission.bundle_slot < kPuredarkAfwBundleRingSize) {
@@ -13536,7 +14894,75 @@ void publish_puredark_afw_submissions(
                 slot.submission_serial =
                     g_puredark_afw_submission_serial.fetch_add(
                         1, std::memory_order_relaxed) + 1;
-                g_puredark_afw_ready_bundle = submission.bundle_slot;
+                slot.ready_present = publish_present;
+                if (mode3_dlss_fifo) {
+                    // Multiple NGX callbacks can publish the same immutable
+                    // task identity. Keep only the newest submitted copy so a
+                    // duplicate cannot occupy the FIFO or exhaust its textures.
+                    bool retained_selected_duplicate{};
+                    for (auto it =
+                             g_puredark_afw_mode3_dlss_ready_queue.begin();
+                         it != g_puredark_afw_mode3_dlss_ready_queue.end();) {
+                        const uint32_t queued_slot = *it;
+                        if (queued_slot == submission.bundle_slot ||
+                            queued_slot >= kPuredarkAfwBundleRingSize) {
+                            ++it;
+                            continue;
+                        }
+                        auto& previous =
+                            g_puredark_afw_bundle_ring[queued_slot];
+                        const bool duplicate =
+                            previous.state == PuredarkAfwBundleState::Ready &&
+                            previous.input.valid &&
+                            previous.input.generation == submission.generation &&
+                            previous.input.eye == submission.eye &&
+                            previous.input.pair_id == submission.pair_id;
+                        if (!duplicate) {
+                            ++it;
+                            continue;
+                        }
+                        if (queued_slot ==
+                                g_mode3_afw_selected_bundle_slot) {
+                            // Present already joined this bundle to its exact
+                            // color. Preserve that transaction and discard the
+                            // newer identical callback instead of invalidating
+                            // the selected slot between promotion and Evaluate.
+                            slot.state = PuredarkAfwBundleState::Free;
+                            slot.input.valid = false;
+                            slot.submission_serial = 0;
+                            slot.ready_present = UINT64_MAX;
+                            slot.retire_fence = 0;
+                            retained_selected_duplicate = true;
+                            break;
+                        }
+                        previous.state = PuredarkAfwBundleState::Free;
+                        previous.input.valid = false;
+                        previous.submission_serial = 0;
+                        previous.ready_present = UINT64_MAX;
+                        previous.retire_fence = 0;
+                        it = g_puredark_afw_mode3_dlss_ready_queue.erase(it);
+                        g_mode3_afw_fifo_discards.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    if (!retained_selected_duplicate) {
+                        const auto already_queued = std::find(
+                            g_puredark_afw_mode3_dlss_ready_queue.begin(),
+                            g_puredark_afw_mode3_dlss_ready_queue.end(),
+                            submission.bundle_slot);
+                        if (already_queued ==
+                                g_puredark_afw_mode3_dlss_ready_queue.end()) {
+                            g_puredark_afw_mode3_dlss_ready_queue.push_back(
+                                submission.bundle_slot);
+                        }
+                        g_mode3_afw_fifo_published.fetch_add(
+                            1, std::memory_order_relaxed);
+                    } else {
+                        g_mode3_afw_fifo_discards.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                } else {
+                    g_puredark_afw_ready_bundle = submission.bundle_slot;
+                }
                 g_puredark_afw_ready_candidates.fetch_add(
                     1, std::memory_order_relaxed);
                 published = true;
@@ -13556,7 +14982,7 @@ void publish_puredark_afw_submissions(
             log_line(
                 "V12016 AFW submitted producer count=%llu published=%u "
                 "slot=%u eye=%u pair=%llu generation=%u exact=%u "
-                "bundle=%u epoch=%llu current_epoch=%llu",
+                "bundle=%u epoch=%llu current_epoch=%llu fifo=%u depth=%zu",
                 static_cast<unsigned long long>(submitted_count),
                 published ? 1u : 0u, submission.bundle_slot,
                 submission.eye,
@@ -13565,7 +14991,9 @@ void publish_puredark_afw_submissions(
                 submission.exact_identity ? 1u : 0u,
                 submission.bundle_ready ? 1u : 0u,
                 static_cast<unsigned long long>(submission.route_epoch),
-                static_cast<unsigned long long>(current_epoch));
+                static_cast<unsigned long long>(current_epoch),
+                mode3_dlss_fifo ? 1u : 0u,
+                g_puredark_afw_mode3_dlss_ready_queue.size());
         }
     }
 }
@@ -13854,7 +15282,8 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         g_config.openxr_mode == 4 &&
         g_config.temporal_backend == TemporalBackend::None;
     const bool puredark_afw_execute_publication =
-        mode1_afw_retained_hud_route_configured() &&
+        (mode1_afw_retained_hud_route_configured() ||
+            puredark_afw_mode3_aer_any_route_configured()) &&
         queue == g_command_queue;
     const bool mode1_dlss_cache_execute_publication =
         mode1_dlss_submitted_cache_route_active() &&
@@ -19056,6 +20485,81 @@ bool find_taau_hmd_motion_parameters(
     return true;
 }
 
+// [FEATURE:PUREDARK-AFW-MODE3-TAAU V12055 3/8] Both No AA and TAAU obtain the
+// PureDark camera from the immutable REDengine temporal ledger. TAAU later
+// freezes the matching Depth/MVec directly at its exact native resolve.
+void capture_puredark_afw_mode3_noaa_camera(const void* constants) {
+    if (!puredark_afw_mode3_aer_route_configured() ||
+        constants == nullptr ||
+        g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
+        g_cinema_mode_active.load(std::memory_order_relaxed) ||
+        g_engine_loading_screen_video_active.load(
+            std::memory_order_acquire)) {
+        return;
+    }
+
+    const auto* values = static_cast<const float*>(constants);
+    TaauHmdMotionParameters motion{};
+    if (!find_taau_hmd_motion_parameters(
+            values + 48, -1, 0, motion) ||
+        motion.matched_eye < 0 || motion.matched_eye > 1 ||
+        motion.matched_pair_id == 0 ||
+        motion.matched_pair_id == UINT64_MAX ||
+        !motion.matched_render_views_valid ||
+        !std::isfinite(values[82]) || !std::isfinite(values[83])) {
+        log_puredark_afw_failure(
+            "mode3_aer_camera_match",
+            L"no exact REDengine camera identity for Mode-3 AER Streamline constants");
+        return;
+    }
+
+    float baseline =
+        g_runtime_eye_baseline_m.load(std::memory_order_relaxed);
+    if (!std::isfinite(baseline) || baseline < 0.04f || baseline > 0.10f) {
+        baseline = std::fabs(g_config.engine_factory_stereo_offset);
+    }
+
+    PuredarkAfwCameraSnapshot captured{};
+    std::wstring error;
+    const uint32_t eye = static_cast<uint32_t>(motion.matched_eye);
+    if (!w3vr::puredark_afw::build_camera_data_from_streamline(
+            values, 102, eye, baseline, captured.camera, error)) {
+        log_puredark_afw_failure("mode3_aer_camera", error);
+        return;
+    }
+
+    captured.render_views = motion.matched_render_views;
+    captured.render_views_valid = true;
+    captured.exact_render_view = motion.matched_render_views[eye];
+    captured.exact_render_view_valid = true;
+    captured.motion_scale[0] = values[82];
+    captured.motion_scale[1] = values[83];
+    captured.capture_present =
+        g_present_count.load(std::memory_order_relaxed);
+    captured.pair_id = motion.matched_pair_id;
+    captured.generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    captured.eye = eye;
+    captured.valid = true;
+    {
+        std::scoped_lock lock{g_puredark_afw_mutex};
+        g_puredark_afw_camera_history.push_back(captured);
+        while (g_puredark_afw_camera_history.size() >
+                kPuredarkAfwCameraHistorySize) {
+            g_puredark_afw_camera_history.pop_front();
+        }
+    }
+    if (take_bounded_log_slot(g_puredark_afw_camera_logs, 16)) {
+        log_line(
+            "V12055 AFW Mode-3 AER camera present=%llu pair=%llu eye=%u generation=%u backend=%s tag_scale=%.6f,%.6f matrix_error=%.7f",
+            static_cast<unsigned long long>(captured.capture_present),
+            static_cast<unsigned long long>(captured.pair_id),
+            captured.eye, captured.generation, temporal_backend_name(),
+            captured.motion_scale[0], captured.motion_scale[1],
+            motion.matrix_error);
+    }
+}
+
 bool derive_taau_private_resolve_jitter(
     const std::array<uint8_t, kTaauPrivateCb10Bytes>& source,
     const TaauHmdMotionParameters& motion,
@@ -20177,6 +21681,21 @@ bool dispatch_taau_inplace_marker(
         }
         return false;
     }
+
+    // [FEATURE:PUREDARK-AFW-MODE3-TAAU V12055 4/8] At this point CB10 has
+    // named the exact eye/pair consumed by this resolve. Snapshot the original
+    // Depth/MVec now: the custom correction below deliberately overwrites the
+    // native motion-vector resource before the TAAU resolve executes.
+    if (puredark_afw_mode3_aer_taau_route_configured() && output_found &&
+        native_output.resource != nullptr) {
+        const auto afw_output_desc = native_output.resource->GetDesc();
+        capture_puredark_afw_mode3_taau_inputs(
+            command_list, depth, original_mvec, afw_output_desc,
+            g_streamline_capture_generation.load(std::memory_order_acquire),
+            static_cast<uint32_t>(hmd_motion.matched_eye),
+            hmd_motion.matched_pair_id);
+    }
+
     float private_resolve_jitter[2]{};
     w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor
         private_resolve_descriptor{};
@@ -21602,6 +23121,11 @@ void STDMETHODCALLTYPE hook_resource_barrier(
     ID3D12GraphicsCommandList* command_list,
     UINT num_barriers,
     const D3D12_RESOURCE_BARRIER* barriers) {
+    // [FIX:PUREDARK-AFW-NOAA-NATIVE-INPUTS V12054 4/6] This tracker is a
+    // narrow functional authority for two registered resources. It remains
+    // active on the clean Mode-3 path without reviving TAAU/reverse probes.
+    track_puredark_afw_mode3_noaa_native_transitions(
+        command_list, num_barriers, barriers);
     const bool clean_mode3_fast_path =
         g_clean_mode3_resource_barrier_fast_path &&
         !g_effect_gpu_probe_active.load(std::memory_order_relaxed) &&
@@ -22265,6 +23789,17 @@ void STDMETHODCALLTYPE hook_resource_barrier(
                 packed_route_tag.render_view_valid,
                 packed_route_tag.eye,
                 packed_route_tag.eye <= 1);
+    }
+    // [FIX:PUREDARK-AFW-NOAA-PRODUCER-BUNDLE V12053 4/6] The same final
+    // command list now freezes all three AFW inputs under the exact route tag.
+    // ExecuteCommandLists publishes this bundle before Present can consume the
+    // color capture, so OpenXR never joins it to the next frame's tags.
+    if (tagged_capture_succeeded && packed_route_valid &&
+        tagged_backbuffer != nullptr &&
+        puredark_afw_mode3_aer_noaa_route_configured()) {
+        capture_puredark_afw_mode3_noaa_inputs(
+            command_list, packed_route_tag,
+            tagged_backbuffer->GetDesc());
     }
     if (!clean_mode3_fast_path &&
         tagged_backbuffer != nullptr && !tagged_capture_succeeded) {
@@ -23386,6 +24921,7 @@ bool verify_native_asymmetric_frame_projection(
 }
 
 void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data, void* extra) {
+    constexpr uintptr_t kGameplayFrameBuilderCallerRva = 0x01D002CF;
     const auto present = g_present_count.load();
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -23405,6 +24941,57 @@ void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data
             apply_engine_render_tag(found->second);
         }
         g_engine_dual_frame_mutex.unlock();
+    }
+    // [FIX:PUREDARK-AFW-MODE3-DLSS-NATURAL-CLOCK V12066 3/4] The immutable
+    // frame-data tag proves which pending AER identity reached the one accepted
+    // gameplay builder. CAS makes repeated/late builders harmless and releases
+    // the opposite identity for the next natural factory immediately.
+    if (frame_data != nullptr &&
+        caller_rva == kGameplayFrameBuilderCallerRva &&
+        puredark_afw_mode3_aer_dlss_route_configured()) {
+        EngineFrameTag exact_tag{};
+        bool exact_tag_found{};
+        g_engine_dual_frame_mutex.lock();
+        const auto found = g_engine_dual_frame_eyes.find(frame_data);
+        if (found != g_engine_dual_frame_eyes.end()) {
+            exact_tag = found->second;
+            exact_tag_found = true;
+        }
+        g_engine_dual_frame_mutex.unlock();
+        uint64_t expected_ordinal =
+            g_mode3_afw_natural_render_ordinal.load(
+                std::memory_order_acquire);
+        if (exact_tag_found && expected_ordinal != UINT64_MAX) {
+            const auto expected_identity =
+                w3vr::aer::identity_for_render_ordinal(expected_ordinal);
+            const uint32_t generation =
+                g_streamline_capture_generation.load(
+                    std::memory_order_acquire);
+            if (exact_tag.generation == generation &&
+                exact_tag.eye == expected_identity.eye &&
+                exact_tag.pair_id == expected_identity.pair_id &&
+                g_mode3_afw_natural_render_ordinal.compare_exchange_strong(
+                    expected_ordinal, expected_ordinal + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                const uint32_t sample =
+                    g_mode3_afw_natural_clock_logs.fetch_add(
+                        1, std::memory_order_relaxed);
+                if (g_config.runtime_diagnostics && sample < 64) {
+                    log_line(
+                        "V12066 AFW natural clock accepted sample=%u "
+                        "present=%llu ordinal=%llu eye=%u pair=%llu "
+                        "generation=%u frame=%p",
+                        sample,
+                        static_cast<unsigned long long>(present),
+                        static_cast<unsigned long long>(expected_ordinal),
+                        exact_tag.eye,
+                        static_cast<unsigned long long>(exact_tag.pair_id),
+                        exact_tag.generation,
+                        frame_data);
+                }
+            }
+        }
     }
     std::array<float, 512> fallback_original_camera{};
     bool fallback_frame_camera_applied{};
@@ -23489,7 +25076,6 @@ void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data
 
     float saved_camera_x{};
     bool native_stereo_applied{};
-    constexpr uintptr_t kGameplayFrameBuilderCallerRva = 0x01D002CF;
     if (frame_data != nullptr &&
         caller_rva == kGameplayFrameBuilderCallerRva &&
         (g_config.openxr_mode == 3 || g_config.openxr_mode == 4) &&
@@ -33204,8 +34790,29 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
         render_context != nullptr && render_settings != nullptr;
     const bool tag_aer_frame =
         tag_mode1_frame || tag_mode3_aer_frame;
+    // [FIX:PUREDARK-AFW-MODE3-DLSS-NATURAL-CLOCK V12066 2/4] Seed from the
+    // current Present only at a route boundary. Until the canonical gameplay
+    // builder accepts this identity, every auxiliary factory observes the same
+    // pending ordinal instead of advancing on wall-clock presentation cadence.
+    uint64_t aer_render_ordinal = present;
+    if (tag_mode3_aer_frame &&
+        puredark_afw_mode3_aer_dlss_route_configured()) {
+        aer_render_ordinal = g_mode3_afw_natural_render_ordinal.load(
+            std::memory_order_acquire);
+        if (aer_render_ordinal == UINT64_MAX) {
+            uint64_t uninitialized = UINT64_MAX;
+            if (g_mode3_afw_natural_render_ordinal.compare_exchange_strong(
+                    uninitialized, present,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                aer_render_ordinal = present;
+            } else {
+                aer_render_ordinal = uninitialized;
+            }
+        }
+    }
     const auto aer_identity =
-        w3vr::aer::identity_for_render_ordinal(present);
+        w3vr::aer::identity_for_render_ordinal(aer_render_ordinal);
     XrTime pair_pose_display_time{};
     if (defer_openxr_frame_to_stereo_pair && duplicate_render) {
         // [FIX:OPENXR-QUANTIZED-PAIR-POSE 1/3] The REDengine pair is normally
@@ -33286,7 +34893,7 @@ void* __fastcall hook_engine_frame_data_factory(void* render_context, void* rend
     // camera, TAAU and DLSS hooks. Downstream Mode-3 capture/publication keeps
     // its existing authority; only the producer cardinality changes.
     if (tag_aer_frame && result != nullptr) {
-        const EngineFrameTag tag = make_mode1_aer_frame_tag(present);
+        const EngineFrameTag tag = make_mode1_aer_frame_tag(aer_render_ordinal);
         std::scoped_lock lock{g_engine_dual_frame_mutex};
         prune_engine_dual_frame_tags_locked(tag.pair_id);
         g_engine_dual_frame_eyes[result] = tag;
@@ -33794,6 +35401,7 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
     // handed to Streamline after all Mode 1 routing adjustments. The NGX
     // hook will accept them only when eye and AER pair match exactly.
     capture_puredark_afw_camera(constants, eye);
+    capture_puredark_afw_mode3_noaa_camera(constants);
 
     struct AsymmetricSlAuditSnapshot {
         bool active{};
@@ -34006,9 +35614,12 @@ int __fastcall hook_sl_set_tag(const void* resource, uint32_t tag, uint32_t view
         }
     }
     const uint32_t eye = streamline_eye();
+    const bool mode3_noaa_afw_tags =
+        puredark_afw_mode3_aer_noaa_route_configured();
     const bool skip_mode3_legacy_sl_tracking =
         g_clean_mode3_resource_barrier_fast_path &&
-        !g_compute_probe_active.load(std::memory_order_relaxed);
+        !g_compute_probe_active.load(std::memory_order_relaxed) &&
+        !mode3_noaa_afw_tags;
     const void* routed_resource = resource;
     if (resource != nullptr && tag == 4 &&
         g_config.streamline_split_viewports && g_config.openxr_mode == 4 &&
@@ -34043,7 +35654,8 @@ int __fastcall hook_sl_set_tag(const void* resource, uint32_t tag, uint32_t view
         memcpy(&tagged_extent, extent, sizeof(tagged_extent));
     }
     if (resource != nullptr && (tag == 0 || tag == 1 || tag == 3) &&
-        g_config.ngx_trace && !skip_mode3_legacy_sl_tracking) {
+        (g_config.ngx_trace || mode3_noaa_afw_tags) &&
+        !skip_mode3_legacy_sl_tracking) {
         ID3D12Resource* native{};
         uint32_t state{};
         memcpy(&native, static_cast<const uint8_t*>(resource) + 8, sizeof(native));
@@ -34051,6 +35663,11 @@ int __fastcall hook_sl_set_tag(const void* resource, uint32_t tag, uint32_t view
         const uint32_t input_index = tag == 3 ? 0u : (tag == 0 ? 1u : 2u);
         g_ngx_input_resources[input_index].store(native, std::memory_order_release);
         g_ngx_input_states[input_index].store(state, std::memory_order_release);
+        if (mode3_noaa_afw_tags && (tag == 0 || tag == 1)) {
+            g_puredark_afw_noaa_tag_present[tag == 0 ? 0u : 1u].store(
+                g_present_count.load(std::memory_order_relaxed),
+                std::memory_order_release);
+        }
     }
     if (resource != nullptr && tag <= 4 && tag != 2 && g_config.ngx_trace) {
         static std::atomic<uint32_t> tag_trace_counts[2][5]{};
@@ -35696,6 +37313,7 @@ void install_ngx_dlss_hook() {
     if (!temporal_backend_is_dlss() ||
         (!g_config.ngx_trace && !asymmetric_authority_audit_active() &&
             !mode1_afw_retained_hud_route_configured() &&
+            !puredark_afw_mode3_aer_dlss_route_configured() &&
             !mode1_dlss_submitted_cache_route_active()) ||
         g_ngx_evaluate_feature != nullptr) {
         return;
@@ -35940,7 +37558,9 @@ void install_ngx_dlaa_loader_hooks() {
 }
 
 void install_streamline_hook() {
-    if (!temporal_backend_is_dlss()) {
+    const bool mode3_aer_afw =
+        puredark_afw_mode3_aer_any_route_configured();
+    if (!temporal_backend_is_dlss() && !mode3_aer_afw) {
         return;
     }
 
@@ -35951,12 +37571,15 @@ void install_streamline_hook() {
             !g_config.ngx_trace &&
             !asymmetric_authority_audit_active() &&
             !mode1_afw_retained_hud_route_configured() &&
+            !mode3_aer_afw &&
             (g_config.render_width <= 0 || g_config.render_height <= 0))) {
         return;
     }
 
     if (g_sl_set_constants != nullptr) {
-        install_ngx_dlss_hook();
+        if (temporal_backend_is_dlss()) {
+            install_ngx_dlss_hook();
+        }
         return;
     }
 
@@ -35987,7 +37610,9 @@ void install_streamline_hook() {
         log_line("Streamline viewport hooks failed constants=%p tag=%p feature_constants=%p evaluate=%p",
             constants_target, tag_target, feature_constants_target, evaluate_target);
     }
-    install_ngx_dlss_hook();
+    if (temporal_backend_is_dlss()) {
+        install_ngx_dlss_hook();
+    }
 }
 
 void __fastcall hook_engine_viewport_resolution(
@@ -36465,13 +38090,14 @@ void ensure_initialized() {
         // [FEATURE:PUREDARK-AFW-DLSS V12004 6/6] The identity line makes the
         // active AFW scope and fail-open base unambiguous in a bounded run.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1141 bases=V1140+V14003 taau_hot_path=lean_snapshot_lazy_legacy internal_bindings=direct_release gpu_va_cache=generation_guarded command_reset=targeted mode3_taau_native_full_motion=1 mode3_taau_exact_pair_ledger=ring64 mode3_taau_exact_native_compose=skipped legacy_taau_motion_fallback=retained mode3_taau_motion_policy=aer_and_stereo_shared native_taau_mvec_passthrough=direct native_taau_per_eye_0xb0_history=1 hud_editor_text_scale=subtitle_dialog_multiplicative anchor_smoothing=lateral_vertical_only anchor_depth_smoothing=0 anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f clean_first_person=1 stationary_body_turn=always_on first_person_strafe_ini=%d distance_converged_reticle=1 first_person_projectile_release_convergence=1 first_person_distance_converged_aim=1 combat_locked_view=1 native_head_first_person=1 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 cinema_aspect_selectable=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_hud_projection_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1142 bases=V1141+V12081 taau_hot_path=lean_snapshot_lazy_legacy internal_bindings=direct_release gpu_va_cache=generation_guarded command_reset=targeted mode3_taau_native_full_motion=1 mode3_taau_exact_pair_ledger=ring64 mode3_taau_exact_native_compose=skipped legacy_taau_motion_fallback=retained mode3_taau_motion_policy=aer_and_stereo_shared native_taau_mvec_passthrough=direct native_taau_per_eye_0xb0_history=1 hud_editor_text_scale=subtitle_dialog_multiplicative anchor_smoothing=lateral_vertical_only anchor_depth_smoothing=0 anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f clean_first_person=1 stationary_body_turn=always_on first_person_strafe_ini=%d distance_converged_reticle=1 first_person_projectile_release_convergence=1 first_person_distance_converged_aim=1 combat_locked_view=1 native_head_first_person=1 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 cinema_aspect_selectable=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_hud_projection_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 g_config.engine_first_person_anchor_smoothing ? 1 : 0,
                 g_config.engine_first_person_anchor_smoothing_seconds,
                 g_config.engine_first_person_strafe ? 1 : 0,
                 g_config.mode3_aer_presentation ? 1 : 0,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
+            log_line("V1142 AFW import source=V12081 afw_native_inputs=fail_open_disabled afw_projection=absolute_asymmetric_source_and_destination mode3_dlss_afw_mvec=normal mode3_dlss_afw_asymmetric_transition=defer_until_generated_peer mode3_dlss_afw_producer_clock=canonical_gameplay_frame mode3_dlss_afw=input_fifo_exact_color mode3_dlss_afw_fifo_latency=ready_present_age mode3_dlss_afw_latency=one_present mode3_dlss_afw_presentation=current_queued_immutable_pair mode3_dlss_afw_mode=combined_warping mode3_dlss_afw_order=ngx_bundle_then_shared_xr_evaluate_publish_draw mode3_afw_native_order=disabled_after_xr_close_failure mode3_taau_afw=fail_open_native_aer mode3_noaa_afw=fail_open_native_aer afw_visual_debug=F6");
         }
     });
 }
@@ -36515,7 +38141,8 @@ void capture_d3d12_objects(IUnknown* dxgi_device_parameter) {
     // retained Mode-1 DLSS route regardless of AFW. Other Mode-1 backends and
     // Mode 3 retain their established hook timing.
     if (g_config.openxr_mode == 2 ||
-        mode1_dlss_retained_hud_route_configured()) {
+        mode1_dlss_retained_hud_route_configured() ||
+        puredark_afw_mode3_aer_noaa_route_configured()) {
         install_streamline_resource_barrier_probe();
     }
 }
@@ -38872,6 +40499,136 @@ bool ensure_stereo_eye_cache(const D3D12_RESOURCE_DESC& source_desc) {
     return true;
 }
 
+// [FIX:PUREDARK-AFW-MODE3-DLSS-SEQUENCED-PAIR V12063 2/7] The sequential
+// resources are not used by Mode 3 gameplay. Once both have received one
+// complete AFW result they become the immutable presentation pair. Their
+// physical COPY_SOURCE state survives logical menu/loading invalidation.
+bool mode3_afw_sequenced_pair_available() {
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    return puredark_afw_mode3_aer_dlss_route_configured() &&
+        g_mode3_afw_sequenced_pair_valid &&
+        g_mode3_afw_sequenced_generation == generation &&
+        g_mode3_afw_sequenced_pair != 0 &&
+        g_stereo_eye_cache[0] != nullptr &&
+        g_stereo_eye_cache[1] != nullptr &&
+        g_stereo_eye_cache_initialized[0] &&
+        g_stereo_eye_cache_initialized[1] &&
+        g_stereo_eye_cache_view_valid[0] &&
+        g_stereo_eye_cache_view_valid[1];
+}
+
+bool mode3_afw_sequence_accepts(
+    uint32_t generation,
+    uint32_t real_eye,
+    uint64_t pair_id,
+    uint64_t present) {
+    if (!puredark_afw_mode3_aer_dlss_route_configured() || real_eye > 1 ||
+        pair_id == 0 || pair_id == UINT64_MAX || generation !=
+            g_streamline_capture_generation.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (g_mode3_afw_sequenced_generation != generation) {
+        reset_mode3_afw_sequenced_pair_state(generation);
+    }
+    const bool alternating = g_mode3_afw_last_real_eye == UINT32_MAX ||
+        real_eye != g_mode3_afw_last_real_eye;
+    const bool monotonic = !g_mode3_afw_sequenced_pair_valid ||
+        pair_id >= g_mode3_afw_sequenced_pair;
+    if (alternating && monotonic) {
+        return true;
+    }
+
+    const uint64_t hold = ++g_mode3_afw_sequenced_holds;
+    if (g_config.runtime_diagnostics &&
+        (hold <= 32 || (hold % 240) == 0)) {
+        log_line(
+            "V12063 AFW sequencer hold count=%llu present=%llu incoming=%u/%llu last=%u/%llu generation=%u alternating=%u monotonic=%u",
+            static_cast<unsigned long long>(hold),
+            static_cast<unsigned long long>(present), real_eye,
+            static_cast<unsigned long long>(pair_id),
+            g_mode3_afw_last_real_eye,
+            static_cast<unsigned long long>(g_mode3_afw_sequenced_pair),
+            generation, alternating ? 1u : 0u, monotonic ? 1u : 0u);
+    }
+    return false;
+}
+
+bool stage_mode3_afw_sequenced_pair(
+    ID3D12GraphicsCommandList* command_list,
+    uint32_t generation,
+    uint32_t real_eye,
+    uint64_t pair_id,
+    uint64_t present) {
+    if (command_list == nullptr || real_eye > 1 || pair_id == 0 ||
+        generation != g_streamline_capture_generation.load(
+            std::memory_order_acquire) ||
+        g_packed_eye_version[0] != pair_id ||
+        g_packed_eye_version[1] != pair_id ||
+        !g_packed_present_cache_view_valid[0] ||
+        !g_packed_present_cache_view_valid[1] ||
+        g_packed_present_cache[0] == nullptr ||
+        g_packed_present_cache[1] == nullptr ||
+        g_stereo_eye_cache[0] == nullptr ||
+        g_stereo_eye_cache[1] == nullptr) {
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER to_dest[2]{};
+    UINT to_dest_count{};
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        if (!g_stereo_eye_cache_initialized[eye]) {
+            continue;
+        }
+        auto& barrier = to_dest[to_dest_count++];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = g_stereo_eye_cache[eye];
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    if (to_dest_count != 0) {
+        command_list->ResourceBarrier(to_dest_count, to_dest);
+    }
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        command_list->CopyResource(
+            g_stereo_eye_cache[eye], g_packed_present_cache[eye]);
+    }
+    D3D12_RESOURCE_BARRIER to_source[2]{};
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        auto& barrier = to_source[eye];
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = g_stereo_eye_cache[eye];
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    command_list->ResourceBarrier(2, to_source);
+
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        g_stereo_eye_cache_initialized[eye] = true;
+        g_stereo_eye_cache_views[eye] = g_packed_present_cache_views[eye];
+        g_stereo_eye_cache_view_valid[eye] = true;
+    }
+    g_mode3_afw_sequenced_pair_valid = true;
+    g_mode3_afw_sequenced_generation = generation;
+    g_mode3_afw_sequenced_pair = pair_id;
+    g_mode3_afw_last_real_eye = real_eye;
+    const uint64_t accepted = ++g_mode3_afw_sequenced_accepts;
+    if (g_config.runtime_diagnostics &&
+        (accepted <= 32 || (accepted % 240) == 0)) {
+        log_line(
+            "V12063 AFW sequencer staged count=%llu present=%llu pair=%llu real_eye=%u generation=%u holds=%llu",
+            static_cast<unsigned long long>(accepted),
+            static_cast<unsigned long long>(present),
+            static_cast<unsigned long long>(pair_id), real_eye, generation,
+            static_cast<unsigned long long>(g_mode3_afw_sequenced_holds));
+    }
+    return true;
+}
+
 bool mode1_cinema_pair_available() {
     const uint32_t generation =
         g_streamline_capture_generation.load(std::memory_order_acquire);
@@ -39514,12 +41271,194 @@ bool update_mode1_dlss_delayed_eye_cache() {
     return true;
 }
 
+struct Mode3AfwQueuedProducer {
+    uint32_t bundle_slot{UINT32_MAX};
+    uint32_t capture_slot{UINT32_MAX};
+    uint32_t generation{};
+    uint32_t eye{UINT32_MAX};
+    uint64_t pair_id{};
+    uint64_t submission_serial{};
+    uint64_t ready_present{UINT64_MAX};
+    size_t ready_depth{};
+    bool color_already_packed{};
+    bool valid{};
+};
+
+// [FIX:PUREDARK-AFW-MODE3-DLSS-READY-AGE V12065 1/2] Select one exact
+// submitted producer without consuming it. One-Present latency is an age
+// contract, not a queue-depth contract: a sole producer from an older Present
+// is already safe, while a callback published during this Present must wait.
+bool select_mode3_afw_queued_producer(
+    uint64_t present,
+    Mode3AfwQueuedProducer& selected) {
+    selected = {};
+    if (!puredark_afw_mode3_aer_dlss_route_configured()) {
+        return false;
+    }
+
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    const uint64_t route_epoch =
+        g_puredark_afw_route_epoch.load(std::memory_order_acquire);
+    std::scoped_lock lock{g_puredark_afw_mutex};
+
+    const auto release_ready = [&](uint32_t slot_index) {
+        if (slot_index >= kPuredarkAfwBundleRingSize) {
+            return;
+        }
+        auto& slot = g_puredark_afw_bundle_ring[slot_index];
+        if (slot.state == PuredarkAfwBundleState::Ready) {
+            slot.state = PuredarkAfwBundleState::Free;
+            slot.input.valid = false;
+            slot.submission_serial = 0;
+            slot.ready_present = UINT64_MAX;
+            slot.retire_fence = 0;
+        }
+    };
+
+    // Remove only entries whose immutable identity can no longer be consumed.
+    // Newer same-eye pairs stay queued: after the missing opposite eye arrives
+    // they are exactly the next legal AFR producer.
+    for (auto it = g_puredark_afw_mode3_dlss_ready_queue.begin();
+         it != g_puredark_afw_mode3_dlss_ready_queue.end();) {
+        const uint32_t slot_index = *it;
+        bool stale = slot_index >= kPuredarkAfwBundleRingSize;
+        if (!stale) {
+            const auto& slot = g_puredark_afw_bundle_ring[slot_index];
+            stale = slot.state != PuredarkAfwBundleState::Ready ||
+                !slot.input.valid || slot.input.eye > 1 ||
+                slot.input.pair_id == 0 ||
+                slot.input.pair_id == UINT64_MAX ||
+                slot.input.generation != generation ||
+                slot.route_epoch != route_epoch ||
+                slot.submission_serial == 0 ||
+                slot.input.pair_id < g_mode3_afw_sequenced_pair ||
+                (slot.input.pair_id == g_mode3_afw_sequenced_pair &&
+                    slot.input.eye == g_mode3_afw_last_real_eye);
+        }
+        if (!stale) {
+            ++it;
+            continue;
+        }
+        release_ready(slot_index);
+        it = g_puredark_afw_mode3_dlss_ready_queue.erase(it);
+        g_mode3_afw_fifo_discards.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (g_puredark_afw_mode3_dlss_ready_queue.empty()) {
+        const uint64_t waits = g_mode3_afw_fifo_waits.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (g_config.runtime_diagnostics &&
+            (waits <= 32 || (waits % 240) == 0)) {
+            log_line(
+                "V12065 AFW input FIFO wait count=%llu present=%llu depth=0 reason=empty",
+                static_cast<unsigned long long>(waits),
+                static_cast<unsigned long long>(present));
+        }
+        return false;
+    }
+
+    uint32_t desired_eye = g_mode3_afw_last_real_eye <= 1
+        ? 1u - g_mode3_afw_last_real_eye
+        : UINT32_MAX;
+    if (!g_mode3_aer_packed_eye_valid[0]) {
+        desired_eye = 0;
+    } else if (!g_mode3_aer_packed_eye_valid[1]) {
+        desired_eye = 1;
+    }
+
+    auto selected_it = g_puredark_afw_mode3_dlss_ready_queue.end();
+    uint32_t selected_capture = UINT32_MAX;
+    bool selected_packed{};
+    bool age_blocked{};
+    bool exact_color_blocked{};
+    for (auto it = g_puredark_afw_mode3_dlss_ready_queue.begin();
+         it != g_puredark_afw_mode3_dlss_ready_queue.end(); ++it) {
+        const uint32_t bundle_slot = *it;
+        const auto& bundle = g_puredark_afw_bundle_ring[bundle_slot];
+        const auto& input = bundle.input;
+        if (desired_eye <= 1 && input.eye != desired_eye) {
+            continue;
+        }
+        if (bundle.ready_present == UINT64_MAX ||
+            bundle.ready_present >= present) {
+            age_blocked = true;
+            continue;
+        }
+
+        const bool packed_exact =
+            g_mode3_aer_packed_eye_valid[input.eye] &&
+            !g_mode3_aer_packed_eye_generated[input.eye] &&
+            g_packed_eye_version[input.eye] == input.pair_id;
+        uint32_t capture_slot = UINT32_MAX;
+        if (!packed_exact) {
+            for (uint32_t candidate = 0;
+                 candidate < kStreamlineCaptureRingSize; ++candidate) {
+                const auto& capture =
+                    g_streamline_capture_ring[input.eye][candidate];
+                if (capture.initialized && capture.resource != nullptr &&
+                    capture.generation == input.generation &&
+                    capture.pair_id == input.pair_id &&
+                    capture.render_view_valid) {
+                    capture_slot = candidate;
+                    break;
+                }
+            }
+        }
+        if (!packed_exact && capture_slot >= kStreamlineCaptureRingSize) {
+            exact_color_blocked = true;
+            continue;
+        }
+        selected_it = it;
+        selected_capture = capture_slot;
+        selected_packed = packed_exact;
+        break;
+    }
+
+    if (selected_it == g_puredark_afw_mode3_dlss_ready_queue.end()) {
+        const uint64_t waits = g_mode3_afw_fifo_waits.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (g_config.runtime_diagnostics &&
+            (waits <= 32 || (waits % 240) == 0)) {
+            const char* reason = exact_color_blocked
+                ? "exact_color"
+                : (age_blocked ? "same_present" : "expected_eye");
+            log_line(
+                "V12065 AFW input FIFO wait count=%llu present=%llu depth=%zu desired_eye=%u reason=%s",
+                static_cast<unsigned long long>(waits),
+                static_cast<unsigned long long>(present),
+                g_puredark_afw_mode3_dlss_ready_queue.size(), desired_eye,
+                reason);
+        }
+        return false;
+    }
+
+    const uint32_t bundle_slot = *selected_it;
+    const auto& bundle = g_puredark_afw_bundle_ring[bundle_slot];
+    selected.bundle_slot = bundle_slot;
+    selected.capture_slot = selected_capture;
+    selected.generation = bundle.input.generation;
+    selected.eye = bundle.input.eye;
+    selected.pair_id = bundle.input.pair_id;
+    selected.submission_serial = bundle.submission_serial;
+    selected.ready_present = bundle.ready_present;
+    selected.ready_depth = g_puredark_afw_mode3_dlss_ready_queue.size();
+    selected.color_already_packed = selected_packed;
+    selected.valid = true;
+    g_mode3_afw_selected_bundle_slot = bundle_slot;
+    return true;
+}
+
 // [FIX:MODE3-AER-PRESENTATION V12032 2/7] Publish each completed Mode-3
 // capture independently. Once both eyes have bootstrapped, a new eye replaces
 // only its own packed resource and the peer remains the last image submitted
 // for that eye. Numeric complete pairs still advance the low-watermark used by
 // HUD/history diagnostics, but they are no longer a prerequisite for xrEndFrame.
 bool update_mode3_aer_eye_cache() {
+    g_mode3_aer_last_promoted_mask = 0;
+    g_mode3_aer_last_promoted_pair[0] = 0;
+    g_mode3_aer_last_promoted_pair[1] = 0;
+    g_mode3_aer_last_promotion_present = UINT64_MAX;
     if (!mode3_aer_presentation_active() ||
         !g_engine_dual_render_active.load(std::memory_order_acquire) ||
         g_game_swapchain == nullptr || !g_xr_resources_ready) {
@@ -39540,11 +41479,29 @@ bool update_mode3_aer_eye_cache() {
         g_packed_eye_version[1] = 0;
     }
 
+    const bool mode3_dlss_fifo =
+        puredark_afw_mode3_aer_dlss_route_configured();
+    Mode3AfwQueuedProducer queued_producer{};
+    if (mode3_dlss_fifo && !select_mode3_afw_queued_producer(
+            g_present_count.load(std::memory_order_relaxed),
+            queued_producer)) {
+        return false;
+    }
+
     uint32_t promoted_mask{};
     uint64_t promoted_pair[2]{};
     for (uint32_t eye = 0; eye < 2; ++eye) {
-        const uint32_t slot_index =
-            g_streamline_capture_latest_slot[eye].load(
+        if (mode3_dlss_fifo && eye != queued_producer.eye) {
+            continue;
+        }
+        if (mode3_dlss_fifo && queued_producer.color_already_packed) {
+            promoted_pair[eye] = queued_producer.pair_id;
+            promoted_mask |= 1u << eye;
+            continue;
+        }
+        const uint32_t slot_index = mode3_dlss_fifo
+            ? queued_producer.capture_slot
+            : g_streamline_capture_latest_slot[eye].load(
                 std::memory_order_acquire);
         if (slot_index >= kStreamlineCaptureRingSize) {
             continue;
@@ -39552,9 +41509,16 @@ bool update_mode3_aer_eye_cache() {
         auto& slot = g_streamline_capture_ring[eye][slot_index];
         if (!slot.initialized || slot.resource == nullptr ||
             slot.generation != generation || slot.pair_id == 0 ||
-            slot.pair_id <= g_packed_eye_version[eye]) {
+            slot.pair_id < g_packed_eye_version[eye] ||
+            (slot.pair_id == g_packed_eye_version[eye] &&
+                !g_mode3_aer_packed_eye_generated[eye])) {
             continue;
         }
+
+        // [FEATURE:PUREDARK-AFW-MODE3-NOAA V12051 6/8] A generated peer is
+        // deliberately replaceable by the real producer carrying the same
+        // pair ID on the following AER Present. Native eyes keep the original
+        // strictly-increasing rule, so AFW-off and strict Stereo are unchanged.
 
         // [FIX:TAAU-SUBMITTED-PRESENT-AUTHORITY V12049 1/2] The capture tag
         // describes the REDengine task, but V12048 proved that a delayed TAAU
@@ -39598,6 +41562,7 @@ bool update_mode3_aer_eye_cache() {
 
         g_mode3_aer_packed_eye_initialized[eye] = true;
         g_mode3_aer_packed_eye_valid[eye] = true;
+        g_mode3_aer_packed_eye_generated[eye] = false;
         g_packed_eye_version[eye] = promoted_pair[eye];
         promoted_mask |= 1u << eye;
     }
@@ -39608,12 +41573,37 @@ bool update_mode3_aer_eye_cache() {
         return false;
     }
 
-    // A route transition must not combine an off-axis eye with a symmetric
-    // peer. Normal steady-state AER has identical flags and proceeds here.
-    if (g_mode3_aer_packed_native_eye[0] !=
-        g_mode3_aer_packed_native_eye[1]) {
+    // [FIX:PUREDARK-AFW-DLSS-ASYMMETRIC-TRANSITION V12067 1/2] The natural
+    // eye reaches this cache before PureDark replaces its peer. During the
+    // symmetric -> native-asymmetric boundary that temporary mismatch is the
+    // input to AFW, not a publishable pair. Once a sequenced AFW pair exists,
+    // let Evaluate repair the peer on the same XR list; projection keeps using
+    // the previous immutable sequenced pair if Evaluate fails. Every non-AFW
+    // route retains the original fail-closed transition gate.
+    const bool native_projection_mismatch =
+        g_mode3_aer_packed_native_eye[0] !=
+            g_mode3_aer_packed_native_eye[1];
+    const bool afw_repairs_native_peer = mode3_dlss_fifo &&
+        queued_producer.valid && mode3_afw_sequenced_pair_available();
+    if (native_projection_mismatch && !afw_repairs_native_peer) {
         g_packed_present_cache_valid = false;
         return false;
+    }
+    if (native_projection_mismatch && g_config.runtime_diagnostics) {
+        static std::atomic<uint32_t> asymmetric_transition_logs{};
+        if (take_bounded_log_slot(asymmetric_transition_logs, 32)) {
+            log_line(
+                "V12067 AFW asymmetric transition deferred present=%llu "
+                "eye=%u pair=%llu native=%u/%u previous_pair=%llu",
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)),
+                queued_producer.eye,
+                static_cast<unsigned long long>(queued_producer.pair_id),
+                g_mode3_aer_packed_native_eye[0] ? 1u : 0u,
+                g_mode3_aer_packed_native_eye[1] ? 1u : 0u,
+                static_cast<unsigned long long>(
+                    g_mode3_afw_sequenced_pair));
+        }
     }
 
     const uint64_t previous_complete_pair = g_packed_accepted_pair_id;
@@ -39627,6 +41617,35 @@ bool update_mode3_aer_eye_cache() {
     g_packed_last_accepted_present =
         g_present_count.load(std::memory_order_relaxed);
     g_packed_runtime_ready.store(true, std::memory_order_release);
+    g_mode3_aer_last_promoted_mask = promoted_mask;
+    g_mode3_aer_last_promoted_pair[0] = promoted_pair[0];
+    g_mode3_aer_last_promoted_pair[1] = promoted_pair[1];
+    g_mode3_aer_last_promoted_generation = generation;
+    g_mode3_aer_last_promotion_present =
+        g_present_count.load(std::memory_order_relaxed);
+
+    if (mode3_dlss_fifo && g_config.runtime_diagnostics) {
+        static std::atomic<uint64_t> fifo_promotion_logs{};
+        const uint64_t count = fifo_promotion_logs.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count <= 32 || (count % 240) == 0) {
+            log_line(
+                "V12065 AFW input FIFO promoted count=%llu present=%llu slot=%u capture=%u eye=%u pair=%llu generation=%u depth=%zu ready_present=%llu age=%llu packed=%u",
+                static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(
+                    g_mode3_aer_last_promotion_present),
+                queued_producer.bundle_slot, queued_producer.capture_slot,
+                queued_producer.eye,
+                static_cast<unsigned long long>(queued_producer.pair_id),
+                queued_producer.generation, queued_producer.ready_depth,
+                static_cast<unsigned long long>(
+                    queued_producer.ready_present),
+                static_cast<unsigned long long>(
+                    g_mode3_aer_last_promotion_present -
+                        queued_producer.ready_present),
+                queued_producer.color_already_packed ? 1u : 0u);
+        }
+    }
 
     if (complete_low_watermark > previous_complete_pair) {
         if (!g_config.steady_icons) {
@@ -40718,7 +42737,8 @@ void render_openxr_test_frame(
             g_force_mono_cinema.load(std::memory_order_relaxed) ? 1 : 0);
     }
     const bool puredark_afw_gameplay_frame =
-        mode1_afw_retained_hud_route_configured() &&
+        (mode1_afw_retained_hud_route_configured() ||
+            puredark_afw_mode3_aer_any_route_configured()) &&
         !fullscreen_menu && !cinema_mode && !loading_video;
     static bool previous_puredark_afw_gameplay_frame{};
     if (previous_puredark_afw_gameplay_frame &&
@@ -40844,6 +42864,11 @@ void render_openxr_test_frame(
     float cinema_projection_panel_width{};
     float cinema_projection_panel_height{};
     float cinema_projection_aspect_ratio{};
+    bool mode3_dlss_afw_sequence_packet_ready{};
+    uint32_t mode3_dlss_afw_sequence_generation{};
+    uint32_t mode3_dlss_afw_sequence_real_eye{UINT32_MAX};
+    uint64_t mode3_dlss_afw_sequence_pair{};
+    bool mode3_dlss_afw_sequenced_available{};
     bool submitted = views_valid && frame_state.shouldRender;
     const uint64_t loading_video_scene_pair_floor =
         g_loading_video_scene_pair_floor.load(std::memory_order_acquire);
@@ -40881,6 +42906,7 @@ void render_openxr_test_frame(
         uint32_t image_index{};
         bool acquired{};
         bool command_list_recording{};
+        const auto mode = g_config.openxr_mode;
         uint64_t mode1_dlss_cache_submission_to_consume{};
         uint64_t mode1_dlss_hud_submission_to_consume{};
         uint64_t mode1_taau_cache_submission_to_consume{};
@@ -40915,20 +42941,6 @@ void render_openxr_test_frame(
                 "offsets=0,15,30,60,90,120,160,200",
                 static_cast<unsigned long long>(current_present));
         }
-        g_xr_command_allocator_index =
-            (g_xr_command_allocator_index + 1) % kXrCommandAllocatorCount;
-        auto* xr_command_allocator =
-            g_xr_command_allocators[g_xr_command_allocator_index];
-        if (xr_command_allocator == nullptr ||
-            !wait_for_xr_command_allocator(g_xr_command_allocator_index) ||
-            FAILED(xr_command_allocator->Reset()) ||
-            FAILED(g_xr_command_list->Reset(
-                xr_command_allocator, nullptr))) {
-            submitted = false;
-        } else {
-            command_list_recording = true;
-        }
-
         XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         if (submitted) {
             TaauDropFrameScope taau_scope{
@@ -40956,6 +42968,64 @@ void render_openxr_test_frame(
             }
         }
 
+        // [FIX:PUREDARK-AFW-BEFORE-OPENXR-RECORDING V12059 1/2] Match the
+        // beta.5 integration boundary exactly: finish and submit PureDark's
+        // owned list before Reset opens the ordinary XR projection list. The
+        // V12056-V12058 order nested Begin/End/Execute while the XR list was
+        // already recording; the first AFW result then made that XR Close
+        // return E_INVALIDARG even when it contained no PureDark resource.
+        if (submitted && mode == 3 && puredark_afw_gameplay_frame &&
+            puredark_afw_mode3_aer_route_configured() &&
+            g_packed_present_cache_valid &&
+            g_mode3_aer_packed_eye_valid[0] &&
+            g_mode3_aer_packed_eye_valid[1] &&
+            g_packed_present_cache[0] != nullptr &&
+            g_packed_present_cache[1] != nullptr &&
+            g_mode3_aer_last_promotion_present == current_present &&
+            (g_mode3_aer_last_promoted_mask == 0x1u ||
+                g_mode3_aer_last_promoted_mask == 0x2u)) {
+            const uint32_t real_eye =
+                g_mode3_aer_last_promoted_mask == 0x1u ? 0u : 1u;
+            const uint64_t pair_id =
+                g_mode3_aer_last_promoted_pair[real_eye];
+            PuredarkAfwPresentResult mode3_aer_afw{};
+            const auto real_desc =
+                g_packed_present_cache[real_eye]->GetDesc();
+            const bool evaluated = evaluate_puredark_afw_mode3_noaa(
+                g_packed_present_cache[real_eye],
+                g_packed_present_cache[1u - real_eye], real_desc,
+                g_mode3_aer_last_promoted_generation, real_eye, pair_id,
+                current_present, image_index, mode3_aer_afw);
+            const bool view_authority = evaluated &&
+                apply_puredark_afw_producer_view_authority(mode3_aer_afw);
+            const bool published = view_authority &&
+                publish_puredark_afw_mode3_noaa(mode3_aer_afw);
+            if (published) {
+                g_puredark_afw_steady_active.store(
+                    true, std::memory_order_release);
+            } else if (evaluated) {
+                g_puredark_afw_missing_candidates.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+
+        // Open the XR command list only after the complete AFW transaction.
+        if (submitted) {
+            g_xr_command_allocator_index =
+                (g_xr_command_allocator_index + 1) % kXrCommandAllocatorCount;
+            auto* xr_command_allocator =
+                g_xr_command_allocators[g_xr_command_allocator_index];
+            if (xr_command_allocator == nullptr ||
+                !wait_for_xr_command_allocator(g_xr_command_allocator_index) ||
+                FAILED(xr_command_allocator->Reset()) ||
+                FAILED(g_xr_command_list->Reset(
+                    xr_command_allocator, nullptr))) {
+                submitted = false;
+            } else {
+                command_list_recording = true;
+            }
+        }
+
         if (submitted) {
             auto* texture = swapchain.images[image_index].texture;
             UINT submitted_width = swapchain.width;
@@ -40968,7 +43038,6 @@ void render_openxr_test_frame(
             to_rtv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             g_xr_command_list->ResourceBarrier(1, &to_rtv);
 
-            const auto mode = g_config.openxr_mode;
             // [FIX:DLSS-SEQUENTIAL 3/4] Mode 3 no longer reads the two latest
             // capture slots directly. update_packed_eye_cache() first promotes
             // an equal-pair snapshot into the immutable presentation cache.
@@ -41653,6 +43722,62 @@ void render_openxr_test_frame(
 
                 if (packed_stereo_available) {
                     schedule_stereo_luminance_readback(g_xr_command_list);
+                }
+
+                // [FEATURE:PUREDARK-AFW-MODE3-DLSS-POSITIVE-CONTROL
+                // V12061 3/8] DLSS uses the exact V12016 ordering: the natural
+                // promoted eye, AFW Evaluate, generated-peer copy and both XR
+                // projection draws are recorded on this one command list.
+                // Queue submission is therefore the only wait OpenXR needs.
+                if (mode == 3 && packed_stereo_available &&
+                    puredark_afw_gameplay_frame &&
+                    puredark_afw_mode3_aer_dlss_route_configured() &&
+                    g_mode3_aer_last_promotion_present == current_present &&
+                    (g_mode3_aer_last_promoted_mask == 0x1u ||
+                        g_mode3_aer_last_promoted_mask == 0x2u)) {
+                    const uint32_t real_eye =
+                        g_mode3_aer_last_promoted_mask == 0x1u ? 0u : 1u;
+                    const uint64_t pair_id =
+                        g_mode3_aer_last_promoted_pair[real_eye];
+                    // [FIX:PUREDARK-AFW-MODE3-DLSS-SEQUENCED-PAIR V12063
+                    // 3/7] Do not feed PureDark two consecutive natural frames
+                    // from the same eye. Its beta.5 AFR path assumes strict
+                    // alternation; an irregular producer is held as the last
+                    // complete immutable pair instead.
+                    const bool sequence_accepts =
+                        mode3_afw_sequence_accepts(
+                            g_mode3_aer_last_promoted_generation,
+                            real_eye, pair_id, current_present);
+                    PuredarkAfwPresentResult mode3_dlss_afw{};
+                    const auto real_desc =
+                        g_packed_present_cache[real_eye]->GetDesc();
+                    const bool evaluated = sequence_accepts &&
+                        evaluate_puredark_afw_mode3_dlss(
+                            g_xr_command_list,
+                            g_packed_present_cache[real_eye], real_desc,
+                            g_mode3_aer_last_promoted_generation,
+                            real_eye, pair_id, current_present,
+                            mode3_dlss_afw);
+                    const bool view_authority = evaluated &&
+                        apply_puredark_afw_producer_view_authority(
+                            mode3_dlss_afw);
+                    const bool published = view_authority &&
+                        publish_puredark_afw_mode3_dlss(
+                            g_xr_command_list, mode3_dlss_afw);
+                    if (published) {
+                        g_puredark_afw_steady_active.store(
+                            true, std::memory_order_release);
+                        mode3_dlss_afw_sequence_packet_ready = true;
+                        mode3_dlss_afw_sequence_generation =
+                            mode3_dlss_afw.generation;
+                        mode3_dlss_afw_sequence_real_eye =
+                            mode3_dlss_afw.real_eye;
+                        mode3_dlss_afw_sequence_pair =
+                            mode3_dlss_afw.pair_id;
+                    } else if (evaluated) {
+                        g_puredark_afw_missing_candidates.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                 }
 
                 PuredarkAfwPresentResult puredark_afw{};
@@ -42351,6 +44476,25 @@ void render_openxr_test_frame(
                     }
                 }
 
+                // [FIX:PUREDARK-AFW-MODE3-DLSS-INPUT-FIFO V12064 7/8] The
+                // producer FIFO now owns the one-Present latency. Publish the
+                // selected older input into the immutable pair before the XR
+                // draws so the presentation does not add a second frame.
+                if (mode3_dlss_afw_sequence_packet_ready &&
+                    !stage_mode3_afw_sequenced_pair(
+                        g_xr_command_list,
+                        mode3_dlss_afw_sequence_generation,
+                        mode3_dlss_afw_sequence_real_eye,
+                        mode3_dlss_afw_sequence_pair,
+                        current_present)) {
+                    log_puredark_afw_failure(
+                        "mode3_dlss_sequence_stage",
+                        L"queued generated pair could not enter the immutable cache");
+                }
+
+                mode3_dlss_afw_sequenced_available =
+                    mode == 3 && puredark_afw_gameplay_frame &&
+                    mode3_afw_sequenced_pair_available();
                 ID3D12Resource* fit_projection_sources[2]{};
                 const auto select_projection_source = [&](uint32_t eye) {
                     const uint32_t cache_eye =
@@ -42365,7 +44509,9 @@ void render_openxr_test_frame(
                             ? mono_captured_sources[eye]
                             : (stereo_cached
                                 ? (packed_stereo_available
-                                    ? g_packed_present_cache[cache_eye]
+                                    ? (mode3_dlss_afw_sequenced_available
+                                        ? g_stereo_eye_cache[cache_eye]
+                                        : g_packed_present_cache[cache_eye])
                                     : g_stereo_eye_cache[cache_eye])
                                 : game_backbuffer));
                 };
@@ -42962,6 +45108,11 @@ void render_openxr_test_frame(
                         render_view = &g_streamline_capture_ring[render_source_eye][slot_index].render_view;
                         render_view_origin = "direct_capture";
                     }
+                } else if (mode3_dlss_afw_sequenced_available &&
+                    g_stereo_eye_cache_view_valid[render_source_eye]) {
+                    render_view =
+                        &g_stereo_eye_cache_views[render_source_eye];
+                    render_view_origin = "mode3_afw_sequenced";
                 } else if (((mode == 3 || mode == 4) ||
                         mode1_aer_steady_pair_latency_active()) &&
                     g_packed_present_cache_valid &&
@@ -43301,7 +45452,8 @@ void render_openxr_test_frame(
         bool puredark_afw_bundle_submitted{};
         uint64_t puredark_afw_bundle_fence{};
         if (command_list_recording) {
-            if (SUCCEEDED(g_xr_command_list->Close())) {
+            const HRESULT close_result = g_xr_command_list->Close();
+            if (SUCCEEDED(close_result)) {
                 ID3D12CommandList* lists[] = {g_xr_command_list};
                 g_command_queue->ExecuteCommandLists(1, lists);
                 // [FIX:MODE1-DLSS-SUBMITTED-CACHE-AUTHORITY V12021 7/7]
@@ -43334,8 +45486,8 @@ void render_openxr_test_frame(
             } else {
                 submitted = false;
                 log_taau_trace_line(
-                    "OpenXR command list close failed image=%u",
-                    image_index);
+                    "OpenXR command list close failed image=%u hr=0x%08X",
+                    image_index, static_cast<unsigned>(close_result));
             }
         }
 
@@ -43875,6 +46027,19 @@ void try_log_dlss_output_luminance_readback() {
 }
 
 HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
+    // [DEBUG:PUREDARK-AFW-VISUAL-F6 V12052 3/3] Toggle only the ABI debug
+    // bit. This does not enable AFW, alter identities or change publication;
+    // the next successful Evaluate reflects the new visual diagnostic state.
+    if ((GetAsyncKeyState(VK_F6) & 1) != 0) {
+        const bool enabled = !g_puredark_afw_visual_debug.load(
+            std::memory_order_relaxed);
+        g_puredark_afw_visual_debug.store(
+            enabled, std::memory_order_relaxed);
+        log_line("PureDark AFW visual debug=%u hotkey=F6 present=%llu",
+            enabled ? 1u : 0u,
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
     const bool taau_drop_profile_requested =
         taau_drop_diagnostics_active();
     const bool phase_profile_requested =
