@@ -388,6 +388,20 @@ bool dlss_sequential_mode_active() {
         g_config.temporal_backend == TemporalBackend::Dlss;
 }
 
+// [FIX:MODE3-TAAU-NATIVE-FULL-MOTION V14000 1/8] AER and strict Stereo are
+// presentation policies inside the same Mode-3 producer. Keep one temporal
+// motion contract for both and leave Modes 1/2/4 plus every other backend
+// unchanged.
+bool mode3_taau_native_full_motion_active() {
+    return g_config.openxr_enabled && g_config.openxr_mode == 3 &&
+        g_config.temporal_backend == TemporalBackend::Taau;
+}
+
+bool engine_native_per_eye_temporal_history_active() {
+    return dlss_sequential_mode_active() ||
+        mode3_taau_native_full_motion_active();
+}
+
 bool mode1_dlss_submitted_cache_route_active() {
     // [FIX:MODE1-DLSS-SUBMITTED-CACHE-AUTHORITY V12021 1/7] The final
     // backbuffer belongs to the DLSS producer actually accepted by the game
@@ -2053,6 +2067,13 @@ std::array<EnginePerEyeTemporalCameraHistory, 2>
 std::atomic<float> g_engine_temporal_camera_build_time{};
 std::atomic<bool> g_engine_temporal_camera_build_time_valid{};
 std::atomic<uint8_t> g_engine_per_eye_temporal_camera_logged_mask{};
+// [FIX:MODE3-TAAU-EXACT-PAIR-LEDGER V14001 1/3] REDengine can prepare pair
+// N+1 before the asynchronous TAAU resolve consumes N. Retain a bounded exact
+// stamp per eye/pair instead of remembering only the newest prepared pair.
+constexpr size_t kMode3TaauNativeHistoryStampCount = 64;
+std::array<std::array<std::atomic<uint64_t>,
+    kMode3TaauNativeHistoryStampCount>, 2>
+    g_mode3_taau_native_history_prepared_pairs{};
 thread_local XrView g_engine_render_view{XR_TYPE_VIEW};
 thread_local bool g_engine_render_view_valid{};
 struct HmdCameraPoseSnapshot {
@@ -2946,6 +2967,27 @@ struct CommandListInfo {
     uint64_t latest_taau_depth_present{};
 };
 
+// [OPT:TAAU-HOT-PATH-TRIM V14003 1/9] Functional TAAU consumes only four
+// compute tables and the currently bound heaps/root signature.  Keep the
+// multi-kilobyte reverse-diagnostic arrays out of every native resolve copy.
+struct TaauComputeBindingSnapshot {
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 4> compute_tables{};
+    ID3D12DescriptorHeap* cbv_srv_uav_heap{};
+    ID3D12DescriptorHeap* sampler_heap{};
+    ID3D12PipelineState* pipeline_state{};
+    ID3D12RootSignature* compute_root_signature{};
+};
+
+// SetDescriptorHeaps invalidates graphics and compute descriptor tables.  The
+// asymmetric tiled-culling replacement therefore retains all table handles,
+// but still avoids copying unrelated CBVs, constants, vectors and render state.
+struct TiledCullingBindingSnapshot {
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 32> graphics_tables{};
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 32> compute_tables{};
+    ID3D12DescriptorHeap* cbv_srv_uav_heap{};
+    ID3D12DescriptorHeap* sampler_heap{};
+};
+
 struct DlssGraphicsStateSnapshot {
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 32> cbv{};
     std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 32> tables{};
@@ -3450,6 +3492,7 @@ struct RootSignatureInfo {
 
 std::mutex g_reverse_mutex{};
 std::unordered_map<ID3D12Resource*, ResourceInfo> g_resource_infos{};
+std::atomic<uint64_t> g_resource_registry_generation{1};
 std::unordered_map<ID3D12GraphicsCommandList*, CommandListInfo> g_command_list_infos{};
 std::unordered_map<ID3D12DescriptorHeap*, DescriptorHeapInfo> g_descriptor_heap_infos{};
 std::unordered_map<SIZE_T, ResourceDescriptorInfo> g_resource_descriptors{};
@@ -3997,6 +4040,7 @@ ID3D12Resource* g_taau_private_cb10_upload{};
 uint8_t* g_taau_private_cb10_mapped{};
 UINT g_taau_descriptor_increment{};
 std::once_flag g_taau_override_once{};
+std::atomic<bool> g_taau_override_resources_ready{};
 
 // REDengine's tiled-light resolve and dimmer-cull shaders build symmetric
 // tile frusta from M00/M11 and omit the asymmetric M20/M21 center. Each
@@ -4937,6 +4981,16 @@ void log_line(const char* fmt, ...);
 bool copy_gpu_va_bytes(
     D3D12_GPU_VIRTUAL_ADDRESS gpu_va, void* destination, size_t size);
 bool load_cbv_descriptor(SIZE_T cpu_handle_ptr, CbvDescriptorInfo& info_out);
+bool taau_table_cpu_handle_locked(
+    ID3D12DescriptorHeap* cbv_srv_uav_heap,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_count,
+    D3D12_CPU_DESCRIPTOR_HANDLE& cpu_out);
+bool taau_table_cpu_handle(
+    ID3D12DescriptorHeap* cbv_srv_uav_heap,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_count,
+    D3D12_CPU_DESCRIPTOR_HANDLE& cpu_out);
 bool taau_table_cpu_handle(
     const CommandListInfo& snapshot,
     D3D12_GPU_DESCRIPTOR_HANDLE table,
@@ -4990,34 +5044,39 @@ bool dispatch_asymmetric_tiled_culling_remap(
         return note_fallback("device_contract");
     }
 
-    CommandListInfo snapshot{};
+    TiledCullingBindingSnapshot snapshot{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_cbv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_srv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_uav{};
     {
         std::scoped_lock lock{g_reverse_mutex};
         const auto found = g_command_list_infos.find(command_list);
         if (found == g_command_list_infos.end()) {
             return note_fallback("command_state");
         }
-        snapshot = found->second;
-    }
-    if (snapshot.cbv_srv_uav_heap == nullptr ||
-        snapshot.sampler_heap == nullptr ||
-        snapshot.compute_tables[0].ptr == 0 ||
-        snapshot.compute_tables[1].ptr == 0 ||
-        snapshot.compute_tables[2].ptr == 0 ||
-        snapshot.compute_tables[3].ptr == 0) {
-        return note_fallback("root_tables");
-    }
-
-    D3D12_CPU_DESCRIPTOR_HANDLE source_cbv{};
-    D3D12_CPU_DESCRIPTOR_HANDLE source_srv{};
-    D3D12_CPU_DESCRIPTOR_HANDLE source_uav{};
-    if (!taau_table_cpu_handle(snapshot, snapshot.compute_tables[0],
-            kTiledCullingCbvCount, source_cbv) ||
-        !taau_table_cpu_handle(snapshot, snapshot.compute_tables[1],
-            kTiledCullingSrvCount, source_srv) ||
-        !taau_table_cpu_handle(snapshot, snapshot.compute_tables[3],
-            kTiledCullingUavCount, source_uav)) {
-        return note_fallback("descriptor_translation");
+        snapshot.graphics_tables = found->second.graphics_tables;
+        snapshot.compute_tables = found->second.compute_tables;
+        snapshot.cbv_srv_uav_heap = found->second.cbv_srv_uav_heap;
+        snapshot.sampler_heap = found->second.sampler_heap;
+        if (snapshot.cbv_srv_uav_heap == nullptr ||
+            snapshot.sampler_heap == nullptr ||
+            snapshot.compute_tables[0].ptr == 0 ||
+            snapshot.compute_tables[1].ptr == 0 ||
+            snapshot.compute_tables[2].ptr == 0 ||
+            snapshot.compute_tables[3].ptr == 0) {
+            return note_fallback("root_tables");
+        }
+        if (!taau_table_cpu_handle_locked(
+                snapshot.cbv_srv_uav_heap, snapshot.compute_tables[0],
+                kTiledCullingCbvCount, source_cbv) ||
+            !taau_table_cpu_handle_locked(
+                snapshot.cbv_srv_uav_heap, snapshot.compute_tables[1],
+                kTiledCullingSrvCount, source_srv) ||
+            !taau_table_cpu_handle_locked(
+                snapshot.cbv_srv_uav_heap, snapshot.compute_tables[3],
+                kTiledCullingUavCount, source_uav)) {
+            return note_fallback("descriptor_translation");
+        }
     }
 
     const UINT source_descriptor_increment =
@@ -5178,18 +5237,48 @@ bool dispatch_asymmetric_tiled_culling_remap(
 
     ID3D12DescriptorHeap* override_heaps[]{
         g_tiled_culling_override_heap, snapshot.sampler_heap};
-    command_list->SetDescriptorHeaps(
+    const bool observe_internal_bindings =
+        reverse_diagnostic_hooks_requested() ||
+        g_compute_probe_active.load(std::memory_order_relaxed) ||
+        g_effect_gpu_probe_active.load(std::memory_order_relaxed);
+    const auto set_descriptor_heaps = [&](UINT count,
+                                          ID3D12DescriptorHeap* const* heaps) {
+        if (observe_internal_bindings) {
+            command_list->SetDescriptorHeaps(count, heaps);
+        } else {
+            g_set_descriptor_heaps(command_list, count, heaps);
+        }
+    };
+    const auto set_compute_table = [&](
+                                       UINT root,
+                                       D3D12_GPU_DESCRIPTOR_HANDLE table) {
+        if (observe_internal_bindings) {
+            command_list->SetComputeRootDescriptorTable(root, table);
+        } else {
+            g_set_compute_root_descriptor_table(command_list, root, table);
+        }
+    };
+    const auto set_graphics_table = [&](
+                                        UINT root,
+                                        D3D12_GPU_DESCRIPTOR_HANDLE table) {
+        if (observe_internal_bindings) {
+            command_list->SetGraphicsRootDescriptorTable(root, table);
+        } else {
+            g_set_graphics_root_descriptor_table(command_list, root, table);
+        }
+    };
+    set_descriptor_heaps(
         static_cast<UINT>(std::size(override_heaps)), override_heaps);
-    command_list->SetComputeRootDescriptorTable(0,
+    set_compute_table(0,
         D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
             static_cast<UINT64>(kTiledCullingCbvOffset) *
                 g_tiled_culling_descriptor_increment});
-    command_list->SetComputeRootDescriptorTable(1,
+    set_compute_table(1,
         D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
             static_cast<UINT64>(kTiledCullingSrvOffset) *
                 g_tiled_culling_descriptor_increment});
-    command_list->SetComputeRootDescriptorTable(2, snapshot.compute_tables[2]);
-    command_list->SetComputeRootDescriptorTable(3,
+    set_compute_table(2, snapshot.compute_tables[2]);
+    set_compute_table(3,
         D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
             static_cast<UINT64>(kTiledCullingUavOffset) *
                 g_tiled_culling_descriptor_increment});
@@ -5197,18 +5286,16 @@ bool dispatch_asymmetric_tiled_culling_remap(
 
     ID3D12DescriptorHeap* original_heaps[]{
         snapshot.cbv_srv_uav_heap, snapshot.sampler_heap};
-    command_list->SetDescriptorHeaps(
+    set_descriptor_heaps(
         static_cast<UINT>(std::size(original_heaps)), original_heaps);
     for (UINT root = 0; root < snapshot.compute_tables.size(); ++root) {
         if (snapshot.compute_tables[root].ptr != 0) {
-            command_list->SetComputeRootDescriptorTable(
-                root, snapshot.compute_tables[root]);
+            set_compute_table(root, snapshot.compute_tables[root]);
         }
     }
     for (UINT root = 0; root < snapshot.graphics_tables.size(); ++root) {
         if (snapshot.graphics_tables[root].ptr != 0) {
-            command_list->SetGraphicsRootDescriptorTable(
-                root, snapshot.graphics_tables[root]);
+            set_graphics_table(root, snapshot.graphics_tables[root]);
         }
     }
 
@@ -11033,20 +11120,54 @@ bool copy_gpu_va_bytes(D3D12_GPU_VIRTUAL_ADDRESS gpu_va, void* destination, size
     bool copied{};
     {
         std::scoped_lock lock{g_reverse_mutex};
+        struct GpuVaReadCache {
+            uint64_t generation{};
+            D3D12_GPU_VIRTUAL_ADDRESS base{};
+            uint64_t width{};
+            const uint8_t* mapped{};
+            size_t mapped_size{};
+        };
+        thread_local GpuVaReadCache cache{};
+        const uint64_t generation = g_resource_registry_generation.load(
+            std::memory_order_acquire);
+        const auto try_copy = [&](D3D12_GPU_VIRTUAL_ADDRESS base,
+                                  uint64_t width,
+                                  const uint8_t* mapped,
+                                  size_t mapped_size) {
+            if (base == 0 || mapped == nullptr || gpu_va < base) {
+                return false;
+            }
+            const auto offset = static_cast<uint64_t>(gpu_va - base);
+            if (offset > width || size > width - offset ||
+                offset > mapped_size ||
+                size > mapped_size - static_cast<size_t>(offset)) {
+                return false;
+            }
+            return guarded_memcpy(
+                destination, mapped + static_cast<size_t>(offset), size);
+        };
+
+        if (cache.generation == generation &&
+            try_copy(cache.base, cache.width, cache.mapped,
+                cache.mapped_size)) {
+            copied = true;
+        }
         for (const auto& [resource, info] : g_resource_infos) {
+            if (copied) {
+                break;
+            }
             if (info.gpu_va == 0 || info.desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
                 info.mapped == nullptr || gpu_va < info.gpu_va) {
                 continue;
             }
 
-            const auto offset = static_cast<uint64_t>(gpu_va - info.gpu_va);
-            if (offset > info.desc.Width || size > info.desc.Width - offset ||
-                offset > info.mapped_size || size > info.mapped_size - static_cast<size_t>(offset)) {
-                continue;
-            }
-
-            const auto* source = static_cast<const uint8_t*>(info.mapped) + offset;
-            if (guarded_memcpy(destination, source, size)) {
+            if (try_copy(info.gpu_va, info.desc.Width,
+                    static_cast<const uint8_t*>(info.mapped),
+                    info.mapped_size)) {
+                cache = GpuVaReadCache{
+                    generation, info.gpu_va, info.desc.Width,
+                    static_cast<const uint8_t*>(info.mapped),
+                    info.mapped_size};
                 copied = true;
                 break;
             }
@@ -12596,16 +12717,16 @@ void nudge_cbv_gpu_va(
 }
 
 bool resolve_descriptor_table_cbv(
-    const CommandListInfo& command_list_info,
+    ID3D12DescriptorHeap* cbv_srv_uav_heap,
     D3D12_GPU_DESCRIPTOR_HANDLE table,
     CbvDescriptorInfo& cbv_out,
     SIZE_T& cpu_handle_out,
     UINT descriptor_offset = 0) {
-    if (table.ptr == 0 || command_list_info.cbv_srv_uav_heap == nullptr) {
+    if (table.ptr == 0 || cbv_srv_uav_heap == nullptr) {
         return false;
     }
 
-    auto heap_it = g_descriptor_heap_infos.find(command_list_info.cbv_srv_uav_heap);
+    auto heap_it = g_descriptor_heap_infos.find(cbv_srv_uav_heap);
     if (heap_it == g_descriptor_heap_infos.end()) {
         return false;
     }
@@ -12633,16 +12754,27 @@ bool resolve_descriptor_table_cbv(
     return true;
 }
 
-bool resolve_descriptor_table_resource(
+bool resolve_descriptor_table_cbv(
     const CommandListInfo& command_list_info,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    CbvDescriptorInfo& cbv_out,
+    SIZE_T& cpu_handle_out,
+    UINT descriptor_offset = 0) {
+    return resolve_descriptor_table_cbv(
+        command_list_info.cbv_srv_uav_heap, table, cbv_out,
+        cpu_handle_out, descriptor_offset);
+}
+
+bool resolve_descriptor_table_resource(
+    ID3D12DescriptorHeap* cbv_srv_uav_heap,
     D3D12_GPU_DESCRIPTOR_HANDLE table,
     UINT descriptor_offset,
     ResourceDescriptorInfo& descriptor_out,
     SIZE_T& cpu_handle_out) {
-    if (table.ptr == 0 || command_list_info.cbv_srv_uav_heap == nullptr) {
+    if (table.ptr == 0 || cbv_srv_uav_heap == nullptr) {
         return false;
     }
-    const auto heap_it = g_descriptor_heap_infos.find(command_list_info.cbv_srv_uav_heap);
+    const auto heap_it = g_descriptor_heap_infos.find(cbv_srv_uav_heap);
     if (heap_it == g_descriptor_heap_infos.end()) {
         return false;
     }
@@ -12663,6 +12795,17 @@ bool resolve_descriptor_table_resource(
     descriptor_out = descriptor_it->second;
     cpu_handle_out = cpu_handle;
     return true;
+}
+
+bool resolve_descriptor_table_resource(
+    const CommandListInfo& command_list_info,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_offset,
+    ResourceDescriptorInfo& descriptor_out,
+    SIZE_T& cpu_handle_out) {
+    return resolve_descriptor_table_resource(
+        command_list_info.cbv_srv_uav_heap, table, descriptor_offset,
+        descriptor_out, cpu_handle_out);
 }
 
 void copy_cbv_descriptor_metadata(SIZE_T dest_cpu, SIZE_T src_cpu, UINT increment) {
@@ -13875,6 +14018,11 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
             }
             auto& last = g_taau_last_submitted_pair[
                 static_cast<size_t>(submitted.eye)];
+            if (!taau_resolve_runtime_diagnostics_active() &&
+                !taau_drop_diagnostics_active()) {
+                last.store(submitted.pair_id, std::memory_order_relaxed);
+                continue;
+            }
             const uint64_t previous = last.exchange(
                 submitted.pair_id, std::memory_order_relaxed);
             const uint64_t submitted_count = g_taau_submitted_resolve_count.fetch_add(
@@ -14091,6 +14239,8 @@ HRESULT STDMETHODCALLTYPE hook_create_committed_resource(
                     d3d_resource->GetGPUVirtualAddress(),
                     nullptr,
                     static_cast<size_t>(std::min<uint64_t>(desc->Width, SIZE_MAX))};
+                g_resource_registry_generation.fetch_add(
+                    1, std::memory_order_release);
             }
 
             install_resource_hooks(d3d_resource);
@@ -14830,6 +14980,8 @@ HRESULT STDMETHODCALLTYPE hook_resource_map(
                 if (it->second.mapped_size == 0 && it->second.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
                     it->second.mapped_size = static_cast<size_t>(std::min<uint64_t>(it->second.desc.Width, SIZE_MAX));
                 }
+                g_resource_registry_generation.fetch_add(
+                    1, std::memory_order_release);
                 info = it->second;
                 tracked = true;
             }
@@ -14851,6 +15003,8 @@ HRESULT STDMETHODCALLTYPE hook_resource_map(
             if (info.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
                 std::scoped_lock lock{g_reverse_mutex};
                 g_resource_infos[resource] = info;
+                g_resource_registry_generation.fetch_add(
+                    1, std::memory_order_release);
                 tracked = true;
             }
         }
@@ -15031,8 +15185,31 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
     {
         std::scoped_lock lock{g_reverse_mutex};
         auto& tracked = g_command_list_infos[command_list];
-        tracked = {};
+        const bool full_diagnostic_state =
+            reverse_enabled() ||
+            g_compute_probe_active.load(std::memory_order_relaxed);
+        if (full_diagnostic_state) {
+            tracked.graphics_cbv.fill(0);
+            tracked.compute_cbv.fill(0);
+            tracked.compute_constants = {};
+            tracked.compute_constant_masks.fill(0);
+        }
+        tracked.graphics_tables.fill(D3D12_GPU_DESCRIPTOR_HANDLE{});
+        tracked.compute_tables.fill(D3D12_GPU_DESCRIPTOR_HANDLE{});
+        tracked.cbv_srv_uav_heap = nullptr;
+        tracked.sampler_heap = nullptr;
         tracked.pipeline_state = initial_state;
+        tracked.graphics_root_signature = nullptr;
+        tracked.compute_root_signature = nullptr;
+        tracked.draw_count = 0;
+        tracked.active_uav_resources.clear();
+        tracked.active_render_targets.clear();
+        tracked.active_rtv_handles.fill(D3D12_CPU_DESCRIPTOR_HANDLE{});
+        tracked.active_rtv_count = 0;
+        tracked.active_rtvs_contiguous = FALSE;
+        tracked.active_dsv_handle = {};
+        tracked.latest_taau_depth_resource = nullptr;
+        tracked.latest_taau_depth_present = 0;
     }
     // [FIX:RETAINED-CINEMA-HUD-PREVIOUS-FRAME V1123 1/3] A successful Reset
     // starts a new recording epoch. Do not let a scene-only HUD draw from the
@@ -15087,12 +15264,17 @@ void STDMETHODCALLTYPE hook_set_compute_root_descriptor_table(
             state->tables[root_parameter_index] = base_descriptor;
         }
     }
-    if (((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
-            reverse_enabled()) ||
-            (taau_functional_hooks_needed() &&
-                taau_runtime_tracking_active()) ||
-            asymmetric_tiled_culling_fix_needed()) &&
-        root_parameter_index < 32) {
+    const bool diagnostic_tracking =
+        !g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
+        (reverse_enabled() ||
+            g_compute_probe_active.load(std::memory_order_relaxed));
+    const bool functional_tracking =
+        asymmetric_tiled_culling_fix_needed() ||
+        (root_parameter_index < 4 &&
+            taau_functional_hooks_needed() &&
+            taau_runtime_tracking_active());
+    if (root_parameter_index < 32 &&
+        (diagnostic_tracking || functional_tracking)) {
         std::scoped_lock lock{g_reverse_mutex};
         g_command_list_infos[command_list].compute_tables[root_parameter_index] = base_descriptor;
     }
@@ -15140,10 +15322,9 @@ void STDMETHODCALLTYPE hook_set_compute_root_cbv(
             state->cbv[root_parameter_index] = buffer_location;
         }
     }
-    if (((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
-            reverse_enabled()) ||
-            (taau_functional_hooks_needed() &&
-                taau_runtime_tracking_active())) &&
+    if (!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
+        (reverse_enabled() ||
+            g_compute_probe_active.load(std::memory_order_relaxed)) &&
         root_parameter_index < 32) {
         std::scoped_lock lock{g_reverse_mutex};
         g_command_list_infos[command_list].compute_cbv[root_parameter_index] = buffer_location;
@@ -15169,10 +15350,9 @@ void STDMETHODCALLTYPE hook_set_compute_root_32bit_constant(
                     (1u << dest_offset_in_32bit_values));
         }
     }
-    if (((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
-            reverse_enabled()) ||
-            (taau_functional_hooks_needed() &&
-                taau_runtime_tracking_active())) &&
+    if (!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
+        (reverse_enabled() ||
+            g_compute_probe_active.load(std::memory_order_relaxed)) &&
         root_parameter_index < 32 && dest_offset_in_32bit_values < 64) {
         std::scoped_lock lock{g_reverse_mutex};
         auto& info = g_command_list_infos[command_list];
@@ -15208,10 +15388,9 @@ void STDMETHODCALLTYPE hook_set_compute_root_32bit_constants(
             }
         }
     }
-    if (((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
-            reverse_enabled()) ||
-            (taau_functional_hooks_needed() &&
-                taau_runtime_tracking_active())) &&
+    if (!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
+        (reverse_enabled() ||
+            g_compute_probe_active.load(std::memory_order_relaxed)) &&
         root_parameter_index < 32 && src_data != nullptr &&
         dest_offset_in_32bit_values < 64) {
         const UINT count = std::min(num_32bit_values_to_set, 64u - dest_offset_in_32bit_values);
@@ -15666,17 +15845,23 @@ void STDMETHODCALLTYPE hook_set_compute_root_signature(
             state->constant_masks.fill(0);
         }
     }
-    if ((!g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
-            reverse_enabled()) ||
+    const bool diagnostic_tracking =
+        !g_effect_gpu_probe_session_active.load(std::memory_order_relaxed) &&
+        (reverse_enabled() ||
+            g_compute_probe_active.load(std::memory_order_relaxed));
+    const bool functional_tracking =
         (taau_functional_hooks_needed() &&
             taau_runtime_tracking_active()) ||
-        asymmetric_tiled_culling_fix_needed()) {
+        asymmetric_tiled_culling_fix_needed();
+    if (diagnostic_tracking || functional_tracking) {
         std::scoped_lock lock{g_reverse_mutex};
         auto& info = g_command_list_infos[command_list];
         info.compute_root_signature = root_signature;
-        info.compute_cbv.fill(0);
         info.compute_tables.fill(D3D12_GPU_DESCRIPTOR_HANDLE{});
-        info.compute_constant_masks.fill(0);
+        if (diagnostic_tracking) {
+            info.compute_cbv.fill(0);
+            info.compute_constant_masks.fill(0);
+        }
     }
     g_set_compute_root_signature(command_list, root_signature);
 }
@@ -18174,6 +18359,9 @@ void STDMETHODCALLTYPE hook_draw_instanced(
 }
 
 bool ensure_taau_matrix_fallback_resources() {
+    if (g_taau_override_resources_ready.load(std::memory_order_acquire)) {
+        return true;
+    }
     std::call_once(g_taau_override_once, []() {
         if (g_d3d12_device == nullptr) {
             return;
@@ -18247,31 +18435,24 @@ bool ensure_taau_matrix_fallback_resources() {
             g_d3d12_device->CreateUnorderedAccessView(
                 g_taau_invalid_mvec_texture, nullptr, &uav_desc, cpu);
         }
+        g_taau_override_resources_ready.store(true, std::memory_order_release);
         log_line("TAAU matrix fallback resources ready slots=%zu size=%llux%u format=RGBA32F",
             g_taau_override_slots.size(),
             static_cast<unsigned long long>(texture_desc.Width), texture_desc.Height);
     });
 
-    if (g_taau_invalid_mvec_texture == nullptr ||
-        g_taau_private_cb10_upload == nullptr ||
-        g_taau_private_cb10_mapped == nullptr ||
-        g_taau_descriptor_increment == 0) {
-        return false;
-    }
-    return std::all_of(g_taau_override_slots.begin(), g_taau_override_slots.end(),
-        [](const TaauOverrideSlot& slot) { return slot.heap != nullptr; });
+    return g_taau_override_resources_ready.load(std::memory_order_acquire);
 }
 
-bool taau_table_cpu_handle(
-    const CommandListInfo& snapshot,
+bool taau_table_cpu_handle_locked(
+    ID3D12DescriptorHeap* cbv_srv_uav_heap,
     D3D12_GPU_DESCRIPTOR_HANDLE table,
     UINT descriptor_count,
     D3D12_CPU_DESCRIPTOR_HANDLE& cpu_out) {
-    if (snapshot.cbv_srv_uav_heap == nullptr || table.ptr == 0) {
+    if (cbv_srv_uav_heap == nullptr || table.ptr == 0) {
         return false;
     }
-    std::scoped_lock lock{g_reverse_mutex};
-    const auto heap_it = g_descriptor_heap_infos.find(snapshot.cbv_srv_uav_heap);
+    const auto heap_it = g_descriptor_heap_infos.find(cbv_srv_uav_heap);
     if (heap_it == g_descriptor_heap_infos.end()) {
         return false;
     }
@@ -18286,6 +18467,25 @@ bool taau_table_cpu_handle(
     }
     cpu_out.ptr = heap.cpu_start.ptr + descriptor_index * heap.increment;
     return true;
+}
+
+bool taau_table_cpu_handle(
+    ID3D12DescriptorHeap* cbv_srv_uav_heap,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_count,
+    D3D12_CPU_DESCRIPTOR_HANDLE& cpu_out) {
+    std::scoped_lock lock{g_reverse_mutex};
+    return taau_table_cpu_handle_locked(
+        cbv_srv_uav_heap, table, descriptor_count, cpu_out);
+}
+
+bool taau_table_cpu_handle(
+    const CommandListInfo& snapshot,
+    D3D12_GPU_DESCRIPTOR_HANDLE table,
+    UINT descriptor_count,
+    D3D12_CPU_DESCRIPTOR_HANDLE& cpu_out) {
+    return taau_table_cpu_handle(
+        snapshot.cbv_srv_uav_heap, table, descriptor_count, cpu_out);
 }
 
 bool ensure_tiled_culling_override_resources() {
@@ -18456,6 +18656,17 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
     float2 engine_camera_motion = source_uv - previous_uv;
     float2 hmd_camera_motion = source_uv - previous_base_uv;
     bool native_is_valid = native_motion.x < 2.0 && native_motion.y < 2.0;
+    // [FIX:MODE3-TAAU-NATIVE-FULL-MOTION V14000 5/8] The exact 42 marker is
+    // installed only after Mode 3 has supplied REDengine with a private
+    // same-eye previous-camera record. In that route the native field already
+    // combines correct camera, object and skinning motion, so any downstream
+    // analytic replacement would discard or double-correct valid information.
+    bool native_full_motion =
+        abs(current_to_previous_corrected_row0.w - 42.0) < 0.001;
+    if (native_full_motion) {
+        corrected_mvec[dispatch_id.xy] = native_motion;
+        return;
+    }
     bool pure_camera_motion = current_to_previous_corrected_row0.w > 0.5;
     float2 corrected_xy = pure_camera_motion || !native_is_valid
         ? hmd_camera_motion
@@ -18908,7 +19119,7 @@ bool write_taau_private_resolve_cb10(
     const UINT64 upload_offset = static_cast<UINT64>(slot_index) *
         kTaauPrivateCb10Stride;
     auto* private_data = g_taau_private_cb10_mapped + upload_offset;
-    memset(private_data, 0, static_cast<size_t>(kTaauPrivateCb10Stride));
+    // source.size() exactly matches the 512-byte slot stride.
     memcpy(private_data, source.data(), source.size());
     memcpy(private_data, pure_jitter, sizeof(pure_jitter));
 
@@ -19335,7 +19546,7 @@ bool dispatch_taau_inplace_marker(
         taau_drop_diagnostics_active()) {
         g_taau_health_total.fetch_add(1, std::memory_order_relaxed);
     }
-    CommandListInfo snapshot{};
+    TaauComputeBindingSnapshot snapshot{};
     ResourceDescriptorInfo original_mvec{};
     ResourceDescriptorInfo depth{};
     ResourceDescriptorInfo native_history{};
@@ -19343,31 +19554,49 @@ bool dispatch_taau_inplace_marker(
     CbvDescriptorInfo cb10{};
     SIZE_T ignored_cpu{};
     SIZE_T cb10_cpu{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_cbv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_srv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE source_uav{};
     bool motion_found{};
-    bool depth_found{};
     bool cb10_found{};
     bool history_found{};
     bool output_found{};
+    bool source_tables_found{};
     {
         std::scoped_lock lock{g_reverse_mutex};
         const auto it = g_command_list_infos.find(command_list);
         if (it == g_command_list_infos.end()) {
             return false;
         }
-        snapshot = it->second;
+        std::copy_n(it->second.compute_tables.begin(),
+            snapshot.compute_tables.size(), snapshot.compute_tables.begin());
+        snapshot.cbv_srv_uav_heap = it->second.cbv_srv_uav_heap;
+        snapshot.sampler_heap = it->second.sampler_heap;
+        snapshot.compute_root_signature = it->second.compute_root_signature;
         motion_found = resolve_descriptor_table_resource(
-            snapshot, snapshot.compute_tables[1], 7, original_mvec, ignored_cpu);
-        depth_found = resolve_descriptor_table_resource(
-            snapshot, snapshot.compute_tables[1], 3, depth, ignored_cpu);
+            snapshot.cbv_srv_uav_heap, snapshot.compute_tables[1], 7,
+            original_mvec, ignored_cpu);
         history_found = resolve_descriptor_table_resource(
-            snapshot, snapshot.compute_tables[1], 2, native_history, ignored_cpu);
+            snapshot.cbv_srv_uav_heap, snapshot.compute_tables[1], 2,
+            native_history, ignored_cpu);
         output_found = resolve_descriptor_table_resource(
-            snapshot, snapshot.compute_tables[3], 0, native_output, ignored_cpu);
+            snapshot.cbv_srv_uav_heap, snapshot.compute_tables[3], 0,
+            native_output, ignored_cpu);
         cb10_found = resolve_descriptor_table_cbv(
-            snapshot, snapshot.compute_tables[0], cb10, cb10_cpu, 10);
+            snapshot.cbv_srv_uav_heap, snapshot.compute_tables[0], cb10,
+            cb10_cpu, 10);
+        source_tables_found = taau_table_cpu_handle_locked(
+                snapshot.cbv_srv_uav_heap, snapshot.compute_tables[0], 14,
+                source_cbv) &&
+            taau_table_cpu_handle_locked(
+                snapshot.cbv_srv_uav_heap, snapshot.compute_tables[1], 16,
+                source_srv) &&
+            taau_table_cpu_handle_locked(
+                snapshot.cbv_srv_uav_heap, snapshot.compute_tables[3], 4,
+                source_uav);
     }
     snapshot.pipeline_state = load_command_list_pipeline(command_list);
-    if (!motion_found || !depth_found || !cb10_found) {
+    if (!motion_found || !cb10_found) {
         const auto failure = g_taau_health_descriptor_fail.fetch_add(
             1, std::memory_order_relaxed) + 1;
         log_taau_early_failure("descriptor", failure);
@@ -19375,8 +19604,8 @@ bool dispatch_taau_inplace_marker(
                 taau_drop_diagnostics_active()) &&
             (taau_drop_diagnostics_active() ||
                 g_taau_descriptor_resolve_failure_logs.fetch_add(1) < 4)) {
-            log_taau_trace_line("TAAU resolve missing motion=%u depth=%u cb10=%u candidates=0x%X propagated=0x%X table0=0x%zX table1=0x%zX",
-                motion_found ? 1u : 0u, depth_found ? 1u : 0u,
+            log_taau_trace_line("TAAU resolve missing motion=%u cb10=%u candidates=0x%X propagated=0x%X table0=0x%zX table1=0x%zX",
+                motion_found ? 1u : 0u,
                 cb10_found ? 1u : 0u,
                 g_taau_descriptor_candidate_mask.load(),
                 g_taau_descriptor_propagated_mask.load(),
@@ -19384,9 +19613,15 @@ bool dispatch_taau_inplace_marker(
         }
         return false;
     }
-    if (!validate_taau_resolve_resources(original_mvec, depth) ||
-        !initialize_taau_mvec_pipeline() || g_taau_mvec_descriptor_increment == 0 ||
-        snapshot.cbv_srv_uav_heap == nullptr || snapshot.sampler_heap == nullptr) {
+    const auto motion_desc = original_mvec.resource->GetDesc();
+    if (original_mvec.format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        motion_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        motion_desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        motion_desc.Width < 256 || motion_desc.Width > 8192 ||
+        motion_desc.Height < 256 || motion_desc.Height > 8192 ||
+        (motion_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0 ||
+        snapshot.cbv_srv_uav_heap == nullptr ||
+        snapshot.sampler_heap == nullptr) {
         const auto failure = g_taau_health_resource_fail.fetch_add(
             1, std::memory_order_relaxed) + 1;
         log_taau_early_failure("resource", failure);
@@ -19417,10 +19652,6 @@ bool dispatch_taau_inplace_marker(
         }
         return false;
     }
-    std::array<uint32_t, 62> constants{};
-    memcpy(constants.data(), cb_data.data() + 6 * 16, 64);
-    memcpy(constants.data() + 16, cb_data.data(), 64);
-
     const int tls_render_eye = g_engine_render_eye;
     const uint64_t tls_render_pair_id = g_engine_render_pair_id;
     const uint64_t tls_producer_pair_id = g_engine_producer_pair_id;
@@ -19769,6 +20000,9 @@ bool dispatch_taau_inplace_marker(
     ID3D12Resource* committed_native_history{};
     D3D12_GPU_VIRTUAL_ADDRESS committed_cb10_gpu_va{};
     uint64_t committed_cb10_hash{};
+    const bool resolve_diagnostics =
+        taau_resolve_runtime_diagnostics_active() ||
+        taau_drop_diagnostics_active();
     if (g_config.openxr_mode == 2 ||
         (taau_stereo_route_active() &&
             expected_eye >= 0 && expected_eye <= 1)) {
@@ -19778,15 +20012,18 @@ bool dispatch_taau_inplace_marker(
         if (history.initialized) {
             expected_history_pair_id = history.last_pair_id;
             latest_stereo_history = history.texture;
-            committed_command_list = history.last_command_list;
-            committed_native_output = history.last_native_output;
-            committed_native_history = history.last_native_history;
-            committed_cb10_gpu_va = history.last_cb10_gpu_va;
-            committed_cb10_hash = history.last_cb10_hash;
+            if (resolve_diagnostics) {
+                committed_command_list = history.last_command_list;
+                committed_native_output = history.last_native_output;
+                committed_native_history = history.last_native_history;
+                committed_cb10_gpu_va = history.last_cb10_gpu_va;
+                committed_cb10_hash = history.last_cb10_hash;
+            }
         }
     }
 
-    const uint64_t cb10_hash = fnv1a64(cb_data.data(), cb_data.size());
+    const uint64_t cb10_hash = resolve_diagnostics
+        ? fnv1a64(cb_data.data(), cb_data.size()) : 0;
     if (taau_stereo_route_active() &&
         expected_eye >= 0 && expected_eye <= 1 &&
         expected_pair_id != 0 && expected_pair_id != UINT64_MAX) {
@@ -19795,9 +20032,13 @@ bool dispatch_taau_inplace_marker(
         std::scoped_lock lock{g_taau_recorded_resolve_mutex};
         g_taau_recorded_resolves[command_list] = TaauRecordedResolveIdentity{
             expected_eye, expected_pair_id,
-            g_present_count.load(std::memory_order_relaxed),
-            expected_history_pair_id, cb10_hash, native_output.resource,
-            identity_recovered, replayed_as_stale};
+            resolve_diagnostics
+                ? g_present_count.load(std::memory_order_relaxed) : 0,
+            resolve_diagnostics ? expected_history_pair_id : 0,
+            cb10_hash,
+            resolve_diagnostics ? native_output.resource : nullptr,
+            resolve_diagnostics && identity_recovered,
+            resolve_diagnostics && replayed_as_stale};
     }
 
     // Command recording can finish out of order across stereo worker threads.
@@ -19843,10 +20084,11 @@ bool dispatch_taau_inplace_marker(
                 replay_barriers[1].Transition.StateAfter);
             command_list->ResourceBarrier(2, replay_barriers);
 
-            static std::atomic<uint64_t> stale_stereo_replay_count{};
-            const uint64_t count = stale_stereo_replay_count.fetch_add(
-                1, std::memory_order_relaxed) + 1;
-            if (count <= 64 || count % 120 == 0) {
+            if (resolve_diagnostics) {
+                static std::atomic<uint64_t> stale_stereo_replay_count{};
+                const uint64_t count = stale_stereo_replay_count.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                if (count <= 64 || count % 120 == 0) {
                 log_line(
                     "TAAU stale stereo resolve replayed count=%llu present=%llu eye=%d incoming_pair=%llu history_pair=%llu recovered=%u tid=%lu cmd=%p committed_cmd=%p output=%p committed_output=%p native_history=%p committed_native_history=%p cb10=0x%llX committed_cb10=0x%llX cbhash=0x%llX committed_cbhash=0x%llX",
                     static_cast<unsigned long long>(count),
@@ -19865,6 +20107,7 @@ bool dispatch_taau_inplace_marker(
                     static_cast<unsigned long long>(committed_cb10_gpu_va),
                     static_cast<unsigned long long>(cb10_hash),
                     static_cast<unsigned long long>(committed_cb10_hash));
+                }
             }
             return true;
         }
@@ -19967,15 +20210,11 @@ bool dispatch_taau_inplace_marker(
         return false;
     }
     if (private_resolve_jitter_valid) {
-        // The custom motion-vector composition and the native TAAU resolve must
-        // consume the same pure sampling jitter. Neither write touches the
-        // shared REDengine TemporalAAData used by world materials.
-        memcpy(constants.data() + 16, private_resolve_jitter,
-            sizeof(private_resolve_jitter));
-        static std::atomic<uint32_t> private_jitter_logs{};
-        const uint32_t sample = private_jitter_logs.fetch_add(
-            1, std::memory_order_relaxed);
-        if (g_config.runtime_diagnostics && sample < 24) {
+        if (g_config.runtime_diagnostics) {
+            static std::atomic<uint32_t> private_jitter_logs{};
+            const uint32_t sample = private_jitter_logs.fetch_add(
+                1, std::memory_order_relaxed);
+            if (sample < 24) {
             float source_jitter[2]{};
             float render_extent[2]{};
             memcpy(source_jitter, cb_data.data(), sizeof(source_jitter));
@@ -19991,6 +20230,7 @@ bool dispatch_taau_inplace_marker(
                 private_resolve_descriptor.redengine_center_offset_px_y,
                 private_resolve_jitter[0], private_resolve_jitter[1],
                 render_extent[0], render_extent[1]);
+            }
         }
     }
     if (g_config.openxr_mode == 2) {
@@ -20132,24 +20372,151 @@ bool dispatch_taau_inplace_marker(
             static_cast<unsigned long long>(hmd_motion.matched_pair_id),
             hmd_motion.matrix_error);
     }
+    const uint64_t prepared_native_pair =
+        hmd_motion.matched_eye >= 0 && hmd_motion.matched_eye <= 1 &&
+            hmd_motion.matched_pair_id != 0 &&
+            hmd_motion.matched_pair_id != UINT64_MAX
+        ? g_mode3_taau_native_history_prepared_pairs[
+            static_cast<size_t>(hmd_motion.matched_eye)][
+                hmd_motion.matched_pair_id %
+                    kMode3TaauNativeHistoryStampCount].load(
+                        std::memory_order_acquire)
+        : 0;
+    const bool exact_native_full_motion =
+        mode3_taau_native_full_motion_active() &&
+        hmd_motion.matched_pair_id != 0 &&
+        hmd_motion.matched_pair_id != UINT64_MAX &&
+        prepared_native_pair == hmd_motion.matched_pair_id;
+    if (g_config.runtime_diagnostics) {
+        static std::atomic<uint32_t> native_full_motion_logs{};
+        const uint32_t sample = native_full_motion_logs.fetch_add(
+            1, std::memory_order_relaxed);
+        if (sample < 24) {
+            log_line(
+                "V14003 TAAU native full-motion gate sample=%u eye=%d "
+                "pair=%llu prepared_pair=%llu active=%u policy=%s",
+                sample + 1, hmd_motion.matched_eye,
+                static_cast<unsigned long long>(
+                    hmd_motion.matched_pair_id),
+                static_cast<unsigned long long>(prepared_native_pair),
+                exact_native_full_motion ? 1u : 0u,
+                g_config.mode3_aer_presentation ? "aer" : "stereo");
+        }
+    }
+
+    // Internal override bindings are temporary and fully restored before the
+    // intercepted engine Dispatch returns.  Bypass our own tracking hooks on
+    // the gaming path; diagnostic/probe runs retain the previous observability.
+    const bool observe_internal_bindings =
+        reverse_diagnostic_hooks_requested() ||
+        g_compute_probe_active.load(std::memory_order_relaxed) ||
+        g_effect_gpu_probe_active.load(std::memory_order_relaxed);
+    const auto set_descriptor_heaps = [&](UINT count,
+                                          ID3D12DescriptorHeap* const* heaps) {
+        if (observe_internal_bindings) {
+            command_list->SetDescriptorHeaps(count, heaps);
+        } else {
+            g_set_descriptor_heaps(command_list, count, heaps);
+        }
+    };
+    const auto set_compute_root_signature = [&](ID3D12RootSignature* root) {
+        if (observe_internal_bindings) {
+            command_list->SetComputeRootSignature(root);
+        } else {
+            g_set_compute_root_signature(command_list, root);
+        }
+    };
+    const auto set_pipeline_state = [&](ID3D12PipelineState* pipeline) {
+        if (observe_internal_bindings) {
+            command_list->SetPipelineState(pipeline);
+        } else {
+            g_set_pipeline_state(command_list, pipeline);
+        }
+    };
+    const auto set_compute_table = [&](
+                                       UINT root,
+                                       D3D12_GPU_DESCRIPTOR_HANDLE table) {
+        if (observe_internal_bindings) {
+            command_list->SetComputeRootDescriptorTable(root, table);
+        } else {
+            g_set_compute_root_descriptor_table(command_list, root, table);
+        }
+    };
+
+    // [OPT:MODE3-TAAU-SKIP-EXACT-NATIVE-COMPOSE V14002 1/3] The exact gate
+    // proves REDengine has already built the combined camera + object/skinning
+    // field from the private same-eye 0xB0 history. Keep the resource untouched
+    // and transition it directly to the SRV state consumed by the private TAAU
+    // resolve. The old snapshot + full-resolution compose remains available
+    // only when that authority is absent.
+    ID3D12Resource* original_mvec_snapshot{};
+    if (exact_native_full_motion) {
+        D3D12_RESOURCE_BARRIER native_to_srv{};
+        native_to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        native_to_srv.Transition.pResource = original_mvec.resource;
+        native_to_srv.Transition.Subresource =
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        native_to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        native_to_srv.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        command_list->ResourceBarrier(1, &native_to_srv);
+        if (g_config.runtime_diagnostics) {
+            static std::atomic<uint32_t> native_compose_bypass_logs{};
+            const uint32_t sample = native_compose_bypass_logs.fetch_add(
+                1, std::memory_order_relaxed);
+            if (sample < 24) {
+                log_line(
+                    "V14003 TAAU exact native compose bypass sample=%u "
+                    "eye=%d pair=%llu copy=0 dispatch=0",
+                    sample + 1, hmd_motion.matched_eye,
+                    static_cast<unsigned long long>(
+                        hmd_motion.matched_pair_id));
+            }
+        }
+    } else {
+    // The depth descriptor, compose shader/pipeline and 62 root constants are
+    // legacy fallback-only state.  V14002 prepared all of them before checking
+    // the exact native ledger even though its accepted path never consumed
+    // them.
+    bool depth_found{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        depth_found = resolve_descriptor_table_resource(
+            snapshot.cbv_srv_uav_heap, snapshot.compute_tables[1], 3,
+            depth, ignored_cpu);
+    }
+    if (!depth_found ||
+        !validate_taau_resolve_resources(original_mvec, depth) ||
+        !initialize_taau_mvec_pipeline() ||
+        g_taau_mvec_descriptor_increment == 0) {
+        const auto failure = g_taau_health_resource_fail.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        log_taau_early_failure("legacy-resource", failure);
+        return false;
+    }
+
+    std::array<uint32_t, 62> constants{};
+    memcpy(constants.data(), cb_data.data() + 6 * 16, 64);
+    memcpy(constants.data() + 16, cb_data.data(), 64);
+    if (private_resolve_jitter_valid) {
+        memcpy(constants.data() + 16, private_resolve_jitter,
+            sizeof(private_resolve_jitter));
+    }
     float hmd_constants[30]{};
-    memcpy(hmd_constants, hmd_motion.current_to_previous_base.data(), 12 * sizeof(float));
-    memcpy(hmd_constants + 12, hmd_motion.current_to_previous_corrected.data(),
+    memcpy(hmd_constants, hmd_motion.current_to_previous_base.data(),
         12 * sizeof(float));
-    const int first_resolve_eye = g_config.engine_taau_reverse_eye_order ? 0 : 1;
+    memcpy(hmd_constants + 12,
+        hmd_motion.current_to_previous_corrected.data(), 12 * sizeof(float));
+    const int first_resolve_eye =
+        g_config.engine_taau_reverse_eye_order ? 0 : 1;
     if (g_config.engine_taau_pure_camera_motion_all ||
         (g_config.engine_taau_first_eye_pure_camera_motion &&
             hmd_motion.matched_eye == first_resolve_eye)) {
-        // This row translation is otherwise unused by the correction output.
         hmd_constants[15] = 1.0f;
     }
     const float symmetric_half_tangent_y =
         tanf(hmd_motion.vertical_fov_degrees *
             (3.14159265358979323846f / 360.0f));
-    // V1132 proved that pose/pair timing is exact. Its remaining head-motion
-    // scale/shift came from reconstructing rays around symmetric NDC zero even
-    // when native stereo rendered an off-axis frustum. Use the same immutable
-    // pair-FOV descriptor already validated for the private resolve jitter.
     const float projection_constants[6] = {
         private_resolve_jitter_valid
             ? private_resolve_descriptor.center_ndc_x : 0.0f,
@@ -20163,7 +20530,8 @@ bool dispatch_taau_inplace_marker(
             : symmetric_half_tangent_y,
         hmd_motion.near_plane,
         hmd_motion.far_plane};
-    memcpy(hmd_constants + 24, projection_constants, sizeof(projection_constants));
+    memcpy(hmd_constants + 24, projection_constants,
+        sizeof(projection_constants));
     memcpy(constants.data() + 32, hmd_constants, sizeof(hmd_constants));
 
     TaauComposeSlot* compose_slot{};
@@ -20177,7 +20545,7 @@ bool dispatch_taau_inplace_marker(
         return false;
     }
     auto* compose_heap = compose_slot->heap;
-    auto* original_mvec_snapshot = compose_slot->snapshot;
+    original_mvec_snapshot = compose_slot->snapshot;
 
     auto cpu = compose_heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC original_srv{};
@@ -20232,17 +20600,23 @@ bool dispatch_taau_inplace_marker(
     command_list->ResourceBarrier(static_cast<UINT>(std::size(to_compute)), to_compute);
 
     ID3D12DescriptorHeap* marker_heaps[] = {compose_heap};
-    command_list->SetDescriptorHeaps(1, marker_heaps);
-    command_list->SetComputeRootSignature(g_taau_mvec_root_signature);
-    command_list->SetPipelineState(g_taau_mvec_pipeline);
-    command_list->SetComputeRootDescriptorTable(0,
+    set_descriptor_heaps(1, marker_heaps);
+    set_compute_root_signature(g_taau_mvec_root_signature);
+    set_pipeline_state(g_taau_mvec_pipeline);
+    set_compute_table(0,
         compose_heap->GetGPUDescriptorHandleForHeapStart());
     auto output_gpu = compose_heap->GetGPUDescriptorHandleForHeapStart();
     output_gpu.ptr += static_cast<UINT64>(2) * g_taau_mvec_descriptor_increment;
-    command_list->SetComputeRootDescriptorTable(1, output_gpu);
+    set_compute_table(1, output_gpu);
     const auto mvec_desc = original_mvec.resource->GetDesc();
-    command_list->SetComputeRoot32BitConstants(
-        2, static_cast<UINT>(constants.size()), constants.data(), 0);
+    if (observe_internal_bindings) {
+        command_list->SetComputeRoot32BitConstants(
+            2, static_cast<UINT>(constants.size()), constants.data(), 0);
+    } else {
+        g_set_compute_root_32bit_constants(
+            command_list, 2, static_cast<UINT>(constants.size()),
+            constants.data(), 0);
+    }
     g_dispatch(command_list,
         static_cast<UINT>((mvec_desc.Width + 7) / 8),
         static_cast<UINT>((mvec_desc.Height + 7) / 8), 1);
@@ -20259,14 +20633,18 @@ bool dispatch_taau_inplace_marker(
     to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     command_list->ResourceBarrier(1, &to_srv);
+    }
 
     ID3D12DescriptorHeap* original_heaps[] = {
         snapshot.cbv_srv_uav_heap, snapshot.sampler_heap};
-    command_list->SetDescriptorHeaps(static_cast<UINT>(std::size(original_heaps)), original_heaps);
-    command_list->SetComputeRootSignature(snapshot.compute_root_signature);
-    command_list->SetPipelineState(snapshot.pipeline_state);
-    for (UINT root = 0; root < 4; ++root) {
-        command_list->SetComputeRootDescriptorTable(root, snapshot.compute_tables[root]);
+    if (!exact_native_full_motion) {
+        set_descriptor_heaps(
+            static_cast<UINT>(std::size(original_heaps)), original_heaps);
+        set_compute_root_signature(snapshot.compute_root_signature);
+        set_pipeline_state(snapshot.pipeline_state);
+        for (UINT root = 0; root < 4; ++root) {
+            set_compute_table(root, snapshot.compute_tables[root]);
+        }
     }
 
     bool isolated_history_dispatch{};
@@ -20371,13 +20749,7 @@ bool dispatch_taau_inplace_marker(
                     hmd_motion.previous_matched_pair_id));
         }
 
-        D3D12_CPU_DESCRIPTOR_HANDLE source_cbv{};
-        D3D12_CPU_DESCRIPTOR_HANDLE source_srv{};
-        D3D12_CPU_DESCRIPTOR_HANDLE source_uav{};
-        if (eye_history != nullptr &&
-            taau_table_cpu_handle(snapshot, snapshot.compute_tables[0], 14, source_cbv) &&
-            taau_table_cpu_handle(snapshot, snapshot.compute_tables[1], 16, source_srv) &&
-            taau_table_cpu_handle(snapshot, snapshot.compute_tables[3], 4, source_uav)) {
+        if (eye_history != nullptr && source_tables_found) {
             uint32_t slot_index{};
             if (!acquire_taau_override_slot(command_list, slot_index)) {
                 const auto failure = g_taau_health_history_fallback.fetch_add(
@@ -20418,17 +20790,18 @@ bool dispatch_taau_inplace_marker(
                     private_cb10_cpu);
             if (native_asymmetric_noaa_route_active() &&
                 temporal_backend_is_taau() && !private_resolve_cb10_written) {
-                static std::atomic<uint32_t> private_cb10_failures{};
-                const uint32_t failure = private_cb10_failures.fetch_add(
-                    1, std::memory_order_relaxed) + 1;
-                if (g_config.runtime_diagnostics &&
-                    (failure <= 16 || failure % 120 == 0)) {
-                    log_taau_trace_line(
-                        "TAAU private resolve CB10 rejected failure=%u eye=%d pair=%llu slot=%u",
-                        failure, hmd_motion.matched_eye,
-                        static_cast<unsigned long long>(
-                            hmd_motion.matched_pair_id),
-                        slot_index);
+                if (g_config.runtime_diagnostics) {
+                    static std::atomic<uint32_t> private_cb10_failures{};
+                    const uint32_t failure = private_cb10_failures.fetch_add(
+                        1, std::memory_order_relaxed) + 1;
+                    if (failure <= 16 || failure % 120 == 0) {
+                        log_taau_trace_line(
+                            "TAAU private resolve CB10 rejected failure=%u eye=%d pair=%llu slot=%u",
+                            failure, hmd_motion.matched_eye,
+                            static_cast<unsigned long long>(
+                                hmd_motion.matched_pair_id),
+                            slot_index);
+                    }
                 }
             }
 
@@ -20446,18 +20819,18 @@ bool dispatch_taau_inplace_marker(
             }
 
             ID3D12DescriptorHeap* override_heaps[] = {override_heap, snapshot.sampler_heap};
-            command_list->SetDescriptorHeaps(
+            set_descriptor_heaps(
                 static_cast<UINT>(std::size(override_heaps)), override_heaps);
-            command_list->SetComputeRootSignature(snapshot.compute_root_signature);
-            command_list->SetPipelineState(snapshot.pipeline_state);
-            command_list->SetComputeRootDescriptorTable(0,
+            set_compute_root_signature(snapshot.compute_root_signature);
+            set_pipeline_state(snapshot.pipeline_state);
+            set_compute_table(0,
                 D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
                     static_cast<UINT64>(kTaauCbvOffset) * g_taau_descriptor_increment});
-            command_list->SetComputeRootDescriptorTable(1,
+            set_compute_table(1,
                 D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
                     static_cast<UINT64>(kTaauSrvOffset) * g_taau_descriptor_increment});
-            command_list->SetComputeRootDescriptorTable(2, snapshot.compute_tables[2]);
-            command_list->SetComputeRootDescriptorTable(3,
+            set_compute_table(2, snapshot.compute_tables[2]);
+            set_compute_table(3,
                 D3D12_GPU_DESCRIPTOR_HANDLE{private_gpu.ptr +
                     static_cast<UINT64>(kTaauUavOffset) * g_taau_descriptor_increment});
             g_dispatch(command_list, x, y, z);
@@ -20488,11 +20861,13 @@ bool dispatch_taau_inplace_marker(
                 eye_history->initialized = true;
                 eye_history->last_pair_id = hmd_motion.matched_pair_id;
                 eye_history->last_present = hmd_motion.matched_present;
-                eye_history->last_command_list = command_list;
-                eye_history->last_native_output = native_output.resource;
-                eye_history->last_native_history = native_history.resource;
-                eye_history->last_cb10_gpu_va = cb10.gpu_va;
-                eye_history->last_cb10_hash = cb10_hash;
+                if (resolve_diagnostics) {
+                    eye_history->last_command_list = command_list;
+                    eye_history->last_native_output = native_output.resource;
+                    eye_history->last_native_history = native_history.resource;
+                    eye_history->last_cb10_gpu_va = cb10.gpu_va;
+                    eye_history->last_cb10_hash = cb10_hash;
+                }
             }
             if (!history_was_initialized &&
                 history_eye >= 0 && history_eye <= 1) {
@@ -20512,10 +20887,10 @@ bool dispatch_taau_inplace_marker(
                 }
             }
 
-            command_list->SetDescriptorHeaps(
+            set_descriptor_heaps(
                 static_cast<UINT>(std::size(original_heaps)), original_heaps);
             for (UINT root = 0; root < 4; ++root) {
-                command_list->SetComputeRootDescriptorTable(root, snapshot.compute_tables[root]);
+                set_compute_table(root, snapshot.compute_tables[root]);
             }
             isolated_history_dispatch = true;
             static std::atomic<uint32_t> isolated_history_logs{};
@@ -20534,10 +20909,11 @@ bool dispatch_taau_inplace_marker(
         const auto failure = g_taau_health_history_fallback.fetch_add(
             1, std::memory_order_relaxed) + 1;
         log_taau_early_failure("history", failure);
-        // The custom motion pass has already overwritten t7. A native resolve
-        // with a missing private-history route would combine half of each path.
-        // Restore the exact snapshot and let hook_dispatch issue the untouched
-        // native resolve instead.
+        // The custom motion pass has already overwritten t7 only on the legacy
+        // fallback path. Restore that snapshot before issuing the untouched
+        // native resolve. The exact-native V14002 path never changed t7 and can
+        // fail open directly without a second full-texture copy.
+        if (!exact_native_full_motion) {
         D3D12_RESOURCE_BARRIER restore_to_copy[2]{};
         restore_to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         restore_to_copy[0].Transition.pResource = original_mvec.resource;
@@ -20562,12 +20938,16 @@ bool dispatch_taau_inplace_marker(
             restore_to_copy[1].Transition.StateAfter);
         command_list->ResourceBarrier(
             static_cast<UINT>(std::size(restore_to_copy)), restore_to_copy);
+        }
         return false;
     }
     if ((taau_resolve_runtime_diagnostics_active() ||
             taau_drop_diagnostics_active()) &&
         g_taau_override_log_count.fetch_add(1) < 12) {
-        log_taau_trace_line("TAAU in-place HMD motion composed mvec=%p command_list=%p",
+        log_taau_trace_line(
+            exact_native_full_motion
+                ? "TAAU exact native motion preserved mvec=%p command_list=%p"
+                : "TAAU in-place HMD motion composed mvec=%p command_list=%p",
             original_mvec.resource, command_list);
     }
     if (taau_resolve_runtime_diagnostics_active() ||
@@ -29069,9 +29449,10 @@ void trace_native_camera_authority(
         changed ? 1 : 0);
 }
 
-// [FIX:DLSS-NATIVE-PER-EYE-HISTORY V9416 1/4] Retain only REDengine's native
-// frame time here. Eye and pair ownership are established later, after the
-// final HMD pose, projection and stereo offset have been applied.
+// [FIX:MODE3-TAAU-NATIVE-FULL-MOTION V14000 2/8] Retain REDengine's native
+// frame time for the established DLSS route and Mode-3 TAAU. Eye and pair
+// ownership are established later, after the final HMD pose, projection and
+// stereo offset have been applied.
 void* __fastcall hook_engine_temporal_camera_build(
     void* history,
     float time,
@@ -29085,7 +29466,8 @@ void* __fastcall hook_engine_temporal_camera_build(
     void* result = g_engine_temporal_camera_build(
         history, time, position, rotation, fov, aspect,
         near_plane, far_plane, projection_scale);
-    if (dlss_sequential_mode_active() && std::isfinite(time)) {
+    if (engine_native_per_eye_temporal_history_active() &&
+        std::isfinite(time)) {
         g_engine_temporal_camera_build_time.store(
             time, std::memory_order_relaxed);
         g_engine_temporal_camera_build_time_valid.store(
@@ -29099,9 +29481,13 @@ bool prepare_engine_per_eye_native_temporal_history(
     uintptr_t caller_rva,
     bool temporal_scene_camera) {
     constexpr uintptr_t kViewFactoryReturnRva = 0x0162196D;
+    const bool mode3_taau_full_motion =
+        mode3_taau_native_full_motion_active();
     if (view == nullptr || caller_rva != kViewFactoryReturnRva ||
-        !temporal_scene_camera || !dlss_sequential_mode_active() ||
-        (!g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        !temporal_scene_camera ||
+        !engine_native_per_eye_temporal_history_active() ||
+        (!mode3_taau_full_motion &&
+            !g_engine_dual_render_active.load(std::memory_order_acquire) &&
             !mode1_aer_transport_active()) ||
         g_engine_menu_state.load(std::memory_order_relaxed) != 0 ||
         g_engine_temporal_camera_build == nullptr) {
@@ -29151,14 +29537,25 @@ bool prepare_engine_per_eye_native_temporal_history(
         slot.valid = true;
     }
 
+    // [FIX:MODE3-TAAU-EXACT-PAIR-LEDGER V14001 2/3] Publish the exact pair into
+    // its bounded per-eye slot. A later producer may advance without erasing
+    // the authority still needed by an older asynchronous resolve.
+    if (mode3_taau_full_motion) {
+        g_mode3_taau_native_history_prepared_pairs[
+            static_cast<size_t>(eye)][
+                pair_id % kMode3TaauNativeHistoryStampCount].store(
+                    pair_id, std::memory_order_release);
+    }
+
     if (g_config.runtime_diagnostics) {
         const uint8_t eye_bit = static_cast<uint8_t>(1u << eye);
         if ((g_engine_per_eye_temporal_camera_logged_mask.fetch_or(
                 eye_bit, std::memory_order_relaxed) & eye_bit) == 0) {
             log_line(
-                "V9416 native per-eye temporal history active "
-                "eye=%d pair=%llu continued=%u",
-                eye, static_cast<unsigned long long>(pair_id),
+                "V14003 native per-eye temporal history active "
+                "backend=%s eye=%d pair=%llu continued=%u",
+                mode3_taau_full_motion ? "taau" : "dlss", eye,
+                static_cast<unsigned long long>(pair_id),
                 continued ? 1u : 0u);
         }
     }
@@ -30378,9 +30775,10 @@ void __fastcall hook_engine_view_rebuild(float* view) {
                 reinterpret_cast<const uint8_t*>(view),
                 asymmetric_factory_pending->pre_rebuild);
     }
-    // [FIX:DLSS-NATIVE-PER-EYE-HISTORY V9416 2/4] Snapshot the exact final
+    // [FIX:MODE3-TAAU-NATIVE-FULL-MOTION V14000 3/8] Snapshot the exact final
     // camera sent to REDengine and install the previous snapshot belonging to
-    // this same eye before the native motion-vector matrix is rebuilt.
+    // this same eye before the native motion-vector matrix is rebuilt. This is
+    // the V9416 DLSS producer correction shared with Mode-3 TAAU.
     prepare_engine_per_eye_native_temporal_history(
         view, caller_rva, temporal_scene_camera);
     g_engine_view_rebuild(view);
@@ -32173,11 +32571,12 @@ void install_engine_world_vector_to_view_ratio_hook() {
     }
 }
 
-// [FIX:DLSS-NATIVE-PER-EYE-HISTORY V9416 3/4] REDengine's constructor is
+// [FIX:MODE3-TAAU-NATIVE-FULL-MOTION V14000 7/8] REDengine's constructor is
 // reused to create a byte-compatible 0xB0 temporal record from the final
-// corrected camera. Logging remains fully dependent on Diagnostic Logging.
+// corrected camera for both the existing DLSS route and Mode-3 TAAU. Logging
+// remains fully dependent on Diagnostic Logging.
 void install_engine_temporal_camera_builder_hook() {
-    if (!dlss_sequential_mode_active() ||
+    if (!engine_native_per_eye_temporal_history_active() ||
         g_engine_temporal_camera_build != nullptr) {
         return;
     }
@@ -32195,19 +32594,20 @@ void install_engine_temporal_camera_builder_hook() {
         MH_EnableHook(target) == MH_OK;
     if (g_config.runtime_diagnostics) {
         log_line(
-            "V9416 REDengine temporal camera builder %s "
-            "RVA=0x%llX target=%p",
+            "V14003 REDengine temporal camera builder %s "
+            "RVA=0x%llX target=%p backend=%s",
             installed ? "hooked" : "hook failed",
             static_cast<unsigned long long>(
                 kEngineTemporalCameraBuildRva),
-            target);
+            target,
+            mode3_taau_native_full_motion_active() ? "taau" : "dlss");
     }
 }
 
 void install_engine_view_factory_probe() {
     if ((!g_config.engine_view_factory_probe &&
             g_config.engine_factory_stereo_offset == 0.0f &&
-            !dlss_sequential_mode_active()) ||
+            !engine_native_per_eye_temporal_history_active()) ||
         g_engine_view_rebuild != nullptr) {
         return;
     }
@@ -32536,6 +32936,13 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
         false, std::memory_order_release);
     g_engine_per_eye_temporal_camera_logged_mask.store(
         0, std::memory_order_relaxed);
+    // [FIX:MODE3-TAAU-EXACT-PAIR-LEDGER V14001 3/3] A producer-generation
+    // transition invalidates every retained preparation authority.
+    for (auto& eye_stamps : g_mode3_taau_native_history_prepared_pairs) {
+        for (auto& stamp : eye_stamps) {
+            stamp.store(0, std::memory_order_release);
+        }
+    }
     g_taau_packed_core_prearmed.store(
         enabled && taau_functional_hooks_needed(),
         std::memory_order_relaxed);
@@ -36058,7 +36465,7 @@ void ensure_initialized() {
         // [FEATURE:PUREDARK-AFW-DLSS V12004 6/6] The identity line makes the
         // active AFW scope and fail-open base unambiguous in a bounded run.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1140 base=V1139 hud_editor_text_scale=subtitle_dialog_multiplicative anchor_smoothing=lateral_vertical_only anchor_depth_smoothing=0 anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f clean_first_person=1 stationary_body_turn=always_on first_person_strafe_ini=%d distance_converged_reticle=1 first_person_projectile_release_convergence=1 first_person_distance_converged_aim=1 combat_locked_view=1 native_head_first_person=1 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 cinema_aspect_selectable=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_cinema_hud=1 cinema_backend_independent_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1141 bases=V1140+V14003 taau_hot_path=lean_snapshot_lazy_legacy internal_bindings=direct_release gpu_va_cache=generation_guarded command_reset=targeted mode3_taau_native_full_motion=1 mode3_taau_exact_pair_ledger=ring64 mode3_taau_exact_native_compose=skipped legacy_taau_motion_fallback=retained mode3_taau_motion_policy=aer_and_stereo_shared native_taau_mvec_passthrough=direct native_taau_per_eye_0xb0_history=1 hud_editor_text_scale=subtitle_dialog_multiplicative anchor_smoothing=lateral_vertical_only anchor_depth_smoothing=0 anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f clean_first_person=1 stationary_body_turn=always_on first_person_strafe_ini=%d distance_converged_reticle=1 first_person_projectile_release_convergence=1 first_person_distance_converged_aim=1 combat_locked_view=1 native_head_first_person=1 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 cinema_aspect_selectable=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_hud_projection_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 g_config.engine_first_person_anchor_smoothing ? 1 : 0,
                 g_config.engine_first_person_anchor_smoothing_seconds,
                 g_config.engine_first_person_strafe ? 1 : 0,
