@@ -590,12 +590,15 @@ bool mode3_hud_descriptor_hooks_needed() {
     return retained_hud_projection_route_configured();
 }
 
+bool native_temporal_terrain_motion_route_active();
+
 bool descriptor_metadata_hooks_needed() {
     return taau_metadata_hooks_needed() ||
         mode3_hud_descriptor_hooks_needed() ||
         effect_gpu_probe_available() ||
         focus_projection_metadata_hooks_needed() ||
-        asymmetric_tiled_culling_fix_needed();
+        asymmetric_tiled_culling_fix_needed() ||
+        native_temporal_terrain_motion_route_active();
 }
 
 bool graphics_binding_hooks_needed() {
@@ -3159,6 +3162,46 @@ struct PipelineInfo {
     D3D12_BLEND dest_blend{D3D12_BLEND_ZERO};
     D3D12_BLEND_OP blend_op{D3D12_BLEND_OP_ADD};
 };
+
+// [FIX:NATIVE-TEMPORAL-TERRAIN-MOTION V15014] The extensive floor uses one
+// exact terrain PATCH PSO. Its original pixel shader writes the invalid
+// (2,2) fallback sentinel to the RGBA16F velocity MRT even though the domain
+// shader exports the world position needed for a real current-to-history
+// vector. Keep the original material draw intact and register a second PSO
+// that writes only that velocity target.
+constexpr uint64_t kNativeTemporalTerrainVsHash = 0x5D723F550153F88Bull;
+constexpr uint64_t kNativeTemporalTerrainHsHash = 0x5B33D68BABD52A7Eull;
+constexpr uint64_t kNativeTemporalTerrainDsHash = 0x4793F519D8E9F837ull;
+constexpr uint64_t kNativeTemporalTerrainPsHash = 0x377A600256A9EEC2ull;
+constexpr size_t kNativeTemporalTerrainReplayPsoSlotCount = 256;
+constexpr size_t kNativeTemporalTerrainReplayPsoProbeCount = 16;
+constexpr uintptr_t kNativeTemporalTerrainReplayPsoClaimed = ~uintptr_t{};
+constexpr uint32_t kNativeTemporalTerrainCameraBindingRootCbv = 1;
+constexpr uint32_t kNativeTemporalTerrainCameraBindingTable = 2;
+
+struct NativeTemporalTerrainCameraBinding {
+    uint32_t kind{};
+    uint32_t root{};
+    uint32_t descriptor_offset{};
+};
+
+struct NativeTemporalTerrainReplayPsoSlot {
+    std::atomic<uintptr_t> original{};
+    std::atomic<ID3D12PipelineState*> replay{};
+    ID3D12RootSignature* root_signature{};
+    uint32_t camera_source_kind{};
+    uint32_t camera_source_root{};
+    uint32_t camera_source_offset{};
+    uint32_t camera_target_kind{};
+    uint32_t camera_target_root{};
+    uint32_t camera_target_offset{};
+};
+
+std::array<NativeTemporalTerrainReplayPsoSlot,
+    kNativeTemporalTerrainReplayPsoSlotCount> g_native_temporal_terrain_replay_psos{};
+std::once_flag g_native_temporal_terrain_motion_shader_once{};
+IDxcBlob* g_native_temporal_terrain_motion_shader{};
+std::atomic<uint32_t> g_native_temporal_terrain_motion_binding_failure_logs{};
 
 // [DIAG:ASYMMETRIC-EFFECT-GPU V1049 2/8] Keep three independent bounded
 // partitions so a busy left-eye stream cannot consume the right-eye or
@@ -9175,6 +9218,549 @@ void dump_shader_bytecode(const char* stage, uint64_t hash, const D3D12_SHADER_B
         bytecode.BytecodeLength,
         written,
         dump_path);
+}
+
+// [FIX:NATIVE-TEMPORAL-TERRAIN-MOTION V15014] The exact terrain replay is
+// functional renderer state, independent of Diagnostic Logging. It applies to
+// Mode-3 AER and strict Stereo with DLSS or TAAU, plus Mode-1 PureDark AFW
+// DLSS. Other backends and the cinema panel stay excluded.
+bool native_temporal_terrain_motion_route_active() {
+    const bool native_mode3_temporal =
+        native_asymmetric_noaa_route_active() &&
+        (g_config.temporal_backend == TemporalBackend::Dlss ||
+            g_config.temporal_backend == TemporalBackend::Taau);
+    const bool mode1_afw_dlss =
+        puredark_afw_dlss_route_active() &&
+        g_config.temporal_backend == TemporalBackend::Dlss;
+    return (native_mode3_temporal || mode1_afw_dlss) &&
+        !native_asymmetric_cinema_panel_active();
+}
+
+bool initialize_dxc();
+
+// Match the complete terrain PS input signature so TEXCOORD2 remains register
+// 2 instead of being repacked to register 0. REDengine exposes the terrain
+// material constants to the pixel stage at b6 and the camera constants to the
+// domain stage at b1. Compile against the already pixel-visible b6 slot; the
+// replay aliases the bound camera descriptor/CBV onto that slot for one draw
+// and restores the original material binding immediately afterward.
+bool native_temporal_terrain_visibility_matches(
+    D3D12_SHADER_VISIBILITY visibility, bool pixel_stage) {
+    return visibility == D3D12_SHADER_VISIBILITY_ALL ||
+        visibility == (pixel_stage
+            ? D3D12_SHADER_VISIBILITY_PIXEL
+            : D3D12_SHADER_VISIBILITY_DOMAIN);
+}
+
+bool find_native_temporal_terrain_cbv_binding(
+    const RootSignatureInfo& root_info, UINT shader_register,
+    bool pixel_stage, NativeTemporalTerrainCameraBinding& binding) {
+    binding = {};
+    for (UINT root = 0; root < root_info.parameters.size() && root < 32;
+         ++root) {
+        const auto& parameter = root_info.parameters[root];
+        if (!native_temporal_terrain_visibility_matches(
+                parameter.visibility, pixel_stage)) {
+            continue;
+        }
+        if (parameter.type == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+            parameter.shader_register == shader_register &&
+            parameter.register_space == 0) {
+            binding.kind = kNativeTemporalTerrainCameraBindingRootCbv;
+            binding.root = root;
+            return true;
+        }
+        if (parameter.type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+            continue;
+        }
+        UINT appended_offset{};
+        for (const auto& range : parameter.ranges) {
+            const UINT resolved_offset =
+                range.offset == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                ? appended_offset : range.offset;
+            if (range.type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+                range.register_space == 0 &&
+                shader_register >= range.base_shader_register &&
+                (range.num_descriptors == UINT_MAX ||
+                 shader_register - range.base_shader_register <
+                    range.num_descriptors)) {
+                const UINT local =
+                    shader_register - range.base_shader_register;
+                if (resolved_offset <= UINT_MAX - local) {
+                    binding.kind = kNativeTemporalTerrainCameraBindingTable;
+                    binding.root = root;
+                    binding.descriptor_offset = resolved_offset + local;
+                    return true;
+                }
+            }
+            if (range.num_descriptors != UINT_MAX &&
+                resolved_offset <= UINT_MAX - range.num_descriptors) {
+                appended_offset = resolved_offset + range.num_descriptors;
+            }
+        }
+    }
+    return false;
+}
+
+bool resolve_native_temporal_terrain_camera_bindings(
+    ID3D12RootSignature* root_signature,
+    NativeTemporalTerrainCameraBinding& source,
+    NativeTemporalTerrainCameraBinding& target) {
+    RootSignatureInfo root_info{};
+    {
+        std::scoped_lock lock{g_reverse_mutex};
+        const auto found = g_root_signature_infos.find(root_signature);
+        if (found == g_root_signature_infos.end()) {
+            return false;
+        }
+        root_info = found->second;
+    }
+    return find_native_temporal_terrain_cbv_binding(root_info, 1, false, source) &&
+        find_native_temporal_terrain_cbv_binding(root_info, 6, true, target) &&
+        source.root != target.root;
+}
+
+// Rows 0..3 are the current world-to-clip transform and rows 4..7 are the
+// history transform. Disassembly of the paired ordinary GBuffer shaders
+// EDFD76797EB58077/BB5967B70E8594BF proves TEXCOORD0 is also SV_Position
+// (current), TEXCOORD1 is history, and REDengine writes:
+//   X = (currentNdc.x - historyNdc.x) * 0.5
+//   Y = (currentNdc.y - historyNdc.y) * -0.5
+// Use that same native subtraction order.
+IDxcBlob* compile_native_temporal_terrain_motion_pixel_shader() {
+    std::call_once(g_native_temporal_terrain_motion_shader_once, []() {
+        if (!initialize_dxc()) {
+            log_line("Terrain motion shader unavailable: DXC initialization failed");
+            return;
+        }
+        static constexpr char kShaderSource[] = R"(
+cbuffer CameraShaderConsts : register(b6) {
+    float4 cameraRows[44];
+};
+struct PixelInput {
+    float4 terrainData0 : TEXCOORD0;
+    nointerpolation int4 terrainData1 : TEXCOORD1;
+    float3 worldPosition : TEXCOORD2;
+    bool frontFace : SV_IsFrontFace;
+};
+float4 projectWorld(float3 worldPosition, uint firstRow) {
+    float4 worldPoint = float4(worldPosition, 1.0);
+    return float4(
+        dot(cameraRows[firstRow + 0], worldPoint),
+        dot(cameraRows[firstRow + 1], worldPoint),
+        dot(cameraRows[firstRow + 2], worldPoint),
+        dot(cameraRows[firstRow + 3], worldPoint));
+}
+float4 ps_main(PixelInput input) : SV_Target3 {
+    float4 currentClip = projectWorld(input.worldPosition, 0);
+    float4 historyClip = projectWorld(input.worldPosition, 4);
+    float3 currentNdc = currentClip.xyz / currentClip.w;
+    float3 historyNdc = historyClip.xyz / historyClip.w;
+    float3 currentMinusHistory = currentNdc - historyNdc;
+    return float4(
+        currentMinusHistory.x * 0.5,
+        currentMinusHistory.y * -0.5,
+        currentMinusHistory.z,
+        1.0);
+}
+)";
+        DxcBuffer source{
+            kShaderSource, sizeof(kShaderSource) - 1, DXC_CP_UTF8};
+        LPCWSTR arguments[] = {
+            L"-E", L"ps_main", L"-T", L"ps_6_0", L"-O3"};
+        IDxcResult* result{};
+        if (FAILED(g_dxc_compiler->Compile(
+                &source, arguments,
+                static_cast<UINT32>(std::size(arguments)), nullptr,
+                IID_PPV_ARGS(&result))) || result == nullptr) {
+            log_line("Terrain motion shader compile call failed");
+            return;
+        }
+        HRESULT status{};
+        result->GetStatus(&status);
+        if (FAILED(status)) {
+            IDxcBlobUtf8* errors{};
+            result->GetOutput(
+                DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+            log_line("Terrain motion shader compile failed: %s",
+                errors != nullptr
+                    ? errors->GetStringPointer()
+                    : "unknown");
+            if (errors != nullptr) {
+                errors->Release();
+            }
+            result->Release();
+            return;
+        }
+        if (FAILED(result->GetOutput(
+                DXC_OUT_OBJECT,
+                IID_PPV_ARGS(&g_native_temporal_terrain_motion_shader),
+                nullptr))) {
+            g_native_temporal_terrain_motion_shader = nullptr;
+        }
+        result->Release();
+    });
+    return g_native_temporal_terrain_motion_shader;
+}
+
+bool native_temporal_terrain_pipeline_matches(
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    if (desc.PrimitiveTopologyType !=
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH ||
+        desc.NumRenderTargets != 4 ||
+        desc.RTVFormats[0] != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        desc.RTVFormats[1] != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        desc.RTVFormats[2] != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        desc.RTVFormats[3] != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        desc.DSVFormat != DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+        desc.GS.pShaderBytecode != nullptr || desc.GS.BytecodeLength != 0) {
+        return false;
+    }
+    return hash_shader_bytecode(desc.VS) == kNativeTemporalTerrainVsHash &&
+        hash_shader_bytecode(desc.HS) == kNativeTemporalTerrainHsHash &&
+        hash_shader_bytecode(desc.DS) == kNativeTemporalTerrainDsHash &&
+        hash_shader_bytecode(desc.PS) == kNativeTemporalTerrainPsHash;
+}
+
+void register_native_temporal_terrain_replay_pso(
+    ID3D12PipelineState* original, ID3D12PipelineState* replay,
+    ID3D12RootSignature* root_signature,
+    const NativeTemporalTerrainCameraBinding& source,
+    const NativeTemporalTerrainCameraBinding& target) {
+    if (original == nullptr || replay == nullptr) {
+        return;
+    }
+    const auto original_key = reinterpret_cast<uintptr_t>(original);
+    const size_t base = (original_key >> 4) &
+        (kNativeTemporalTerrainReplayPsoSlotCount - 1);
+    for (size_t probe = 0;
+         probe < kNativeTemporalTerrainReplayPsoProbeCount; ++probe) {
+        auto& slot = g_native_temporal_terrain_replay_psos[
+            (base + probe) & (kNativeTemporalTerrainReplayPsoSlotCount - 1)];
+        auto value = slot.original.load(std::memory_order_acquire);
+        if (value == original_key) {
+            slot.root_signature = root_signature;
+            slot.camera_source_kind = source.kind;
+            slot.camera_source_root = source.root;
+            slot.camera_source_offset = source.descriptor_offset;
+            slot.camera_target_kind = target.kind;
+            slot.camera_target_root = target.root;
+            slot.camera_target_offset = target.descriptor_offset;
+            slot.replay.store(replay, std::memory_order_release);
+            return;
+        }
+        if (value == 0) {
+            uintptr_t expected{};
+            if (slot.original.compare_exchange_strong(
+                    expected, kNativeTemporalTerrainReplayPsoClaimed,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                slot.root_signature = root_signature;
+                slot.camera_source_kind = source.kind;
+                slot.camera_source_root = source.root;
+                slot.camera_source_offset = source.descriptor_offset;
+                slot.camera_target_kind = target.kind;
+                slot.camera_target_root = target.root;
+                slot.camera_target_offset = target.descriptor_offset;
+                slot.replay.store(replay, std::memory_order_release);
+                slot.original.store(original_key, std::memory_order_release);
+                return;
+            }
+        }
+    }
+    log_line("Terrain motion PSO registry overflow original=%p replay=%p",
+        original, replay);
+}
+
+const NativeTemporalTerrainReplayPsoSlot* lookup_native_temporal_terrain_replay_pso(
+    ID3D12PipelineState* original) {
+    if (original == nullptr || !native_temporal_terrain_motion_route_active()) {
+        return nullptr;
+    }
+    const auto original_key = reinterpret_cast<uintptr_t>(original);
+    const size_t base = (original_key >> 4) &
+        (kNativeTemporalTerrainReplayPsoSlotCount - 1);
+    for (size_t probe = 0;
+         probe < kNativeTemporalTerrainReplayPsoProbeCount; ++probe) {
+        const auto& slot = g_native_temporal_terrain_replay_psos[
+            (base + probe) & (kNativeTemporalTerrainReplayPsoSlotCount - 1)];
+        const auto value = slot.original.load(std::memory_order_acquire);
+        if (value == original_key) {
+            return slot.replay.load(std::memory_order_acquire) != nullptr
+                ? &slot : nullptr;
+        }
+        if (value == 0) {
+            return nullptr;
+        }
+    }
+    return nullptr;
+}
+
+// Keep the complete original PSO descriptor and replace only the pixel shader,
+// retaining the exact input signature linkage and terrain register layout.
+void create_native_temporal_terrain_motion_replay_pso(
+    ID3D12Device* device, ID3D12PipelineState* original,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    if (device == nullptr || original == nullptr ||
+        !native_temporal_terrain_pipeline_matches(desc)) {
+        return;
+    }
+    auto* shader = compile_native_temporal_terrain_motion_pixel_shader();
+    if (shader == nullptr) {
+        return;
+    }
+    NativeTemporalTerrainCameraBinding camera_source{};
+    NativeTemporalTerrainCameraBinding camera_target{};
+    if (!resolve_native_temporal_terrain_camera_bindings(
+            desc.pRootSignature, camera_source, camera_target)) {
+        log_line(
+            "Terrain motion camera bindings unavailable original=%p rs=%p expected=ds_b1_to_ps_b6",
+            original, desc.pRootSignature);
+        return;
+    }
+    auto replay_desc = desc;
+    replay_desc.PS = D3D12_SHADER_BYTECODE{
+        shader->GetBufferPointer(), shader->GetBufferSize()};
+    replay_desc.CachedPSO = {};
+
+    ID3D12PipelineState* replay{};
+    const auto hr = g_create_graphics_pipeline_state(
+        device, &replay_desc, IID_PPV_ARGS(&replay));
+    if (FAILED(hr) || replay == nullptr) {
+        log_line(
+            "Terrain motion replay PSO creation failed original=%p hr=0x%08X source=%u:%u+%u target=%u:%u+%u state=original input_signature=terrain_exact",
+            original, static_cast<unsigned>(hr),
+            camera_source.kind, camera_source.root,
+            camera_source.descriptor_offset, camera_target.kind,
+            camera_target.root, camera_target.descriptor_offset);
+        return;
+    }
+    register_native_temporal_terrain_replay_pso(
+        original, replay, desc.pRootSignature, camera_source, camera_target);
+}
+
+struct NativeTemporalTerrainCameraRestore {
+    uint32_t kind{};
+    uint32_t root{};
+    D3D12_GPU_VIRTUAL_ADDRESS cbv{};
+    D3D12_GPU_DESCRIPTOR_HANDLE table{};
+};
+
+bool resolve_native_temporal_terrain_table_descriptor(
+    const DlssGraphicsStateSnapshot& state,
+    D3D12_GPU_DESCRIPTOR_HANDLE table, UINT descriptor_offset,
+    D3D12_GPU_DESCRIPTOR_HANDLE& descriptor, UINT32& stage) {
+    stage = 1;
+    if (table.ptr == 0 || state.cbv_srv_uav_heap == nullptr ||
+        state.cbv_descriptor_increment == 0 ||
+        state.cbv_gpu_start.ptr == 0 || state.cbv_descriptor_count == 0 ||
+        descriptor_offset >
+            (UINT64_MAX - table.ptr) / state.cbv_descriptor_increment) {
+        return false;
+    }
+    descriptor.ptr = table.ptr +
+        static_cast<UINT64>(descriptor_offset) *
+            state.cbv_descriptor_increment;
+    const UINT64 heap_bytes =
+        static_cast<UINT64>(state.cbv_descriptor_count) *
+            state.cbv_descriptor_increment;
+    if (descriptor.ptr < state.cbv_gpu_start.ptr ||
+        descriptor.ptr - state.cbv_gpu_start.ptr >= heap_bytes ||
+        (descriptor.ptr - state.cbv_gpu_start.ptr) %
+            state.cbv_descriptor_increment != 0) {
+        stage = 2;
+        return false;
+    }
+    return true;
+}
+
+bool alias_native_temporal_terrain_camera(
+    ID3D12GraphicsCommandList* command_list,
+    const NativeTemporalTerrainReplayPsoSlot& slot,
+    NativeTemporalTerrainCameraRestore& restore, UINT32& stage) {
+    stage = 10;
+    const auto* state = access_dlss_graphics_state(command_list, false);
+    if (state == nullptr || state->root_signature != slot.root_signature ||
+        slot.camera_source_root >= state->cbv.size() ||
+        slot.camera_target_root >= state->cbv.size()) {
+        return false;
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE source_descriptor{};
+    D3D12_GPU_VIRTUAL_ADDRESS source_cbv{};
+    if (slot.camera_source_kind == kNativeTemporalTerrainCameraBindingTable) {
+        if (!resolve_native_temporal_terrain_table_descriptor(
+                *state, state->tables[slot.camera_source_root],
+                slot.camera_source_offset, source_descriptor, stage)) {
+            stage += 10;
+            return false;
+        }
+    } else if (
+        slot.camera_source_kind == kNativeTemporalTerrainCameraBindingRootCbv) {
+        source_cbv = state->cbv[slot.camera_source_root];
+        if (source_cbv == 0) {
+            stage = 21;
+            return false;
+        }
+    } else {
+        stage = 22;
+        return false;
+    }
+
+    restore.root = slot.camera_target_root;
+    if (slot.camera_target_kind == kNativeTemporalTerrainCameraBindingTable) {
+        stage = 30;
+        if (source_descriptor.ptr == 0 ||
+            g_set_graphics_root_descriptor_table == nullptr ||
+            state->tables[slot.camera_target_root].ptr == 0) {
+            return false;
+        }
+        const UINT64 target_byte_offset =
+            static_cast<UINT64>(slot.camera_target_offset) *
+                state->cbv_descriptor_increment;
+        if (source_descriptor.ptr < target_byte_offset) {
+            stage = 31;
+            return false;
+        }
+        D3D12_GPU_DESCRIPTOR_HANDLE alias_table{
+            source_descriptor.ptr - target_byte_offset};
+        D3D12_GPU_DESCRIPTOR_HANDLE target_descriptor{};
+        if (!resolve_native_temporal_terrain_table_descriptor(
+                *state, alias_table, slot.camera_target_offset,
+                target_descriptor, stage) ||
+            target_descriptor.ptr != source_descriptor.ptr) {
+            stage += 30;
+            return false;
+        }
+        restore.kind = kNativeTemporalTerrainCameraBindingTable;
+        restore.table = state->tables[slot.camera_target_root];
+        g_set_graphics_root_descriptor_table(
+            command_list, slot.camera_target_root, alias_table);
+        return true;
+    }
+
+    if (slot.camera_target_kind == kNativeTemporalTerrainCameraBindingRootCbv) {
+        stage = 40;
+        if (g_set_graphics_root_cbv == nullptr) {
+            return false;
+        }
+        if (source_cbv == 0) {
+            if (source_descriptor.ptr < state->cbv_gpu_start.ptr ||
+                state->cbv_descriptor_increment == 0 ||
+                state->cbv_cpu_start.ptr == 0) {
+                stage = 41;
+                return false;
+            }
+            const UINT64 descriptor_index =
+                (source_descriptor.ptr - state->cbv_gpu_start.ptr) /
+                    state->cbv_descriptor_increment;
+            CbvDescriptorInfo cbv{};
+            if (descriptor_index >= state->cbv_descriptor_count ||
+                !load_cbv_descriptor(
+                    state->cbv_cpu_start.ptr +
+                        static_cast<SIZE_T>(descriptor_index) *
+                            state->cbv_descriptor_increment,
+                    cbv) || cbv.gpu_va == 0) {
+                stage = 42;
+                return false;
+            }
+            source_cbv = cbv.gpu_va;
+        }
+        restore.kind = kNativeTemporalTerrainCameraBindingRootCbv;
+        restore.cbv = state->cbv[slot.camera_target_root];
+        if (restore.cbv == 0) {
+            stage = 43;
+            return false;
+        }
+        g_set_graphics_root_cbv(
+            command_list, slot.camera_target_root, source_cbv);
+        return true;
+    }
+    stage = 50;
+    return false;
+}
+
+void restore_native_temporal_terrain_camera(
+    ID3D12GraphicsCommandList* command_list,
+    const NativeTemporalTerrainCameraRestore& restore) {
+    if (restore.kind == kNativeTemporalTerrainCameraBindingTable) {
+        g_set_graphics_root_descriptor_table(
+            command_list, restore.root, restore.table);
+    } else if (restore.kind == kNativeTemporalTerrainCameraBindingRootCbv) {
+        g_set_graphics_root_cbv(command_list, restore.root, restore.cbv);
+    }
+}
+
+void log_native_temporal_terrain_binding_failure(
+    ID3D12PipelineState* original, UINT32 stage) {
+    if (g_config.runtime_diagnostics &&
+        g_native_temporal_terrain_motion_binding_failure_logs.fetch_add(
+            1, std::memory_order_relaxed) < 16) {
+        log_line(
+            "Terrain motion camera alias failed original=%p stage=%u present=%llu",
+            original, stage,
+            static_cast<unsigned long long>(
+                g_present_count.load(std::memory_order_relaxed)));
+    }
+}
+
+void replay_native_temporal_terrain_indexed_motion(
+    ID3D12GraphicsCommandList* command_list,
+    UINT index_count_per_instance, UINT instance_count,
+    UINT start_index_location, INT base_vertex_location,
+    UINT start_instance_location) {
+    if (command_list == nullptr || g_set_pipeline_state == nullptr ||
+        g_draw_indexed_instanced == nullptr) {
+        return;
+    }
+    auto* original = load_command_list_pipeline(command_list);
+    const auto* slot = lookup_native_temporal_terrain_replay_pso(original);
+    if (slot == nullptr) {
+        return;
+    }
+    auto* replay = slot->replay.load(std::memory_order_acquire);
+    NativeTemporalTerrainCameraRestore restore{};
+    UINT32 alias_stage{};
+    if (!alias_native_temporal_terrain_camera(
+            command_list, *slot, restore, alias_stage)) {
+        log_native_temporal_terrain_binding_failure(original, alias_stage);
+        return;
+    }
+    g_set_pipeline_state(command_list, replay);
+    g_draw_indexed_instanced(
+        command_list, index_count_per_instance, instance_count,
+        start_index_location, base_vertex_location, start_instance_location);
+    g_set_pipeline_state(command_list, original);
+    restore_native_temporal_terrain_camera(command_list, restore);
+}
+
+void replay_native_temporal_terrain_nonindexed_motion(
+    ID3D12GraphicsCommandList* command_list,
+    UINT vertex_count_per_instance, UINT instance_count,
+    UINT start_vertex_location, UINT start_instance_location) {
+    if (command_list == nullptr || g_set_pipeline_state == nullptr ||
+        g_draw_instanced == nullptr) {
+        return;
+    }
+    auto* original = load_command_list_pipeline(command_list);
+    const auto* slot = lookup_native_temporal_terrain_replay_pso(original);
+    if (slot == nullptr) {
+        return;
+    }
+    auto* replay = slot->replay.load(std::memory_order_acquire);
+    NativeTemporalTerrainCameraRestore restore{};
+    UINT32 alias_stage{};
+    if (!alias_native_temporal_terrain_camera(
+            command_list, *slot, restore, alias_stage)) {
+        log_native_temporal_terrain_binding_failure(original, alias_stage);
+        return;
+    }
+    g_set_pipeline_state(command_list, replay);
+    g_draw_instanced(
+        command_list, vertex_count_per_instance, instance_count,
+        start_vertex_location, start_instance_location);
+    g_set_pipeline_state(command_list, original);
+    restore_native_temporal_terrain_camera(command_list, restore);
 }
 
 void load_geometry_shift_shaders() {
@@ -15807,6 +16393,10 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
         info.blend_op = blend.BlendOp;
     }
 
+    // Create the motion-only correction beside the exact original terrain PSO.
+    // Generated PSOs call the real function pointer and cannot recurse here.
+    create_native_temporal_terrain_motion_replay_pso(device, pso, *desc);
+
     const auto stereo_dump_candidate =
         (info.vs_hash == 0xEDFD76797EB58077ull && info.ps_hash == 0xBB5967B70E8594BFull) ||
         (info.vs_hash == 0xA6D5EB4C9688AB1Bull && info.ps_hash == 0xA04F949CEF867EA0ull) ||
@@ -18690,6 +19280,13 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
         if (focus_fire_selected != nullptr) {
             g_set_pipeline_state(command_list, focus_fire_original);
         }
+        // The material draw has completed. Replay the exact same indexed
+        // terrain geometry with the motion-only PSO, then restore the original
+        // PSO before returning.
+        replay_native_temporal_terrain_indexed_motion(
+            command_list, index_count_per_instance, instance_count,
+            start_index_location, base_vertex_location,
+            start_instance_location);
         return;
     }
 
@@ -18745,6 +19342,10 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
     if (focus_fire_selected != nullptr) {
         g_set_pipeline_state(command_list, focus_fire_original);
     }
+    replay_native_temporal_terrain_indexed_motion(
+        command_list, index_count_per_instance, instance_count,
+        start_index_location, base_vertex_location,
+        start_instance_location);
     if (publish_packed_after_draw) {
         const bool published = publish_packed_dlss_output_after_draw(command_list);
         const uint64_t candidate = g_streamline_transition_publish_candidate;
@@ -19760,6 +20361,11 @@ void STDMETHODCALLTYPE hook_draw_instanced(
         instance_count,
         start_vertex_location,
         start_instance_location);
+    // Cover the non-indexed PATCH form as well; the exact terrain PSO was never
+    // observed through ExecuteIndirect during isolation.
+    replay_native_temporal_terrain_nonindexed_motion(
+        command_list, vertex_count_per_instance, instance_count,
+        start_vertex_location, start_instance_location);
     // [FIX:RETAINED-CINEMA-HUD-PREVIOUS-FRAME V1123 2/3] Commit the marker
     // only after the real scene-only draw has executed. If the current HUD
     // pair is incomplete, get_mode3_early_hud_pair() already falls back to the
@@ -38087,17 +38693,19 @@ void ensure_initialized() {
             temporal_backend_is_dlss() ? 1u : 0u,
             reverse_diagnostic_hooks_requested() ? 1u : 0u,
             g_config.openxr_mode);
-        // [FEATURE:PUREDARK-AFW-DLSS V12004 6/6] The identity line makes the
-        // active AFW scope and fail-open base unambiguous in a bounded run.
+        // This identity marker is diagnostic-only. The terrain route and its
+        // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
-            log_line("witcher3vr dxgi proxy initialized build=V1142 bases=V1141+V12081 taau_hot_path=lean_snapshot_lazy_legacy internal_bindings=direct_release gpu_va_cache=generation_guarded command_reset=targeted mode3_taau_native_full_motion=1 mode3_taau_exact_pair_ledger=ring64 mode3_taau_exact_native_compose=skipped legacy_taau_motion_fallback=retained mode3_taau_motion_policy=aer_and_stereo_shared native_taau_mvec_passthrough=direct native_taau_per_eye_0xb0_history=1 hud_editor_text_scale=subtitle_dialog_multiplicative anchor_smoothing=lateral_vertical_only anchor_depth_smoothing=0 anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f clean_first_person=1 stationary_body_turn=always_on first_person_strafe_ini=%d distance_converged_reticle=1 first_person_projectile_release_convergence=1 first_person_distance_converged_aim=1 combat_locked_view=1 native_head_first_person=1 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 cinema_aspect_selectable=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_hud_projection_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
+            log_line("witcher3vr dxgi proxy initialized build=V1143 bases=V1142+V15014 taau_hot_path=lean_snapshot_lazy_legacy internal_bindings=direct_release gpu_va_cache=generation_guarded command_reset=targeted mode3_taau_native_full_motion=1 mode3_taau_exact_pair_ledger=ring64 mode3_taau_exact_native_compose=skipped legacy_taau_motion_fallback=retained mode3_taau_motion_policy=aer_and_stereo_shared native_taau_mvec_passthrough=direct native_taau_per_eye_0xb0_history=1 hud_editor_text_scale=subtitle_dialog_multiplicative anchor_smoothing=lateral_vertical_only anchor_depth_smoothing=0 anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f clean_first_person=1 stationary_body_turn=always_on first_person_strafe_ini=%d distance_converged_reticle=1 first_person_projectile_release_convergence=1 first_person_distance_converged_aim=1 combat_locked_view=1 native_head_first_person=1 mode3_aer_presentation=%d mode3_aer_producer=single_natural_frame mode3_aer_policy=old_plus_new_per_eye mode3_stereo_policy=complete_pair taau_present_authority=exact_submitted_eye_pair diagnostic_text_logging=restored mode3_pose_timeline=disabled native_stereo_shader_log=diagnostic mode1_legacy_present=1 mode1_afw_enabled=%d native_stereo_dlss=sequential_private_ngx_jitter native_dlss_pair_input_mask=1 native_dlss_packed=0 cinema_effect_center_guard=panel_only cinema_menu_hud_draw_guard=1 cinema_aspect_selectable=1 native_focus_draw_eye_authority=shared_b1_camera native_focus_recording_epoch_cache=1 taau_b12_jitter_eye_reject=1 native_stereo_taau_asymmetric_motion_projection=1 native_stereo_taau_full_512b_cb10=1 native_stereo_taau_complete_private_cb10=1 native_stereo_taau_pair_fov_resolve_jitter=1 native_stereo_taau_private_resolve_jitter=1 native_stereo_taau_shared_center=1 native_stereo_taau_split_jitter_projection=1 native_stereo_taau_single_center=1 retained_cinema_hud_previous_frame=1 scene_only_draw_epoch_marker=1 vr_shadow_default=extreme_plus render_proxy_distance_authority=gameplay_camera all_mode3_backends=1 retained_hud_projection_route=1 command_list_reset_epoch=1 amd_static_root_vertices=1 native_stereo_flag_separate=1 fullscreen_projection_all_modes=1 alternate_presentation_resize_experimental=1 alternate_default=0 post_video_full_vr_bootstrap=complete launcher_utf16_filelist_fix=1 djules_xr_allocator_round_robin=46aedda djules_producer_wait_on_address=19fe298 djules_descriptor_increment_cache=6645501 djules_persistent_log_handle=8c43ba0 producer_spin_us=200 rotating_xr_allocators=3 full_queue_drain_per_submit=0 projection_default=legacy post_loading_recenter_ms=2000 asymmetric_tiled_culling_remap=1 target_compute_psos=2 isolated_cb12=1 exact_grid_translation=1 inverse_projection_compensation=1 descriptor_slots=256 clean_native_mvec_history=1 native_mvec_passthrough=1 per_eye_redengine_history=1 persistent_registry=%d real_smoke_owner=world_up_specialized",
                 g_config.engine_first_person_anchor_smoothing ? 1 : 0,
                 g_config.engine_first_person_anchor_smoothing_seconds,
                 g_config.engine_first_person_strafe ? 1 : 0,
                 g_config.mode3_aer_presentation ? 1 : 0,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
-            log_line("V1142 AFW import source=V12081 afw_native_inputs=fail_open_disabled afw_projection=absolute_asymmetric_source_and_destination mode3_dlss_afw_mvec=normal mode3_dlss_afw_asymmetric_transition=defer_until_generated_peer mode3_dlss_afw_producer_clock=canonical_gameplay_frame mode3_dlss_afw=input_fifo_exact_color mode3_dlss_afw_fifo_latency=ready_present_age mode3_dlss_afw_latency=one_present mode3_dlss_afw_presentation=current_queued_immutable_pair mode3_dlss_afw_mode=combined_warping mode3_dlss_afw_order=ngx_bundle_then_shared_xr_evaluate_publish_draw mode3_afw_native_order=disabled_after_xr_close_failure mode3_taau_afw=fail_open_native_aer mode3_noaa_afw=fail_open_native_aer afw_visual_debug=F6");
+            log_line("V1143 retained AFW source=V12081 afw_native_inputs=fail_open_disabled afw_projection=absolute_asymmetric_source_and_destination mode3_dlss_afw_mvec=normal mode3_dlss_afw_asymmetric_transition=defer_until_generated_peer mode3_dlss_afw_producer_clock=canonical_gameplay_frame mode3_dlss_afw=input_fifo_exact_color mode3_dlss_afw_fifo_latency=ready_present_age mode3_dlss_afw_latency=one_present mode3_dlss_afw_presentation=current_queued_immutable_pair mode3_dlss_afw_mode=combined_warping mode3_dlss_afw_order=ngx_bundle_then_shared_xr_evaluate_publish_draw mode3_afw_native_order=disabled_after_xr_close_failure mode3_taau_afw=fail_open_native_aer mode3_noaa_afw=fail_open_native_aer afw_visual_debug=F6");
+            log_line(
+                "V1143 native temporal terrain motion source=V15014 mode3_taau_native_full_motion=1 taau_terrain_replay=aer_and_stereo native_temporal_terrain_motion=1 diagnostic_independent=1 diagnostic_off_log_io=none camera_binding=ds_b1_to_ps_b6_alias exact_tuple=5D723F550153F88B,5B33D68BABD52A7E,4793F519D8E9F837,377A600256A9EEC2 motion_formula=current_ndc_minus_history_ndc velocity_target=rt3_only overlay_psos=inherit_base_motion afw_compatible=1");
         }
     });
 }
@@ -46239,9 +46847,6 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
         bootstrap_until != UINT64_MAX && frame >= bootstrap_until) {
         g_taau_descriptor_bootstrap_active.store(false, std::memory_order_relaxed);
     }
-    // F5-F7 are intentionally not polled by the renderer. F7 belongs to the
-    // Witcher input action that switches the HUD profile, including when
-    // diagnostic logging is enabled.
     // [FIX:FIRST-PERSON-SPLIT-HOTKEYS 1/1] F8 owns only main/near.
     // F11 owns first-person as an independent toggle, removing the fragile
     // three-state counter shared with the companion WitcherScript.
