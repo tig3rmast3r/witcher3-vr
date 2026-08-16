@@ -16,8 +16,7 @@
 namespace w3vr {
 namespace {
 
-constexpr std::array<ModeSettings, 6> kModes{{
-    {3, true, true, "none", 0, false},
+constexpr std::array<ModeSettings, 5> kModes{{
     {3, true, true, "taau", 3, false},
     {3, true, true, "dlss", 6, true},
     {3, true, false, "none", 0, false},
@@ -25,7 +24,7 @@ constexpr std::array<ModeSettings, 6> kModes{{
     {3, true, false, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 10;
+constexpr int kCurrentConfigVersion = 12;
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
 constexpr float kFullVrHudReferenceScale = 1.00f;
@@ -81,6 +80,13 @@ void RemoveObsoleteSettings(IniDocument& ini) {
     ini.Remove("openxr", "cinema_subtitle_stereo_shift_px");
     ini.Remove("engine", "streamline_ps93_learning_log");
     ini.Remove("engine", "first_person_stationary_turn");
+    ini.Remove("engine", "gamepad_select_recenter");
+    ini.Remove("engine", "gamepad_select_first_person");
+    ini.Remove("engine", "streamline_mvec_probe");
+    ini.Remove("engine", "streamline_output_probe");
+    ini.Remove("engine", "streamline_mvec_correction");
+    ini.Remove("engine", "streamline_reconstruct_camera_motion");
+    ini.Remove("engine", "streamline_force_camera_mvec");
 }
 
 void MigrateConfigurationToV2(IniDocument& ini) {
@@ -297,6 +303,117 @@ void MigrateConfigurationToV10(IniDocument& ini) {
             "engine", "first_person_anchor_smoothing_seconds", "0.200000");
     }
     RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "10");
+}
+
+void MigrateConfigurationToV11(IniDocument& ini) {
+    // The launcher now owns both halves of Ray Tracing. Preserve an existing
+    // opt-in only on the supported AER + AFW / DLSS route; every other mode
+    // starts from the safe disabled state and Save also clears the game flag.
+    const bool supported_route = ReadBool(
+        ini, "openxr", "mode3_aer_presentation", false) &&
+        ReadString(ini, "engine", "temporal_backend", "none") == "dlss";
+    const bool enabled = supported_route && ReadBool(
+        ini, "engine", "raytracing_enabled", false);
+    ini.Set("engine", "raytracing_enabled", enabled ? "1" : "0");
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "11");
+}
+
+void NormalizeLauncherOwnedConfiguration(IniDocument& ini) {
+    // Every supported launcher mode now uses the validated Mode-3 dual-render
+    // producer. Repair stale route fragments left by older launchers without
+    // touching user-owned resolution, HUD or renderer-tuning values.
+    auto backend = ReadString(ini, "engine", "temporal_backend", "none");
+    if (backend == "dlss_packed") backend = "dlss";
+    if (backend != "none" && backend != "taau" && backend != "dlss") {
+        backend = "none";
+    }
+    bool aer = ReadBool(
+        ini, "openxr", "mode3_aer_presentation", false);
+    if (backend == "none") aer = false;
+
+    ini.Set("openxr", "enabled", "1");
+    ini.Set("openxr", "mode", "3");
+    ini.Set("openxr", "mode3_aer_presentation", aer ? "1" : "0");
+    ini.Set("engine", "temporal_backend", backend);
+    ini.Set("engine", "dual_render_probe", "1");
+    ini.Set("engine", "dual_render_start", "1");
+    ini.Set("engine", "menu_state_probe", "1");
+
+    const bool ray_tracing = aer && backend == "dlss" && ReadBool(
+        ini, "engine", "raytracing_enabled", false);
+    ini.Set("engine", "raytracing_enabled", ray_tracing ? "1" : "0");
+
+    const bool native_stereo = ReadBool(
+        ini, "openxr", "native_stereo", false);
+    const float presentation_scale = ReadFloat(
+        ini, "openxr", "presentation_scale", 1.0f);
+    const bool alternate_resize =
+        !native_stereo && presentation_scale < 0.9999f && ReadBool(
+            ini, "openxr", "alternate_presentation_resize", false);
+    const bool fullscreen_projection = alternate_resize || ReadBool(
+        ini, "openxr", "fullscreen_projection", false);
+    ini.Set("openxr", "native_stereo", native_stereo ? "1" : "0");
+    ini.Set("openxr", "alternate_presentation_resize",
+        alternate_resize ? "1" : "0");
+    ini.Set("openxr", "fullscreen_projection",
+        fullscreen_projection ? "1" : "0");
+
+    // Diagnostic Logging is one launcher switch. A partial pair inherited
+    // from an old INI is safer normalized to off than allowed to resurrect a
+    // stale low-level probe on a later diagnostic run.
+    const bool diagnostics =
+        ReadBool(ini, "debug", "logging_enabled", false) &&
+        ReadBool(ini, "debug", "runtime_diagnostics", false);
+    constexpr std::array<const char*, 8> kDiagnosticKeys{{
+        "logging_enabled",
+        "runtime_diagnostics",
+        "taau_drop_diagnostics",
+        "cinema_camera_diagnostics",
+        "cinema_subtitle_diagnostics",
+        "first_person_state_diagnostics",
+        "first_person_aim_diagnostics",
+        "world_marker_diagnostics",
+    }};
+    for (const auto* key : kDiagnosticKeys) {
+        ini.Set("debug", key, diagnostics ? "1" : "0");
+    }
+
+    constexpr std::array<const char*, 9> kReverseProbeKeys{{
+        "enabled",
+        "scan_periodic",
+        "scan_unmap",
+        "cbv_probe",
+        "active_nudge",
+        "orbit_probe",
+        "copy_probe",
+        "stereo_probe",
+        "geometry_shift",
+    }};
+    for (const auto* key : kReverseProbeKeys) {
+        ini.Set("reverse", key, "0");
+    }
+
+    constexpr std::array<const char*, 7> kEngineDiagnosticKeys{{
+        "view_probe",
+        "frame_builder_probe",
+        "gameplay_entry_probe",
+        "scene_enqueue_probe",
+        "view_factory_probe",
+        "frame_factory_probe",
+        "streamline_trace",
+    }};
+    for (const auto* key : kEngineDiagnosticKeys) {
+        ini.Set("engine", key, "0");
+    }
+    RemoveObsoleteSettings(ini);
+}
+
+void MigrateConfigurationToV12(IniDocument& ini) {
+    // Full normalization runs after missing values have been materialized from
+    // the embedded defaults, so a partial legacy INI retains its migrated mode.
+    RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
 
@@ -348,7 +465,9 @@ RenderMode BestEffortMode(
     if (backend == "taau") return aer ? RenderMode::AerAfwTaau : RenderMode::StereoTaau;
     if (backend == "dlss_packed") return RenderMode::StereoDlssSequential;
     if (backend == "dlss") return aer ? RenderMode::AerAfwDlss : RenderMode::StereoDlssSequential;
-    return aer ? RenderMode::AerAfwNone : RenderMode::StereoNone;
+    // AER without AA has no AFW implementation and is intentionally retired.
+    // Keep the same AA family while falling back to full Stereo.
+    return RenderMode::StereoNone;
 }
 
 struct EditableTextLine {
@@ -871,8 +990,7 @@ const ModeSettings& SettingsForMode(RenderMode mode) {
 
 const wchar_t* ModeDisplayName(RenderMode mode) {
     constexpr const wchar_t* names[]{
-        L"AER - No AA / FXAA", L"AER - TAAU",
-        L"AER - DLSS",
+        L"AER + AFW - TAAU", L"AER + AFW - DLSS",
         L"Stereo - No AA / FXAA", L"Stereo - TAAU",
         L"Stereo - DLSS"};
     return names[static_cast<size_t>(mode)];
@@ -886,12 +1004,21 @@ bool ModeUsesDlss(RenderMode mode) {
 bool ModeUsesStereo(RenderMode mode) {
     // Both launcher families now use Mode-3 geometry stereo. AER changes only
     // producer/publication cadence, so native stereo remains available to all.
-    return mode == RenderMode::AerAfwNone ||
-        mode == RenderMode::AerAfwTaau ||
+    return mode == RenderMode::AerAfwTaau ||
         mode == RenderMode::AerAfwDlss ||
         mode == RenderMode::StereoNone ||
         mode == RenderMode::StereoTaau ||
         mode == RenderMode::StereoDlssSequential;
+}
+
+bool ModeSupportsRayTracing(RenderMode mode) {
+    return mode == RenderMode::AerAfwDlss;
+}
+
+bool AlternatePresentationResizeAvailable(
+    RenderMode mode, bool native_stereo, float presentation_scale) {
+    return ModeUsesStereo(mode) && !native_stereo &&
+        std::isfinite(presentation_scale) && presentation_scale < 0.9999f;
 }
 
 int CinemaHudConvergenceShift(float hud_scale, int offset) {
@@ -1024,11 +1151,19 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         if (existing_version < 10) {
             MigrateConfigurationToV10(migrated);
         }
+        if (existing_version < 11) {
+            MigrateConfigurationToV11(migrated);
+        }
+        if (existing_version < 12) {
+            MigrateConfigurationToV12(migrated);
+        }
         // This is deliberately independent from version migration: extending
         // the default template must heal a partial current-version INI on the
         // very next launcher start, without overwriting manual tuning.
         migrated.FillMissingFrom(defaults);
-        RemoveObsoleteSettings(migrated);
+        NormalizeLauncherOwnedConfiguration(migrated);
+        migrated.Set(
+            "meta", "config_version", std::to_string(kCurrentConfigVersion));
         const auto serialized = migrated.Serialize();
         if (serialized == existing->Serialize()) {
             return true;
@@ -1195,8 +1330,13 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     } else {
         result.state.mode = BestEffortMode(
             xr_mode, mode3_aer_presentation, backend);
-        result.warning = L"The current AA/stereo settings are inconsistent. "
-            L"The closest mode is displayed; no files are changed until Save.";
+        const bool retired_aer_no_aa =
+            (mode3_aer_presentation || legacy_aer_mode) && backend == "none";
+        result.warning = retired_aer_no_aa
+            ? L"AER + AFW has no No AA implementation. Stereo - No AA / FXAA "
+                L"is selected; no files are changed until Save."
+            : L"The current AA/stereo settings are inconsistent. The closest "
+                L"mode is displayed; no files are changed until Save.";
     }
 
     result.state.width = ReadInt(*vr, "openxr", "render_width", 2688);
@@ -1209,6 +1349,9 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         dlss_dlaa && ModeUsesDlss(result.state.mode)
         ? 0
         : std::clamp(saved_dlss_quality, 1, 4);
+    result.state.ray_tracing = ModeSupportsRayTracing(result.state.mode) &&
+        ReadBool(*vr, "engine", "raytracing_enabled", false) &&
+        ReadBool(*game, "Rendering/RT", "EnableRT", false);
     result.state.hud_convergence_delta = std::clamp(
         ReadInt(*vr, "openxr", "hud_stereo_shift_px", -36) + 16, -64, 64);
     result.state.presentation_scale = std::clamp(
@@ -1249,7 +1392,7 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         ? snap_turn_degrees
         : 45;
     result.state.first_person_combat_exit = ReadBool(
-        *vr, "engine", "first_person_combat_exit", true);
+        *vr, "engine", "first_person_combat_exit", false);
     result.state.first_person_strafe = ReadBool(
         *vr, "engine", "first_person_strafe", true);
     result.state.first_person_anchor_smoothing = ReadBool(
@@ -1302,12 +1445,17 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     // geometry in every supported stereo mode.
     const bool native_stereo_active =
         state.native_stereo && ModeUsesStereo(state.mode);
+    const bool alternate_presentation_resize_active =
+        state.alternate_presentation_resize &&
+        AlternatePresentationResizeAvailable(
+            state.mode, native_stereo_active, state.presentation_scale);
     vr_ini.Set("openxr", "native_stereo",
         native_stereo_active ? "1" : "0");
     vr_ini.Set("openxr", "fullscreen_projection",
-        state.fullscreen_projection ? "1" : "0");
+        state.fullscreen_projection || alternate_presentation_resize_active
+            ? "1" : "0");
     vr_ini.Set("openxr", "alternate_presentation_resize",
-        state.alternate_presentation_resize ? "1" : "0");
+        alternate_presentation_resize_active ? "1" : "0");
     vr_ini.Set("openxr", "hud_stereo_shift_px",
         std::to_string(std::clamp(state.hud_convergence_delta - 16, -256, 256)));
     vr_ini.Set("openxr", "presentation_scale", FloatString(
@@ -1341,6 +1489,10 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("engine", "dual_render_probe", mode.dual_render ? "1" : "0");
     vr_ini.Set("engine", "dual_render_start", mode.dual_render ? "1" : "0");
     vr_ini.Set("engine", "temporal_backend", mode.temporal_backend);
+    const bool ray_tracing_active =
+        state.ray_tracing && ModeSupportsRayTracing(state.mode);
+    vr_ini.Set("engine", "raytracing_enabled",
+        ray_tracing_active ? "1" : "0");
     // One experimental launcher option owns both cooperating F11 controls.
     // Keeping them equal avoids a persistent snap preview without its
     // continuous native-camera follower, or the inverse partial state.
@@ -1381,16 +1533,9 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         state.diagnostic_logging ? "1" : "0");
     vr_ini.Set("debug", "world_marker_diagnostics",
         state.diagnostic_logging ? "1" : "0");
-    // [FIX:FUNCTIONAL-REVERSE-ROUTE 2/2] Functional renderer hooks no longer
-    // depend on the historical reverse master. Clear manual release-era
-    // workarounds on every launcher save while preserving individual probes.
-    vr_ini.Set("reverse", "enabled", "0");
-    // Remove the two pre-release compositor snap-turn keys. V831/V838 use the
-    // first-person native-camera controls in [engine]; retaining these ignored
-    // aliases makes migrated user INIs misleading.
-    // Remove distributed trial keys that no longer have a runtime consumer.
-    // Keep all other unmanaged renderer values intact.
-    RemoveObsoleteSettings(vr_ini);
+    // Repair stale route fragments and diagnostic probes while preserving all
+    // unrelated advanced tuning.
+    NormalizeLauncherOwnedConfiguration(vr_ini);
     vr_ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 
     game_settings.Set("Viewport", "Resolution", "\"" +
@@ -1402,6 +1547,8 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
             : std::clamp(state.dlss_quality, 1, 4)));
     game_settings.Set("Rendering", "AllowDLSS",
         mode.allow_dlss ? "true" : "false");
+    game_settings.Set("Rendering/RT", "EnableRT",
+        ray_tracing_active ? "true" : "false");
     // The DLC remains installed; REDengine's native DLC switch keeps its
     // animation-behavior mounter dormant when the launcher option is disabled.
     game_settings.Set("DLC", "DlcEnabled_movementinputfix",

@@ -31,6 +31,7 @@ as a runtime dependency.
 | TAAU | Working |
 | DLSS | Working |
 | DLAA | Working |
+| Ray tracing | Launcher-controlled on AER + AFW - DLSS only |
 | Custom render resolutions | Working |
 | 6DoF HMD free look | Synchronized with OpenXR |
 | Crossbow HMD aiming | Working |
@@ -64,7 +65,6 @@ The ForceDLAA parameter-query and resolution-override approach is adapted from
 
 ### Not yet implemented
 
-- Ray tracing
 - Screen Space Reflections (High)
 - Far/Distante game camera modes for exploration, combat, and horse riding; only close/near cameras are currently corrected
 
@@ -133,6 +133,17 @@ The bundled Fast Transitions DLC remains installed, while the launcher option
 enable flag. It is enabled by default and can be disabled without removing or
 renaming any files; the change applies on the next game launch.
 
+The launcher exposes only the implemented **AER + AFW - TAAU** and
+**AER + AFW - DLSS** routes; AER without AA is omitted because PureDark AFW is
+not implemented for that backend. AER + AFW uses PureDark alternating-eye
+frame generation for the highest-performance route with minimal artifacts,
+while Stereo renders both eyes for the most stable result.
+
+The **Ray Tracing** option owns both REDengine's master switch and the
+Witcher 3 VR renderer flag. It can be enabled only with
+**AER + AFW - DLSS** and is forced off when any other render mode is saved or
+launched, preventing an incompatible startup configuration.
+
 If `witcher3vr.ini` does not exist, the launcher creates it automatically. The
 first run inherits the game's current supported AA choice as **Stereo No AA /
 FXAA**, **Stereo TAAU**, or **Stereo DLSS**. An unknown AA mode falls back to
@@ -160,18 +171,18 @@ whose borders are still invisible or acceptable for your headset and fit. On
 Quest 3, `0.85` is a good starting point: unless the headset is worn extremely
 close to the lenses, the borders are practically invisible.
 
-The three experimental presentation controls are independent:
+The presentation controls remain independent:
 
-- **Native Stereo** enables asymmetric stereo geometry for every AER and
-  Stereo No AA/TAAU/DLSS choice. Presentation Size remains adjustable: the
+- **Asymmetric Projection** enables native off-axis stereo geometry for every
+  AER + AFW and Stereo No AA/TAAU/DLSS choice. Presentation Size remains adjustable: the
   renderer scales each eye's off-axis FOV around its optical center and submits
   that exact scaled FOV through the same presentation path.
 - **Fullscreen Projection** changes the presentation method for every render
   mode. It defaults to off, so all modes use the validated legacy presenter.
 - **Alternate Presentation Resize** opts into the PR-style resize needed for
-  Virtual Desktop foveated-rendering experiments. It is effective only with
-  Fullscreen Projection and Presentation Size below `1.00`, and defaults to
-  off.
+  Virtual Desktop foveated-rendering experiments. The launcher enables it when
+  Presentation Size is below `1.00` and Asymmetric Projection is off, and turns
+  on its required Fullscreen Projection route automatically.
 
 ## Recommended game settings
 
@@ -202,14 +213,14 @@ currently recommended.
 
 | Setting | Value |
 |---|---|
-| Ray tracing | Off |
+| Ray tracing | Optional only with AER + AFW - DLSS; otherwise forced Off |
 | Screen Space Reflections | Off or Low |
 | Motion blur | Off |
 | Shadow quality | Extreme+ |
 
-The launcher warns when Ray Tracing or SSR High is detected. These settings
-are not changed automatically: disable Ray Tracing and set Screen Space
-Reflections to Low or Off before launching VR.
+The launcher controls Ray Tracing and automatically disables it outside the
+supported AER + AFW - DLSS route. It still warns when SSR High is detected; set
+Screen Space Reflections to Low or Off before launching VR.
 
 The bundled VR profile uses Extreme+ shadows. Lower shadow presets can expose
 VR cascade flicker; Extreme+ is the validated default even though it carries a
@@ -282,8 +293,8 @@ and horse states rather than a fully animation-driven body anchor. Its
 placement may not be ideal for every animation or contextual action; Standard
 third-person view is recommended for combat.
 
-The launcher option **Gamepad Snap Turn + Head Follow (First Person Only,
-Experimental)** enables both gamepad snap turning and continuous headset-based
+The launcher option **Gamepad Snap Turn + Head Follow** in the dedicated
+**First Person** section enables both gamepad snap turning and continuous headset-based
 movement direction while `F11` First Person is active. The snap-turn angle is
 selectable as 30, 45, or 60 degrees and defaults to 45 degrees. The option is
 disabled by default and does not affect Standard, Near, or Cinema views.
@@ -295,19 +306,19 @@ as locomotion begins. Combat, horse riding, swimming, diving, menus, Cinema
 Mode, and cutscenes are excluded from this behavior.
 
 Stationary body turning is always enabled while the safe First Person state is
-active. **Strafe Movement in First Person** independently controls the validated
+active. **Strafe Movement** independently controls the validated
 strafe/backpedal movement policy and defaults to enabled.
 
-**Reduce Head Bobbing (First Person)** smooths only the lateral and vertical
+**Reduce Head Bobbing** smooths only the lateral and vertical
 body anchor while preserving live depth, root and face-clearance correction. It
 defaults to enabled. Its response time remains an advanced INI-only value:
 `engine.first_person_anchor_smoothing_seconds`, default `0.200000` seconds.
 
-The launcher option **Auto switch to third person during combats (First Person
-Only)** automatically switches from First Person to Standard
+The launcher option **Auto switch to third person during combats** automatically
+switches from First Person to Standard
 third-person view when combat begins. After combat has remained inactive for
 10 seconds, it returns to First Person. Manual view changes cancel the pending
-automatic return. This option is enabled by default.
+automatic return. This option is disabled by default.
 
 While First Person is active, aiming temporarily uses the Standard third-person
 camera so the weapon trajectory remains aligned with the crosshair. The view

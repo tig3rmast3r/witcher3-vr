@@ -42169,7 +42169,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1190 base=V1189 taau_afw=V12128 raytracing=V13044 aer_afw_post_hud=scene_only_then_late afw_cinema_hud=baked_restore "
+                "witcher3vr canonical build=V1191 base=V1190 taau_afw=V12128 raytracing=V13044 aer_afw_post_hud=scene_only_then_late afw_cinema_hud=baked_restore "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -42189,7 +42189,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1190 base=V1189 "
+                "witcher3vr dxgi proxy initialized build=V1191 base=V1190 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d "
                 "mode1_afw_enabled=%d persistent_registry=%d",

@@ -1,9 +1,11 @@
 // Witcher3VR per-panel HUD editor - isolated clean-room prototype.
 //
-// SubtitlesModule and DialogModule are scale-only editor panels with guarded
-// examples that never enter real story-scene or menu state. Their local scale
-// multiplies vanilla UI scale; renderer-owned Cinema3D/Full VR zoom remains an
-// independent outer multiplier. InteractionsModule,
+// SubtitlesModule and DialogModule expose independent position and scale banks
+// with editor-only examples that never enter real story-scene state. Their
+// local scale multiplies vanilla UI scale; renderer-owned Cinema3D/Full VR zoom
+// remains an independent outer multiplier. Their ScaleOnly-authored Flash
+// roots receive a non-accumulating direct offset, while world-space oneliners
+// and overhead text stay outside this mod. InteractionsModule,
 // EnemyFocusModule, OnelinersModule, RadialMenuModule, marker projection and
 // crosshair remain outside this mod.
 
@@ -25,7 +27,7 @@ function W3VRHudEditor_DebugChannel(): name
 
 function W3VRHudEditor_Version(): string
 {
-  return "V1140";
+  return "V1192";
 }
 
 function W3VRHudEditor_DebugEnabled(): bool
@@ -479,8 +481,8 @@ class W3VRHudEditorController
     AddDescriptor("TimeLapseModule", "Time Lapse", 'TimeLapseX', 'TimeLapseY', 'TimeLapseScale', true);
     AddDescriptor("TimeLeftModule", "Time Remaining", 'TimeLeftX', 'TimeLeftY', 'TimeLeftScale', true);
     AddDescriptor("TutorialPopup", "Tutorial Messages", 'TutorialX', 'TutorialY', 'TutorialScale', true);
-    AddDescriptor("SubtitlesModule", "Gameplay Subtitles Size", 'SubtitlesX', 'SubtitlesY', 'SubtitlesScale', false, true);
-    AddDescriptor("DialogModule", "Cutscene Text and Dialog Choices Size", 'DialogX', 'DialogY', 'DialogScale', false, true);
+    AddDescriptor("SubtitlesModule", "Gameplay Subtitles", 'SubtitlesX', 'SubtitlesY', 'SubtitlesScale', true);
+    AddDescriptor("DialogModule", "Cutscene Text and Dialog Choices", 'DialogX', 'DialogY', 'DialogScale', true);
   }
 
   private function AddDescriptor(
@@ -527,8 +529,9 @@ class W3VRHudEditorController
     // Capture the live module reference while vanilla publishes it. On this
     // runtime route CHud.GetHudModule() returns NULL even after loading, while
     // CR4ScriptedHud.AddHudModuleReference() still receives every real module.
-    // Dialog/subtitle roots are admitted as scale-only panels. Markers,
-    // interactions, oneliners, radial menu and crosshair stay excluded.
+    // Dialog/subtitle roots are admitted as independently movable fixed-screen
+    // panels. Markers, interactions, world-space oneliners, radial menu and
+    // crosshair stay excluded.
     if ((CR4HudModuleControlsFeedback)module)
       AddSlot(module, "ControlsFeedbackModule", "Controls Feedback", 'ControlsFeedbackX', 'ControlsFeedbackY', 'ControlsFeedbackScale', true);
     else if ((CR4HudModuleHorseStaminaBar)module)
@@ -568,9 +571,9 @@ class W3VRHudEditorController
     else if ((CR4HudModuleTimeLeft)module)
       AddSlot(module, "TimeLeftModule", "Time Remaining", 'TimeLeftX', 'TimeLeftY', 'TimeLeftScale', true);
     else if ((CR4HudModuleSubtitles)module)
-      AddSlot(module, "SubtitlesModule", "Gameplay Subtitles Size", 'SubtitlesX', 'SubtitlesY', 'SubtitlesScale', false, true);
+      AddSlot(module, "SubtitlesModule", "Gameplay Subtitles", 'SubtitlesX', 'SubtitlesY', 'SubtitlesScale', true);
     else if ((CR4HudModuleDialog)module)
-      AddSlot(module, "DialogModule", "Cutscene Text and Dialog Choices Size", 'DialogX', 'DialogY', 'DialogScale', false, true);
+      AddSlot(module, "DialogModule", "Cutscene Text and Dialog Choices", 'DialogX', 'DialogY', 'DialogScale', true);
 
     if (GetLiveModuleCount() != beforeCount)
     {
@@ -1580,15 +1583,6 @@ class W3VRHudEditorController
       return;
     }
 
-    // Dialog and subtitle roots are full-screen ScaleOnly containers. Moving
-    // those roots would fight their internal line/choice layout; V1140 owns
-    // only their multiplicative text size.
-    if (slot.scaleOnly)
-    {
-      ShowEditorLabel();
-      return;
-    }
-
     oldX = slot.GetX(activeProfile);
     oldY = slot.GetY(activeProfile);
     newX = ClampOffset(oldX + deltaX, 3840.0f);
@@ -1772,6 +1766,9 @@ class W3VRHudEditorController
   private function SetModuleTarget(slot: W3VRHudEditorSlot)
   {
     slot.module.w3vr_hud_editor_managed = true;
+    slot.module.w3vr_hud_editor_direct_position =
+      slot.moduleName == "SubtitlesModule" ||
+      slot.moduleName == "DialogModule";
     slot.module.w3vr_hud_editor_target_x = slot.GetX(activeProfile);
     slot.module.w3vr_hud_editor_target_y = slot.GetY(activeProfile);
     slot.module.w3vr_hud_editor_target_scale =
@@ -1781,13 +1778,34 @@ class W3VRHudEditorController
   private function RemoveRegistryTransforms()
   {
     var i: int;
+    var root: CScriptedFlashSprite;
 
     for (i = 0; i < slots.Size(); i += 1)
     {
       if (slots[i] && slots[i].module)
       {
         slots[i].RestoreVisualState();
+        if (
+          slots[i].module.w3vr_hud_editor_direct_position &&
+          slots[i].module.w3vr_hud_editor_direct_base_captured
+        )
+        {
+          root = slots[i].module.GetModuleFlash();
+          if (root)
+          {
+            root.SetX(slots[i].module.w3vr_hud_editor_direct_base_x);
+            root.SetY(slots[i].module.w3vr_hud_editor_direct_base_y);
+            root.SetXScale(
+              slots[i].module.w3vr_hud_editor_direct_base_scale_x
+            );
+            root.SetYScale(
+              slots[i].module.w3vr_hud_editor_direct_base_scale_y
+            );
+          }
+        }
         slots[i].module.w3vr_hud_editor_managed = false;
+        slots[i].module.w3vr_hud_editor_direct_position = false;
+        slots[i].module.w3vr_hud_editor_direct_base_captured = false;
         slots[i].module.SnapToAnchorPosition();
       }
     }
@@ -2077,6 +2095,24 @@ var w3vr_hud_editor_target_y: float;
 var w3vr_hud_editor_target_scale: float;
 
 @addField(CR4HudModuleBase)
+var w3vr_hud_editor_direct_position: bool;
+
+@addField(CR4HudModuleBase)
+var w3vr_hud_editor_direct_base_captured: bool;
+
+@addField(CR4HudModuleBase)
+var w3vr_hud_editor_direct_base_x: float;
+
+@addField(CR4HudModuleBase)
+var w3vr_hud_editor_direct_base_y: float;
+
+@addField(CR4HudModuleBase)
+var w3vr_hud_editor_direct_base_scale_x: float;
+
+@addField(CR4HudModuleBase)
+var w3vr_hud_editor_direct_base_scale_y: float;
+
+@addField(CR4HudModuleBase)
 var w3vr_hud_editor_position_trace_pending: bool;
 
 @addField(CR4HudModuleBase)
@@ -2258,6 +2294,8 @@ function W3VRHudEditorHidePreview()
 @addMethod(CR4HudModuleSubtitles)
 function W3VRHudEditorShowPreview()
 {
+  var root: CScriptedFlashSprite;
+
   if (this.w3vr_hud_editor_preview_active)
   {
     if (theGame.IsDialogOrCutscenePlaying())
@@ -2267,24 +2305,24 @@ function W3VRHudEditorShowPreview()
       this.OnSubtitleRemoved(2000001140);
       this.w3vr_hud_editor_preview_active = false;
     }
-    else if (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
-    {
-      this.W3VRHudEditorHidePreview();
-    }
     return;
   }
-  if (
-    theGame.IsDialogOrCutscenePlaying() ||
-    (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
-  )
+  if (theGame.IsDialogOrCutscenePlaying())
   {
     return;
   }
 
+  root = this.GetModuleFlash();
+  if (root)
+  {
+    root.SetVisible(true);
+    root.SetAlpha(100.0f);
+  }
+
   this.OnSubtitleAdded(
     2000001140,
-    "Geralt",
-    "HUD EDITOR - GAMEPLAY SUBTITLE EXAMPLE",
+    "HUD EDITOR",
+    "LONG SUBTITLE PREVIEW: this deliberately long sample fills the available subtitle width and wraps onto multiple lines, so you can clearly judge the real text area, scale, and position before saving your HUD layout.",
     false
   );
   this.w3vr_hud_editor_preview_active = true;
@@ -2306,6 +2344,7 @@ function W3VRHudEditorShowPreview()
 {
   var choices: array<SSceneChoice>;
   var choice: SSceneChoice;
+  var root: CScriptedFlashSprite;
 
   if (this.w3vr_hud_editor_preview_active)
   {
@@ -2315,18 +2354,18 @@ function W3VRHudEditorShowPreview()
       // flag without hiding or clearing anything owned by that scene.
       this.w3vr_hud_editor_preview_active = false;
     }
-    else if (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
-    {
-      this.W3VRHudEditorHidePreview();
-    }
     return;
   }
-  if (
-    theGame.IsDialogOrCutscenePlaying() ||
-    (theGame.GetGuiManager() && theGame.GetGuiManager().IsAnyMenu())
-  )
+  if (theGame.IsDialogOrCutscenePlaying())
   {
     return;
+  }
+
+  root = this.GetModuleFlash();
+  if (root)
+  {
+    root.SetVisible(true);
+    root.SetAlpha(100.0f);
   }
 
   // Call the internal Flash population path directly: unlike
@@ -2507,11 +2546,77 @@ function UpdateScale(
   flashModule: CScriptedFlashSprite
 ): bool
 {
-  if (this.w3vr_hud_editor_managed)
+  var result: bool;
+
+  // Subtitle and dialog are vanilla ScaleOnly roots. Their ActionScript path
+  // accepts the scale value but does not reliably resize the visible root, so
+  // capture that root before the vanilla refresh and apply the editor scale
+  // directly below. All other modules retain the normal multiplier path.
+  if (
+    this.w3vr_hud_editor_managed &&
+    this.w3vr_hud_editor_direct_position &&
+    flashModule &&
+    !this.w3vr_hud_editor_direct_base_captured
+  )
+  {
+    this.w3vr_hud_editor_direct_base_x = flashModule.GetX();
+    this.w3vr_hud_editor_direct_base_y = flashModule.GetY();
+    this.w3vr_hud_editor_direct_base_scale_x = flashModule.GetXScale();
+    this.w3vr_hud_editor_direct_base_scale_y = flashModule.GetYScale();
+    this.w3vr_hud_editor_direct_base_captured = true;
+  }
+  if (
+    this.w3vr_hud_editor_managed &&
+    !this.w3vr_hud_editor_direct_position
+  )
   {
     scale *= this.w3vr_hud_editor_target_scale;
   }
-  return wrappedMethod(scale, flashModule);
+  result = wrappedMethod(scale, flashModule);
+
+  // Vanilla marks subtitles and dialog as ScaleOnly, so SnapToAnchorPosition()
+  // never dispatches UpdatePosition() for them. Preserve the authored root
+  // position once, then apply the editor offset directly after every vanilla
+  // scale refresh. This moves only these fixed-screen roots; world-space text
+  // remains owned by its separate modules.
+  if (
+    this.w3vr_hud_editor_managed &&
+    this.w3vr_hud_editor_direct_position &&
+    flashModule
+  )
+  {
+    flashModule.SetX(
+      this.w3vr_hud_editor_direct_base_x +
+      this.w3vr_hud_editor_target_x
+    );
+    flashModule.SetY(
+      this.w3vr_hud_editor_direct_base_y +
+      this.w3vr_hud_editor_target_y
+    );
+    flashModule.SetXScale(
+      this.w3vr_hud_editor_direct_base_scale_x *
+      this.w3vr_hud_editor_target_scale
+    );
+    flashModule.SetYScale(
+      this.w3vr_hud_editor_direct_base_scale_y *
+      this.w3vr_hud_editor_target_scale
+    );
+
+    if (this.w3vr_hud_editor_position_trace_pending)
+    {
+      W3VRHudEditor_PersistPositionTrace(
+        'WrapperOutSeq',
+        this.w3vr_hud_editor_position_trace_sequence,
+        this.w3vr_hud_editor_position_trace_name,
+        flashModule.GetX(), flashModule.GetY(),
+        this.w3vr_hud_editor_target_x,
+        this.w3vr_hud_editor_target_y
+      );
+      this.w3vr_hud_editor_position_trace_pending = false;
+    }
+  }
+
+  return result;
 }
 
 @wrapMethod(CR4HudModuleBase)

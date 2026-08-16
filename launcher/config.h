@@ -8,12 +8,12 @@
 namespace w3vr {
 
 enum class RenderMode {
-    AerAfwNone,
     AerAfwTaau,
     AerAfwDlss,
     StereoNone,
     StereoTaau,
     StereoDlssSequential,
+    Count,
 };
 
 enum class CinemaAspect {
@@ -35,6 +35,7 @@ struct LauncherState {
     int width{2688};
     int height{2784};
     int dlss_quality{1};
+    bool ray_tracing{};
     int hud_convergence_delta{-20};
     float presentation_scale{1.0f};
     float menu_scale{0.85f};
@@ -50,7 +51,7 @@ struct LauncherState {
     bool steady_icons{};
     bool first_person_gamepad_head_follow{};
     int first_person_snap_turn_degrees{45};
-    bool first_person_combat_exit{true};
+    bool first_person_combat_exit{false};
     bool first_person_strafe{true};
     bool first_person_anchor_smoothing{true};
     bool fast_movement_transitions{true};
@@ -106,6 +107,9 @@ const ModeSettings& SettingsForMode(RenderMode mode);
 const wchar_t* ModeDisplayName(RenderMode mode);
 bool ModeUsesDlss(RenderMode mode);
 bool ModeUsesStereo(RenderMode mode);
+bool ModeSupportsRayTracing(RenderMode mode);
+bool AlternatePresentationResizeAvailable(
+    RenderMode mode, bool native_stereo, float presentation_scale);
 std::optional<int> DlssNearSquareCompatibleWidth(const LauncherState& state);
 int CinemaHudConvergenceShift(float hud_scale, int offset);
 int FullVrHudConvergenceShift(float hud_scale, int offset);
