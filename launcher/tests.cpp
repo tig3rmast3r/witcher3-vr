@@ -229,8 +229,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         const bool expected_native_stereo =
             w3vr::ModeUsesStereo(state.mode);
         Require(vr.Get("openxr", "presentation_scale") ==
-            std::string(expected_native_stereo ? "1.000" : "0.850"),
-            "native stereo presentation-scale contract mismatch");
+            "0.850",
+            "presentation scale must be preserved in every render mode");
         Require(vr.Get("openxr", "native_stereo") ==
             std::string(expected_native_stereo ? "1" : "0"),
             "native stereo must remain enabled in every stereo mode");

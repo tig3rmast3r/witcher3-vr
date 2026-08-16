@@ -307,6 +307,57 @@ bool derive_asymmetric_projection_descriptor(
     return true;
 }
 
+bool scale_asymmetric_projection_fov(
+    const XrFovf& fov,
+    float scale,
+    XrFovf& scaled_fov) {
+    if (!std::isfinite(scale) || scale <= 0.0f ||
+        !std::isfinite(fov.angleLeft) ||
+        !std::isfinite(fov.angleRight) ||
+        !std::isfinite(fov.angleUp) ||
+        !std::isfinite(fov.angleDown)) {
+        return false;
+    }
+
+    const float left = std::tan(fov.angleLeft);
+    const float right = std::tan(fov.angleRight);
+    const float up = std::tan(fov.angleUp);
+    const float down = std::tan(fov.angleDown);
+    if (!std::isfinite(left) || !std::isfinite(right) ||
+        !std::isfinite(up) || !std::isfinite(down) ||
+        right - left <= 0.01f || up - down <= 0.01f) {
+        return false;
+    }
+
+    // Preserve the exact runtime values at 1.0 so the established Native
+    // Stereo route remains byte-identical at its historical setting.
+    if (scale == 1.0f) {
+        scaled_fov = fov;
+        return true;
+    }
+
+    const float scaled_left = left * scale;
+    const float scaled_right = right * scale;
+    const float scaled_up = up * scale;
+    const float scaled_down = down * scale;
+    if (!std::isfinite(scaled_left) || !std::isfinite(scaled_right) ||
+        !std::isfinite(scaled_up) || !std::isfinite(scaled_down) ||
+        scaled_right - scaled_left <= 0.01f ||
+        scaled_up - scaled_down <= 0.01f) {
+        return false;
+    }
+
+    scaled_fov = {
+        std::atan(scaled_left),
+        std::atan(scaled_right),
+        std::atan(scaled_up),
+        std::atan(scaled_down)};
+    return std::isfinite(scaled_fov.angleLeft) &&
+        std::isfinite(scaled_fov.angleRight) &&
+        std::isfinite(scaled_fov.angleUp) &&
+        std::isfinite(scaled_fov.angleDown);
+}
+
 float inverse_hud_distance_from_parallel_reference(
     float left_eye_shift_px,
     float hud_size,

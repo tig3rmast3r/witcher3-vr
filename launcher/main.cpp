@@ -250,10 +250,7 @@ void UpdateModeControls() {
     EnableWindow(Item(IdNativeStereo), native_stereo_available);
     const bool native_stereo_active = native_stereo_available &&
         SendMessageW(Item(IdNativeStereo), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    if (native_stereo_active) {
-        SendMessageW(Item(IdPresentationScale), TBM_SETPOS, TRUE, 100);
-    }
-    EnableWindow(Item(IdPresentationScale), !native_stereo_active);
+    EnableWindow(Item(IdPresentationScale), TRUE);
     EnableWindow(Item(IdAlternatePresentationResize),
         g_app.fullscreen_projection && !native_stereo_active);
     UpdateTrackLabels();

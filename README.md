@@ -53,6 +53,12 @@ as a runtime dependency.
 | World-locked menus, inventory, and Cinema Mode | Free HMD rotation while the screen remains stationary |
 | First-person aiming handoff | Temporarily switches to third person while aiming |
 
+Mode-3 TAAU uses exact per-eye REDengine temporal-camera history and preserves
+the native combined camera, object, skinning, foliage and cloth motion field for
+both AER and strict Stereo. Its accepted path skips the redundant legacy
+full-resolution motion-vector composition while retaining that route as a
+fail-closed fallback whenever exact eye/pair authority is unavailable.
+
 The ForceDLAA parameter-query and resolution-override approach is adapted from
 [DLSSTweaks](https://github.com/emoose/DLSSTweaks) by emoose.
 
@@ -156,9 +162,10 @@ close to the lenses, the borders are practically invisible.
 
 The three experimental presentation controls are independent:
 
-- **Native Stereo** enables asymmetric stereo geometry only. It is available
-  only with **Stereo - No AA / FXAA**, forces Presentation Size to `1.00`, and
-  otherwise uses the same legacy presentation path as every render mode.
+- **Native Stereo** enables asymmetric stereo geometry for every AER and
+  Stereo No AA/TAAU/DLSS choice. Presentation Size remains adjustable: the
+  renderer scales each eye's off-axis FOV around its optical center and submits
+  that exact scaled FOV through the same presentation path.
 - **Fullscreen Projection** changes the presentation method for every render
   mode. It defaults to off, so all modes use the validated legacy presenter.
 - **Alternate Presentation Resize** opts into the PR-style resize needed for

@@ -1297,9 +1297,9 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         mode.mode3_aer_presentation ? "1" : "0");
     vr_ini.Set("openxr", "render_width", std::to_string(state.width));
     vr_ini.Set("openxr", "render_height", std::to_string(state.height));
-    // Native asymmetric geometry is independent from the presentation route.
-    // Keep its 1:1 source scale in every stereo mode; renderer support is
-    // introduced one temporal backend at a time.
+    // Native asymmetric geometry is independent from the presentation route,
+    // but uses the same user-selected angular presentation size as symmetric
+    // geometry in every supported stereo mode.
     const bool native_stereo_active =
         state.native_stereo && ModeUsesStereo(state.mode);
     vr_ini.Set("openxr", "native_stereo",
@@ -1311,7 +1311,7 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "hud_stereo_shift_px",
         std::to_string(std::clamp(state.hud_convergence_delta - 16, -256, 256)));
     vr_ini.Set("openxr", "presentation_scale", FloatString(
-        native_stereo_active ? 1.0f : state.presentation_scale));
+        state.presentation_scale));
     vr_ini.Set("openxr", "menu_scale", FloatString(state.menu_scale));
     vr_ini.Set("openxr", "cinema_scale", FloatString(state.cinema_scale));
     vr_ini.Set("openxr", "cinema_hud_scale",

@@ -625,6 +625,58 @@ void test_asymmetric_projection_descriptor() {
         "asymmetric descriptor rejects zero extent");
 }
 
+void test_asymmetric_presentation_scale() {
+    constexpr uint32_t width = 3072;
+    constexpr uint32_t height = 3216;
+    const XrFovf source{
+        -0.942478f, 0.698132f, 0.767945f, -0.959931f};
+
+    XrFovf identity{};
+    require(eye_geometry::scale_asymmetric_projection_fov(
+        source, 1.0f, identity),
+        "asymmetric presentation identity scale");
+    require(identity.angleLeft == source.angleLeft &&
+        identity.angleRight == source.angleRight &&
+        identity.angleUp == source.angleUp &&
+        identity.angleDown == source.angleDown,
+        "asymmetric presentation scale 1 preserves exact FOV");
+
+    constexpr float scale = 0.75f;
+    XrFovf scaled{};
+    require(eye_geometry::scale_asymmetric_projection_fov(
+        source, scale, scaled),
+        "asymmetric presentation reduced scale");
+    eye_geometry::AsymmetricProjectionDescriptor original_descriptor{};
+    eye_geometry::AsymmetricProjectionDescriptor scaled_descriptor{};
+    require(eye_geometry::derive_asymmetric_projection_descriptor(
+        source, width, height, original_descriptor),
+        "asymmetric presentation source descriptor");
+    require(eye_geometry::derive_asymmetric_projection_descriptor(
+        scaled, width, height, scaled_descriptor),
+        "asymmetric presentation scaled descriptor");
+    require(std::fabs(scaled_descriptor.horizontal_tangent_span -
+        original_descriptor.horizontal_tangent_span * scale) < 2.0e-6f &&
+        std::fabs(scaled_descriptor.vertical_tangent_span -
+        original_descriptor.vertical_tangent_span * scale) < 2.0e-6f,
+        "asymmetric presentation scales both tangent spans");
+    require(std::fabs(scaled_descriptor.center_ndc_x -
+        original_descriptor.center_ndc_x) < 2.0e-6f &&
+        std::fabs(scaled_descriptor.center_ndc_y -
+        original_descriptor.center_ndc_y) < 2.0e-6f,
+        "asymmetric presentation preserves optical center");
+    require(std::fabs(scaled_descriptor.redengine_center_offset_px_x -
+        original_descriptor.redengine_center_offset_px_x) < 0.001f &&
+        std::fabs(scaled_descriptor.redengine_center_offset_px_y -
+        original_descriptor.redengine_center_offset_px_y) < 0.001f,
+        "asymmetric presentation preserves REDengine center offsets");
+    require(!eye_geometry::scale_asymmetric_projection_fov(
+        source, 0.0f, scaled),
+        "asymmetric presentation rejects zero scale");
+    require(!eye_geometry::scale_asymmetric_projection_fov(
+        source, std::numeric_limits<float>::quiet_NaN(), scaled),
+        "asymmetric presentation rejects non-finite scale");
+}
+
 } // namespace
 
 int main() {
@@ -638,6 +690,7 @@ int main() {
     test_canted_hud_plane_and_invalid_fallback();
     test_parallel_headset_adaptation();
     test_asymmetric_projection_descriptor();
+    test_asymmetric_presentation_scale();
     if (failures != 0) {
         std::fprintf(stderr, "%d eye-geometry test(s) failed\n", failures);
         return 1;

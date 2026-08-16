@@ -77,6 +77,14 @@ bool derive_asymmetric_projection_descriptor(
     uint32_t render_height,
     AsymmetricProjectionDescriptor& descriptor);
 
+// Scales all four tangent extents around the eye's optical axis. This changes
+// angular presentation size while preserving the asymmetric principal point.
+// A scale of 1 returns the original OpenXR FOV exactly.
+bool scale_asymmetric_projection_fov(
+    const XrFovf& fov,
+    float scale,
+    XrFovf& scaled_fov);
+
 // Converts a legacy left-eye source-pixel shift, captured on a parallel-view
 // reference headset, into the inverse physical distance of a cyclopean HUD
 // plane. A negative left-eye shift produces a positive distance in front of

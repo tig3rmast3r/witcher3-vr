@@ -125,7 +125,7 @@ struct Config {
     float resolution_scale{1.0f};
     float presentation_scale{0.9f};
     // Native asymmetric geometry is independent from the final presentation
-    // method. It remains a No-AA, scale-1 experimental renderer route.
+    // method. Presentation Size scales its immutable per-eye tangent FOV.
     bool native_stereo{false};
     // The visibility-mask envelope/fit route is opt-in. Missing keys retain
     // the proven legacy crop-and-copy presentation path.
@@ -655,8 +655,7 @@ bool real_smoke_center_fix_route_active() {
         (g_config.temporal_backend == TemporalBackend::None ||
             g_config.temporal_backend == TemporalBackend::Taau ||
             g_config.temporal_backend == TemporalBackend::Dlss) &&
-        g_config.hmd_freelook &&
-        fabsf(g_config.presentation_scale - 1.0f) <= 0.0005f;
+        g_config.hmd_freelook;
 }
 
 bool real_smoke_world_up_route_active() {
@@ -2171,8 +2170,8 @@ void* g_engine_animation_frustum_return{};
 uintptr_t g_engine_frustum_module_base{};
 std::atomic<uint32_t> g_engine_animation_frustum_apply_logs{};
 // [DIAG:ASYMMETRIC-AUTHORITY V1046] The audit observes the projection-center
-// values which survive REDengine's temporal rebuilds.  The separately gated
-// No-AA scale-1 trial below may inject them only for a fully tagged pair.
+// values which survive REDengine's temporal rebuilds. The native asymmetric
+// route below may inject them only for a fully tagged pair.
 // The eight return RVAs below are the complete static caller set of
 // FUN_1415E5A90 in witcher3.exe; the frustum RVAs consume primary, secondary
 // or copied camera matrices.
@@ -2417,8 +2416,7 @@ bool native_asymmetric_noaa_route_active() {
         (g_config.temporal_backend == TemporalBackend::None ||
             g_config.temporal_backend == TemporalBackend::Taau ||
             g_config.temporal_backend == TemporalBackend::Dlss) &&
-        g_config.hmd_freelook &&
-        std::fabs(g_config.presentation_scale - 1.0f) <= 0.0001f;
+        g_config.hmd_freelook;
 }
 
 // [FIX:CINEMA-EFFECT-CENTER-GUARD V1135] A normal Cinema presentation renders
@@ -2459,11 +2457,17 @@ bool initialize_native_asymmetric_pair(uint64_t pair_id) {
         g_xr_views.size() < 2 || pair_id == 0 || pair_id == UINT64_MAX) {
         return false;
     }
+    const float presentation_scale = std::clamp(
+        g_config.presentation_scale, 0.01f, 1.0f);
+    std::array<XrFovf, 2> presentation_fovs{};
     for (uint32_t eye = 0; eye < 2; ++eye) {
         w3vr::openxr_eye_geometry::AsymmetricProjectionDescriptor descriptor{};
-        if (!w3vr::openxr_eye_geometry::
+        if (!w3vr::openxr_eye_geometry::scale_asymmetric_projection_fov(
+                g_xr_views[eye].fov, presentation_scale,
+                presentation_fovs[eye]) ||
+            !w3vr::openxr_eye_geometry::
                 derive_asymmetric_projection_descriptor(
-                    g_xr_views[eye].fov, 1, 1, descriptor)) {
+                    presentation_fovs[eye], 1, 1, descriptor)) {
             return false;
         }
     }
@@ -2477,8 +2481,8 @@ bool initialize_native_asymmetric_pair(uint64_t pair_id) {
     slot.factory_mask.store(0, std::memory_order_relaxed);
     slot.temporal_mask.store(0, std::memory_order_relaxed);
     slot.dlss_input_mask.store(0, std::memory_order_relaxed);
-    slot.fov[0] = g_xr_views[0].fov;
-    slot.fov[1] = g_xr_views[1].fov;
+    slot.fov[0] = presentation_fovs[0];
+    slot.fov[1] = presentation_fovs[1];
     slot.pair_id.store(pair_id, std::memory_order_release);
     return true;
 }
@@ -41861,7 +41865,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1177 base=V1176 taau_afw=V12128 raytracing=V13044 "
+                "witcher3vr canonical build=V1178 base=V1177 taau_afw=V12128 raytracing=V13044 "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -41873,9 +41877,10 @@ void ensure_initialized() {
                 "rt_lineage_census=bounded_diagnostic_only rt_provisional_clock=accepted_natural_render rt_camera_slot_key=pair_eye rt_packet_commit=first_proof_immutable "
                 "rt_enabled=ini_owned rt_metadata=release_owned_exact_formats rt_diagnostics=checkbox_only "
                 "afw_native_dlss_source=exact_submitted_final_backbuffer "
-                "afw_native_dlss_camera=final_source_centered");
+                "afw_native_dlss_camera=final_source_centered "
+                "native_presentation_size=pair_fov_tangent_scaled");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1177 bases=V1176+V12128 "
+                "witcher3vr dxgi proxy initialized build=V1178 base=V1177 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d "
                 "mode1_afw_enabled=%d persistent_registry=%d",
