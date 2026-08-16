@@ -677,6 +677,43 @@ void test_asymmetric_presentation_scale() {
         "asymmetric presentation rejects non-finite scale");
 }
 
+void test_asymmetric_hud_source_shift() {
+    constexpr uint32_t width = 3072;
+    constexpr uint32_t height = 3216;
+    const XrFovf quest_left{
+        -0.942478f, 0.698132f, 0.767945f, -0.959931f};
+    eye_geometry::AsymmetricProjectionDescriptor descriptor{};
+    require(eye_geometry::derive_asymmetric_projection_descriptor(
+        quest_left, width, height, descriptor),
+        "asymmetric HUD Quest descriptor");
+
+    constexpr float base_hud_size = 1.0f;
+    constexpr float asymmetric_hud_size = 1.2425f;
+    int source_x{};
+    int source_y{};
+    require(eye_geometry::derive_asymmetric_hud_source_shift(
+        descriptor, base_hud_size, asymmetric_hud_size, -36,
+        source_x, source_y),
+        "asymmetric HUD source shift");
+    const float displayed_x = -static_cast<float>(source_x) *
+        asymmetric_hud_size;
+    const float displayed_y = -static_cast<float>(source_y) *
+        asymmetric_hud_size;
+    require(std::fabs(displayed_x -
+        (descriptor.optical_center_offset_px_x + 36.0f)) <=
+            asymmetric_hud_size,
+        "asymmetric HUD keeps horizontal optical centre and convergence");
+    require(std::fabs(displayed_y +
+        descriptor.optical_center_offset_px_y) <= asymmetric_hud_size,
+        "asymmetric HUD moves upward to the OpenXR optical centre");
+    require(source_y > 0,
+        "asymmetric HUD positive OpenXR Y uses positive source shift");
+
+    require(!eye_geometry::derive_asymmetric_hud_source_shift(
+        descriptor, base_hud_size, 0.0f, -36, source_x, source_y),
+        "asymmetric HUD rejects zero scale");
+}
+
 } // namespace
 
 int main() {
@@ -691,6 +728,7 @@ int main() {
     test_parallel_headset_adaptation();
     test_asymmetric_projection_descriptor();
     test_asymmetric_presentation_scale();
+    test_asymmetric_hud_source_shift();
     if (failures != 0) {
         std::fprintf(stderr, "%d eye-geometry test(s) failed\n", failures);
         return 1;

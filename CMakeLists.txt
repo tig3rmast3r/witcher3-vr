@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1193.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1229.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -47,6 +47,8 @@ add_library(witcher3vr_dxgi SHARED
     src/openxr_eye_geometry.cpp
     src/puredark_afw_bridge.cpp
     src/puredark_afw_camera.cpp
+    src/rt_flight_recorder.cpp
+    src/rt_ingress_join.cpp
 )
 target_compile_definitions(witcher3vr_dxgi PRIVATE
     WIN32_LEAN_AND_MEAN
@@ -113,6 +115,22 @@ if(BUILD_TESTING)
         "${W3VR_OPENXR_DIR}/include"
     )
     add_test(NAME renderer_eye_geometry COMMAND w3vr_openxr_eye_geometry_tests)
+
+    add_executable(w3vr_rt_flight_recorder_tests
+        tests/rt_flight_recorder_tests.cpp
+        src/rt_flight_recorder.cpp
+    )
+    target_include_directories(w3vr_rt_flight_recorder_tests PRIVATE src)
+    add_test(NAME renderer_rt_flight_recorder
+        COMMAND w3vr_rt_flight_recorder_tests)
+
+    add_executable(w3vr_rt_ingress_join_tests
+        tests/rt_ingress_join_tests.cpp
+        src/rt_ingress_join.cpp
+    )
+    target_include_directories(w3vr_rt_ingress_join_tests PRIVATE src)
+    add_test(NAME renderer_rt_ingress_join
+        COMMAND w3vr_rt_ingress_join_tests)
 
     add_executable(w3vr_first_person_strafe_policy_tests
         tests/first_person_strafe_policy_tests.cpp

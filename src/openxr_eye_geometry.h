@@ -77,6 +77,18 @@ bool derive_asymmetric_projection_descriptor(
     uint32_t render_height,
     AsymmetricProjectionDescriptor& descriptor);
 
+// Converts the headset optical centre and the legacy horizontal convergence
+// into source-pixel offsets for the scaled HUD composite. Pixel-space Y grows
+// down while OpenXR NDC Y grows up, so a positive optical-centre Y becomes a
+// positive source offset and moves the displayed HUD upward.
+bool derive_asymmetric_hud_source_shift(
+    const AsymmetricProjectionDescriptor& descriptor,
+    float base_hud_size,
+    float asymmetric_hud_size,
+    int legacy_horizontal_shift_px,
+    int& source_shift_x_px,
+    int& source_shift_y_px);
+
 // Scales all four tangent extents around the eye's optical axis. This changes
 // angular presentation size while preserving the asymmetric principal point.
 // A scale of 1 returns the original OpenXR FOV exactly.

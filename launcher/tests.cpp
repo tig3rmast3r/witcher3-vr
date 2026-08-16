@@ -111,6 +111,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "[engine]\r\n"
         "temporal_backend=dlss_packed\r\n"
         "dlss_dlaa=0\r\n"
+        "raytracing_history_buffers=7\r\n"
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
         "menu_state_probe=0\r\n"
@@ -234,7 +235,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
                 std::string(expected_ray_tracing ? "1" : "0") &&
             game.Get("Rendering/RT", "EnableRT") ==
                 std::string(expected_ray_tracing ? "true" : "false"),
-            "Ray Tracing was not restricted to AER + AFW - DLSS");
+            "Ray Tracing was not restricted to an AER + AFW temporal mode");
+        Require(vr.Get("engine", "raytracing_history_buffers") == "7",
+            "launcher overwrote the INI-only RTX history buffer count");
         Require(game.Get("Viewport", "Resolution") == "\"" +
             std::to_string(state.width) + "x" + std::to_string(state.height) + "\"",
             "wrong game resolution");
@@ -337,11 +340,12 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(vr.Get("debug", "taau_drop_diagnostics") == "1",
             "per-eye TAAU diagnostics flag missing");
         Require(vr.Get("debug", "cinema_camera_diagnostics") == "1" &&
-            vr.Get("debug", "cinema_subtitle_diagnostics") == "1" &&
             vr.Get("debug", "first_person_state_diagnostics") == "1" &&
             vr.Get("debug", "first_person_aim_diagnostics") == "1" &&
             vr.Get("debug", "world_marker_diagnostics") == "1",
             "diagnostic checkbox does not own every runtime probe");
+        Require(!vr.Get("debug", "cinema_subtitle_diagnostics").has_value(),
+            "dead cinema subtitle diagnostic key was retained");
         Require(vr.Get("reverse", "enabled") == "0",
             "launcher must clear the obsolete reverse master workaround");
         Require(vr.Get("reverse", "scan_periodic") == "0",
@@ -435,10 +439,10 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
 void TestControlledRayTracingAndAlternateResize(
     const w3vr::ConfigPaths& paths) {
     Require(w3vr::ModeSupportsRayTracing(w3vr::RenderMode::AerAfwDlss) &&
-            !w3vr::ModeSupportsRayTracing(w3vr::RenderMode::AerAfwTaau) &&
+            w3vr::ModeSupportsRayTracing(w3vr::RenderMode::AerAfwTaau) &&
             !w3vr::ModeSupportsRayTracing(
                 w3vr::RenderMode::StereoDlssSequential),
-        "Ray Tracing support predicate is not limited to AER + AFW - DLSS");
+        "Ray Tracing support predicate does not match the AER + AFW temporal modes");
     Require(w3vr::AlternatePresentationResizeAvailable(
             w3vr::RenderMode::StereoTaau, false, 0.85f) &&
             !w3vr::AlternatePresentationResizeAvailable(
@@ -466,6 +470,12 @@ void TestControlledRayTracingAndAlternateResize(
     Require(vr.Get("engine", "raytracing_enabled") == "0" &&
             game.Get("Rendering/RT", "EnableRT") == "false",
         "incompatible render mode did not force both Ray Tracing flags off");
+
+    state.mode = w3vr::RenderMode::AerAfwTaau;
+    Require(w3vr::BuildUpdatedDocuments(paths, state, vr, game, error) &&
+            vr.Get("engine", "raytracing_enabled") == "1" &&
+            game.Get("Rendering/RT", "EnableRT") == "true",
+        "AER + AFW - TAAU did not enable both Ray Tracing flags");
 
     state.mode = w3vr::RenderMode::AerAfwDlss;
     Require(w3vr::BuildUpdatedDocuments(paths, state, vr, game, error) &&
@@ -566,7 +576,8 @@ void TestEmbeddedLauncherDefaults() {
         "embedded launcher INI defaults could not be loaded");
     Require(defaults->Get("meta", "config_version") == "12" &&
         defaults->Get("openxr", "presentation_scale") == "1.000" &&
-        defaults->Get("engine", "first_person_combat_exit") == "0",
+        defaults->Get("engine", "first_person_combat_exit") == "0" &&
+        defaults->Get("engine", "raytracing_history_buffers") == "8",
         "embedded launcher defaults do not match schema 12 release policy");
 }
 
@@ -931,6 +942,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
         "raytracing_enabled=0\r\n"
+        "raytracing_history_buffers=8\r\n"
         "first_person_combat_exit=0\r\n"
         "first_person_strafe=1\r\n"
         "first_person_anchor_smoothing=1\r\n"
@@ -1015,6 +1027,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     migrated->Set("engine", "first_person_strafe", "0");
     migrated->Set("engine", "first_person_anchor_smoothing", "0");
     migrated->Set("engine", "first_person_anchor_smoothing_seconds", "0.125000");
+    migrated->Remove("engine", "raytracing_history_buffers");
     migrated->Remove("debug", "runtime_diagnostics");
     Write(paths.vr_ini, migrated->Serialize());
     Require(w3vr::EnsureVrConfiguration(
@@ -1030,6 +1043,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         versioned->Get("engine", "first_person_anchor_smoothing") == "0" &&
         versioned->Get("engine", "first_person_anchor_smoothing_seconds") ==
             "0.125000" &&
+        versioned->Get("engine", "raytracing_history_buffers") == "8" &&
         versioned->Get("debug", "runtime_diagnostics") == "0",
         "current-version INI defaults were not materialized safely");
 
@@ -1161,14 +1175,14 @@ void TestFirstRunConfiguration(const fs::path& root) {
 
     // V11 makes the launcher the sole owner of Ray Tracing compatibility.
     // An incompatible route must be disabled during migration, while the
-    // already supported AER + AFW / DLSS opt-in remains selected.
+    // already supported AER + AFW temporal opt-in remains selected.
     Write(paths.vr_ini,
         "[meta]\r\n"
         "config_version=10\r\n"
         "[openxr]\r\n"
         "mode3_aer_presentation=0\r\n"
         "[engine]\r\n"
-        "temporal_backend=dlss\r\n"
+        "temporal_backend=taau\r\n"
         "raytracing_enabled=1\r\n");
     Require(w3vr::EnsureVrConfiguration(
         paths, defaults, created, error), "V10-to-V11 RT migration failed");
@@ -1186,7 +1200,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "[openxr]\r\n"
         "mode3_aer_presentation=1\r\n"
         "[engine]\r\n"
-        "temporal_backend=dlss\r\n"
+        "temporal_backend=taau\r\n"
         "raytracing_enabled=1\r\n");
     Require(w3vr::EnsureVrConfiguration(
         paths, defaults, created, error), "supported V10-to-V11 RT migration failed");
@@ -1195,7 +1209,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
             migrated_rt_supported->Get("meta", "config_version") == "12" &&
             migrated_rt_supported->Get(
                 "engine", "raytracing_enabled") == "1",
-        "V11 migration removed the supported AER + AFW / DLSS RT opt-in");
+        "V11 migration removed the supported AER + AFW / TAAU RT opt-in");
 
     // V9 is the last V1138 launcher schema. Remove its retired stationary
     // switch while retaining every explicit V9531 First Person preference.

@@ -25,6 +25,7 @@ constexpr std::array<ModeSettings, 5> kModes{{
 }};
 
 constexpr int kCurrentConfigVersion = 12;
+constexpr char kDefaultRayTracingHistoryBuffers[] = "8";
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
 constexpr float kFullVrHudReferenceScale = 1.00f;
@@ -87,6 +88,7 @@ void RemoveObsoleteSettings(IniDocument& ini) {
     ini.Remove("engine", "streamline_mvec_correction");
     ini.Remove("engine", "streamline_reconstruct_camera_motion");
     ini.Remove("engine", "streamline_force_camera_mvec");
+    ini.Remove("debug", "cinema_subtitle_diagnostics");
 }
 
 void MigrateConfigurationToV2(IniDocument& ini) {
@@ -108,7 +110,6 @@ void MigrateConfigurationToV2(IniDocument& ini) {
     ini.Set("debug", "runtime_diagnostics", "0");
     ini.Set("debug", "taau_drop_diagnostics", "0");
     ini.Set("debug", "cinema_camera_diagnostics", "0");
-    ini.Set("debug", "cinema_subtitle_diagnostics", "0");
     ini.Set("debug", "first_person_state_diagnostics", "0");
     ini.Set("debug", "first_person_aim_diagnostics", "0");
     ini.Set("debug", "world_marker_diagnostics", "0");
@@ -308,11 +309,13 @@ void MigrateConfigurationToV10(IniDocument& ini) {
 
 void MigrateConfigurationToV11(IniDocument& ini) {
     // The launcher now owns both halves of Ray Tracing. Preserve an existing
-    // opt-in only on the supported AER + AFW / DLSS route; every other mode
+    // opt-in only on a supported AER + AFW temporal route; every other mode
     // starts from the safe disabled state and Save also clears the game flag.
+    const auto backend = ReadString(
+        ini, "engine", "temporal_backend", "none");
     const bool supported_route = ReadBool(
         ini, "openxr", "mode3_aer_presentation", false) &&
-        ReadString(ini, "engine", "temporal_backend", "none") == "dlss";
+        (backend == "taau" || backend == "dlss");
     const bool enabled = supported_route && ReadBool(
         ini, "engine", "raytracing_enabled", false);
     ini.Set("engine", "raytracing_enabled", enabled ? "1" : "0");
@@ -341,9 +344,16 @@ void NormalizeLauncherOwnedConfiguration(IniDocument& ini) {
     ini.Set("engine", "dual_render_start", "1");
     ini.Set("engine", "menu_state_probe", "1");
 
-    const bool ray_tracing = aer && backend == "dlss" && ReadBool(
+    const bool ray_tracing = aer &&
+        (backend == "taau" || backend == "dlss") && ReadBool(
         ini, "engine", "raytracing_enabled", false);
     ini.Set("engine", "raytracing_enabled", ray_tracing ? "1" : "0");
+    // This remains an INI-only renderer tuning value. Materialize the new
+    // default in partial/current INIs while preserving every explicit choice.
+    if (!ini.Get("engine", "raytracing_history_buffers").has_value()) {
+        ini.Set("engine", "raytracing_history_buffers",
+            kDefaultRayTracingHistoryBuffers);
+    }
 
     const bool native_stereo = ReadBool(
         ini, "openxr", "native_stereo", false);
@@ -366,12 +376,11 @@ void NormalizeLauncherOwnedConfiguration(IniDocument& ini) {
     const bool diagnostics =
         ReadBool(ini, "debug", "logging_enabled", false) &&
         ReadBool(ini, "debug", "runtime_diagnostics", false);
-    constexpr std::array<const char*, 8> kDiagnosticKeys{{
+    constexpr std::array<const char*, 7> kDiagnosticKeys{{
         "logging_enabled",
         "runtime_diagnostics",
         "taau_drop_diagnostics",
         "cinema_camera_diagnostics",
-        "cinema_subtitle_diagnostics",
         "first_person_state_diagnostics",
         "first_person_aim_diagnostics",
         "world_marker_diagnostics",
@@ -1012,7 +1021,8 @@ bool ModeUsesStereo(RenderMode mode) {
 }
 
 bool ModeSupportsRayTracing(RenderMode mode) {
-    return mode == RenderMode::AerAfwDlss;
+    return mode == RenderMode::AerAfwTaau ||
+        mode == RenderMode::AerAfwDlss;
 }
 
 bool AlternatePresentationResizeAvailable(
@@ -1524,8 +1534,6 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("debug", "taau_drop_diagnostics",
         state.diagnostic_logging ? "1" : "0");
     vr_ini.Set("debug", "cinema_camera_diagnostics",
-        state.diagnostic_logging ? "1" : "0");
-    vr_ini.Set("debug", "cinema_subtitle_diagnostics",
         state.diagnostic_logging ? "1" : "0");
     vr_ini.Set("debug", "first_person_state_diagnostics",
         state.diagnostic_logging ? "1" : "0");

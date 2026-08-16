@@ -660,7 +660,8 @@ void ShowCompatibilityWarnings() {
             L"Ray Tracing is currently enabled in the game with an "
             L"incompatible render mode.\n\nThe launcher now controls both the "
             L"game setting and the Witcher 3 VR flag. Save or Save & Launch "
-            L"will turn Ray Tracing off unless AER + AFW - DLSS is selected.",
+            L"will turn Ray Tracing off unless an AER + AFW TAAU or DLSS "
+            L"mode is selected.",
             L"Ray Tracing mode compatibility",
             MB_OK | MB_ICONWARNING);
     }
@@ -932,9 +933,9 @@ void CreateInterface(HWND window) {
          AddControl(L"EDIT", L"", WS_BORDER | ES_NUMBER | ES_CENTER |
              WS_TABSTOP, 589, 76, 82, 25, IdHeight, WS_EX_CLIENTEDGE)});
     AddTooltip(AddControl(L"BUTTON",
-        L"Ray Tracing (AER + AFW - DLSS only)",
+        L"Ray Tracing (AER + AFW)",
         BS_AUTOCHECKBOX | WS_TABSTOP, 38, 112, 620, 28, IdRayTracing),
-        L"The launcher controls both the game's Ray Tracing master switch and Witcher 3 VR's RT flag. Ray Tracing can be enabled only with AER + AFW - DLSS and is forced off for every other render mode.");
+        L"The launcher controls both the game's Ray Tracing master switch and Witcher 3 VR's RT flag. Ray Tracing can be enabled with AER + AFW using either TAAU or DLSS, and is forced off for every other render mode.");
 
     AddTooltip(AddControl(L"BUTTON", L"Comfort and interface", BS_GROUPBOX,
         20, 174, 680, 494),

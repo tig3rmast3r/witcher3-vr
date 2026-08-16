@@ -28,7 +28,7 @@ function W3VRHudEditor_DebugChannel(): name
 
 function W3VRHudEditor_Version(): string
 {
-  return "V1193";
+  return "V1210";
 }
 
 function W3VRHudEditor_DebugEnabled(): bool
@@ -2595,6 +2595,19 @@ function UpdateScale(
     // apparent panel position. Profile X/Y remains an independent pixel offset.
     scale_pivot_x = this.curResolutionWidth * 0.5f;
     scale_pivot_y = this.curResolutionHeight;
+    // [FIX:HUD-TEXT-POST-SCALE-POSITION V1210] Flash can rebuild the root's
+    // effective XY bounds when its scale changes. Apply the saved zoom first,
+    // then place the root in those final scaled bounds. A later editor nudge
+    // used to perform this second pass accidentally; bootstrap now has the
+    // same deterministic order.
+    flashModule.SetXScale(
+      this.w3vr_hud_editor_direct_base_scale_x *
+      this.w3vr_hud_editor_target_scale
+    );
+    flashModule.SetYScale(
+      this.w3vr_hud_editor_direct_base_scale_y *
+      this.w3vr_hud_editor_target_scale
+    );
     flashModule.SetX(
       this.w3vr_hud_editor_direct_base_x +
       this.w3vr_hud_editor_target_x +
@@ -2606,14 +2619,6 @@ function UpdateScale(
       this.w3vr_hud_editor_target_y +
       (scale_pivot_y - this.w3vr_hud_editor_direct_base_y) *
       (1.0f - this.w3vr_hud_editor_target_scale)
-    );
-    flashModule.SetXScale(
-      this.w3vr_hud_editor_direct_base_scale_x *
-      this.w3vr_hud_editor_target_scale
-    );
-    flashModule.SetYScale(
-      this.w3vr_hud_editor_direct_base_scale_y *
-      this.w3vr_hud_editor_target_scale
     );
 
     if (this.w3vr_hud_editor_position_trace_pending)

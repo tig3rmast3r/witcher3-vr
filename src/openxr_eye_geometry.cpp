@@ -307,6 +307,37 @@ bool derive_asymmetric_projection_descriptor(
     return true;
 }
 
+bool derive_asymmetric_hud_source_shift(
+    const AsymmetricProjectionDescriptor& descriptor,
+    float base_hud_size,
+    float asymmetric_hud_size,
+    int legacy_horizontal_shift_px,
+    int& source_shift_x_px,
+    int& source_shift_y_px) {
+    if (!std::isfinite(descriptor.optical_center_offset_px_x) ||
+        !std::isfinite(descriptor.optical_center_offset_px_y) ||
+        !std::isfinite(base_hud_size) || base_hud_size <= 0.01f ||
+        !std::isfinite(asymmetric_hud_size) ||
+        asymmetric_hud_size <= 0.01f) {
+        return false;
+    }
+
+    const float source_x =
+        (static_cast<float>(legacy_horizontal_shift_px) * base_hud_size -
+            descriptor.optical_center_offset_px_x) /
+        asymmetric_hud_size;
+    const float source_y = descriptor.optical_center_offset_px_y /
+        asymmetric_hud_size;
+    if (!std::isfinite(source_x) || !std::isfinite(source_y)) {
+        return false;
+    }
+    source_shift_x_px = std::clamp(
+        static_cast<int>(std::lround(source_x)), -16384, 16384);
+    source_shift_y_px = std::clamp(
+        static_cast<int>(std::lround(source_y)), -16384, 16384);
+    return true;
+}
+
 bool scale_asymmetric_projection_fov(
     const XrFovf& fov,
     float scale,
