@@ -170,6 +170,15 @@ No NVIDIA game DLL or standalone SDK package is distributed by Witcher 3 VR.
 Users must rely on the DLSS/NGX runtime supplied with their legally installed
 game and compatible NVIDIA driver.
 
+## RenderDoc in-application API header
+
+- Source repository: https://github.com/baldurk/renderdoc
+- Pinned revision: `e43b7c14d3c37fab664391db94f7586be29e49a0`
+- Vendored file: `renderdoc/api/app/renderdoc_app.h`
+
+The RenderDoc API header is distributed under the MIT license included in the
+header. Witcher 3 VR does not distribute or relicense the RenderDoc runtime.
+
 ## CD PROJEKT RED fan content
 
 Witcher 3 VR is an unofficial fan work and is not approved or endorsed by

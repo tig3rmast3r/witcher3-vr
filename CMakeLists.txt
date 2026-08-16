@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1176.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1177.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -14,12 +14,14 @@ set(W3VR_MINHOOK_DIR "${W3VR_DEPENDENCIES_DIR}/minhook")
 set(W3VR_OPENXR_DIR "${W3VR_DEPENDENCIES_DIR}/openxr-sdk")
 set(W3VR_DIRECTX_HEADERS_DIR "${W3VR_DEPENDENCIES_DIR}/directx-headers")
 set(W3VR_STREAMLINE_DIR "${W3VR_DEPENDENCIES_DIR}/streamline")
+set(W3VR_RENDERDOC_DIR "${W3VR_DEPENDENCIES_DIR}/renderdoc")
 
 foreach(required_path IN ITEMS
     "${W3VR_MINHOOK_DIR}/include/MinHook.h"
     "${W3VR_OPENXR_DIR}/include/openxr/openxr.h"
     "${W3VR_DIRECTX_HEADERS_DIR}/include/directx/d3d12.h"
-    "${W3VR_STREAMLINE_DIR}/external/ngx-sdk/include/nvsdk_ngx.h")
+    "${W3VR_STREAMLINE_DIR}/external/ngx-sdk/include/nvsdk_ngx.h"
+    "${W3VR_RENDERDOC_DIR}/renderdoc_app.h")
     if(NOT EXISTS "${required_path}")
         message(FATAL_ERROR
             "Missing dependency file: ${required_path}\n"
@@ -54,6 +56,7 @@ target_include_directories(witcher3vr_dxgi PRIVATE
     "${W3VR_OPENXR_DIR}/include"
     "${W3VR_DIRECTX_HEADERS_DIR}/include"
     "${W3VR_STREAMLINE_DIR}/external/ngx-sdk/include"
+    "${W3VR_RENDERDOC_DIR}"
 )
 target_link_libraries(witcher3vr_dxgi PRIVATE
     minhook
