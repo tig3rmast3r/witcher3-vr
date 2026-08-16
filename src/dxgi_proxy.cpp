@@ -397,6 +397,8 @@ bool mode1_dlss_retained_hud_route_active();
 bool mode1_dlss_retained_hud_gameplay_active();
 bool mode1_dlss_retained_hud_cinema_active();
 bool mode1_afw_retained_hud_gameplay_active();
+bool mode3_aer_afw_post_hud_gameplay_active();
+bool mode3_aer_afw_baked_hud_cinema_active();
 bool mode1_aer_icon_policy_gameplay_active();
 bool mode1_aer_steady_pair_latency_active();
 bool stereo_icon_policy_transport_active();
@@ -563,13 +565,16 @@ bool puredark_afw_mode3_aer_native_dlss_final_source_active() {
 
 bool retained_hud_projection_route_active() {
     return (mode3_stereo_transport_active() &&
-            !mode3_aer_final_present_source_active()) ||
+            !mode3_aer_final_present_source_active() &&
+            !mode3_aer_afw_baked_hud_cinema_active()) ||
+        mode3_aer_afw_post_hud_gameplay_active() ||
         mode1_dlss_retained_hud_route_active();
 }
 
 bool retained_hud_projection_route_configured() {
     return (mode3_stereo_transport_active() &&
             !mode3_aer_final_present_source_active()) ||
+        puredark_afw_mode3_aer_common_transport_configured() ||
         mode1_dlss_retained_hud_route_configured();
 }
 
@@ -2268,6 +2273,35 @@ using EngineIsAnyMenuFn = void(__fastcall*)(void*, void*, uint8_t*);
 EngineIsAnyMenuFn g_engine_is_any_menu{};
 std::atomic<int> g_engine_menu_state{-1};
 
+// [FIX:AER-AFW-CINEMA-HUD-RESTORE V1190 1/4] AFW is suspended in normal or
+// manual Cinema, so its HUD must remain on the already validated per-eye
+// Cinema PSO instead of entering the gameplay retained-HUD transaction.
+bool mode3_aer_afw_baked_hud_cinema_active() {
+    return puredark_afw_mode3_aer_common_transport_configured() &&
+        g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        (g_force_mono_cinema.load(std::memory_order_relaxed) ||
+            !g_config.cinema_full_vr) &&
+        !g_engine_loading_screen_video_active.load(
+            std::memory_order_acquire) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0;
+}
+
+// [FIX:AER-AFW-POST-HUD V1189 1/9] PureDark must see scene color only.
+// Activate the retained-HUD path for Mode-3 AER gameplay and automatic
+// Full-VR cutscenes, while preserving the already validated manual/normal
+// Cinema, menu, loading-video and AFW-off contracts.
+bool mode3_aer_afw_post_hud_gameplay_active() {
+    const bool normal_cinema =
+        g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        (g_force_mono_cinema.load(std::memory_order_relaxed) ||
+            !g_config.cinema_full_vr);
+    return puredark_afw_mode3_aer_common_transport_configured() &&
+        !normal_cinema &&
+        !g_engine_loading_screen_video_active.load(
+            std::memory_order_acquire) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0;
+}
+
 bool mode1_dlss_retained_hud_gameplay_active() {
     return mode1_dlss_retained_hud_route_configured() &&
         !g_engine_loading_screen_video_active.load(
@@ -2706,6 +2740,12 @@ std::atomic<bool> g_mode1_dlss_pending_hud_submission_ready{};
 EngineFrameTag g_mode1_dlss_latest_submitted_hud_tag{};
 uint64_t g_mode1_dlss_latest_hud_submission_serial{};
 uint64_t g_mode1_dlss_consumed_hud_submission_serial{};
+// [FIX:AER-AFW-POST-HUD V1189 2/9] The final HUD writer is independent from
+// the TAAU/DLSS scene producer. Keep its immutable natural AER identity on the
+// recording command list until the final PRESENT labels the captured t1 copy.
+std::mutex g_mode3_aer_afw_hud_mutex{};
+std::unordered_map<ID3D12GraphicsCommandList*, EngineFrameTag>
+    g_mode3_aer_afw_pending_hud_tags{};
 std::atomic<uint32_t> g_mode1_dlss_submission_logs{};
 std::atomic<uint32_t> g_mode1_dlss_hud_submission_logs{};
 std::atomic<uint32_t> g_mode1_dlss_join_miss_logs{};
@@ -9522,6 +9562,85 @@ bool lookup_mode1_dlss_recording_hud(
     return tag.task_provenance_valid && tag.eye <= 1 && tag.pair_id != 0 &&
         tag.pair_id != UINT64_MAX && tag.generation ==
             g_streamline_capture_generation.load(std::memory_order_acquire);
+}
+
+// [FIX:AER-AFW-POST-HUD V1189 3/9] Freeze the identity of REDengine's final
+// HUD writer without joining it to AFW scene cadence. DLSS can expose an exact
+// command-list producer tag; TAAU and deferred HUD lists fall back to the most
+// recently accepted natural gameplay ordinal, adjusted only to the HUD eye
+// already selected by REDengine when that authority exists.
+void record_mode3_aer_afw_final_hud_tag(
+    ID3D12GraphicsCommandList* command_list,
+    int hud_eye) {
+    if (!mode3_aer_afw_post_hud_gameplay_active() ||
+        command_list == nullptr) {
+        return;
+    }
+
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    EngineFrameTag tag{};
+    bool exact_tag = lookup_mode1_dlss_recording_producer(
+        command_list, tag) ||
+        lookup_streamline_command_list_route(command_list, tag);
+    exact_tag = exact_tag && tag.eye <= 1 && tag.pair_id != 0 &&
+        tag.pair_id != UINT64_MAX && tag.generation == generation &&
+        (hud_eye < 0 || hud_eye > 1 ||
+            tag.eye == static_cast<uint32_t>(hud_eye));
+
+    if (!exact_tag) {
+        const uint64_t next_ordinal =
+            g_mode3_afw_natural_render_ordinal.load(
+                std::memory_order_acquire);
+        if (next_ordinal == UINT64_MAX || next_ordinal == 0) {
+            return;
+        }
+        uint64_t hud_ordinal = next_ordinal - 1;
+        auto identity =
+            w3vr::aer::identity_for_render_ordinal(hud_ordinal);
+        if (hud_eye >= 0 && hud_eye <= 1 &&
+            identity.eye != static_cast<uint32_t>(hud_eye)) {
+            if (hud_ordinal == 0) {
+                return;
+            }
+            --hud_ordinal;
+            identity = w3vr::aer::identity_for_render_ordinal(
+                hud_ordinal);
+        }
+        if (hud_eye >= 0 && hud_eye <= 1 &&
+            identity.eye != static_cast<uint32_t>(hud_eye)) {
+            return;
+        }
+        tag = make_mode1_aer_frame_tag(hud_ordinal);
+    }
+
+    if (tag.eye > 1 || tag.pair_id == 0 ||
+        tag.pair_id == UINT64_MAX || tag.generation != generation) {
+        return;
+    }
+    tag.task_provenance_valid = true;
+    std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+    g_mode3_aer_afw_pending_hud_tags[command_list] = tag;
+}
+
+bool take_mode3_aer_afw_final_hud_tag(
+    ID3D12GraphicsCommandList* command_list,
+    EngineFrameTag& tag) {
+    if (command_list == nullptr) {
+        return false;
+    }
+    std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+    const auto found =
+        g_mode3_aer_afw_pending_hud_tags.find(command_list);
+    if (found == g_mode3_aer_afw_pending_hud_tags.end()) {
+        return false;
+    }
+    tag = found->second;
+    g_mode3_aer_afw_pending_hud_tags.erase(found);
+    return tag.task_provenance_valid && tag.eye <= 1 &&
+        tag.pair_id != 0 && tag.pair_id != UINT64_MAX &&
+        tag.generation == g_streamline_capture_generation.load(
+            std::memory_order_acquire);
 }
 
 void reset_rt_temporal_lineage_for_route_epoch(uint64_t route_epoch) {
@@ -20134,6 +20253,12 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
         std::scoped_lock lock{g_mode3_scene_only_output_mutex};
         g_mode3_scene_only_draw_generations.erase(command_list);
     }
+    // [FIX:AER-AFW-POST-HUD V1189 4/9] A recycled command list must never
+    // inherit the retained-HUD identity from its preceding recording epoch.
+    {
+        std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+        g_mode3_aer_afw_pending_hud_tags.erase(command_list);
+    }
     return result;
 }
 
@@ -20603,6 +20728,7 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
             // Attach its AER identity to this command list; publication waits
             // for ExecuteCommandLists below, exactly like the NGX producer.
             record_mode1_dlss_final_hud_submission(command_list, hud_eye);
+            record_mode3_aer_afw_final_hud_tag(command_list, hud_eye);
             if (hud_eye == 0) {
                 bound_pipeline_state = automatic_stereo_cinema_hud
                     ? g_auto_cinema_hud_composite_eye0_pso.load(
@@ -20656,9 +20782,21 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
             const bool aer_taau_retained_hud_pair_ready =
                 !mode3_taau_afw_final_source_active() ||
                 mode3_early_hud_pair_ready();
+            // [FIX:AER-AFW-POST-HUD V1189 6/9] Native DLSS now joins TAAU's
+            // scene-only gameplay contract. Suppress REDengine's baked HUD
+            // only after both the immutable AFW scene pair and independently
+            // captured HUD pair can be composited on this same XR frame.
+            const bool aer_afw_post_hud_scene_pair_ready =
+                !mode3_aer_afw_post_hud_gameplay_active() ||
+                mode3_afw_sequenced_pair_available();
+            const bool aer_afw_post_hud_pair_ready =
+                !mode3_aer_afw_post_hud_gameplay_active() ||
+                mode3_early_hud_pair_ready();
             if (retained_hud_projection_route_active() &&
                 aer_taau_final_hud_pair_ready &&
                 aer_taau_retained_hud_pair_ready &&
+                aer_afw_post_hud_scene_pair_ready &&
+                aer_afw_post_hud_pair_ready &&
                 g_mode3_hud_layer_available.load(
                     std::memory_order_acquire) &&
                 (normal_stereo_cinema_hud
@@ -22541,6 +22679,12 @@ void reset_loading_video_presentation_state(uint64_t present) {
     g_mode3_latest_hud_format.store(
         static_cast<uint32_t>(DXGI_FORMAT_UNKNOWN),
         std::memory_order_release);
+    // [FIX:AER-AFW-POST-HUD V1189 8/9] Loading changes the renderer
+    // generation and invalidates every recorded HUD writer identity.
+    {
+        std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+        g_mode3_aer_afw_pending_hud_tags.clear();
+    }
     {
         std::scoped_lock lock{g_mode3_early_hud_mutex};
         reset_mode3_early_hud_generation_locked(generation);
@@ -23123,10 +23267,16 @@ bool publish_mode3_hud_source(
     auto* const bound_pipeline = load_command_list_pipeline(command_list);
     const bool mode1_retained_hud =
         mode1_dlss_retained_hud_route_active();
+    const bool mode3_aer_afw_post_hud =
+        mode3_aer_afw_post_hud_gameplay_active();
     // [FIX:MODE1-AFW-HUD-SOURCE V12009 3/3] During fail-open bootstrap the
     // native/eye HUD family still owns the draw. It carries the same t1
     // binding as scene-only, so accept it solely for Mode 1 source discovery.
-    const bool eligible_hud_pipeline = mode1_retained_hud || cinema_active
+    // [FIX:AER-AFW-POST-HUD V1189 5/9] Bootstrap from the original HUD family
+    // before a retained pair exists. Restricting discovery to scene-only made
+    // TAAU's fail-open permanent and gave native DLSS no source to extract.
+    const bool eligible_hud_pipeline = mode1_retained_hud ||
+        mode3_aer_afw_post_hud || cinema_active
         ? mode3_hud_pipeline_family(bound_pipeline)
         : bound_pipeline ==
             g_mode3_scene_only_pso.load(std::memory_order_acquire);
@@ -23303,6 +23453,79 @@ void STDMETHODCALLTYPE hook_draw_instanced(
     const bool publish_packed_after_draw =
         try_bridge_streamline_second_present_before_draw(command_list, false,
             vertex_count_per_instance, instance_count);
+    // [FIX:AER-AFW-CINEMA-HUD-RESTORE V1190 2/4] V1189 can enter Cinema
+    // while the gameplay scene-only PSO is still bound. AFW is intentionally
+    // suspended here, so restore the validated baked Cinema HUD on the actual
+    // draw even when REDengine does not issue another SetPipelineState.
+    if (mode3_aer_afw_baked_hud_cinema_active()) {
+        auto* const current_pipeline =
+            load_command_list_pipeline(command_list);
+        auto* const scene_only =
+            g_mode3_scene_only_pso.load(std::memory_order_acquire);
+        if (g_set_pipeline_state != nullptr && scene_only != nullptr &&
+            current_pipeline == scene_only) {
+            int cinema_hud_eye{-1};
+            if (temporal_backend_is_dlss()) {
+                const uint32_t routed_eye =
+                    lookup_streamline_command_list_last_eye(command_list);
+                if (routed_eye <= 1) {
+                    cinema_hud_eye = static_cast<int>(routed_eye);
+                }
+            } else if (mode3_aer_presentation_active()) {
+                const auto identity =
+                    w3vr::aer::identity_for_render_ordinal(
+                        g_present_count.load(std::memory_order_relaxed));
+                cinema_hud_eye = static_cast<int>(identity.eye);
+                if (mode3_taau_afw_final_source_active()) {
+                    cinema_hud_eye = 1 - cinema_hud_eye;
+                }
+            }
+
+            const bool automatic_cinema =
+                !g_force_mono_cinema.load(std::memory_order_relaxed);
+            ID3D12PipelineState* restored_pipeline =
+                g_hud_composite_original_pso.load(
+                    std::memory_order_acquire);
+            if (cinema_hud_eye == 0) {
+                auto* const eye_pipeline = automatic_cinema
+                    ? g_auto_cinema_hud_composite_eye0_pso.load(
+                        std::memory_order_acquire)
+                    : g_cinema_hud_composite_eye0_pso.load(
+                        std::memory_order_acquire);
+                if (eye_pipeline != nullptr) {
+                    restored_pipeline = eye_pipeline;
+                }
+            } else if (cinema_hud_eye == 1) {
+                auto* const eye_pipeline = automatic_cinema
+                    ? g_auto_cinema_hud_composite_eye1_pso.load(
+                        std::memory_order_acquire)
+                    : g_cinema_hud_composite_eye1_pso.load(
+                        std::memory_order_acquire);
+                if (eye_pipeline != nullptr) {
+                    restored_pipeline = eye_pipeline;
+                }
+            }
+            if (restored_pipeline != nullptr &&
+                restored_pipeline != scene_only) {
+                g_set_pipeline_state(command_list, restored_pipeline);
+                store_command_list_pipeline(
+                    command_list, restored_pipeline);
+                static std::atomic<uint32_t>
+                    aer_afw_cinema_hud_restore_logs{};
+                if (take_bounded_log_slot(
+                        aer_afw_cinema_hud_restore_logs, 24)) {
+                    log_line(
+                        "V1190 AER AFW Cinema HUD restored eye=%d "
+                        "automatic=%d original=%p restored=%p present=%llu",
+                        cinema_hud_eye, automatic_cinema ? 1 : 0,
+                        current_pipeline, restored_pipeline,
+                        static_cast<unsigned long long>(
+                            g_present_count.load(
+                                std::memory_order_relaxed)));
+                }
+            }
+        }
+    }
     // Native No-AA can keep the already-bound gameplay HUD PSO across the
     // F10/Cinema transition, while DLSS tends to rebind it. Make the final HUD
     // draw independent of that backend cadence: once a retained pair exists,
@@ -23319,6 +23542,7 @@ void STDMETHODCALLTYPE hook_draw_instanced(
         mode3_stereo_transport_active() &&
         (g_force_mono_cinema.load(std::memory_order_relaxed) ||
             !g_config.cinema_full_vr) &&
+        !mode3_aer_afw_baked_hud_cinema_active() &&
         g_mode3_hud_layer_available.load(std::memory_order_acquire)) {
         auto* const current_pipeline =
             load_command_list_pipeline(command_list);
@@ -23366,9 +23590,19 @@ void STDMETHODCALLTYPE hook_draw_instanced(
             }
         }
     }
+    auto* const active_hud_pipeline =
+        load_command_list_pipeline(command_list);
+    if (mode3_hud_pipeline_family(active_hud_pipeline)) {
+        const uint32_t routed_hud_eye =
+            lookup_streamline_command_list_last_eye(command_list);
+        record_mode3_aer_afw_final_hud_tag(
+            command_list,
+            routed_hud_eye <= 1
+                ? static_cast<int>(routed_hud_eye) : -1);
+    }
     const bool scene_only_hud_draw =
         mode3_stereo_transport_active() && command_list != nullptr &&
-        load_command_list_pipeline(command_list) ==
+        active_hud_pipeline ==
             g_mode3_scene_only_pso.load(std::memory_order_acquire);
     g_draw_instanced(
         command_list,
@@ -27331,6 +27565,52 @@ void STDMETHODCALLTYPE hook_resource_barrier(
             }
         }
     }
+    // [FIX:AER-AFW-POST-HUD V1189 7/9] Final-source AER deliberately skips
+    // the packed PRESENT block above. Label its independently captured HUD at
+    // the pointer-exact game backbuffer boundary instead, using the identity
+    // frozen when REDengine selected the final HUD writer. This metadata join
+    // does not change AFW scene cadence or consume its producer tag.
+    if (mode3_aer_afw_post_hud_gameplay_active() &&
+        !g_packed_capture_internal && barriers != nullptr) {
+        for (UINT index = 0; index < num_barriers; ++index) {
+            const auto& barrier = barriers[index];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr ||
+                barrier.Transition.StateAfter !=
+                    D3D12_RESOURCE_STATE_PRESENT ||
+                !game_swapchain_owns_resource(
+                    barrier.Transition.pResource)) {
+                continue;
+            }
+            EngineFrameTag hud_tag{};
+            const bool tag_found = take_mode3_aer_afw_final_hud_tag(
+                command_list, hud_tag);
+            const bool labeled = tag_found &&
+                label_mode3_early_hud_at_present(
+                    command_list, hud_tag);
+            if (g_config.runtime_diagnostics) {
+                static std::atomic<uint32_t>
+                    mode3_aer_afw_hud_label_logs{};
+                if (take_bounded_log_slot(
+                        mode3_aer_afw_hud_label_logs, 32)) {
+                    log_line(
+                        "V1189 AER AFW retained HUD label eye=%u pair=%llu "
+                        "generation=%u tag=%d labeled=%d command_list=%p "
+                        "present=%llu",
+                        hud_tag.eye,
+                        static_cast<unsigned long long>(hud_tag.pair_id),
+                        hud_tag.generation,
+                        tag_found ? 1 : 0, labeled ? 1 : 0,
+                        command_list,
+                        static_cast<unsigned long long>(
+                            g_present_count.load(
+                                std::memory_order_relaxed)));
+                }
+            }
+            break;
+        }
+    }
+
     // [FIX:MODE1-AFW-RETAINED-HUD V12007] Mode 1 does not enter the packed
     // same-tick capture block above. Its natural final PRESENT is nevertheless
     // the exact boundary where the HUD copy captured earlier on this command
@@ -41889,7 +42169,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1187 base=V1184 taau_afw=V12128 raytracing=V13044 "
+                "witcher3vr canonical build=V1190 base=V1189 taau_afw=V12128 raytracing=V13044 aer_afw_post_hud=scene_only_then_late afw_cinema_hud=baked_restore "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -41909,7 +42189,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1187 base=V1184 "
+                "witcher3vr dxgi proxy initialized build=V1190 base=V1189 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d "
                 "mode1_afw_enabled=%d persistent_registry=%d",
@@ -49572,6 +49852,10 @@ void render_openxr_test_frame(
             }
         }
 
+    // [FIX:AER-AFW-POST-HUD V1189 9/9] AFW scene evaluation and real/generated
+    // eye publication are complete before this point. Blend only the retained
+    // native HUD now, so neither AFW motion warping nor generated-eye synthesis
+    // can deform it.
     // [FIX:MODE3-SHARED-FRESH-HUD 2/2] The selected shared source is consumed
     // only here; scene routing and OpenXR publication remain unchanged.
     // [FIX:PROJECTION-HUD-COMPOSITE 4/4] The scene copy leaves the stereo
