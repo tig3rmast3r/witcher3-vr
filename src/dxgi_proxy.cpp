@@ -616,6 +616,16 @@ bool reverse_diagnostic_hooks_requested() {
 
 bool native_asymmetric_noaa_route_active();
 
+// [FIX:AER-UPSTREAM-TRANSPARENT-CENTER-OWNER V1187 1/3] Strict Stereo keeps
+// the validated structural GS correction. Mode-3 AER already applies its
+// asymmetric projection through the alternating geometry producer, so the
+// supplementary GS would be a second center operation for every enrolled
+// transparent shader. This is a route policy, never a shader whitelist.
+bool automatic_focus_projection_route_active() {
+    return native_asymmetric_noaa_route_active() &&
+        !mode3_aer_presentation_active();
+}
+
 // The tiled-light correction is release behavior for the validated native
 // asymmetric No-AA route. It is deliberately independent of diagnostics.
 bool asymmetric_tiled_culling_fix_needed() {
@@ -626,7 +636,7 @@ bool asymmetric_tiled_culling_fix_needed() {
 // b12 projection is functional renderer state for automatic focus correction.
 // It must not disappear when launcher diagnostics are disabled.
 bool focus_projection_metadata_hooks_needed() {
-    return native_asymmetric_noaa_route_active();
+    return automatic_focus_projection_route_active();
 }
 
 bool focus_projection_shader_registry_enabled() {
@@ -2432,7 +2442,7 @@ bool native_asymmetric_cinema_panel_active() {
 }
 
 bool native_asymmetric_transparent_center_route_active() {
-    return native_asymmetric_noaa_route_active() &&
+    return automatic_focus_projection_route_active() &&
         !native_asymmetric_cinema_panel_active();
 }
 
@@ -13914,7 +13924,11 @@ void create_focus_fire_horizontal_psos(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
     ID3D12PipelineState* original,
     const PipelineInfo& info) {
-    if (device == nullptr || desc == nullptr || original == nullptr ||
+    // [FIX:AER-UPSTREAM-TRANSPARENT-CENTER-OWNER V1187 2/3] Do not even
+    // create supplementary variants when AER owns the projection. The exact
+    // same structural classifier and PSOs remain available in strict Stereo.
+    if (!automatic_focus_projection_route_active() ||
+        device == nullptr || desc == nullptr || original == nullptr ||
         desc->GS.pShaderBytecode != nullptr ||
         desc->PrimitiveTopologyType !=
             D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
@@ -41875,7 +41889,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1184 base=V1183 taau_afw=V12128 raytracing=V13044 "
+                "witcher3vr canonical build=V1187 base=V1184 taau_afw=V12128 raytracing=V13044 "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -41892,10 +41906,10 @@ void ensure_initialized() {
                 "aer_final_source_cinema=strict_sequential_pair "
                 "aer_cinema_eye_phase=final_backbuffer_opposite_command_list "
                 "aer_cinema_hud_phase=dlss_native_taau_opposite "
-                "focus_fire_b1=per_draw_no_cached_reapply "
+                "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1184 base=V1183 "
+                "witcher3vr dxgi proxy initialized build=V1187 base=V1184 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d "
                 "mode1_afw_enabled=%d persistent_registry=%d",
