@@ -4,8 +4,9 @@
 // with editor-only examples that never enter real story-scene state. Their
 // local scale multiplies vanilla UI scale; renderer-owned Cinema3D/Full VR zoom
 // remains an independent outer multiplier. Their ScaleOnly-authored Flash
-// roots receive a non-accumulating direct offset, while world-space oneliners
-// and overhead text stay outside this mod. InteractionsModule,
+// roots receive a non-accumulating direct offset and bottom-centre scale-pivot
+// compensation, while world-space oneliners and overhead text stay outside
+// this mod. InteractionsModule,
 // EnemyFocusModule, OnelinersModule, RadialMenuModule, marker projection and
 // crosshair remain outside this mod.
 
@@ -27,7 +28,7 @@ function W3VRHudEditor_DebugChannel(): name
 
 function W3VRHudEditor_Version(): string
 {
-  return "V1192";
+  return "V1193";
 }
 
 function W3VRHudEditor_DebugEnabled(): bool
@@ -2547,6 +2548,8 @@ function UpdateScale(
 ): bool
 {
   var result: bool;
+  var scale_pivot_x: float;
+  var scale_pivot_y: float;
 
   // Subtitle and dialog are vanilla ScaleOnly roots. Their ActionScript path
   // accepts the scale value but does not reliably resize the visible root, so
@@ -2585,13 +2588,24 @@ function UpdateScale(
     flashModule
   )
   {
+    // These full-stage roots contain their text at positive stage coordinates.
+    // Scaling the root around Flash's top-left registration point therefore
+    // drags the visible text left/up. Counter-translate around the natural
+    // bottom-centre text anchor so changing size does not also change the
+    // apparent panel position. Profile X/Y remains an independent pixel offset.
+    scale_pivot_x = this.curResolutionWidth * 0.5f;
+    scale_pivot_y = this.curResolutionHeight;
     flashModule.SetX(
       this.w3vr_hud_editor_direct_base_x +
-      this.w3vr_hud_editor_target_x
+      this.w3vr_hud_editor_target_x +
+      (scale_pivot_x - this.w3vr_hud_editor_direct_base_x) *
+      (1.0f - this.w3vr_hud_editor_target_scale)
     );
     flashModule.SetY(
       this.w3vr_hud_editor_direct_base_y +
-      this.w3vr_hud_editor_target_y
+      this.w3vr_hud_editor_target_y +
+      (scale_pivot_y - this.w3vr_hud_editor_direct_base_y) *
+      (1.0f - this.w3vr_hud_editor_target_scale)
     );
     flashModule.SetXScale(
       this.w3vr_hud_editor_direct_base_scale_x *
