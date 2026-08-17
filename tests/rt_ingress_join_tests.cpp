@@ -6,8 +6,6 @@
 
 namespace {
 
-constexpr uint32_t kFullMask = 0x3Fu;
-
 void require(bool condition, const char* message) {
     if (!condition) {
         std::cerr << "Test failure: " << message << '\n';
@@ -15,24 +13,9 @@ void require(bool condition, const char* message) {
     }
 }
 
-w3vr::rt_join::Packet complete_packet(
-    uint64_t pair,
-    uint64_t predecessor) {
-    w3vr::rt_join::Packet packet{};
-    w3vr::rt_join::reset_packet(packet, {7, 1, pair, 3});
-    w3vr::rt_join::observe(packet, kFullMask);
-    w3vr::rt_join::mark_ready(packet, kFullMask);
-    require(w3vr::rt_join::commit_predecessor(
-        packet, predecessor, w3vr::rt_join::kAllPredecessors),
-        "valid predecessor was rejected");
-    return packet;
-}
-
 }  // namespace
 
 int main() {
-    const w3vr::rt_join::Identity current_identity{7, 1, 105, 3};
-
     w3vr::rt_join::CommandIdentityLatch command_latch{};
     constexpr uintptr_t kCommandList = 0x1234u;
     const w3vr::rt_join::Identity first_pass{7, 0, 105, 3};
@@ -137,58 +120,6 @@ int main() {
         kReflectionClaim, true, 0.05f);
     require(!rejected_cross_frame.matched,
         "a mismatching signed transaction was joined by arrival order");
-
-    auto missing = w3vr::rt_join::evaluate(
-        nullptr, nullptr, current_identity, kFullMask,
-        w3vr::rt_join::kAllPredecessors);
-    require(!missing.present && !missing.ready,
-        "missing packet failed open");
-
-    auto partial = complete_packet(105, 101);
-    partial.ready_mask &= ~0x20u;
-    auto previous = complete_packet(101, 97);
-    auto partial_result = w3vr::rt_join::evaluate(
-        &partial, &previous, current_identity, kFullMask,
-        w3vr::rt_join::kAllPredecessors);
-    require(partial_result.present && !partial_result.current_complete &&
-        !partial_result.ready,
-        "partial current packet was published");
-
-    auto observed_partial = complete_packet(105, 101);
-    observed_partial.observed_mask &= ~0x20u;
-    observed_partial.ready_mask &= ~0x20u;
-    auto observed_partial_result = w3vr::rt_join::evaluate(
-        &observed_partial, &previous, current_identity, kFullMask,
-        w3vr::rt_join::kAllPredecessors);
-    require(!observed_partial_result.current_complete &&
-        !observed_partial_result.ready,
-        "packet with matching partial observed/ready masks was published");
-
-    auto current = complete_packet(105, 101);
-    auto exact_gap_result = w3vr::rt_join::evaluate(
-        &current, &previous, current_identity, kFullMask,
-        w3vr::rt_join::kAllPredecessors);
-    require(exact_gap_result.ready &&
-        exact_gap_result.predecessor_pair_id == 101,
-        "exact non-contiguous predecessor did not recover the lineage");
-
-    auto numeric_previous = complete_packet(104, 100);
-    auto wrong_previous_result = w3vr::rt_join::evaluate(
-        &current, &numeric_previous, current_identity, kFullMask,
-        w3vr::rt_join::kAllPredecessors);
-    require(!wrong_previous_result.predecessor_complete &&
-        !wrong_previous_result.ready,
-        "numeric pair-1 incorrectly replaced the exact predecessor");
-
-    auto conflict = complete_packet(105, 101);
-    require(!w3vr::rt_join::commit_predecessor(
-        conflict, 102, w3vr::rt_join::kReflectionPredecessor),
-        "conflicting family predecessor was accepted");
-    auto conflict_result = w3vr::rt_join::evaluate(
-        &conflict, &previous, current_identity, kFullMask,
-        w3vr::rt_join::kAllPredecessors);
-    require(!conflict_result.current_complete && !conflict_result.ready,
-        "conflicting family lineage was published");
 
     w3vr::rt_join::AfwTransportProof transport{
         true, true, true, true, true, true, true};

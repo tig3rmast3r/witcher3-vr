@@ -21,8 +21,16 @@
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
 #include "first_person_anchor_smoothing.h"
-#include "rt_flight_recorder.h"
 #include "rt_ingress_join.h"
+
+// V1230 removes the always-on F3 recorder and the diagnostic RTX ingress
+// ledger. Keep the former trace sites as compile-time-only breadcrumbs: the
+// preprocessor discards their arguments, so Release contains no recorder,
+// packet ring, atomic loads or hot-path calls from those sites.
+#define record_rt_flight(...) ((void)0)
+#define observe_rt_temporal_ingress(...) ((void)0)
+#define ready_rt_temporal_ingress(...) ((void)0)
+#define commit_rt_temporal_ingress_predecessor(...) (true)
 
 #include <atomic>
 #include <algorithm>
@@ -1014,16 +1022,8 @@ struct PuredarkAfwPendingSubmission {
     uint32_t eye{UINT32_MAX};
     uint64_t pair_id{};
     uint64_t route_epoch{};
-    uint32_t rt_ingress_observed_mask{};
-    uint32_t rt_ingress_ready_mask{};
-    uint32_t rt_ingress_previous_observed_mask{};
-    uint32_t rt_ingress_previous_ready_mask{};
-    uint64_t rt_ingress_predecessor_pair_id{};
     bool exact_identity{};
     bool bundle_ready{};
-    bool rt_ingress_packet_present{};
-    bool rt_ingress_packet_ready{};
-    bool rt_ingress_predecessor_ready{};
 };
 
 std::mutex g_puredark_afw_mutex{};
@@ -1259,155 +1259,6 @@ std::mutex g_streamline_capture_mutex{};
 DXGI_FORMAT g_streamline_capture_format{DXGI_FORMAT_UNKNOWN};
 UINT g_streamline_capture_width{};
 UINT g_streamline_capture_height{};
-
-// [DIAG:RT-FLIGHT-RECORDER V1221 1/1] Keep a compact always-on RTX timeline
-// in RAM. One QPC sample is published per Present; hot render paths only load
-// that value and append POD records. F3 pauses writers only long enough to copy
-// the bounded ring, then performs all file I/O after recording has resumed.
-w3vr::rt_flight::Recorder g_rt_flight_recorder{};
-std::atomic<int64_t> g_rt_flight_present_qpc{};
-
-void update_rt_flight_present_clock() {
-    if (!g_config.raytracing_enabled) {
-        return;
-    }
-    LARGE_INTEGER now{};
-    if (QueryPerformanceCounter(&now)) {
-        g_rt_flight_present_qpc.store(now.QuadPart, std::memory_order_relaxed);
-    }
-}
-
-void record_rt_flight(
-    w3vr::rt_flight::EventCode code,
-    uint32_t eye = UINT32_MAX,
-    uint64_t pair_id = 0,
-    uint64_t previous_pair_id = 0,
-    w3vr::rt_flight::RejectReason reason =
-        w3vr::rt_flight::RejectReason::None,
-    uint32_t flags = 0,
-    uint32_t detail0 = 0,
-    uint32_t detail1 = 0,
-    uint32_t detail2 = 0,
-    uint32_t detail3 = 0,
-    uint32_t generation = UINT32_MAX,
-    uint64_t route_epoch = UINT64_MAX) {
-    if (!g_config.raytracing_enabled) {
-        return;
-    }
-    w3vr::rt_flight::Event event{};
-    event.qpc = g_rt_flight_present_qpc.load(std::memory_order_relaxed);
-    event.present = g_present_count.load(std::memory_order_relaxed);
-    event.pair_id = pair_id;
-    event.previous_pair_id = previous_pair_id;
-    event.route_epoch = route_epoch == UINT64_MAX
-        ? g_puredark_afw_route_epoch.load(std::memory_order_relaxed)
-        : route_epoch;
-    event.generation = generation == UINT32_MAX
-        ? g_streamline_capture_generation.load(std::memory_order_relaxed)
-        : generation;
-    event.eye = eye;
-    event.code = code;
-    event.reason = reason;
-    event.flags = flags;
-    event.detail0 = detail0;
-    event.detail1 = detail1;
-    event.detail2 = detail2;
-    event.detail3 = detail3;
-    g_rt_flight_recorder.record(event);
-}
-
-bool dump_rt_flight_recorder() {
-    LARGE_INTEGER now{};
-    LARGE_INTEGER frequency{};
-    if (!QueryPerformanceCounter(&now) ||
-        !QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) {
-        return false;
-    }
-    constexpr int64_t kWindowSeconds = 10;
-    const int64_t minimum_qpc = now.QuadPart -
-        frequency.QuadPart * kWindowSeconds;
-    auto snapshot = g_rt_flight_recorder.capture_since(minimum_qpc);
-
-    char path[MAX_PATH]{};
-    if (GetModuleFileNameA(nullptr, path, sizeof(path)) == 0) {
-        return false;
-    }
-    if (char* slash = strrchr(path, '\\')) {
-        slash[1] = '\0';
-    } else {
-        path[0] = '\0';
-    }
-    strcat_s(path, "witcher3vr-rt-flight.log");
-
-    FILE* file{};
-    if (fopen_s(&file, path, "w") != 0 || file == nullptr) {
-        return false;
-    }
-
-    fprintf(file,
-        "# Witcher3VR V1229 RTX/AFW flight recorder; window=%llds; hotkey=F3\n",
-        static_cast<long long>(kWindowSeconds));
-    fprintf(file,
-        "# events=%zu total_claimed=%llu overwritten=%llu skipped_during_snapshot=%llu qpc_frequency=%lld\n",
-        snapshot.events.size(),
-        static_cast<unsigned long long>(snapshot.total_claimed),
-        static_cast<unsigned long long>(snapshot.overwritten),
-        static_cast<unsigned long long>(snapshot.skipped_while_paused),
-        static_cast<long long>(frequency.QuadPart));
-    fprintf(file,
-        "# ingress bits: identity=0x01 current_camera=0x02 previous_camera=0x04 ao=0x08 shadow=0x10 reflection=0x20\n");
-    fprintf(file,
-        "# identity flags: latch=0x01/0x03 exact_route=0x04 task=0x08 untagged_reject=0x10 open_join=0x20 natural_open=0x40; detail0 claim: ao=1 reflection=2 shadow=4\n");
-    fprintf(file,
-        "# afw_submission flags: slot=0x001 bundle=0x002 exact=0x004 ordered=0x008 gameplay=0x010 epoch=0x020 generation=0x040 rt_ready=0x080 published=0x100\n");
-    fprintf(file,
-        "# afw_present_route flags: submitted_route=0x01 submitted=0x02 selected=0x04 sequence=0x08 evaluated=0x10 view=0x20 valid=0x40 hold=0x80\n");
-    fprintf(file,
-        "# present details: recorded,submitted,ready,consumed cumulative AFW counters (low 32 bits)\n");
-
-    std::array<uint64_t, static_cast<size_t>(
-        w3vr::rt_flight::EventCode::Count)> counts{};
-    for (const auto& event : snapshot.events) {
-        const size_t index = static_cast<size_t>(event.code);
-        if (index < counts.size()) {
-            ++counts[index];
-        }
-    }
-    fprintf(file, "# summary\n");
-    for (size_t index = 0; index < counts.size(); ++index) {
-        if (counts[index] == 0) {
-            continue;
-        }
-        fprintf(file, "#   %-28s %llu\n",
-            w3vr::rt_flight::event_code_name(
-                static_cast<w3vr::rt_flight::EventCode>(index)),
-            static_cast<unsigned long long>(counts[index]));
-    }
-    fprintf(file,
-        "# columns: ms_to_dump sequence present event reason eye pair previous generation epoch flags detail0 detail1 detail2 detail3\n");
-    for (const auto& event : snapshot.events) {
-        const double milliseconds = static_cast<double>(
-            event.qpc - now.QuadPart) * 1000.0 /
-            static_cast<double>(frequency.QuadPart);
-        fprintf(file,
-            "%10.3f %10llu p=%llu %-28s reason=%-15s eye=%u pair=%llu prev=%llu gen=%u epoch=%llu flags=0x%03X d=%u,%u,%u,%u\n",
-            milliseconds,
-            static_cast<unsigned long long>(event.sequence),
-            static_cast<unsigned long long>(event.present),
-            w3vr::rt_flight::event_code_name(event.code),
-            w3vr::rt_flight::reject_reason_name(event.reason),
-            event.eye,
-            static_cast<unsigned long long>(event.pair_id),
-            static_cast<unsigned long long>(event.previous_pair_id),
-            event.generation,
-            static_cast<unsigned long long>(event.route_epoch),
-            event.flags,
-            event.detail0, event.detail1, event.detail2, event.detail3);
-    }
-    fclose(file);
-    OutputDebugStringA("Witcher3VR RTX flight recorder dumped to witcher3vr-rt-flight.log\n");
-    return true;
-}
 
 // [FIX:COVER-SCALE-FOV-COMPENSATION 1/4] Return the uniform source fraction
 // which can be submitted without exposing the shifted clear bands while each
@@ -3970,41 +3821,6 @@ struct RtAoCameraHistory {
 };
 std::array<std::array<RtAoCameraHistory, kRtHistorySlotCapacity>, 2>
     g_rt_ao_camera_histories{};
-// [FIX:RT-COMPLETE-SLOT-JOIN V1222 1/8] The six values which establish one
-// temporal NRD input are committed under one exact render identity: identity,
-// current camera, same-eye previous camera, AO history, shadow history and
-// reflection history. Each bounded slot is independent. AFW may publish the
-// matching rendered output only when the complete slot and the exact older
-// camera predecessor used by all three history families are complete. Pass
-// arrival order and numeric pair adjacency are not publication authority.
-enum RtTemporalIngressBit : uint32_t {
-    kRtIngressIdentity = 1u << 0,
-    kRtIngressCurrentCamera = 1u << 1,
-    kRtIngressPreviousCamera = 1u << 2,
-    kRtIngressAoHistory = 1u << 3,
-    kRtIngressShadowHistory = 1u << 4,
-    kRtIngressReflectionHistory = 1u << 5,
-};
-constexpr size_t kRtTemporalIngressPacketCount = 64;
-using RtTemporalIngressPacket = w3vr::rt_join::Packet;
-struct RtTemporalIngressSnapshot {
-    uint32_t observed_mask{};
-    uint32_t ready_mask{};
-    uint32_t previous_observed_mask{};
-    uint32_t previous_ready_mask{};
-    uint64_t predecessor_pair_id{};
-    bool present{};
-    bool packet_ready{};
-    bool predecessor_ready{};
-    bool ready{};
-};
-constexpr uint32_t kRtIngressCompleteMask =
-    kRtIngressIdentity | kRtIngressCurrentCamera |
-    kRtIngressPreviousCamera | kRtIngressAoHistory |
-    kRtIngressShadowHistory | kRtIngressReflectionHistory;
-std::mutex g_rt_temporal_ingress_mutex{};
-std::array<RtTemporalIngressPacket, kRtTemporalIngressPacketCount * 2>
-    g_rt_temporal_ingress_packets{};
 w3vr::rt_join::CommandIdentityLatch g_rt_command_identity_latch{};
 // [DIAG:RT-LINEAGE-CENSUS V1165 1/5] Reset these bounded counters at every
 // route epoch so the first post-menu AO reader/writer transactions and exact
@@ -4012,7 +3828,6 @@ w3vr::rt_join::CommandIdentityLatch g_rt_command_identity_latch{};
 std::atomic<uint32_t> g_rt_lineage_ao_reader_reject_logs{};
 std::atomic<uint32_t> g_rt_lineage_ao_writer_logs{};
 std::atomic<uint32_t> g_rt_lineage_ao_gap_join_logs{};
-std::atomic<uint32_t> g_rt_lineage_snapshot_miss_logs{};
 // SIGMA PreBlur t2 is the stable public previous-shadow
 // input and TemporalStabilization u0 as the current public output. Retain one
 // private bounded snapshots per physical eye; never redirect the public u0
@@ -5804,183 +5619,6 @@ bool ensure_rt_specular_eye_histories_locked(
     g_rt_specular_last_generation = generation;
     g_rt_specular_last_write_slot = kRtInvalidHistorySlot;
     return true;
-}
-
-RtTemporalIngressPacket& access_rt_temporal_ingress_packet_locked(
-    uint32_t generation,
-    uint32_t eye,
-    uint64_t pair_id,
-    uint64_t route_epoch) {
-    auto& packet = g_rt_temporal_ingress_packets[
-        (pair_id % kRtTemporalIngressPacketCount) * 2 + eye];
-    const w3vr::rt_join::Identity identity{
-        generation, eye, pair_id, route_epoch};
-    if (!w3vr::rt_join::identity_matches(packet, identity)) {
-        w3vr::rt_join::reset_packet(packet, identity);
-    }
-    return packet;
-}
-
-void observe_rt_temporal_ingress(
-    uint32_t eye,
-    uint64_t pair_id,
-    uint32_t mask) {
-    if (eye > 1 || pair_id == 0 || pair_id == UINT64_MAX || mask == 0) {
-        return;
-    }
-    const uint32_t generation =
-        g_streamline_capture_generation.load(std::memory_order_acquire);
-    const uint64_t route_epoch =
-        g_puredark_afw_route_epoch.load(std::memory_order_acquire);
-    std::scoped_lock lock{g_rt_temporal_ingress_mutex};
-    auto& packet = access_rt_temporal_ingress_packet_locked(
-        generation, eye, pair_id, route_epoch);
-    // [FIX:RT-FIRST-PROOF-LATCH V1168 1/1] One exact slot is a transaction.
-    // The first observer of each input bit opens that field and its matching
-    // ready() commits it. A duplicate downstream dispatch for the same
-    // {generation,eye,pair,epoch} must not revoke a field already proved by the
-    // first complete render; doing so removed one eye retroactively and made
-    // the unchanged AFW sequencer hold its last projection for long bursts.
-    const uint32_t first_observation = mask & ~packet.observed_mask;
-    w3vr::rt_join::observe(packet, mask);
-    if (first_observation != 0) {
-        record_rt_flight(
-            w3vr::rt_flight::EventCode::IngressObserved,
-            eye, pair_id, 0, w3vr::rt_flight::RejectReason::None,
-            first_observation, packet.observed_mask, packet.ready_mask);
-    }
-}
-
-void ready_rt_temporal_ingress(
-    uint32_t eye,
-    uint64_t pair_id,
-    uint32_t mask) {
-    if (eye > 1 || pair_id == 0 || pair_id == UINT64_MAX || mask == 0) {
-        return;
-    }
-    const uint32_t generation =
-        g_streamline_capture_generation.load(std::memory_order_acquire);
-    const uint64_t route_epoch =
-        g_puredark_afw_route_epoch.load(std::memory_order_acquire);
-    std::scoped_lock lock{g_rt_temporal_ingress_mutex};
-    auto& packet = access_rt_temporal_ingress_packet_locked(
-        generation, eye, pair_id, route_epoch);
-    const uint32_t newly_ready = mask & ~packet.ready_mask;
-    w3vr::rt_join::mark_ready(packet, mask);
-    if (newly_ready != 0) {
-        record_rt_flight(
-            w3vr::rt_flight::EventCode::IngressReady,
-            eye, pair_id, 0, w3vr::rt_flight::RejectReason::None,
-            newly_ready, packet.observed_mask, packet.ready_mask);
-    }
-}
-
-bool commit_rt_temporal_ingress_predecessor(
-    uint32_t eye,
-    uint64_t pair_id,
-    uint64_t predecessor_pair_id,
-    uint32_t source_mask) {
-    if (eye > 1 || pair_id == 0 || pair_id == UINT64_MAX ||
-        predecessor_pair_id == 0 ||
-        predecessor_pair_id == UINT64_MAX || source_mask == 0) {
-        return false;
-    }
-    const uint32_t generation =
-        g_streamline_capture_generation.load(std::memory_order_acquire);
-    const uint64_t route_epoch =
-        g_puredark_afw_route_epoch.load(std::memory_order_acquire);
-    std::scoped_lock lock{g_rt_temporal_ingress_mutex};
-    auto& packet = access_rt_temporal_ingress_packet_locked(
-        generation, eye, pair_id, route_epoch);
-    const bool committed = w3vr::rt_join::commit_predecessor(
-        packet, predecessor_pair_id, source_mask);
-    if (!committed) {
-        record_rt_flight(
-            w3vr::rt_flight::EventCode::IngressReady,
-            eye, pair_id, predecessor_pair_id,
-            w3vr::rt_flight::RejectReason::History,
-            source_mask, packet.predecessor_sources,
-            packet.observed_mask, packet.ready_mask,
-            static_cast<uint32_t>(packet.predecessor_pair_id));
-    }
-    return committed;
-}
-
-RtTemporalIngressSnapshot snapshot_rt_temporal_ingress(
-    uint32_t generation,
-    uint32_t eye,
-    uint64_t pair_id,
-    uint64_t route_epoch) {
-    RtTemporalIngressSnapshot snapshot{};
-    if (eye > 1 || pair_id == 0 || pair_id == UINT64_MAX) {
-        snapshot.ready = false;
-        return snapshot;
-    }
-    std::scoped_lock lock{g_rt_temporal_ingress_mutex};
-    const auto& packet = g_rt_temporal_ingress_packets[
-        (pair_id % kRtTemporalIngressPacketCount) * 2 + eye];
-    const w3vr::rt_join::Identity identity{
-        generation, eye, pair_id, route_epoch};
-    if (!w3vr::rt_join::identity_matches(packet, identity)) {
-        record_rt_flight(
-            w3vr::rt_flight::EventCode::IngressSnapshot,
-            eye, pair_id, packet.pair_id,
-            w3vr::rt_flight::RejectReason::Identity,
-            0, packet.generation, packet.eye,
-            packet.observed_mask, packet.ready_mask,
-            generation, route_epoch);
-        // [DIAG:RT-LINEAGE-CENSUS V1165 2/5] Show whether NGX found no RT
-        // ingress at all or the hashed slot contains a differently numbered
-        // provisional producer. Bounded and Diagnostic Logging only.
-        if (g_config.runtime_diagnostics &&
-            g_rt_lineage_snapshot_miss_logs.fetch_add(
-                1, std::memory_order_relaxed) < 48) {
-            log_line(
-                "V1165 RT ingress snapshot miss request=%u:%u:%llu:e%llu stored=%u:%u:%llu:e%llu observed=0x%X ready=0x%X",
-                generation, eye, static_cast<unsigned long long>(pair_id),
-                static_cast<unsigned long long>(route_epoch),
-                packet.generation, packet.eye,
-                static_cast<unsigned long long>(packet.pair_id),
-                static_cast<unsigned long long>(packet.route_epoch),
-                packet.observed_mask, packet.ready_mask);
-        }
-        // Missing exact ingress is never a complete packet. Non-RT routes do
-        // not call this gate.
-        return snapshot;
-    }
-    const RtTemporalIngressPacket* predecessor{};
-    if (packet.predecessor_pair_id != 0 &&
-        packet.predecessor_pair_id != UINT64_MAX) {
-        predecessor = &g_rt_temporal_ingress_packets[
-            (packet.predecessor_pair_id % kRtTemporalIngressPacketCount) *
-                2 + eye];
-    }
-    const auto evaluated = w3vr::rt_join::evaluate(
-        &packet, predecessor, identity, kRtIngressCompleteMask,
-        w3vr::rt_join::kAllPredecessors);
-    snapshot.observed_mask = evaluated.observed_mask;
-    snapshot.ready_mask = evaluated.ready_mask;
-    snapshot.previous_observed_mask =
-        evaluated.predecessor_observed_mask;
-    snapshot.previous_ready_mask = evaluated.predecessor_ready_mask;
-    snapshot.predecessor_pair_id = evaluated.predecessor_pair_id;
-    snapshot.present = evaluated.present;
-    snapshot.packet_ready = evaluated.current_complete;
-    snapshot.predecessor_ready = evaluated.predecessor_complete;
-    snapshot.ready = evaluated.ready;
-    const uint32_t flags = (snapshot.present ? 0x1u : 0u) |
-        (snapshot.packet_ready ? 0x2u : 0u) |
-        (snapshot.predecessor_ready ? 0x4u : 0u) |
-        (snapshot.ready ? 0x8u : 0u);
-    record_rt_flight(
-        w3vr::rt_flight::EventCode::IngressSnapshot,
-        eye, pair_id, snapshot.predecessor_pair_id,
-        snapshot.ready ? w3vr::rt_flight::RejectReason::None
-                       : w3vr::rt_flight::RejectReason::History,
-        flags, packet.observed_mask, packet.ready_mask,
-        snapshot.previous_observed_mask, snapshot.previous_ready_mask,
-        generation, route_epoch);
-    return snapshot;
 }
 
 enum RtCameraTagClaim : uint32_t {
@@ -9894,11 +9532,9 @@ bool take_mode3_aer_afw_final_hud_tag(
 
 void reset_rt_temporal_lineage_for_route_epoch(uint64_t route_epoch) {
     // Menu/loading/Cinema can advance AFW's logical route without changing
-    // the renderer generation. The ingress packet already carries that epoch,
-    // but the GPU-history ownership did not: the first post-resume dispatch
-    // could therefore accumulate an old AO/SIGMA/REBLUR texture and make the
-    // newly complete packet certify contaminated pixels. Keep the allocations
-    // alive, but revoke every exact-pair transaction under one lifecycle edge.
+    // the renderer generation. Keep the GPU allocations alive, but revoke all
+    // exact AO/SIGMA/REBLUR history ownership under one lifecycle edge so the
+    // first post-resume dispatch cannot accumulate a stale-eye texture.
     const uint32_t generation =
         g_streamline_capture_generation.load(std::memory_order_acquire);
     record_rt_flight(
@@ -9913,8 +9549,7 @@ void reset_rt_temporal_lineage_for_route_epoch(uint64_t route_epoch) {
         std::scoped_lock reset_lock{
             g_rt_shadow_history_mutex,
             g_rt_specular_history_mutex,
-            g_rt_ao_history_mutex,
-            g_rt_temporal_ingress_mutex};
+            g_rt_ao_history_mutex};
         g_rt_ao_history_generation = generation;
         g_rt_ao_history_pairs = {};
         g_rt_ao_history_transactions = {};
@@ -9931,7 +9566,6 @@ void reset_rt_temporal_lineage_for_route_epoch(uint64_t route_epoch) {
         g_rt_specular_last_generation = generation;
         g_rt_specular_last_write_slot = kRtInvalidHistorySlot;
 
-        g_rt_temporal_ingress_packets = {};
     }
     if (g_config.runtime_diagnostics) {
         log_line(
@@ -9954,7 +9588,6 @@ void reset_puredark_afw_publication_state() {
         g_rt_lineage_ao_reader_reject_logs.store(0, std::memory_order_relaxed);
         g_rt_lineage_ao_writer_logs.store(0, std::memory_order_relaxed);
         g_rt_lineage_ao_gap_join_logs.store(0, std::memory_order_relaxed);
-        g_rt_lineage_snapshot_miss_logs.store(0, std::memory_order_relaxed);
     }
     g_puredark_afw_steady_active.store(false, std::memory_order_release);
     std::scoped_lock lock{g_puredark_afw_mutex};
@@ -16287,42 +15920,8 @@ void publish_puredark_afw_submissions(
     const uint64_t publish_present =
         g_present_count.load(std::memory_order_relaxed);
 
-    // [REFACTOR:COMMON-TEMPORAL-AFW-TRANSACTION V1226 3/8] The temporal
-    // adapter only records producer identity. Sample the RTX CPU ledger after
-    // its command list reaches ExecuteCommandLists for either backend, so late
-    // AO/shadow/reflection hooks are visible. This remains diagnostic proof;
-    // GPU queue ordering is authority for the actual RTX -> temporal pixels.
-    std::vector<PuredarkAfwPendingSubmission> refreshed = pending;
-    const bool sample_rt_ledger = mode3_common_fifo &&
-        rt_per_eye_temporal_history_active();
-    for (auto& submission : refreshed) {
-        if (!sample_rt_ledger) {
-            submission.rt_ingress_packet_ready = true;
-            submission.rt_ingress_predecessor_ready = true;
-            continue;
-        }
-        if (!submission.exact_identity) {
-            continue;
-        }
-        const auto rt_ingress = snapshot_rt_temporal_ingress(
-            submission.generation, submission.eye, submission.pair_id,
-            submission.route_epoch);
-        submission.rt_ingress_observed_mask = rt_ingress.observed_mask;
-        submission.rt_ingress_ready_mask = rt_ingress.ready_mask;
-        submission.rt_ingress_previous_observed_mask =
-            rt_ingress.previous_observed_mask;
-        submission.rt_ingress_previous_ready_mask =
-            rt_ingress.previous_ready_mask;
-        submission.rt_ingress_predecessor_pair_id =
-            rt_ingress.predecessor_pair_id;
-        submission.rt_ingress_packet_present = rt_ingress.present;
-        submission.rt_ingress_packet_ready = rt_ingress.ready;
-        submission.rt_ingress_predecessor_ready =
-            rt_ingress.predecessor_ready;
-    }
-
     std::scoped_lock lock{g_puredark_afw_mutex};
-    for (const auto& submission : refreshed) {
+    for (const auto& submission : pending) {
         const uint64_t submitted_count =
             g_puredark_afw_submitted_candidates.fetch_add(
                 1, std::memory_order_relaxed) + 1;
@@ -16461,38 +16060,12 @@ void publish_puredark_afw_submissions(
             g_puredark_afw_missing_candidates.fetch_add(
                 1, std::memory_order_relaxed);
         }
-        const uint32_t flight_flags =
-            (slot_matches ? 0x001u : 0u) |
-            (submission.bundle_ready ? 0x002u : 0u) |
-            (submission.exact_identity ? 0x004u : 0u) |
-            (submission_ordered ? 0x008u : 0u) |
-            (gameplay_active ? 0x010u : 0u) |
-            (submission.route_epoch == current_epoch ? 0x020u : 0u) |
-            (submission.generation == current_generation ? 0x040u : 0u) |
-            (submission.rt_ingress_packet_ready ? 0x080u : 0u) |
-            (published ? 0x100u : 0u);
-        record_rt_flight(
-            w3vr::rt_flight::EventCode::AfwSubmission,
-            submission.eye, submission.pair_id,
-            submission.rt_ingress_predecessor_pair_id,
-            published ? w3vr::rt_flight::RejectReason::None
-                      : w3vr::rt_flight::RejectReason::PublishGate,
-            flight_flags,
-            submission.rt_ingress_observed_mask,
-            submission.rt_ingress_ready_mask,
-            submission.bundle_slot,
-            static_cast<uint32_t>(
-                g_puredark_afw_mode3_common_ready_queue.size()),
-            submission.generation, submission.route_epoch);
-
         if (g_config.runtime_diagnostics &&
             (submitted_count <= 32 || submitted_count % 240 == 0)) {
             log_line(
                 "V12016 AFW submitted producer count=%llu published=%u "
                 "slot=%u eye=%u pair=%llu generation=%u exact=%u "
                 "bundle=%u epoch=%llu current_epoch=%llu fifo=%u depth=%zu "
-                "rt_packet=%u rt_observed=0x%X rt_ready=0x%X "
-                "rt_previous=%u rt_complete=%u "
                 "ordered=%u producer_fence=%p producer_value=%llu",
                 static_cast<unsigned long long>(submitted_count),
                 published ? 1u : 0u, submission.bundle_slot,
@@ -16505,11 +16078,6 @@ void publish_puredark_afw_submissions(
                 static_cast<unsigned long long>(current_epoch),
                 mode3_common_fifo ? 1u : 0u,
                 g_puredark_afw_mode3_common_ready_queue.size(),
-                submission.rt_ingress_packet_present ? 1u : 0u,
-                submission.rt_ingress_observed_mask,
-                submission.rt_ingress_ready_mask,
-                submission.rt_ingress_predecessor_ready ? 1u : 0u,
-                submission.rt_ingress_packet_ready ? 1u : 0u,
                 submission_ordered ? 1u : 0u,
                 producer_queue_fence,
                 static_cast<unsigned long long>(
@@ -35965,14 +35533,14 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1229 base=V1228 taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=always_ram_f3_10s aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_hud=eye_local full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
-                "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss "
+                "witcher3vr canonical build=V1230 base=V1229 taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_hud=eye_local full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
+                "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss_taau "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
                 "native_dlss_source=exact_ngx_output_ticket "
                 "native_dlss_view=bundle_identity "
                 "rt_cb_resolution=fresh_registry_scan "
-                "rt_ingress_packet=exact_six_value_bounded_diagnostic_ledger "
+                "rt_ingress_packet=removed "
                 "rt_identity=first_family_opens_camera_tag_per_family_fifo_nrd_signature_consistency "
                 "rt_lineage_census=bounded_diagnostic_only rt_provisional_clock=open_transaction_only_accepted_natural_render rt_camera_slot_key=pair_eye rt_packet_commit=first_proof_immutable "
                 "rt_enabled=ini_owned rt_history_buffers=ini_4_to_16_default_8 rt_metadata=release_owned_exact_formats rt_diagnostics=checkbox_only "
@@ -35986,7 +35554,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1229 base=V1228 "
+                "witcher3vr dxgi proxy initialized build=V1230 base=V1229 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
@@ -35998,7 +35566,7 @@ void ensure_initialized() {
                 g_config.raytracing_history_buffers,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
-            log_line("V1177 retained AFW DLSS source=V1176 TAAU source=V12128 common_transport=dlss_and_taau taau_color=exact_final_backbuffer taau_motion=normalized_rg16f_previous_minus_current taau_fov=exact_sequenced_resolve taau_execute_lifecycle=functional_always afw_projection=packed_absolute_asymmetric_final_source_centered mode3_dlss_afw_mvec=normal mode3_dlss_afw_producer_clock=canonical_gameplay_frame mode3_dlss_afw_bundle_fifo=exact_submitted_ngx mode3_dlss_afw_symmetric_color=packed_exact mode3_dlss_afw_native_color=final_backbuffer_exact_submitted_tag mode3_dlss_afw_native_latency=same_present_queue_order mode3_dlss_afw_presentation=sequential_immutable_pair mode3_dlss_afw_mode=combined_warping mode3_dlss_afw_order=ngx_bundle_then_shared_xr_evaluate_copy_draw aer_barrier_tracking=functional_release rt_barrier_tracking=ini_owned_release rt_descriptor_metadata=exact_history_formats_release rt_override_slot_retirement=queue_fenced_release rt_lineage=route_epoch_atomic_reseed rt_ingress_packet=first_complete_exact_slot rt_identity=exact_route_then_task_then_accepted_natural_slot_exact_ngx_gate rt_provisional_clock=accepted_natural_render rt_camera_slot_key=pair_eye rt_packet_commit=first_proof_immutable rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 rt_lineage_census=bounded_diagnostic_only old_rt_slots=bounded_overwrite mode3_noaa_afw=fail_open_native_aer afw_visual_debug=F6");
+            log_line("V1230 AFW common_transport=dlss_and_taau taau_color=exact_final_backbuffer taau_motion=normalized_rg16f_previous_minus_current afw_projection=packed_absolute_asymmetric_final_source_centered mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6");
             log_line(
                 "V1177 RenderDoc integration=retained ini=optional_default_off capture=F7 system_dxgi_exports=pre_resolved api=1.6.0");
             log_line(
@@ -43318,10 +42886,6 @@ void try_log_dlss_output_luminance_readback() {
 }
 
 HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
-    update_rt_flight_present_clock();
-    if ((GetAsyncKeyState(VK_F3) & 1) != 0) {
-        dump_rt_flight_recorder();
-    }
     if ((GetAsyncKeyState(VK_F7) & 1) != 0) {
         trigger_renderdoc_capture(swapchain);
     }
@@ -44092,10 +43656,6 @@ HRESULT STDMETHODCALLTYPE hook_present1(
     UINT sync_interval,
     UINT flags,
     const DXGI_PRESENT_PARAMETERS* params) {
-    update_rt_flight_present_clock();
-    if ((GetAsyncKeyState(VK_F3) & 1) != 0) {
-        dump_rt_flight_recorder();
-    }
     const auto frame = ++g_present_count;
     record_rt_flight(
         w3vr::rt_flight::EventCode::Present,

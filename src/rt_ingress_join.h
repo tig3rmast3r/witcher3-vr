@@ -7,12 +7,6 @@
 
 namespace w3vr::rt_join {
 
-constexpr uint32_t kAoPredecessor = 1u << 0;
-constexpr uint32_t kShadowPredecessor = 1u << 1;
-constexpr uint32_t kReflectionPredecessor = 1u << 2;
-constexpr uint32_t kAllPredecessors =
-    kAoPredecessor | kShadowPredecessor | kReflectionPredecessor;
-
 struct Identity {
     uint32_t generation{};
     uint32_t eye{UINT32_MAX};
@@ -38,30 +32,6 @@ struct OpenTransactionCandidate {
     float signature_error{};
     uint32_t claimed_sources{};
     bool signature_valid{};
-};
-
-struct Packet {
-    uint64_t pair_id{};
-    uint64_t route_epoch{};
-    uint32_t generation{};
-    uint32_t eye{UINT32_MAX};
-    uint64_t predecessor_pair_id{};
-    uint32_t observed_mask{};
-    uint32_t ready_mask{};
-    uint32_t predecessor_sources{};
-    bool predecessor_conflict{};
-};
-
-struct Evaluation {
-    uint32_t observed_mask{};
-    uint32_t ready_mask{};
-    uint32_t predecessor_observed_mask{};
-    uint32_t predecessor_ready_mask{};
-    uint64_t predecessor_pair_id{};
-    bool present{};
-    bool current_complete{};
-    bool predecessor_complete{};
-    bool ready{};
 };
 
 // Once a pass has recovered an exact camera-created RTX identity, cache it for
@@ -107,9 +77,9 @@ TaggedIdentitySelection select_open_transaction(
     bool incoming_signature_valid,
     float maximum_signature_error) noexcept;
 
-// GPU queue ordering proves the pixels. The CPU ingress ledger is deliberately
-// absent from this transport gate: it may be sampled for diagnostics but must
-// never discard an immutable DLSS/AFW ticket.
+// GPU queue ordering proves the pixels. The removed CPU diagnostic ingress
+// ledger is not part of this transport gate and cannot discard an immutable
+// DLSS/AFW ticket.
 struct AfwTransportProof {
     bool slot_matches{};
     bool bundle_ready{};
@@ -120,20 +90,6 @@ struct AfwTransportProof {
     bool generation_matches{};
 };
 
-bool identity_matches(const Packet& packet, const Identity& identity) noexcept;
-void reset_packet(Packet& packet, const Identity& identity) noexcept;
-void observe(Packet& packet, uint32_t mask) noexcept;
-void mark_ready(Packet& packet, uint32_t mask) noexcept;
-bool commit_predecessor(
-    Packet& packet,
-    uint64_t predecessor_pair_id,
-    uint32_t source_mask) noexcept;
-Evaluation evaluate(
-    const Packet* packet,
-    const Packet* predecessor,
-    const Identity& identity,
-    uint32_t required_mask,
-    uint32_t required_predecessor_sources) noexcept;
 bool afw_transport_ready(const AfwTransportProof& proof) noexcept;
 bool afw_sequence_accepts(
     bool sequence_valid,
