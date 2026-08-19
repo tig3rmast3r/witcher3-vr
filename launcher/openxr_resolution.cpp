@@ -84,9 +84,9 @@ bool QueryOpenXrRecommendedResolution(
     strcpy_s(
         create_info.applicationInfo.applicationName,
         "Witcher 3 VR Launcher");
-    create_info.applicationInfo.applicationVersion = 1242;
+    create_info.applicationInfo.applicationVersion = 1244;
     strcpy_s(create_info.applicationInfo.engineName, "Witcher3VR");
-    create_info.applicationInfo.engineVersion = 1242;
+    create_info.applicationInfo.engineVersion = 1244;
     create_info.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
 
     XrInstance instance{XR_NULL_HANDLE};

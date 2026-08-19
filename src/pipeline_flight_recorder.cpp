@@ -3,6 +3,9 @@
 #include <Windows.h>
 #include <TlHelp32.h>
 
+#include <fcntl.h>
+#include <io.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -24,16 +27,25 @@ namespace {
 constexpr size_t kPhaseCount = static_cast<size_t>(Phase::Count);
 constexpr size_t kFrameCapacity = 4096;
 constexpr size_t kThreadSampleCapacity = 8192;
+constexpr size_t kThreadCpuIntervalCapacity = 32768;
+constexpr size_t kProcessCpuIntervalCapacity = 128;
 constexpr size_t kGpuSampleCapacity = 1024;
 constexpr size_t kQueueCapacity = 8;
 constexpr uint64_t kGpuSampleStride = 4;
 constexpr uint32_t kThreadPriorityRefreshStride = 64;
+constexpr DWORD kThreadCpuSamplePeriodMs = 250;
+constexpr uint32_t kThreadCpuRefreshStride = 4;
 constexpr double kWindowSeconds = 10.0;
 constexpr uint64_t kResetSequence = UINT64_MAX;
 constexpr int32_t kUnknownThreadPriority = INT32_MAX;
 
 constexpr std::array<const char*, kPhaseCount> kPhaseNames{
     "frame_factory",
+    "engine_scene_setup_hook",
+    "engine_scene_setup_original",
+    "engine_gameplay_hook",
+    "engine_gameplay_original",
+    "engine_pair_wait",
     "rtx_ao",
     "rtx_shadow",
     "rtx_reflection",
@@ -138,6 +150,35 @@ struct ProcessThreadSnapshot {
     std::string description{};
 };
 
+struct ThreadCpuInterval {
+    int64_t begin_qpc{};
+    int64_t end_qpc{};
+    uint32_t thread_id{};
+    uint64_t kernel_100ns{};
+    uint64_t user_100ns{};
+    uint64_t cycles{};
+};
+
+struct ProcessCpuInterval {
+    int64_t begin_qpc{};
+    int64_t end_qpc{};
+    uint64_t kernel_100ns{};
+    uint64_t user_100ns{};
+    uint32_t queried_threads{};
+    uint32_t failed_threads{};
+    uint64_t sampler_wall_ticks{};
+};
+
+struct LiveThreadCounter {
+    HANDLE handle{};
+    uint64_t kernel_100ns{};
+    uint64_t user_100ns{};
+    uint64_t cycles{};
+    int64_t qpc{};
+    uint32_t refresh_generation{};
+    bool initialized{};
+};
+
 struct QueueState {
     ID3D12CommandQueue* queue{};
     ID3D12Fence* fence{};
@@ -164,6 +205,23 @@ std::atomic<uint64_t> g_thread_sample_sequence{};
 std::array<ThreadSampleSlot, kThreadSampleCapacity> g_thread_samples{};
 std::once_flag g_cpu_topology_once{};
 std::vector<CpuTopologyEntry> g_cpu_topology{};
+
+std::mutex g_thread_cpu_mutex{};
+std::array<ThreadCpuInterval, kThreadCpuIntervalCapacity>
+    g_thread_cpu_intervals{};
+size_t g_thread_cpu_next{};
+size_t g_thread_cpu_count{};
+std::array<ProcessCpuInterval, kProcessCpuIntervalCapacity>
+    g_process_cpu_intervals{};
+size_t g_process_cpu_next{};
+size_t g_process_cpu_count{};
+std::mutex g_thread_cpu_lifecycle_mutex{};
+HANDLE g_thread_cpu_stop_event{};
+HANDLE g_thread_cpu_sampler_thread{};
+std::atomic<uint32_t> g_thread_cpu_sampler_tid{};
+std::atomic<uint64_t> g_thread_cpu_samples_taken{};
+std::atomic<uint64_t> g_thread_cpu_query_failures{};
+std::atomic<uint64_t> g_dump_sequence{};
 
 std::mutex g_gpu_mutex{};
 ID3D12QueryHeap* g_query_heap{};
@@ -481,6 +539,226 @@ void release_gpu_sample(uint32_t index) {
     sample = {};
 }
 
+uint64_t filetime_ticks(const FILETIME& value) {
+    ULARGE_INTEGER ticks{};
+    ticks.LowPart = value.dwLowDateTime;
+    ticks.HighPart = value.dwHighDateTime;
+    return ticks.QuadPart;
+}
+
+void append_thread_cpu_intervals(
+    const std::vector<ThreadCpuInterval>& thread_intervals,
+    const ProcessCpuInterval* process_interval) {
+    std::scoped_lock lock{g_thread_cpu_mutex};
+    for (const auto& interval : thread_intervals) {
+        g_thread_cpu_intervals[g_thread_cpu_next] = interval;
+        g_thread_cpu_next =
+            (g_thread_cpu_next + 1) % kThreadCpuIntervalCapacity;
+        g_thread_cpu_count = std::min(
+            g_thread_cpu_count + 1, kThreadCpuIntervalCapacity);
+    }
+    if (process_interval != nullptr) {
+        g_process_cpu_intervals[g_process_cpu_next] = *process_interval;
+        g_process_cpu_next =
+            (g_process_cpu_next + 1) % kProcessCpuIntervalCapacity;
+        g_process_cpu_count = std::min(
+            g_process_cpu_count + 1, kProcessCpuIntervalCapacity);
+    }
+}
+
+void refresh_live_thread_counters(
+    std::unordered_map<uint32_t, LiveThreadCounter>& counters,
+    uint32_t generation) {
+    const DWORD process_id = GetCurrentProcessId();
+    const DWORD sampler_tid = GetCurrentThreadId();
+    const HANDLE toolhelp = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (toolhelp == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    if (Thread32First(toolhelp, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID != process_id ||
+                entry.th32ThreadID == sampler_tid) {
+                continue;
+            }
+            const uint32_t thread_id = entry.th32ThreadID;
+            auto found = counters.find(thread_id);
+            if (found == counters.end()) {
+                const HANDLE thread = OpenThread(
+                    THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                    FALSE, thread_id);
+                if (thread == nullptr) {
+                    g_thread_cpu_query_failures.fetch_add(
+                        1, std::memory_order_relaxed);
+                    continue;
+                }
+                LiveThreadCounter counter{};
+                counter.handle = thread;
+                counter.refresh_generation = generation;
+                counters.emplace(thread_id, counter);
+            } else {
+                found->second.refresh_generation = generation;
+            }
+        } while (Thread32Next(toolhelp, &entry));
+    }
+    CloseHandle(toolhelp);
+
+    for (auto found = counters.begin(); found != counters.end();) {
+        if (found->second.refresh_generation == generation) {
+            ++found;
+            continue;
+        }
+        CloseHandle(found->second.handle);
+        found = counters.erase(found);
+    }
+}
+
+DWORD WINAPI thread_cpu_sampler_main(void*) {
+    g_thread_cpu_sampler_tid.store(
+        GetCurrentThreadId(), std::memory_order_release);
+    SetThreadDescription(GetCurrentThread(), L"W3VR Flight CPU Sampler");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+
+    std::unordered_map<uint32_t, LiveThreadCounter> counters{};
+    uint32_t refresh_generation{};
+    uint32_t sample_index{};
+    uint64_t previous_process_kernel{};
+    uint64_t previous_process_user{};
+    int64_t previous_process_qpc{};
+    bool process_initialized{};
+
+    while (g_enabled.load(std::memory_order_acquire)) {
+        const int64_t sampler_begin = qpc_now();
+        if (sample_index % kThreadCpuRefreshStride == 0) {
+            ++refresh_generation;
+            refresh_live_thread_counters(counters, refresh_generation);
+        }
+
+        std::vector<ThreadCpuInterval> intervals{};
+        intervals.reserve(counters.size());
+        uint32_t queried_threads{};
+        uint32_t failed_threads{};
+        for (auto& [thread_id, counter] : counters) {
+            FILETIME creation{}, exit{}, kernel{}, user{};
+            ULONG64 cycles{};
+            const bool time_ok = GetThreadTimes(
+                counter.handle, &creation, &exit, &kernel, &user) != FALSE;
+            const bool cycles_ok =
+                QueryThreadCycleTime(counter.handle, &cycles) != FALSE;
+            if (!time_ok || !cycles_ok) {
+                ++failed_threads;
+                g_thread_cpu_query_failures.fetch_add(
+                    1, std::memory_order_relaxed);
+                continue;
+            }
+            ++queried_threads;
+            const uint64_t kernel_ticks = filetime_ticks(kernel);
+            const uint64_t user_ticks = filetime_ticks(user);
+            const int64_t sample_qpc = qpc_now();
+            if (counter.initialized && sample_qpc >= counter.qpc &&
+                kernel_ticks >= counter.kernel_100ns &&
+                user_ticks >= counter.user_100ns &&
+                cycles >= counter.cycles) {
+                intervals.push_back(ThreadCpuInterval{
+                    counter.qpc,
+                    sample_qpc,
+                    thread_id,
+                    kernel_ticks - counter.kernel_100ns,
+                    user_ticks - counter.user_100ns,
+                    cycles - counter.cycles});
+            }
+            counter.kernel_100ns = kernel_ticks;
+            counter.user_100ns = user_ticks;
+            counter.cycles = cycles;
+            counter.qpc = sample_qpc;
+            counter.initialized = true;
+        }
+
+        ProcessCpuInterval process_interval{};
+        ProcessCpuInterval* process_interval_ptr{};
+        FILETIME process_creation{}, process_exit{}, process_kernel{},
+            process_user{};
+        const int64_t process_qpc = qpc_now();
+        if (GetProcessTimes(GetCurrentProcess(), &process_creation,
+                &process_exit, &process_kernel, &process_user)) {
+            const uint64_t kernel_ticks = filetime_ticks(process_kernel);
+            const uint64_t user_ticks = filetime_ticks(process_user);
+            if (process_initialized && process_qpc >= previous_process_qpc &&
+                kernel_ticks >= previous_process_kernel &&
+                user_ticks >= previous_process_user) {
+                process_interval.begin_qpc = previous_process_qpc;
+                process_interval.end_qpc = process_qpc;
+                process_interval.kernel_100ns =
+                    kernel_ticks - previous_process_kernel;
+                process_interval.user_100ns = user_ticks - previous_process_user;
+                process_interval.queried_threads = queried_threads;
+                process_interval.failed_threads = failed_threads;
+                process_interval_ptr = &process_interval;
+            }
+            previous_process_kernel = kernel_ticks;
+            previous_process_user = user_ticks;
+            previous_process_qpc = process_qpc;
+            process_initialized = true;
+        }
+
+        const int64_t sampler_end = qpc_now();
+        if (process_interval_ptr != nullptr && sampler_end >= sampler_begin) {
+            process_interval.sampler_wall_ticks =
+                static_cast<uint64_t>(sampler_end - sampler_begin);
+        }
+        append_thread_cpu_intervals(intervals, process_interval_ptr);
+        g_thread_cpu_samples_taken.fetch_add(1, std::memory_order_relaxed);
+        ++sample_index;
+
+        const HANDLE stop_event = g_thread_cpu_stop_event;
+        if (stop_event == nullptr ||
+            WaitForSingleObject(stop_event, kThreadCpuSamplePeriodMs) !=
+                WAIT_TIMEOUT) {
+            break;
+        }
+    }
+
+    for (auto& [thread_id, counter] : counters) {
+        (void)thread_id;
+        CloseHandle(counter.handle);
+    }
+    g_thread_cpu_sampler_tid.store(0, std::memory_order_release);
+    return 0;
+}
+
+void start_thread_cpu_sampler() {
+    std::scoped_lock lock{g_thread_cpu_lifecycle_mutex};
+    if (g_thread_cpu_sampler_thread != nullptr) {
+        return;
+    }
+    g_thread_cpu_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_thread_cpu_stop_event == nullptr) {
+        return;
+    }
+    g_thread_cpu_sampler_thread = CreateThread(
+        nullptr, 0, &thread_cpu_sampler_main, nullptr, 0, nullptr);
+    if (g_thread_cpu_sampler_thread == nullptr) {
+        CloseHandle(g_thread_cpu_stop_event);
+        g_thread_cpu_stop_event = nullptr;
+    }
+}
+
+void stop_thread_cpu_sampler() {
+    std::scoped_lock lock{g_thread_cpu_lifecycle_mutex};
+    if (g_thread_cpu_sampler_thread == nullptr) {
+        return;
+    }
+    SetEvent(g_thread_cpu_stop_event);
+    WaitForSingleObject(g_thread_cpu_sampler_thread, 2000);
+    CloseHandle(g_thread_cpu_sampler_thread);
+    CloseHandle(g_thread_cpu_stop_event);
+    g_thread_cpu_sampler_thread = nullptr;
+    g_thread_cpu_stop_event = nullptr;
+}
+
 double percentile(std::vector<double> values, double fraction) {
     if (values.empty()) {
         return 0.0;
@@ -491,12 +769,18 @@ double percentile(std::vector<double> values, double fraction) {
     return values[std::min(index, values.size() - 1)];
 }
 
-bool flight_log_path(wchar_t (&path)[MAX_PATH]) {
+bool open_unique_flight_log(
+    FILE** file,
+    wchar_t (&path)[MAX_PATH]) {
+    if (file == nullptr) {
+        return false;
+    }
+    *file = nullptr;
     HMODULE module{};
     if (!GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&flight_log_path), &module)) {
+            reinterpret_cast<LPCWSTR>(&open_unique_flight_log), &module)) {
         return false;
     }
     const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
@@ -508,7 +792,52 @@ bool flight_log_path(wchar_t (&path)[MAX_PATH]) {
         return false;
     }
     *(slash + 1) = L'\0';
-    return wcscat_s(path, L"witcher3vr_pipeline_flight.log") == 0;
+    const size_t directory_length = wcslen(path);
+    SYSTEMTIME local_time{};
+    GetLocalTime(&local_time);
+    for (uint32_t attempt = 0; attempt < 100; ++attempt) {
+        const uint64_t sequence =
+            g_dump_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int written = swprintf_s(
+            path + directory_length,
+            MAX_PATH - directory_length,
+            L"witcher3vr_pipeline_flight_%04u%02u%02u_%02u%02u%02u_%03u_"
+            L"pid%lu_%06llu.log",
+            local_time.wYear, local_time.wMonth, local_time.wDay,
+            local_time.wHour, local_time.wMinute, local_time.wSecond,
+            local_time.wMilliseconds,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long long>(sequence));
+        if (written <= 0) {
+            return false;
+        }
+
+        const HANDLE handle = CreateFileW(
+            path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            if (GetLastError() == ERROR_FILE_EXISTS ||
+                GetLastError() == ERROR_ALREADY_EXISTS) {
+                continue;
+            }
+            return false;
+        }
+        const int descriptor = _open_osfhandle(
+            reinterpret_cast<intptr_t>(handle),
+            _O_BINARY | _O_WRONLY | _O_NOINHERIT);
+        if (descriptor == -1) {
+            CloseHandle(handle);
+            return false;
+        }
+        FILE* stream = _fdopen(descriptor, "wb");
+        if (stream == nullptr) {
+            _close(descriptor);
+            return false;
+        }
+        *file = stream;
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -516,12 +845,20 @@ bool flight_log_path(wchar_t (&path)[MAX_PATH]) {
 void set_enabled(bool enabled_value) {
     if (enabled_value) {
         initialize_cpu_topology();
+        g_enabled.store(true, std::memory_order_release);
+        start_thread_cpu_sampler();
+        return;
     }
-    g_enabled.store(enabled_value, std::memory_order_release);
+    g_enabled.store(false, std::memory_order_release);
+    stop_thread_cpu_sampler();
 }
 
 bool enabled() {
     return g_enabled.load(std::memory_order_relaxed);
+}
+
+uint64_t current_frame() {
+    return g_current_frame.load(std::memory_order_acquire);
 }
 
 void begin_frame(
@@ -886,30 +1223,79 @@ bool dump_last_ten_seconds() {
             return std::tie(left.qpc, left.sequence) <
                 std::tie(right.qpc, right.sequence);
         });
+
+    std::vector<ThreadCpuInterval> thread_cpu_intervals{};
+    std::vector<ProcessCpuInterval> process_cpu_intervals{};
+    {
+        std::scoped_lock lock{g_thread_cpu_mutex};
+        thread_cpu_intervals.reserve(g_thread_cpu_count);
+        const size_t thread_begin =
+            (g_thread_cpu_next + kThreadCpuIntervalCapacity -
+                g_thread_cpu_count) % kThreadCpuIntervalCapacity;
+        for (size_t index = 0; index < g_thread_cpu_count; ++index) {
+            const auto& interval = g_thread_cpu_intervals[
+                (thread_begin + index) % kThreadCpuIntervalCapacity];
+            if (interval.end_qpc >= oldest && interval.end_qpc <= now) {
+                thread_cpu_intervals.push_back(interval);
+            }
+        }
+
+        process_cpu_intervals.reserve(g_process_cpu_count);
+        const size_t process_begin =
+            (g_process_cpu_next + kProcessCpuIntervalCapacity -
+                g_process_cpu_count) % kProcessCpuIntervalCapacity;
+        for (size_t index = 0; index < g_process_cpu_count; ++index) {
+            const auto& interval = g_process_cpu_intervals[
+                (process_begin + index) % kProcessCpuIntervalCapacity];
+            if (interval.end_qpc >= oldest && interval.end_qpc <= now) {
+                process_cpu_intervals.push_back(interval);
+            }
+        }
+    }
+    std::sort(thread_cpu_intervals.begin(), thread_cpu_intervals.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.end_qpc, left.thread_id) <
+                std::tie(right.end_qpc, right.thread_id);
+        });
+    std::sort(process_cpu_intervals.begin(), process_cpu_intervals.end(),
+        [](const auto& left, const auto& right) {
+            return left.end_qpc < right.end_qpc;
+        });
     const auto process_threads = snapshot_process_threads();
 
     wchar_t path[MAX_PATH]{};
-    if (!flight_log_path(path)) {
-        return false;
-    }
     FILE* file{};
-    if (_wfopen_s(&file, path, L"wb") != 0 || file == nullptr) {
+    if (!open_unique_flight_log(&file, path) || file == nullptr) {
         return false;
     }
 
-    fprintf(file, "WITCHER3VR_PIPELINE_FLIGHT_V2\n");
-    fprintf(file, "build=V1242 window_seconds=10 cpu_sampling=every_call "
+    fprintf(file, "WITCHER3VR_PIPELINE_FLIGHT_V3\n");
+    fprintf(file, "build=V1247 base=V1245 window_seconds=10 "
+        "cpu_sampling=every_call "
         "gpu_sampling=every_4th_frame gpu_readback=asynchronous "
         "thread_sampling=producer_exit+render_worker_entry "
-        "thread_priority_refresh=64_samples diagnostic_logging_required=0\n");
-    fprintf(file, "frames=%zu thread_samples=%zu process_threads=%zu "
+        "thread_priority_refresh=64_samples thread_cpu_period_ms=%lu "
+        "thread_cpu_source=GetThreadTimes+QueryThreadCycleTime "
+        "diagnostic_logging_required=0\n",
+        static_cast<unsigned long>(kThreadCpuSamplePeriodMs));
+    fprintf(file, "file_policy=timestamped_create_new_no_overwrite path=%ls\n",
+        path);
+    fprintf(file, "frames=%zu thread_samples=%zu thread_cpu_intervals=%zu "
+        "process_cpu_intervals=%zu process_threads=%zu "
         "thread_capacity=%zu thread_total=%llu qpc_frequency=%lld "
-        "gpu_dropped=%llu gpu_invalid=%llu\n",
-        snapshots.size(), thread_snapshots.size(), process_threads.size(),
+        "thread_cpu_sampler_tid=%u thread_cpu_sampler_passes=%llu "
+        "thread_cpu_query_failures=%llu gpu_dropped=%llu gpu_invalid=%llu\n",
+        snapshots.size(), thread_snapshots.size(), thread_cpu_intervals.size(),
+        process_cpu_intervals.size(), process_threads.size(),
         kThreadSampleCapacity,
         static_cast<unsigned long long>(
             g_thread_sample_sequence.load(std::memory_order_relaxed)),
         static_cast<long long>(frequency),
+        g_thread_cpu_sampler_tid.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(
+            g_thread_cpu_samples_taken.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            g_thread_cpu_query_failures.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
             g_gpu_dropped_samples.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
@@ -918,6 +1304,16 @@ bool dump_last_ten_seconds() {
         "bit1=rtx bit2=afw bit3=afw_visual_debug\n");
     fprintf(file, "NOTE: xr_record_composite is the enclosing XR GPU list and "
         "can overlap the nested AFW value. Do not add nested phases together.\n\n");
+    fprintf(file, "NOTE: engine_*_hook includes its nested engine_*_original "
+        "phase (and engine_pair_wait where applicable). Do not add those "
+        "nested CPU phases together.\n");
+    fprintf(file, "NOTE: THREAD_CPU measures CPU actually consumed by each "
+        "TID. A long wall interval with little CPU is evidence of waiting or "
+        "lack of scheduling, but this recorder does not directly capture "
+        "Windows ready-queue time; ETW is required for that distinction.\n");
+    fprintf(file, "NOTE: the dedicated sampler runs at THREAD_PRIORITY_LOWEST, "
+        "never changes game-thread affinity/priority, and is excluded from "
+        "THREAD_CPU rows. sampler_wall_ms reports each sampling pass cost.\n");
     fprintf(file, "NOTE: THREAD rows are exact samples only for the inline "
         "producer/render-worker hooks, not the complete REDengine worker pool. "
         "Use ETW for whole-process scheduling.\n");
@@ -1065,6 +1461,161 @@ bool dump_last_ten_seconds() {
             thread.selected_cpu_sets.c_str(), thread.description.c_str());
     }
 
+    struct ThreadCpuSummary {
+        uint64_t kernel_100ns{};
+        uint64_t user_100ns{};
+        uint64_t cycles{};
+        uint64_t observed_qpc{};
+        size_t samples{};
+        size_t active_samples{};
+        std::vector<double> sample_cpu_ms{};
+    };
+    std::map<uint32_t, ThreadCpuSummary> thread_cpu_summaries{};
+    for (const auto& interval : thread_cpu_intervals) {
+        auto& summary = thread_cpu_summaries[interval.thread_id];
+        summary.kernel_100ns += interval.kernel_100ns;
+        summary.user_100ns += interval.user_100ns;
+        summary.cycles += interval.cycles;
+        if (interval.end_qpc >= interval.begin_qpc) {
+            summary.observed_qpc += static_cast<uint64_t>(
+                interval.end_qpc - interval.begin_qpc);
+        }
+        ++summary.samples;
+        const uint64_t cpu_100ns =
+            interval.kernel_100ns + interval.user_100ns;
+        if (cpu_100ns != 0) {
+            ++summary.active_samples;
+        }
+        summary.sample_cpu_ms.push_back(
+            static_cast<double>(cpu_100ns) / 10000.0);
+    }
+
+    std::map<uint32_t, const ProcessThreadSnapshot*> thread_config_by_id{};
+    for (const auto& thread : process_threads) {
+        thread_config_by_id[thread.thread_id] = &thread;
+    }
+    std::map<uint32_t, std::set<uint32_t>> thread_roles{};
+    for (const auto& sample : thread_snapshots) {
+        if (sample.point < kThreadPointCount) {
+            thread_roles[sample.thread_id].insert(sample.point);
+        }
+    }
+
+    fprintf(file, "\nTHREAD_CPU_SUMMARY,tid,roles,samples,active_samples,"
+        "observed_ms,kernel_ms,user_ms,total_cpu_ms,one_core_pct,cycles,"
+        "p95_sample_cpu_ms,max_sample_cpu_ms,current_priority,name\n");
+    for (const auto& [thread_id, summary] : thread_cpu_summaries) {
+        std::ostringstream roles{};
+        const auto role_found = thread_roles.find(thread_id);
+        if (role_found != thread_roles.end()) {
+            bool first = true;
+            for (const uint32_t point : role_found->second) {
+                if (!first) {
+                    roles << ';';
+                }
+                roles << thread_point_name(point);
+                first = false;
+            }
+        }
+        const double observed_ms = frequency > 0
+            ? static_cast<double>(summary.observed_qpc) * 1000.0 /
+                static_cast<double>(frequency)
+            : 0.0;
+        const double kernel_ms =
+            static_cast<double>(summary.kernel_100ns) / 10000.0;
+        const double user_ms =
+            static_cast<double>(summary.user_100ns) / 10000.0;
+        const double total_ms = kernel_ms + user_ms;
+        const double one_core_pct = observed_ms > 0.0
+            ? total_ms * 100.0 / observed_ms
+            : 0.0;
+        const auto config_found = thread_config_by_id.find(thread_id);
+        const ProcessThreadSnapshot* config = config_found !=
+                thread_config_by_id.end()
+            ? config_found->second
+            : nullptr;
+        const double maximum = summary.sample_cpu_ms.empty()
+            ? 0.0
+            : *std::max_element(summary.sample_cpu_ms.begin(),
+                summary.sample_cpu_ms.end());
+        fprintf(file,
+            "THREAD_CPU_SUMMARY,%u,%s,%zu,%zu,%.3f,%.3f,%.3f,%.3f,"
+            "%.3f,%llu,%.3f,%.3f,%d,%s\n",
+            thread_id, roles.str().c_str(), summary.samples,
+            summary.active_samples, observed_ms, kernel_ms, user_ms,
+            total_ms, one_core_pct,
+            static_cast<unsigned long long>(summary.cycles),
+            percentile(summary.sample_cpu_ms, 0.95), maximum,
+            config != nullptr ? config->relative_priority
+                              : kUnknownThreadPriority,
+            config != nullptr ? config->description.c_str() : "");
+    }
+
+    uint64_t process_kernel_100ns{};
+    uint64_t process_user_100ns{};
+    uint64_t process_observed_qpc{};
+    uint64_t sampler_wall_ticks{};
+    uint64_t failed_thread_queries{};
+    std::vector<double> process_sample_cpu_ms{};
+    std::vector<double> sampler_sample_wall_ms{};
+    for (const auto& interval : process_cpu_intervals) {
+        process_kernel_100ns += interval.kernel_100ns;
+        process_user_100ns += interval.user_100ns;
+        failed_thread_queries += interval.failed_threads;
+        sampler_wall_ticks += interval.sampler_wall_ticks;
+        if (interval.end_qpc >= interval.begin_qpc) {
+            process_observed_qpc += static_cast<uint64_t>(
+                interval.end_qpc - interval.begin_qpc);
+        }
+        process_sample_cpu_ms.push_back(static_cast<double>(
+            interval.kernel_100ns + interval.user_100ns) / 10000.0);
+        sampler_sample_wall_ms.push_back(frequency > 0
+            ? static_cast<double>(interval.sampler_wall_ticks) * 1000.0 /
+                static_cast<double>(frequency)
+            : 0.0);
+    }
+    const double process_observed_ms = frequency > 0
+        ? static_cast<double>(process_observed_qpc) * 1000.0 /
+            static_cast<double>(frequency)
+        : 0.0;
+    const double process_kernel_ms =
+        static_cast<double>(process_kernel_100ns) / 10000.0;
+    const double process_user_ms =
+        static_cast<double>(process_user_100ns) / 10000.0;
+    const double process_total_ms = process_kernel_ms + process_user_ms;
+    const double equivalent_cores = process_observed_ms > 0.0
+        ? process_total_ms / process_observed_ms
+        : 0.0;
+    const DWORD logical_processors =
+        GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    const double machine_pct = logical_processors != 0
+        ? equivalent_cores * 100.0 / static_cast<double>(logical_processors)
+        : 0.0;
+    const double sampler_total_wall_ms = frequency > 0
+        ? static_cast<double>(sampler_wall_ticks) * 1000.0 /
+            static_cast<double>(frequency)
+        : 0.0;
+    fprintf(file, "\nPROCESS_CPU_SUMMARY,samples,observed_ms,kernel_ms,"
+        "user_ms,total_cpu_ms,average_equivalent_cores,machine_pct,"
+        "logical_processors,p95_sample_cpu_ms,max_sample_cpu_ms,"
+        "sampler_total_wall_ms,sampler_avg_wall_ms,sampler_max_wall_ms,"
+        "failed_thread_queries\n");
+    fprintf(file,
+        "PROCESS_CPU_SUMMARY,%zu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%lu,"
+        "%.3f,%.3f,%.3f,%.3f,%.3f,%llu\n",
+        process_cpu_intervals.size(), process_observed_ms, process_kernel_ms,
+        process_user_ms, process_total_ms, equivalent_cores, machine_pct,
+        static_cast<unsigned long>(logical_processors),
+        percentile(process_sample_cpu_ms, 0.95),
+        process_sample_cpu_ms.empty() ? 0.0 : *std::max_element(
+            process_sample_cpu_ms.begin(), process_sample_cpu_ms.end()),
+        sampler_total_wall_ms,
+        process_cpu_intervals.empty() ? 0.0 : sampler_total_wall_ms /
+            static_cast<double>(process_cpu_intervals.size()),
+        sampler_sample_wall_ms.empty() ? 0.0 : *std::max_element(
+            sampler_sample_wall_ms.begin(), sampler_sample_wall_ms.end()),
+        static_cast<unsigned long long>(failed_thread_queries));
+
     fprintf(file, "\nCPU_TOPOLOGY,group,logical_cpu,core_index,"
         "efficiency_class,scheduling_class,cpu_set_id,flags\n");
     for (const auto& topology : g_cpu_topology) {
@@ -1124,6 +1675,69 @@ bool dump_last_ten_seconds() {
             sample.group, sample.logical_processor, sample.core_index,
             sample.efficiency_class, sample.scheduling_class,
             sample.thread_priority);
+    }
+
+    fprintf(file, "\nPROCESS_CPU_SAMPLE,end_age_ms,elapsed_ms,kernel_ms,"
+        "user_ms,total_cpu_ms,equivalent_cores,machine_pct,queried_threads,"
+        "failed_threads,sampler_wall_ms\n");
+    for (const auto& interval : process_cpu_intervals) {
+        const double end_age_ms = frequency > 0
+            ? static_cast<double>(interval.end_qpc - now) * 1000.0 /
+                static_cast<double>(frequency)
+            : 0.0;
+        const double elapsed_ms = frequency > 0
+            ? static_cast<double>(interval.end_qpc - interval.begin_qpc) *
+                1000.0 / static_cast<double>(frequency)
+            : 0.0;
+        const double kernel_ms =
+            static_cast<double>(interval.kernel_100ns) / 10000.0;
+        const double user_ms =
+            static_cast<double>(interval.user_100ns) / 10000.0;
+        const double total_ms = kernel_ms + user_ms;
+        const double sample_equivalent_cores = elapsed_ms > 0.0
+            ? total_ms / elapsed_ms
+            : 0.0;
+        const double sample_machine_pct = logical_processors != 0
+            ? sample_equivalent_cores * 100.0 /
+                static_cast<double>(logical_processors)
+            : 0.0;
+        const double sample_sampler_wall_ms = frequency > 0
+            ? static_cast<double>(interval.sampler_wall_ticks) * 1000.0 /
+                static_cast<double>(frequency)
+            : 0.0;
+        fprintf(file,
+            "PROCESS_CPU_SAMPLE,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
+            "%u,%u,%.3f\n",
+            end_age_ms, elapsed_ms, kernel_ms, user_ms, total_ms,
+            sample_equivalent_cores, sample_machine_pct,
+            interval.queried_threads, interval.failed_threads,
+            sample_sampler_wall_ms);
+    }
+
+    fprintf(file, "\nTHREAD_CPU_SAMPLE,end_age_ms,elapsed_ms,tid,kernel_ms,"
+        "user_ms,total_cpu_ms,one_core_pct,cycles\n");
+    for (const auto& interval : thread_cpu_intervals) {
+        const double end_age_ms = frequency > 0
+            ? static_cast<double>(interval.end_qpc - now) * 1000.0 /
+                static_cast<double>(frequency)
+            : 0.0;
+        const double elapsed_ms = frequency > 0
+            ? static_cast<double>(interval.end_qpc - interval.begin_qpc) *
+                1000.0 / static_cast<double>(frequency)
+            : 0.0;
+        const double kernel_ms =
+            static_cast<double>(interval.kernel_100ns) / 10000.0;
+        const double user_ms =
+            static_cast<double>(interval.user_100ns) / 10000.0;
+        const double total_ms = kernel_ms + user_ms;
+        const double one_core_pct = elapsed_ms > 0.0
+            ? total_ms * 100.0 / elapsed_ms
+            : 0.0;
+        fprintf(file,
+            "THREAD_CPU_SAMPLE,%.3f,%.3f,%u,%.3f,%.3f,%.3f,%.3f,%llu\n",
+            end_age_ms, elapsed_ms, interval.thread_id, kernel_ms, user_ms,
+            total_ms, one_core_pct,
+            static_cast<unsigned long long>(interval.cycles));
     }
     fclose(file);
     return true;

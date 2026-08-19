@@ -10,6 +10,11 @@ namespace w3vr::pipeline_flight {
 // cadence and resolved asynchronously after their real submission queue fence.
 enum class Phase : uint32_t {
     FrameFactory,
+    EngineSceneSetupHook,
+    EngineSceneSetupOriginal,
+    EngineGameplayHook,
+    EngineGameplayOriginal,
+    EnginePairWait,
     RtxAo,
     RtxShadow,
     RtxReflection,
@@ -44,6 +49,7 @@ struct GpuToken {
 
 void set_enabled(bool enabled);
 bool enabled();
+uint64_t current_frame();
 
 void begin_frame(
     uint64_t frame,
@@ -104,8 +110,9 @@ void on_execute(
 // Nonblocking: only consumes query results whose submission fence has retired.
 void process_gpu();
 
-// Overwrites witcher3vr_pipeline_flight.log beside this DLL with the most
-// recent ten seconds. File I/O happens only on this explicit F2 action.
+// Creates a timestamped witcher3vr_pipeline_flight_*.log beside this DLL with
+// the most recent ten seconds. Every F2 dump is a new file; the recorder keeps
+// running and file I/O happens only on this explicit action.
 bool dump_last_ten_seconds();
 
 } // namespace w3vr::pipeline_flight

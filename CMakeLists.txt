@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1242.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1247.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -178,6 +178,16 @@ if(BUILD_TESTING)
         COMMAND w3vr_mode3_transport_policy_tests
     )
 
+    add_executable(w3vr_native_asymmetric_transport_policy_tests
+        tests/native_asymmetric_transport_policy_tests.cpp
+    )
+    target_include_directories(
+        w3vr_native_asymmetric_transport_policy_tests PRIVATE src)
+    add_test(
+        NAME renderer_native_asymmetric_transport_policy
+        COMMAND w3vr_native_asymmetric_transport_policy_tests
+    )
+
     add_executable(w3vr_pipeline_flight_thread_tests
         tests/pipeline_flight_thread_tests.cpp
         src/pipeline_flight_recorder.cpp
@@ -197,6 +207,13 @@ if(BUILD_TESTING)
     add_test(
         NAME pipeline_flight_thread_placement
         COMMAND w3vr_pipeline_flight_thread_tests
+    )
+
+    add_test(
+        NAME hud_editor_subtitle_preview_nudge_contract
+        COMMAND "${CMAKE_COMMAND}"
+            "-DHUD_EDITOR_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/support/modWitcher3VRHUDEditor/content/scripts/local/witcher3vr_hud_editor/hud_editor.ws"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/hud_editor_subtitle_preview_nudge_contract.cmake"
     )
 endif()
 

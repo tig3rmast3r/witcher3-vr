@@ -28,7 +28,7 @@ function W3VRHudEditor_DebugChannel(): name
 
 function W3VRHudEditor_Version(): string
 {
-  return "V1233";
+  return "V1247";
 }
 
 function W3VRHudEditor_DebugEnabled(): bool
@@ -1521,6 +1521,37 @@ class W3VRHudEditorController
     AnnounceSelectedSlot();
   }
 
+  private function BootstrapSubtitlePreviewLayout(
+    slot: W3VRHudEditorSlot
+  )
+  {
+    var savedY: float;
+    var temporaryY: float;
+
+    if (!slot || !slot.module || slot.moduleName != "SubtitlesModule")
+    {
+      return;
+    }
+
+    savedY = slot.GetY(activeProfile);
+    temporaryY = savedY + 1.0f;
+    if (temporaryY > 2160.0f)
+    {
+      temporaryY = savedY - 1.0f;
+    }
+
+    // [FIX:SUBTITLE-PREVIEW-NUDGE-BOOTSTRAP V1247] OnSubtitleAdded can
+    // recreate the ScaleOnly root after its saved transform was last applied.
+    // Reproduce one real vertical nudge and its exact inverse only on that
+    // creation edge. The saved coordinate is restored before returning, so
+    // closing the editor persists the original value and no per-frame owner
+    // fights Scaleform animation.
+    slot.SetY(activeProfile, temporaryY);
+    RefreshSlot(slot);
+    slot.SetY(activeProfile, savedY);
+    RefreshSlot(slot);
+  }
+
   private function ShowConditionalPreview(slot: W3VRHudEditorSlot)
   {
     var consoleModule: CR4HudModuleConsole;
@@ -1528,6 +1559,7 @@ class W3VRHudEditorController
     var areaModule: CR4HudModuleAreaInfo;
     var subtitlesModule: CR4HudModuleSubtitles;
     var dialogModule: CR4HudModuleDialog;
+    var subtitlePreviewWasActive: bool;
 
     if (!slot)
     {
@@ -1574,7 +1606,16 @@ class W3VRHudEditorController
       subtitlesModule = (CR4HudModuleSubtitles)slot.module;
       if (subtitlesModule)
       {
+        subtitlePreviewWasActive =
+          subtitlesModule.w3vr_hud_editor_preview_active;
         subtitlesModule.W3VRHudEditorShowPreview();
+        if (
+          !subtitlePreviewWasActive &&
+          subtitlesModule.w3vr_hud_editor_preview_active
+        )
+        {
+          BootstrapSubtitlePreviewLayout(slot);
+        }
       }
     }
     else if (slot.moduleName == "DialogModule")

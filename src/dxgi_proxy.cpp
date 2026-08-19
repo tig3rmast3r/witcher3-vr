@@ -22,9 +22,16 @@
 #include "first_person_combat_lock.h"
 #include "first_person_anchor_smoothing.h"
 #include "mode3_transport_policy.h"
+#include "native_asymmetric_transport_policy.h"
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
+// V1245 lets the already-proven Full-VR final-frame fallback establish native
+// asymmetric transport after the opening movie, where no perspective factory
+// callback exists to preflight it. V1212's per-eye factory-mask proof remains
+// unchanged. V1244 keeps V1242's renderer and adds only low-overhead flight diagnostics:
+// complete REDengine hook/original/wait timing plus timestamped per-thread CPU
+// captures. It does not change affinity, CPU sets, priority, or frame routing.
 // V1242 keeps V1241's renderer, allows the AFW F6 visual diagnostic whenever
 // the independent flight recorder is active, and adds launcher-owned OpenXR
 // automatic resolution. V1241 extends the lightweight F2 recorder with exact
@@ -25280,6 +25287,10 @@ void install_engine_dlss_command_route_hook() {
 }
 
 void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
+    const uint64_t flight_hook_frame =
+        w3vr::pipeline_flight::current_frame();
+    const int64_t flight_hook_begin =
+        w3vr::pipeline_flight::cpu_begin();
     // [FIX:PUREDARK-AFW-DIRECT-PROVENANCE V12015 6/6] Distinguish an exact
     // frame-data registry hit from the scheduler fallback so AFW can never
     // bind a deferred command to a guessed current-Present camera.
@@ -25387,7 +25398,13 @@ void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
         }
     }
 
+    const int64_t flight_original_begin =
+        w3vr::pipeline_flight::cpu_begin();
     g_engine_gameplay_frame_entry(frame_task);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::EngineGameplayOriginal,
+        flight_original_begin,
+        flight_hook_frame);
     // [FIX:AER-CINEMA-EXACT-EYE-CONTRACT V1214 3/12] Publish the exact
     // REDengine frame-data tag at task completion. The current Present value
     // identifies the DXGI producer interval; the next Present can therefore
@@ -25504,6 +25521,10 @@ void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
     g_engine_render_view_valid = previous_view_valid;
     g_engine_render_hmd_pose = previous_hmd_pose;
     g_engine_render_tag_frame_lookup_exact = previous_frame_lookup_exact;
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::EngineGameplayHook,
+        flight_hook_begin,
+        flight_hook_frame);
 }
 
 void install_engine_gameplay_entry_probe() {
@@ -25706,6 +25727,10 @@ void mark_engine_pair_output_captured(uint64_t pair_id, uint32_t eye) {
 }
 
 void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time) {
+    const uint64_t flight_hook_frame =
+        w3vr::pipeline_flight::current_frame();
+    const int64_t flight_hook_begin =
+        w3vr::pipeline_flight::cpu_begin();
     if (g_config.openxr_mode == 3 &&
         g_engine_dual_render_active.load()) {
         apply_performance_cpu_sets_to_current_thread(
@@ -25713,7 +25738,13 @@ void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time)
     }
     const auto previous_pair = g_engine_producer_pair_id;
     g_engine_producer_pair_id = 0;
+    const int64_t flight_original_begin =
+        w3vr::pipeline_flight::cpu_begin();
     g_engine_render_scene_setup(renderer, delta_time);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::EngineSceneSetupOriginal,
+        flight_original_begin,
+        flight_hook_frame);
     const auto produced_pair = g_engine_producer_pair_id;
     g_engine_producer_pair_id = previous_pair;
     if (w3vr::pipeline_flight::enabled() &&
@@ -25730,8 +25761,18 @@ void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time)
         !mode3_aer_presentation_active() &&
         g_engine_dual_render_active.load() &&
         produced_pair != 0) {
+        const int64_t flight_pair_wait_begin =
+            w3vr::pipeline_flight::cpu_begin();
         wait_for_engine_pair_completion(produced_pair, 64);
+        w3vr::pipeline_flight::cpu_end(
+            w3vr::pipeline_flight::Phase::EnginePairWait,
+            flight_pair_wait_begin,
+            flight_hook_frame);
     }
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::EngineSceneSetupHook,
+        flight_hook_begin,
+        flight_hook_frame);
 }
 
 void install_engine_render_scene_setup_probe() {
@@ -35700,7 +35741,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1236 base=V1235 pipeline_flight=ini_cpu_all_gpu_async_every4_f2_last10s full_vr_hud=eye_local_scene_only_pair_proven mode3_transport=projection_agnostic_exact_temporal_final_color_any_queue static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
+                "witcher3vr canonical build=V1236 base=V1235 pipeline_flight=ini_cpu_all_gpu_async_every4_f2_last10s full_vr_hud=eye_local_scene_only_pair_proven mode3_transport=projection_agnostic_exact_temporal_final_color_any_queue static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_asymmetric_fallback=requires_factory_mask_post_video_transport_preflight hud_text_bootstrap=scale_then_position "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss_taau "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -41781,11 +41822,28 @@ void render_openxr_test_frame(
                     native_asymmetric_geometry_transport_valid &&
                     (native_asymmetric_copy_compatible ||
                         native_asymmetric_shader_fallback_valid);
-                const bool native_asymmetric_gameplay_preflight =
-                    native_asymmetric_transport_capable && !cinema_mode;
+                // [FIX:POST-VIDEO-ASYMMETRIC-FULL-VR-BOOTSTRAP V1245]
+                // The opening cutscene can skip every perspective-view factory.
+                // V1212 correctly keeps the frame fallback alive while its
+                // per-eye factory mask is absent, but pair initialization also
+                // required this preflight bit and the old !cinema_mode gate
+                // therefore made that fallback impossible to enter. Admit the
+                // already-armed automatic Full-VR fallback as a second preflight
+                // owner. Manual/normal Cinema panels remain rejected, and the
+                // fallback must still write and publish each exact factory bit
+                // before an asymmetric pair can be accepted.
+                const bool native_asymmetric_transport_preflight =
+                    w3vr::native_asymmetric_transport_policy::preflight_ready({
+                        native_asymmetric_transport_capable,
+                        cinema_mode,
+                        g_automatic_full_vr_camera_active.load(
+                            std::memory_order_acquire),
+                        g_config.cinema_full_vr,
+                        g_force_mono_cinema.load(
+                            std::memory_order_relaxed)});
                 if (native_asymmetric_noaa_route_active()) {
                     g_native_asymmetric_transport_ready.store(
-                        native_asymmetric_gameplay_preflight,
+                        native_asymmetric_transport_preflight,
                         std::memory_order_release);
                 }
                 const bool native_pair_fully_built =
