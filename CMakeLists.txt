@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1259.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1260.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -71,6 +71,14 @@ set_target_properties(witcher3vr_dxgi PROPERTIES OUTPUT_NAME dxgi)
 target_link_options(witcher3vr_dxgi PRIVATE /MAP)
 
 if(BUILD_TESTING)
+    add_executable(w3vr_shadow_cascade_authority_policy_tests
+        tests/shadow_cascade_authority_policy_tests.cpp
+    )
+    target_include_directories(w3vr_shadow_cascade_authority_policy_tests
+        PRIVATE src)
+    add_test(NAME renderer_shadow_cascade_authority_policy
+        COMMAND w3vr_shadow_cascade_authority_policy_tests)
+
     add_executable(w3vr_taau_submission_policy_tests
         tests/taau_submission_policy_tests.cpp
     )

@@ -25,9 +25,14 @@
 #include "native_asymmetric_transport_policy.h"
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
+#include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
-// V1259 prevents a TAAU command list already classified and rendered as a
+// V1260 gives both eyes of one exact gameplay pair the first-arriving view only
+// inside REDengine's native shadow-cascade builder. The second eye receives a
+// private renderer snapshot, so scene cameras, projection, engine memory and
+// every non-shadow culling route remain untouched. V1259 prevents a TAAU
+// command list already classified and rendered as a
 // stale private-history replay from regressing submitted-pair authority. The
 // V12049 exact submission gate remains unchanged and fail-closed; only normal
 // resolves can publish a new authority. V1258 makes V1257's same-Present AER
@@ -2088,6 +2093,29 @@ using EngineFrameDataFactoryFn = void*(__fastcall*)(void*, void*, void*);
 EngineFrameDataFactoryFn g_engine_frame_data_factory{};
 using EngineRenderSceneSetupFn = void(__fastcall*)(void*, float);
 EngineRenderSceneSetupFn g_engine_render_scene_setup{};
+using EngineShadowCascadeBuildFn = void(__fastcall*)(void*, void*, void*);
+EngineShadowCascadeBuildFn g_engine_shadow_cascade_build{};
+constexpr size_t kShadowCascadeViewFloatCount = 512;
+constexpr size_t kShadowCascadeRendererReadBytes = 0xB768;
+constexpr size_t kShadowCascadeAuthorityPairSlots = 128;
+struct ShadowCascadeAuthoritySlot {
+    uint64_t pair_id{};
+    uint32_t generation{};
+    uint32_t authority_eye{};
+    std::array<float, kShadowCascadeViewFloatCount> view{};
+    bool valid{};
+};
+std::array<ShadowCascadeAuthoritySlot,
+    kShadowCascadeAuthorityPairSlots * 2> g_shadow_cascade_authority{};
+std::mutex g_shadow_cascade_authority_mutex{};
+alignas(16) thread_local std::array<uint8_t,
+    kShadowCascadeRendererReadBytes> g_shadow_cascade_private_renderer{};
+std::atomic<uint64_t> g_shadow_cascade_authority_seeded{};
+std::atomic<uint64_t> g_shadow_cascade_authority_reused{};
+std::atomic<uint64_t> g_shadow_cascade_authority_same_eye{};
+std::atomic<uint64_t> g_shadow_cascade_authority_route_miss{};
+std::atomic<uint64_t> g_shadow_cascade_authority_copy_fault{};
+std::atomic<uint32_t> g_shadow_cascade_authority_logs{};
 // [DIAG:ASYMMETRIC-AUTHORITY V1046] The audit observes the projection-center
 // values which survive REDengine's temporal rebuilds. The native asymmetric
 // route below may inject them only for a fully tagged pair.
@@ -26079,6 +26107,186 @@ bool safe_write_engine_view_snapshot(
     }
 }
 
+bool shadow_cascade_shared_view_active() {
+    return g_config.openxr_enabled && g_config.openxr_mode == 3 &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
+        !g_cinema_mode_active.load(std::memory_order_relaxed) &&
+        !g_engine_loading_screen_video_active.load(std::memory_order_acquire);
+}
+
+bool valid_shadow_cascade_view(
+    const std::array<float, kShadowCascadeViewFloatCount>& view) {
+    for (const size_t index : {0u, 1u, 2u, 4u, 5u, 6u, 7u, 10u, 12u, 13u}) {
+        if (!std::isfinite(view[index])) {
+            return false;
+        }
+    }
+    return view[7] > 0.1f && view[7] < 179.0f &&
+        view[10] > 0.01f && view[12] > 0.0f && view[13] > view[12];
+}
+
+// [FIX:SHADOW-CASCADE-SHARED-VIEW V1260 1/3] The earlier V1088 trial changed
+// frame+0x730, which feeds the main scene frustum and never reached the native
+// cascade builder. FUN_141E60B20 receives the shadow output, renderer and build
+// input separately. It reads renderer+0x10 as a complete view descriptor and
+// never writes the renderer (verified across the full 0x1522-byte function).
+// Seed the first exact eye/caller of each pair, then run the opposite eye with
+// a thread-private renderer copy carrying that same view. This cannot modify
+// scene projection, scene culling or REDengine's shared renderer object.
+void __fastcall hook_engine_shadow_cascade_build(
+    void* shadow_output, void* renderer, void* build_input) {
+    if (!shadow_cascade_shared_view_active() || renderer == nullptr) {
+        g_engine_shadow_cascade_build(shadow_output, renderer, build_input);
+        return;
+    }
+
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t caller_rva = module != 0 && return_address >= module
+        ? return_address - module
+        : 0;
+    const int caller_kind = w3vr::shadow_cascade::caller_kind(caller_rva);
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    const bool route_valid = caller_kind >= 0 &&
+        g_engine_render_tag_frame_lookup_exact &&
+        g_engine_render_eye >= 0 && g_engine_render_eye <= 1 &&
+        g_engine_render_pair_id != 0 &&
+        g_engine_render_pair_id != UINT64_MAX &&
+        g_engine_render_generation == generation;
+    if (!route_valid) {
+        g_shadow_cascade_authority_route_miss.fetch_add(
+            1, std::memory_order_relaxed);
+        g_engine_shadow_cascade_build(shadow_output, renderer, build_input);
+        return;
+    }
+
+    std::array<float, kShadowCascadeViewFloatCount> incoming_view{};
+    auto* renderer_bytes = static_cast<uint8_t*>(renderer);
+    if (!safe_copy_engine_view_snapshot(
+            reinterpret_cast<float*>(renderer_bytes + 0x10),
+            incoming_view.data(), sizeof(incoming_view)) ||
+        !valid_shadow_cascade_view(incoming_view)) {
+        g_shadow_cascade_authority_copy_fault.fetch_add(
+            1, std::memory_order_relaxed);
+        g_engine_shadow_cascade_build(shadow_output, renderer, build_input);
+        return;
+    }
+
+    const uint64_t pair_id = g_engine_render_pair_id;
+    const uint32_t eye = static_cast<uint32_t>(g_engine_render_eye);
+    std::array<float, kShadowCascadeViewFloatCount> authority_view{};
+    w3vr::shadow_cascade::AuthorityAction action{};
+    uint32_t authority_eye = eye;
+    {
+        std::scoped_lock lock{g_shadow_cascade_authority_mutex};
+        const size_t slot_index =
+            (pair_id % kShadowCascadeAuthorityPairSlots) * 2 +
+            static_cast<size_t>(caller_kind);
+        auto& slot = g_shadow_cascade_authority[slot_index];
+        action = w3vr::shadow_cascade::decide_authority(
+            slot.valid, slot.pair_id, slot.generation, slot.authority_eye,
+            pair_id, generation, eye);
+        if (action == w3vr::shadow_cascade::AuthorityAction::Seed) {
+            slot = {};
+            slot.pair_id = pair_id;
+            slot.generation = generation;
+            slot.authority_eye = eye;
+            slot.view = incoming_view;
+            slot.valid = true;
+            g_shadow_cascade_authority_seeded.fetch_add(
+                1, std::memory_order_relaxed);
+        } else if (action ==
+            w3vr::shadow_cascade::AuthorityAction::Reuse) {
+            authority_eye = slot.authority_eye;
+            authority_view = slot.view;
+            g_shadow_cascade_authority_reused.fetch_add(
+                1, std::memory_order_relaxed);
+        } else {
+            g_shadow_cascade_authority_same_eye.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+
+    void* effective_renderer = renderer;
+    if (action == w3vr::shadow_cascade::AuthorityAction::Reuse) {
+        if (!safe_copy_engine_view_snapshot(
+                reinterpret_cast<float*>(renderer),
+                reinterpret_cast<float*>(
+                    g_shadow_cascade_private_renderer.data()),
+                g_shadow_cascade_private_renderer.size())) {
+            g_shadow_cascade_authority_copy_fault.fetch_add(
+                1, std::memory_order_relaxed);
+            g_engine_shadow_cascade_build(shadow_output, renderer, build_input);
+            return;
+        }
+        memcpy(g_shadow_cascade_private_renderer.data() + 0x10,
+            authority_view.data(), sizeof(authority_view));
+        effective_renderer = g_shadow_cascade_private_renderer.data();
+    }
+
+    if (g_config.runtime_diagnostics &&
+        action != w3vr::shadow_cascade::AuthorityAction::SameEye) {
+        const uint32_t log_index =
+            g_shadow_cascade_authority_logs.fetch_add(
+                1, std::memory_order_relaxed);
+        if (log_index < 32) {
+            const auto& logged_view = action ==
+                    w3vr::shadow_cascade::AuthorityAction::Reuse
+                ? authority_view
+                : incoming_view;
+            log_line(
+                "V1260 shadow cascade shared view sample=%u pair=%llu "
+                "caller=%d authority_eye=%u render_eye=%u action=%s "
+                "view_hash=%016llX private_renderer=%u",
+                log_index,
+                static_cast<unsigned long long>(pair_id),
+                caller_kind, authority_eye, eye,
+                action == w3vr::shadow_cascade::AuthorityAction::Reuse
+                    ? "reuse" : "seed",
+                static_cast<unsigned long long>(fnv1a64(
+                    logged_view.data(), sizeof(logged_view))),
+                effective_renderer != renderer ? 1u : 0u);
+        }
+    }
+
+    g_engine_shadow_cascade_build(
+        shadow_output, effective_renderer, build_input);
+}
+
+void install_engine_shadow_cascade_build_hook() {
+    if (g_engine_shadow_cascade_build != nullptr) {
+        return;
+    }
+    constexpr uintptr_t kEngineShadowCascadeBuildRva = 0x01E60B20;
+    auto* module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* target = module != nullptr
+        ? module + kEngineShadowCascadeBuildRva
+        : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target,
+            reinterpret_cast<void*>(&hook_engine_shadow_cascade_build),
+            reinterpret_cast<void**>(
+                &g_engine_shadow_cascade_build)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line(
+            "V1260 shadow cascade shared-view hook installed "
+            "builder_rva=0x%llX view_bytes=%zu renderer_copy_bytes=%zu "
+            "authority=first_exact_eye_per_pair_and_caller",
+            static_cast<unsigned long long>(
+                kEngineShadowCascadeBuildRva),
+            sizeof(float) * kShadowCascadeViewFloatCount,
+            kShadowCascadeRendererReadBytes);
+    } else {
+        log_line(
+            "V1260 shadow cascade shared-view hook failed "
+            "builder_rva=0x%llX target=%p",
+            static_cast<unsigned long long>(
+                kEngineShadowCascadeBuildRva), target);
+    }
+}
+
 bool safe_rebuild_shadow_view(float* shadow_view) {
     __try {
         g_engine_view_rebuild(shadow_view);
@@ -33445,6 +33653,13 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
             stamp.store(0, std::memory_order_release);
         }
     }
+    // [FIX:SHADOW-CASCADE-SHARED-VIEW V1260 2/3] A producer generation owns
+    // every pair-scoped shadow view. Clear the bounded ring at the same safe
+    // transition used by the other per-eye renderer histories.
+    {
+        std::scoped_lock lock{g_shadow_cascade_authority_mutex};
+        g_shadow_cascade_authority = {};
+    }
     g_taau_packed_core_prearmed.store(
         enabled && taau_functional_hooks_needed(),
         std::memory_order_relaxed);
@@ -33456,6 +33671,8 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
         install_engine_frame_builder_probe();
         install_engine_gameplay_entry_probe();
         install_engine_render_scene_setup_probe();
+        // [FIX:SHADOW-CASCADE-SHARED-VIEW V1260 3/3]
+        install_engine_shadow_cascade_build_hook();
         install_streamline_resource_barrier_probe();
     }
     log_line("Engine dual render %s by %s at safe Present boundary present=%llu generation=%u",
@@ -36076,7 +36293,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1234 base=V1233 "
+                "witcher3vr dxgi proxy initialized build=V1260 base=V1259 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
