@@ -29,6 +29,9 @@
 #include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
+// V1267 gives the native Full-VR HUD fallback the same route-specific size and
+// convergence as the retained projection HUD. This keeps both launcher
+// controls effective while exact scene-only ownership is not yet available.
 // V1266 bounds an unselectable AFW producer queue: after a short grace window
 // it drops stale generated work, releases the ring, and uses the real frame.
 // V1265 stops AFW gameplay producer admission on the native automatic Full-VR
@@ -3616,6 +3619,8 @@ std::atomic<ID3D12PipelineState*> g_cinema_hud_composite_eye0_pso{};
 std::atomic<ID3D12PipelineState*> g_cinema_hud_composite_eye1_pso{};
 std::atomic<ID3D12PipelineState*> g_auto_cinema_hud_composite_eye0_pso{};
 std::atomic<ID3D12PipelineState*> g_auto_cinema_hud_composite_eye1_pso{};
+std::atomic<ID3D12PipelineState*> g_full_vr_hud_composite_eye0_pso{};
+std::atomic<ID3D12PipelineState*> g_full_vr_hud_composite_eye1_pso{};
 std::atomic<ID3D12PipelineState*> g_mode3_scene_only_pso{};
 constexpr uint32_t kMode3SceneOnlyPairHistory = 4;
 std::mutex g_mode3_scene_only_output_mutex{};
@@ -3713,6 +3718,10 @@ bool mode3_hud_pipeline_family(ID3D12PipelineState* pipeline) {
         pipeline == g_auto_cinema_hud_composite_eye0_pso.load(
             std::memory_order_acquire) ||
         pipeline == g_auto_cinema_hud_composite_eye1_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_full_vr_hud_composite_eye0_pso.load(
+            std::memory_order_acquire) ||
+        pipeline == g_full_vr_hud_composite_eye1_pso.load(
             std::memory_order_acquire) ||
         pipeline == g_mode3_scene_only_pso.load(
             std::memory_order_acquire));
@@ -17140,6 +17149,14 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
                 g_config.hud_stereo_shift_px, g_config.hud_size);
             IDxcBlob* eye1_shader = compile_hud_composite_pixel_shader(
                 -g_config.hud_stereo_shift_px, g_config.hud_size);
+            IDxcBlob* full_vr_eye0_shader =
+                compile_hud_composite_pixel_shader(
+                    g_config.full_vr_hud_stereo_shift_px,
+                    g_config.hud_size * g_config.full_vr_hud_scale);
+            IDxcBlob* full_vr_eye1_shader =
+                compile_hud_composite_pixel_shader(
+                    -g_config.full_vr_hud_stereo_shift_px,
+                    g_config.hud_size * g_config.full_vr_hud_scale);
             std::array<int, 2> asymmetric_source_shifts_x{};
             std::array<int, 2> asymmetric_source_shifts_y{};
             std::array<float, 2> asymmetric_optical_offsets_x{};
@@ -17200,6 +17217,8 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
             ID3D12PipelineState* cinema_eye1_pso{};
             ID3D12PipelineState* auto_cinema_eye0_pso{};
             ID3D12PipelineState* auto_cinema_eye1_pso{};
+            ID3D12PipelineState* full_vr_eye0_pso{};
+            ID3D12PipelineState* full_vr_eye1_pso{};
             ID3D12PipelineState* scene_pso{};
             if (eye0_shader != nullptr && eye1_shader != nullptr) {
                 auto shifted_desc = *desc;
@@ -17221,6 +17240,40 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
                         g_config.hud_stereo_shift_px, g_config.hud_size,
                         static_cast<unsigned>(eye0_hr),
                         static_cast<unsigned>(eye1_hr));
+                }
+            }
+            if (full_vr_eye0_shader != nullptr &&
+                full_vr_eye1_shader != nullptr) {
+                auto full_vr_desc = *desc;
+                full_vr_desc.PS = {
+                    full_vr_eye0_shader->GetBufferPointer(),
+                    full_vr_eye0_shader->GetBufferSize()};
+                const auto full_vr_eye0_hr =
+                    g_create_graphics_pipeline_state(
+                        device, &full_vr_desc,
+                        IID_PPV_ARGS(&full_vr_eye0_pso));
+                full_vr_desc.PS = {
+                    full_vr_eye1_shader->GetBufferPointer(),
+                    full_vr_eye1_shader->GetBufferSize()};
+                const auto full_vr_eye1_hr =
+                    g_create_graphics_pipeline_state(
+                        device, &full_vr_desc,
+                        IID_PPV_ARGS(&full_vr_eye1_pso));
+                if (FAILED(full_vr_eye0_hr) || FAILED(full_vr_eye1_hr)) {
+                    if (full_vr_eye0_pso != nullptr) {
+                        full_vr_eye0_pso->Release();
+                    }
+                    if (full_vr_eye1_pso != nullptr) {
+                        full_vr_eye1_pso->Release();
+                    }
+                    full_vr_eye0_pso = nullptr;
+                    full_vr_eye1_pso = nullptr;
+                    log_line(
+                        "Full VR HUD fallback PSO creation failed shift=%d size=%.3f hr=0x%08X,0x%08X",
+                        g_config.full_vr_hud_stereo_shift_px,
+                        g_config.hud_size * g_config.full_vr_hud_scale,
+                        static_cast<unsigned>(full_vr_eye0_hr),
+                        static_cast<unsigned>(full_vr_eye1_hr));
                 }
             }
             if (asymmetric_eye0_shader != nullptr &&
@@ -17342,6 +17395,12 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
             }
             if (eye0_shader != nullptr) eye0_shader->Release();
             if (eye1_shader != nullptr) eye1_shader->Release();
+            if (full_vr_eye0_shader != nullptr) {
+                full_vr_eye0_shader->Release();
+            }
+            if (full_vr_eye1_shader != nullptr) {
+                full_vr_eye1_shader->Release();
+            }
             if (asymmetric_eye0_shader != nullptr) {
                 asymmetric_eye0_shader->Release();
             }
@@ -17382,6 +17441,12 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
                     if (auto_cinema_eye1_pso != nullptr) {
                         g_pipeline_infos[auto_cinema_eye1_pso] = info;
                     }
+                    if (full_vr_eye0_pso != nullptr) {
+                        g_pipeline_infos[full_vr_eye0_pso] = info;
+                    }
+                    if (full_vr_eye1_pso != nullptr) {
+                        g_pipeline_infos[full_vr_eye1_pso] = info;
+                    }
                     if (scene_pso != nullptr) {
                         g_pipeline_infos[scene_pso] = info;
                     }
@@ -17400,17 +17465,24 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
                     auto_cinema_eye0_pso, std::memory_order_relaxed);
                 g_auto_cinema_hud_composite_eye1_pso.store(
                     auto_cinema_eye1_pso, std::memory_order_relaxed);
+                g_full_vr_hud_composite_eye0_pso.store(
+                    full_vr_eye0_pso, std::memory_order_relaxed);
+                g_full_vr_hud_composite_eye1_pso.store(
+                    full_vr_eye1_pso, std::memory_order_relaxed);
                 g_mode3_scene_only_pso.store(
                     scene_pso, std::memory_order_relaxed);
                 g_hud_composite_original_pso.store(pso, std::memory_order_release);
                 cache_mode3_hud_srv_binding(info.root_signature);
                 log_line(
-                    "HUD PSOs ready original=%p eye0=%p eye1=%p cinema_eye0=%p cinema_eye1=%p scene=%p shift=%d cinema_shift=%d size=%.3f",
+                    "HUD PSOs ready original=%p eye0=%p eye1=%p cinema_eye0=%p cinema_eye1=%p full_vr_eye0=%p full_vr_eye1=%p scene=%p shift=%d cinema_shift=%d full_vr_shift=%d size=%.3f full_vr_size=%.3f",
                     pso, eye0_pso, eye1_pso,
-                    cinema_eye0_pso, cinema_eye1_pso, scene_pso,
+                    cinema_eye0_pso, cinema_eye1_pso,
+                    full_vr_eye0_pso, full_vr_eye1_pso, scene_pso,
                     g_config.hud_stereo_shift_px,
                     g_config.cinema_hud_stereo_shift_px,
-                    g_config.hud_size);
+                    g_config.full_vr_hud_stereo_shift_px,
+                    g_config.hud_size,
+                    g_config.hud_size * g_config.full_vr_hud_scale);
                 log_line(
                     "V1206 asymmetric bootstrap HUD ready=%u pso=%p,%p optical_px=%.3f,%.3f/%.3f,%.3f hud_size=%.4f,%.4f source_shift=%d,%d/%d,%d launcher_shift=%d render=%ux%u",
                     asymmetric_eye0_pso != nullptr &&
@@ -17444,6 +17516,12 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
                 }
                 if (auto_cinema_eye1_pso != nullptr) {
                     auto_cinema_eye1_pso->Release();
+                }
+                if (full_vr_eye0_pso != nullptr) {
+                    full_vr_eye0_pso->Release();
+                }
+                if (full_vr_eye1_pso != nullptr) {
+                    full_vr_eye1_pso->Release();
                 }
                 if (scene_pso != nullptr) scene_pso->Release();
             }
@@ -18337,6 +18415,10 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                     bound_pipeline_state =
                         g_cinema_hud_composite_eye0_pso.load(
                             std::memory_order_acquire);
+                } else if (automatic_full_vr_hud) {
+                    bound_pipeline_state =
+                        g_full_vr_hud_composite_eye0_pso.load(
+                            std::memory_order_acquire);
                 } else if (strict_stereo_asymmetric_gameplay_hud) {
                     bound_pipeline_state =
                         g_asymmetric_hud_composite_eye0_pso.load(
@@ -18359,6 +18441,10 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                 } else if (normal_stereo_cinema_hud) {
                     bound_pipeline_state =
                         g_cinema_hud_composite_eye1_pso.load(
+                            std::memory_order_acquire);
+                } else if (automatic_full_vr_hud) {
+                    bound_pipeline_state =
+                        g_full_vr_hud_composite_eye1_pso.load(
                             std::memory_order_acquire);
                 } else if (strict_stereo_asymmetric_gameplay_hud) {
                     bound_pipeline_state =
@@ -36325,7 +36411,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1266 base=V1265 "
+                "witcher3vr dxgi proxy initialized build=V1267 base=V1266 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
