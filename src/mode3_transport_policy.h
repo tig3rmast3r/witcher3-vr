@@ -77,6 +77,19 @@ constexpr bool afw_gameplay_capture_allowed(
         !loading_active && !automatic_full_vr_active;
 }
 
+// A queued producer is only a short-lived bridge between the temporal
+// callback and presentation. If no exact consumer can use it for this many
+// Presents, retaining it is less safe than dropping back to the real frame and
+// allowing the bounded ring to repopulate.
+inline constexpr uint64_t kAfwStaleProducerMaxAgePresents = 8;
+
+constexpr bool afw_queued_producer_expired(
+    uint64_t present,
+    uint64_t ready_present) noexcept {
+    return ready_present != UINT64_MAX && present > ready_present &&
+        present - ready_present >= kAfwStaleProducerMaxAgePresents;
+}
+
 // Gameplay owns the validated continuously scene-only contract. Cinema and
 // automatic Full VR can cross their activation boundary between the two AER
 // renders, so their late HUD is safe only when the exact published pair proves

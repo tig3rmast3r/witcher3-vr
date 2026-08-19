@@ -29,6 +29,8 @@
 #include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
+// V1266 bounds an unselectable AFW producer queue: after a short grace window
+// it drops stale generated work, releases the ring, and uses the real frame.
 // V1265 stops AFW gameplay producer admission on the native automatic Full-VR
 // ownership edge instead of waiting for the debounced Cinema detector. This
 // keeps the six-slot producer FIFO available when gameplay resumes and avoids
@@ -36323,7 +36325,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1265 base=V1264 "
+                "witcher3vr dxgi proxy initialized build=V1266 base=V1265 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
@@ -39367,6 +39369,7 @@ bool select_mode3_afw_queued_producer(
                 slot.input.generation != generation ||
                 slot.route_epoch != route_epoch ||
                 slot.submission_serial == 0 ||
+                slot.ready_present == UINT64_MAX ||
                 slot.input.pair_id < g_mode3_afw_sequenced_pair ||
                 (slot.input.pair_id == g_mode3_afw_sequenced_pair &&
                     slot.input.eye == g_mode3_afw_last_real_eye);
@@ -39467,6 +39470,47 @@ bool select_mode3_afw_queued_producer(
     }
 
     if (selected_it == g_puredark_afw_mode3_common_ready_queue.end()) {
+        uint64_t oldest_ready_present = UINT64_MAX;
+        for (const uint32_t slot_index :
+             g_puredark_afw_mode3_common_ready_queue) {
+            if (slot_index >= kPuredarkAfwBundleRingSize) {
+                continue;
+            }
+            const auto& slot = g_puredark_afw_bundle_ring[slot_index];
+            if (slot.state == PuredarkAfwBundleState::Ready &&
+                slot.input.valid && slot.ready_present != UINT64_MAX) {
+                oldest_ready_present = std::min(
+                    oldest_ready_present, slot.ready_present);
+            }
+        }
+        if (w3vr::mode3_transport::afw_queued_producer_expired(
+                present, oldest_ready_present)) {
+            const size_t stale_depth =
+                g_puredark_afw_mode3_common_ready_queue.size();
+            for (const uint32_t slot_index :
+                 g_puredark_afw_mode3_common_ready_queue) {
+                release_ready(slot_index);
+            }
+            g_puredark_afw_mode3_common_ready_queue.clear();
+            g_puredark_afw_ready_bundle = UINT32_MAX;
+            g_mode3_afw_selected_bundle_slot = UINT32_MAX;
+            g_mode3_afw_fifo_discards.fetch_add(
+                stale_depth, std::memory_order_relaxed);
+            // Do not keep presenting a possibly invalid generated pair after
+            // liveness recovery. This Present falls through to the normal
+            // final-backbuffer path; later producers can reclaim the ring.
+            g_puredark_afw_steady_active.store(
+                false, std::memory_order_release);
+            if (g_config.runtime_diagnostics) {
+                log_line(
+                    "V1266 AFW stale FIFO recovery present=%llu depth=%zu oldest=%llu age=%llu action=real_frame_fallback",
+                    static_cast<unsigned long long>(present), stale_depth,
+                    static_cast<unsigned long long>(oldest_ready_present),
+                    static_cast<unsigned long long>(
+                        present - oldest_ready_present));
+            }
+            return false;
+        }
         const uint64_t waits = g_mode3_afw_fifo_waits.fetch_add(
             1, std::memory_order_relaxed) + 1;
         if (g_config.runtime_diagnostics &&

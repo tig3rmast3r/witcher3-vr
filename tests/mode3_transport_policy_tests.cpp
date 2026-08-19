@@ -7,6 +7,7 @@ int main() {
     using w3vr::mode3_transport::HudProjectionRoute;
     using w3vr::mode3_transport::TemporalAdapter;
     using w3vr::mode3_transport::afw_gameplay_capture_allowed;
+    using w3vr::mode3_transport::afw_queued_producer_expired;
     using w3vr::mode3_transport::dlss_submission_route_active;
     using w3vr::mode3_transport::exact_afw_backend;
     using w3vr::mode3_transport::final_backbuffer_route_active;
@@ -56,6 +57,14 @@ int main() {
     assert(!afw_gameplay_capture_allowed(true, 0, true, false, false));
     assert(!afw_gameplay_capture_allowed(true, 0, false, true, false));
     assert(!afw_gameplay_capture_allowed(true, 0, false, false, true));
+
+    // An unselectable AFW packet gets a short grace period, then loses to the
+    // real-frame fallback so the fixed-size producer ring cannot deadlock.
+    assert(!afw_queued_producer_expired(100, UINT64_MAX));
+    assert(!afw_queued_producer_expired(100, 100));
+    assert(!afw_queued_producer_expired(107, 100));
+    assert(afw_queued_producer_expired(108, 100));
+    assert(afw_queued_producer_expired(1000, 100));
 
     // Gameplay continuously removes the baked HUD. A cutscene or Cinema
     // boundary must fail open on its native HUD until the exact final pair
