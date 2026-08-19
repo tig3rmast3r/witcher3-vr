@@ -195,6 +195,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.first_person_combat_exit = true;
         state.first_person_strafe = index % 2 != 0;
         state.first_person_anchor_smoothing = index % 2 == 0;
+        state.camera_follow_policy = static_cast<w3vr::CameraFollowPolicy>(
+            index % 3);
         state.fast_movement_transitions = index % 2 == 0;
         state.native_stereo = true;
         state.fullscreen_projection = true;
@@ -333,6 +335,12 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(vr.Get("engine", "first_person_anchor_smoothing_seconds") ==
             "0.125000",
             "launcher overwrote the INI-only smoothing time");
+        Require(game.Get("W3VRSettings", "CameraFollowPolicy") ==
+                std::to_string(index % 3),
+            "dynamic camera-follow policy missing");
+        Require(game.Get("Gameplay", "AutoCameraCenter") ==
+                std::string(index % 3 == 0 ? "true" : "false"),
+            "native camera-follow bootstrap is inconsistent");
         Require(vr.Get("debug", "logging_enabled") == "1",
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
@@ -402,6 +410,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(loaded.state.first_person_anchor_smoothing ==
             state.first_person_anchor_smoothing,
             "round-trip first-person head-bobbing reduction mismatch");
+        Require(loaded.state.camera_follow_policy ==
+                state.camera_follow_policy,
+            "round-trip dynamic camera-follow policy mismatch");
         Require(loaded.state.cinema_hud_scale == state.cinema_hud_scale &&
             loaded.state.cinema_hud_convergence_offset ==
                 state.cinema_hud_convergence_offset,
@@ -534,6 +545,9 @@ void TestReleaseDefaults() {
         "first-person strafe must default to enabled");
     Require(defaults.first_person_anchor_smoothing,
         "first-person head-bobbing reduction must default to enabled");
+    Require(defaults.camera_follow_policy ==
+            w3vr::CameraFollowPolicy::HorseBoatOnly,
+        "camera follow must default to the vehicle-only policy");
     Require(defaults.fast_movement_transitions,
         "faster movement transitions must default to enabled");
     Require(!defaults.native_stereo,
@@ -860,6 +874,8 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     vr->Remove("debug", "runtime_diagnostics");
     Write(paths.vr_ini, vr->Serialize());
     game->Remove("DLC", "DlcEnabled_movementinputfix");
+    game->Remove("W3VRSettings", "CameraFollowPolicy");
+    game->Set("Gameplay", "AutoCameraCenter", "false");
     Write(paths.game_settings, game->Serialize());
     const auto missing_flags = w3vr::LoadConfiguration(paths);
     Require(missing_flags.state.cinema_full_vr,
@@ -874,10 +890,20 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
         "missing first-person strafe flag must default to enabled");
     Require(missing_flags.state.first_person_anchor_smoothing,
         "missing head-bobbing reduction flag must default to enabled");
+    Require(missing_flags.state.camera_follow_policy ==
+            w3vr::CameraFollowPolicy::HorseBoatOnly,
+        "legacy disabled camera follow must migrate to vehicle-only");
     Require(missing_flags.state.fast_movement_transitions,
         "missing faster-transitions DLC flag must default to enabled");
     Require(!missing_flags.state.diagnostic_logging,
         "missing diagnostic flags must default to disabled");
+
+    game->Set("Gameplay", "AutoCameraCenter", "true");
+    Write(paths.game_settings, game->Serialize());
+    const auto legacy_camera_follow_on = w3vr::LoadConfiguration(paths);
+    Require(legacy_camera_follow_on.state.camera_follow_policy ==
+            w3vr::CameraFollowPolicy::AlwaysOn,
+        "legacy enabled camera follow must migrate to Always On");
 }
 
 void TestFallbackAndAtomicSave(const w3vr::ConfigPaths& paths) {

@@ -21,6 +21,18 @@ var w3vr_fp_native_stationary_turn_heartbeat_sink: bool;
 @addField(CR4Player)
 var w3vr_fp_native_visibility_heartbeat_sink: bool;
 
+// Persistent, fail-closed mirror of the existing native visibility challenge.
+// Unlike the one-tick visibility token, camera-follow policy reads this value
+// during REDengine camera ticks and therefore must keep the last sampled state.
+@addField(CR4Player)
+var w3vr_fp_native_first_person_active: bool;
+
+@addField(CR4Player)
+var w3vr_camera_follow_policy: int;
+
+@addField(CR4Player)
+var w3vr_camera_follow_policy_initialized: bool;
+
 @addField(CR4Player)
 var w3vr_fp_native_combat_probe_sink: bool;
 
@@ -32,10 +44,51 @@ function OnGameStarted(restored: bool) {
   wrappedMethod(restored);
 
   if (thePlayer) {
+    thePlayer.W3VR_LoadCameraFollowPolicy();
     thePlayer.W3VR_FP_StartNativeHeadProvider();
     thePlayer.W3VR_FP_StartOnFootStrafe();
     thePlayer.W3VR_FP_StartPlayerVisibilityClip();
   }
+}
+
+@addMethod(CR4Player)
+function W3VR_LoadCameraFollowPolicy() {
+  var config: CInGameConfigWrapper;
+  var value: string;
+
+  this.w3vr_camera_follow_policy = 1;
+  config = (CInGameConfigWrapper)theGame.GetInGameConfigWrapper();
+  if (config) {
+    value = config.GetVarValue('W3VRSettings', 'CameraFollowPolicy');
+    if (value != "") {
+      this.w3vr_camera_follow_policy = StringToInt(value);
+    }
+  }
+  if (this.w3vr_camera_follow_policy < 0 ||
+      this.w3vr_camera_follow_policy > 2) {
+    this.w3vr_camera_follow_policy = 1;
+  }
+  this.w3vr_camera_follow_policy_initialized = true;
+}
+
+@addMethod(CR4Player)
+function W3VR_ApplyCameraFollowPolicy(horseOrBoat: bool) {
+  var enabled: bool;
+
+  if (!this.w3vr_camera_follow_policy_initialized) {
+    this.W3VR_LoadCameraFollowPolicy();
+  }
+
+  enabled = false;
+  if (this.w3vr_camera_follow_policy != 2) {
+    if (horseOrBoat) {
+      enabled = true;
+    } else if (this.w3vr_camera_follow_policy == 0 &&
+               !this.w3vr_fp_native_first_person_active) {
+      enabled = true;
+    }
+  }
+  this.SetAutoCameraCenter(enabled);
 }
 
 @addMethod(CR4Player)
@@ -86,6 +139,8 @@ timer function W3VR_FP_UpdateNativeHeadPosition(dt: float, id: int) {
     strafeHandshake == -19529 || strafeHandshake == -29529;
   this.w3vr_fp_native_visibility_heartbeat_sink =
     visibilityHandshake == -9526;
+  this.w3vr_fp_native_first_person_active =
+    this.w3vr_fp_native_visibility_heartbeat_sink;
   if (firstHeadIndex < 0 || confirmedHeadIndex != firstHeadIndex) {
     this.W3VR_FP_UpdatePlayerVisibilityClip();
     return;

@@ -219,6 +219,10 @@ function OnGameCameraTick(out moveData: SCameraMovementData, dt: float) {
   // changes. HorseRiding owns publication while mounted.
   W3VR_RestorePendingStateBridgeFov(this);
 
+  // V1232: camera follow is launcher-owned. On-foot F11 always disables it;
+  // vehicle wrappers below keep it available in both first and third person.
+  this.W3VR_ApplyCameraFollowPolicy(false);
+
   result = wrappedMethod(moveData, dt);
 
   // Seed the two native objects once. The DLL subsequently reads their two
@@ -250,6 +254,8 @@ function OnGameCameraPostTick(
 
   W3VR_RestorePendingStateBridgeFov(parent);
 
+  parent.W3VR_ApplyCameraFollowPolicy(true);
+
   result = wrappedMethod(moveData, dt);
 
   horse = (W3HorseComponent)vehicle;
@@ -272,6 +278,7 @@ function OnGameCameraPostTick(
   var result: bool;
 
   W3VR_RestorePendingStateBridgeFov(parent);
+  parent.W3VR_ApplyCameraFollowPolicy(true);
   result = wrappedMethod(moveData, dt);
   W3VR_PublishStateBridgeChange(parent, 11, parent.IsInCombat());
   return result;
@@ -285,6 +292,7 @@ function OnGameCameraPostTick(
   var result: bool;
 
   W3VR_RestorePendingStateBridgeFov(parent);
+  parent.W3VR_ApplyCameraFollowPolicy(true);
   result = wrappedMethod(moveData, dt);
   W3VR_PublishStateBridgeChange(parent, 11, parent.IsInCombat());
   return result;

@@ -21,10 +21,11 @@ namespace {
 using w3vr::LauncherState;
 using w3vr::RenderMode;
 using w3vr::CinemaAspect;
+using w3vr::CameraFollowPolicy;
 
 constexpr wchar_t kWindowClass[] = L"Witcher3VRLauncherWindow";
 constexpr int kClientWidth = 720;
-constexpr int kClientHeight = 1120;
+constexpr int kClientHeight = 1152;
 constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
     WS_MINIMIZEBOX;
 
@@ -60,6 +61,7 @@ enum ControlId {
     IdFirstPersonCombatExit,
     IdFirstPersonStrafe,
     IdFirstPersonAnchorSmoothing,
+    IdCameraFollow,
     IdFastMovementTransitions,
     IdCinemaFullVr,
     IdSteadyIcons,
@@ -403,6 +405,9 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdFirstPersonStrafe), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.first_person_anchor_smoothing = SendMessageW(
         Item(IdFirstPersonAnchorSmoothing), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.camera_follow_policy = static_cast<CameraFollowPolicy>(std::clamp(
+        static_cast<int>(SendMessageW(
+            Item(IdCameraFollow), CB_GETCURSEL, 0, 0)), 0, 2));
     state.fast_movement_transitions = SendMessageW(
         Item(IdFastMovementTransitions), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_full_vr = SendMessageW(
@@ -720,6 +725,8 @@ void RestoreLauncherDefaults() {
         defaults.first_person_strafe ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdFirstPersonAnchorSmoothing), BM_SETCHECK,
         defaults.first_person_anchor_smoothing ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(Item(IdCameraFollow), CB_SETCURSEL,
+        static_cast<int>(defaults.camera_follow_policy), 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         defaults.fast_movement_transitions ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
@@ -821,6 +828,11 @@ void PopulateControls() {
     ComboAdd(snap_turn_degrees, L"45 degrees");
     ComboAdd(snap_turn_degrees, L"60 degrees");
 
+    HWND camera_follow = Item(IdCameraFollow);
+    ComboAdd(camera_follow, L"Always On");
+    ComboAdd(camera_follow, L"Only Horse/Boat");
+    ComboAdd(camera_follow, L"Always Off");
+
     const auto loaded = w3vr::LoadConfiguration(g_app.paths);
     g_app.loaded = loaded.state;
     g_app.fullscreen_projection = loaded.state.fullscreen_projection;
@@ -870,6 +882,8 @@ void PopulateControls() {
     SendMessageW(Item(IdFirstPersonAnchorSmoothing), BM_SETCHECK,
         loaded.state.first_person_anchor_smoothing
             ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(camera_follow, CB_SETCURSEL,
+        static_cast<int>(loaded.state.camera_follow_policy), 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         loaded.state.fast_movement_transitions
             ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1035,9 +1049,9 @@ void CreateInterface(HWND window) {
         IdDiagnosticLogging),
         L"Writes witcher3vr.log and enables bounded runtime diagnostics. Use it for troubleshooting because it may affect performance.");
 
-    AddTooltip(AddControl(L"BUTTON", L"First Person", BS_GROUPBOX,
-        20, 682, 680, 146),
-        L"These controls apply while the F11 First Person view is active.");
+    AddTooltip(AddControl(L"BUTTON", L"First Person and camera", BS_GROUPBOX,
+        20, 682, 680, 178),
+        L"First Person comfort controls and the dynamic REDengine camera-follow policy.");
     AddTooltip(AddControl(L"BUTTON", L"Gamepad Snap Turn + Head Follow",
         BS_AUTOCHECKBOX | WS_TABSTOP, 38, 708, 420, 28,
         IdFirstPersonGamepadHeadFollow),
@@ -1059,38 +1073,43 @@ void CreateInterface(HWND window) {
         IdFirstPersonAnchorSmoothing),
         L"Smooths lateral and vertical First Person camera-anchor motion while preserving deliberate view rotation.");
 
+    AddTooltips(
+        L"Controls REDengine camera follow dynamically. Always On is disabled while on foot in First Person, but remains enabled on a horse or boat. Only Horse/Boat disables it everywhere else. Always Off never enables it.",
+        {AddLabel(L"Camera Follow", 38, 808, 170, 22),
+         AddCombo(205, 800, 260, IdCameraFollow)});
+
     AddTooltip(AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
-        20, 842, 680, 112),
+        20, 874, 680, 112),
         L"Keyboard shortcuts available while Witcher 3 VR is running.");
     AddTooltip(AddLabel(
         L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
-        38, 868, 650, 24),
+        38, 900, 650, 24),
         L"Runtime view shortcuts: cycle the standard/near camera, recenter the headset, toggle Cinema3D, or toggle First Person.");
     AddTooltip(AddLabel(
         L"HUD editor: INS open / save and close    Q/E select panel    Arrow keys move    Wheel scales",
-        38, 892, 650, 24),
+        38, 924, 650, 24),
         L"HUD editor controls: open or save with Insert, select a panel with Q/E, move it with the arrow keys, and resize it with the mouse wheel.");
     AddTooltip(AddLabel(
         L"R reset panel    X reset profile    F7 switch VR / Cinema3D (editor open or closed)",
-        38, 916, 650, 24),
+        38, 948, 650, 24),
         L"HUD editor reset and preview controls: reset the current panel, reset the profile, or switch between Full VR and Cinema3D.");
 
-    AddTooltip(AddLabel(L"", 20, 962, 680, 26, IdStatus, SS_LEFT),
+    AddTooltip(AddLabel(L"", 20, 994, 680, 26, IdStatus, SS_LEFT),
         L"Shows validation results, saved changes, and launch status.");
     AddTooltip(AddControl(L"BUTTON", L"Configure Settings for VR",
-        BS_PUSHBUTTON | WS_TABSTOP, 20, 992, 220, 34, IdConfigureVr),
+        BS_PUSHBUTTON | WS_TABSTOP, 20, 1024, 220, 34, IdConfigureVr),
         L"Installs the complete recommended VR graphics baseline, then reapplies the selected render mode and resolution.");
     AddTooltip(AddControl(L"BUTTON", L"Restore Original Settings",
-        BS_PUSHBUTTON | WS_TABSTOP, 252, 992, 220, 34, IdRestoreOriginal),
+        BS_PUSHBUTTON | WS_TABSTOP, 252, 1024, 220, 34, IdRestoreOriginal),
         L"Restores the original dx12user.settings backup created by Configure Settings for VR.");
     AddTooltip(AddControl(L"BUTTON", L"Restore Defaults",
-        BS_PUSHBUTTON | WS_TABSTOP, 484, 992, 216, 34, IdRestoreDefaults),
+        BS_PUSHBUTTON | WS_TABSTOP, 484, 1024, 216, 34, IdRestoreDefaults),
         L"Loads Witcher 3 VR launcher defaults into the controls. Press Save to apply them.");
     AddTooltip(AddControl(L"BUTTON", L"Save Only",
-        BS_PUSHBUTTON | WS_TABSTOP, 406, 1038, 130, 36, IdSave),
+        BS_PUSHBUTTON | WS_TABSTOP, 406, 1070, 130, 36, IdSave),
         L"Writes the selected launcher, renderer, and game settings without starting the game.");
     AddTooltip(AddControl(L"BUTTON", L"Save && Launch",
-        BS_DEFPUSHBUTTON | WS_TABSTOP, 550, 1038, 150, 36, IdSaveLaunch),
+        BS_DEFPUSHBUTTON | WS_TABSTOP, 550, 1070, 150, 36, IdSaveLaunch),
         L"Writes all settings, enforces render-mode compatibility, and starts The Witcher 3.");
 
     PopulateControls();

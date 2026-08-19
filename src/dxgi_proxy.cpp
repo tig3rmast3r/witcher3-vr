@@ -23,7 +23,9 @@
 #include "first_person_anchor_smoothing.h"
 #include "rt_ingress_join.h"
 
-// V1231 makes REDengine's deferred sequential-DLSS eye/pair transport
+// V1232 pairs V1231's renderer with the launcher/script-owned dynamic camera
+// follow policy. Renderer behavior remains identical. V1231 makes REDengine's
+// deferred sequential-DLSS eye/pair transport
 // functional independently from ngx_trace and gives the strict-Stereo
 // real-smoke selector first use of that exact command-scoped identity. V1230's
 // removal of the F3 recorder and diagnostic RTX ingress ledger is unchanged.
@@ -35560,7 +35562,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1231 base=V1230 taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_hud=eye_local full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
+                "witcher3vr canonical build=V1232 base=V1231 camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_hud=eye_local full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss_taau "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -35581,7 +35583,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1231 base=V1230 "
+                "witcher3vr dxgi proxy initialized build=V1232 base=V1231 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
@@ -35593,7 +35595,7 @@ void ensure_initialized() {
                 g_config.raytracing_history_buffers,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
-            log_line("V1231 AFW common_transport=dlss_and_taau taau_color=exact_final_backbuffer taau_motion=normalized_rg16f_previous_minus_current afw_projection=packed_absolute_asymmetric_final_source_centered mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_deferred_command_tag rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6");
+            log_line("V1232 AFW common_transport=dlss_and_taau taau_color=exact_final_backbuffer taau_motion=normalized_rg16f_previous_minus_current afw_projection=packed_absolute_asymmetric_final_source_centered mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_deferred_command_tag rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic");
             log_line(
                 "V1177 RenderDoc integration=retained ini=optional_default_off capture=F7 system_dxgi_exports=pre_resolved api=1.6.0");
             log_line(

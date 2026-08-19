@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1231.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1232.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -148,6 +148,15 @@ if(BUILD_TESTING)
     add_test(
         NAME first_person_anchor_smoothing
         COMMAND w3vr_first_person_anchor_smoothing_tests
+    )
+
+    add_executable(w3vr_camera_follow_policy_tests
+        tests/camera_follow_policy_tests.cpp
+    )
+    target_include_directories(w3vr_camera_follow_policy_tests PRIVATE launcher)
+    add_test(
+        NAME camera_follow_policy
+        COMMAND w3vr_camera_follow_policy_tests
     )
 endif()
 

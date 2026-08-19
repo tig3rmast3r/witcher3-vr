@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <UserConfig>
+  <Group id="W3VRSettings" displayName="Witcher3VR runtime settings">
+    <PresetsArray>
+      <Preset id="0" displayName="Defaults">
+        <Entry varId="CameraFollowPolicy" value="1"/>
+      </Preset>
+    </PresetsArray>
+    <VisibleVars>
+      <Var id="CameraFollowPolicy" displayName="Camera follow policy" displayType="SLIDER;0;2;2" visibilityCondition="hideAlways"/>
+    </VisibleVars>
+  </Group>
+
   <Group id="W3VRHudEditorSettings" displayName="Witcher3VR HUD Editor data">
     <PresetsArray>
       <Preset id="0" displayName="Defaults">

@@ -120,6 +120,8 @@ Difficulty=2
 CrossProgression=true
 EnableUberMovement=1
 AutoCameraCenter=false
+[W3VRSettings]
+CameraFollowPolicy=1
 [LevelOfDetail]
 SwarmHideDistance=200
 DecalsHideDistance=40

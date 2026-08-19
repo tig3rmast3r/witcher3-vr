@@ -1407,6 +1407,23 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         *vr, "engine", "first_person_strafe", true);
     result.state.first_person_anchor_smoothing = ReadBool(
         *vr, "engine", "first_person_anchor_smoothing", true);
+    const int saved_camera_follow_policy = ReadInt(
+        *game, "W3VRSettings", "CameraFollowPolicy", -1);
+    if (saved_camera_follow_policy >=
+            static_cast<int>(CameraFollowPolicy::AlwaysOn) &&
+        saved_camera_follow_policy <=
+            static_cast<int>(CameraFollowPolicy::AlwaysOff)) {
+        result.state.camera_follow_policy =
+            static_cast<CameraFollowPolicy>(saved_camera_follow_policy);
+    } else {
+        // A pre-V1232 install has only REDengine's boolean. Preserve an
+        // enabled setting as Always On; an old disabled setting migrates to
+        // the new vehicle-only policy that fixes mouse horse/boat control.
+        result.state.camera_follow_policy = ReadBool(
+            *game, "Gameplay", "AutoCameraCenter", false)
+            ? CameraFollowPolicy::AlwaysOn
+            : CameraFollowPolicy::HorseBoatOnly;
+    }
     result.state.fast_movement_transitions = ReadBool(
         *game, "DLC", "DlcEnabled_movementinputfix", true);
     result.state.native_stereo = ReadBool(
@@ -1523,6 +1540,18 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         state.first_person_strafe ? "1" : "0");
     vr_ini.Set("engine", "first_person_anchor_smoothing",
         state.first_person_anchor_smoothing ? "1" : "0");
+    const int camera_follow_policy = std::clamp(
+        static_cast<int>(state.camera_follow_policy),
+        static_cast<int>(CameraFollowPolicy::AlwaysOn),
+        static_cast<int>(CameraFollowPolicy::AlwaysOff));
+    game_settings.Set("W3VRSettings", "CameraFollowPolicy",
+        std::to_string(camera_follow_policy));
+    // Keep the native boot value coherent until the first script camera tick.
+    // The script then owns the dynamic on-foot/vehicle transitions.
+    game_settings.Set("Gameplay", "AutoCameraCenter",
+        camera_follow_policy ==
+                static_cast<int>(CameraFollowPolicy::AlwaysOn)
+            ? "true" : "false");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
     vr_ini.Set("engine", "dlss_dlaa", dlss_dlaa ? "1" : "0");
     // [DEBUG 1/2] One launcher switch owns the log writer and every bounded

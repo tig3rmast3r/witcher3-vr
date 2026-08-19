@@ -21,6 +21,19 @@ enum class CinemaAspect {
     FourThree,
 };
 
+enum class CameraFollowPolicy {
+    AlwaysOn,
+    HorseBoatOnly,
+    AlwaysOff,
+};
+
+constexpr bool CameraFollowEnabled(
+    CameraFollowPolicy policy, bool horse_or_boat, bool first_person) {
+    if (policy == CameraFollowPolicy::AlwaysOff) return false;
+    if (horse_or_boat) return true;
+    return policy == CameraFollowPolicy::AlwaysOn && !first_person;
+}
+
 struct ModeSettings {
     int openxr_mode{};
     bool dual_render{};
@@ -54,6 +67,7 @@ struct LauncherState {
     bool first_person_combat_exit{false};
     bool first_person_strafe{true};
     bool first_person_anchor_smoothing{true};
+    CameraFollowPolicy camera_follow_policy{CameraFollowPolicy::HorseBoatOnly};
     bool fast_movement_transitions{true};
     bool native_stereo{};
     bool fullscreen_projection{};
