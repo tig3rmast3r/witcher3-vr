@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1233.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1234.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -166,6 +166,15 @@ if(BUILD_TESTING)
     add_test(
         NAME static_hud_policy
         COMMAND w3vr_static_hud_policy_tests
+    )
+
+    add_executable(w3vr_mode3_transport_policy_tests
+        tests/mode3_transport_policy_tests.cpp
+    )
+    target_include_directories(w3vr_mode3_transport_policy_tests PRIVATE src)
+    add_test(
+        NAME renderer_mode3_transport_policy
+        COMMAND w3vr_mode3_transport_policy_tests
     )
 endif()
 

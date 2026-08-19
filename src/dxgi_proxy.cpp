@@ -21,10 +21,15 @@
 #include "puredark_afw_camera.h"
 #include "first_person_combat_lock.h"
 #include "first_person_anchor_smoothing.h"
+#include "mode3_transport_policy.h"
 #include "rt_ingress_join.h"
 
-// V1233 adds the launcher/script-owned dynamic static-HUD policy over V1232's
-// camera-follow policy. Renderer behavior remains identical. V1231 makes REDengine's
+// V1234 makes Mode-3 post-render transport projection-agnostic: symmetric and
+// asymmetric DLSS/TAAU feed the same exact submitted-temporal/final-color
+// transaction, and exact command-list publication may come from any hooked
+// queue. Projection differences remain only in pre-render camera/FOV/shader
+// preparation. V1233's dynamic HUD and V1232's camera-follow policy are
+// unchanged. V1231 makes REDengine's
 // deferred sequential-DLSS eye/pair transport
 // functional independently from ngx_trace and gives the strict-Stereo
 // real-smoke selector first use of that exact command-scoped identity. V1230's
@@ -378,6 +383,7 @@ bool mode3_aer_afw_post_hud_gameplay_active();
 bool mode3_aer_afw_baked_hud_cinema_active();
 bool mode3_aer_cinema_sequential_present_source_active();
 bool stereo_icon_policy_transport_active();
+bool mode3_aer_presentation_active();
 
 bool geometry_stereo_transport_active() {
     return g_config.openxr_mode == 3;
@@ -403,16 +409,17 @@ bool engine_native_per_eye_temporal_history_active() {
 }
 
 bool dlss_submitted_cache_route_active() {
-    // [FIX:AER-DLSS-SUBMITTED-CACHE-AUTHORITY V12021 1/7] The final
+    // [FIX:UNIFIED-MODE3-TRANSPORT V1234 1/6] The final
     // backbuffer belongs to the DLSS producer actually accepted by the game
-    // queue, not to DXGI Present parity or a late task-completion cursor.
-    // Native Mode-3 DLSS uses the same exact submitted-NGX producer authority
-    // as the validated final-backbuffer AER route. Symmetric Mode 3 keeps
-    // its packed-pair presentation authority.
-    return g_config.temporal_backend == TemporalBackend::Dlss &&
-        g_config.openxr_mode == 3 &&
-        g_config.mode3_aer_presentation &&
-        g_config.native_stereo;
+    // queue, not to DXGI Present parity or a projection-specific cache. Both
+    // symmetric and asymmetric Mode-3 DLSS publish this exact producer.
+    return w3vr::mode3_transport::dlss_submission_route_active(
+        mode3_aer_presentation_active(),
+        g_config.temporal_backend == TemporalBackend::Dlss
+            ? w3vr::mode3_transport::TemporalAdapter::Dlss
+            : (g_config.temporal_backend == TemporalBackend::Taau
+                ? w3vr::mode3_transport::TemporalAdapter::Taau
+                : w3vr::mode3_transport::TemporalAdapter::None));
 }
 
 bool mode3_stereo_transport_active() {
@@ -515,26 +522,24 @@ bool rt_temporal_history_descriptor_format(DXGI_FORMAT format) {
 }
 
 bool mode3_aer_final_present_source_active() {
-    // [TRIAL:RT-AER-FINAL-PRESENT-SOURCE V13008 1/5] Keep the Mode-3 AER
-    // camera and natural alternating producer, but present selected AER routes
-    // through AER's proven final-backbuffer eye cache. This deliberately
-    // bypasses Mode 3's scene-only capture-ring promotion so the HMD receives
-    // the same post-processed RGBA source which preserves color in V12031.
-    // Native No-AA and native DLSS use this source. Symmetric DLSS keeps its
-    // validated packed Mode-3 route. RT resources and histories are untouched.
-    return mode3_aer_presentation_active() &&
-        (g_config.temporal_backend == TemporalBackend::None ||
-            (g_config.native_stereo &&
-                g_config.temporal_backend == TemporalBackend::Dlss));
+    // [FIX:UNIFIED-MODE3-TRANSPORT V1234 2/6] AER's final post-processed
+    // backbuffer cache is the common No-AA/DLSS presentation source. Camera,
+    // FOV and shader preparation may differ before rendering; cache selection
+    // and publication may not differ by projection afterwards.
+    const auto backend = g_config.temporal_backend == TemporalBackend::Dlss
+        ? w3vr::mode3_transport::TemporalAdapter::Dlss
+        : (g_config.temporal_backend == TemporalBackend::Taau
+            ? w3vr::mode3_transport::TemporalAdapter::Taau
+            : w3vr::mode3_transport::TemporalAdapter::None);
+    return w3vr::mode3_transport::final_backbuffer_route_active(
+        mode3_aer_presentation_active(), backend);
 }
 
-bool puredark_afw_mode3_aer_native_dlss_final_source_active() {
-    // [FIX:PUREDARK-AFW-NATIVE-DLSS-FINAL-SOURCE V1158 1/6] The canonical
-    // RT merge established this final post-processed source for native DLSS.
-    // AFW may consume it only while its exact submitted NGX bundle route is
-    // enabled; symmetric DLSS remains on the V1145 packed transaction.
+bool puredark_afw_mode3_aer_dlss_final_source_active() {
+    // [FIX:UNIFIED-MODE3-TRANSPORT V1234 3/6] AFW consumes the same final
+    // post-processed DLSS transaction for both projections.
     return puredark_afw_mode3_aer_dlss_route_configured() &&
-        g_config.native_stereo && mode3_aer_final_present_source_active();
+        mode3_aer_final_present_source_active();
 }
 
 bool retained_hud_projection_route_active() {
@@ -575,13 +580,14 @@ Mode3AfwTemporalBackend mode3_afw_exact_final_source_backend() {
     // [REFACTOR:COMMON-TEMPORAL-AFW-TRANSACTION V1226 2/8] From the exact
     // temporal producer tag onward, DLSS and TAAU enter one final-color join.
     // Backend-specific capture and motion normalization have already finished.
-    if (puredark_afw_mode3_aer_native_dlss_final_source_active()) {
-        return Mode3AfwTemporalBackend::Dlss;
-    }
-    if (mode3_taau_afw_final_source_active()) {
-        return Mode3AfwTemporalBackend::Taau;
-    }
-    return Mode3AfwTemporalBackend::None;
+    const auto backend = w3vr::mode3_transport::exact_afw_backend(
+        puredark_afw_mode3_aer_dlss_final_source_active(),
+        mode3_taau_afw_final_source_active());
+    return backend == w3vr::mode3_transport::TemporalAdapter::Dlss
+        ? Mode3AfwTemporalBackend::Dlss
+        : (backend == w3vr::mode3_transport::TemporalAdapter::Taau
+            ? Mode3AfwTemporalBackend::Taau
+            : Mode3AfwTemporalBackend::None);
 }
 
 bool mode3_afw_exact_final_source_active() {
@@ -590,13 +596,15 @@ bool mode3_afw_exact_final_source_active() {
 }
 
 Mode3AfwTemporalBackend mode3_final_color_submission_backend() {
-    if (dlss_submitted_cache_route_active()) {
-        return Mode3AfwTemporalBackend::Dlss;
-    }
-    if (mode3_taau_afw_final_source_active()) {
-        return Mode3AfwTemporalBackend::Taau;
-    }
-    return Mode3AfwTemporalBackend::None;
+    const auto backend =
+        w3vr::mode3_transport::final_color_submission_backend(
+            dlss_submitted_cache_route_active(),
+            mode3_taau_afw_final_source_active());
+    return backend == w3vr::mode3_transport::TemporalAdapter::Dlss
+        ? Mode3AfwTemporalBackend::Dlss
+        : (backend == w3vr::mode3_transport::TemporalAdapter::Taau
+            ? Mode3AfwTemporalBackend::Taau
+            : Mode3AfwTemporalBackend::None);
 }
 
 bool taau_stereo_route_active() {
@@ -2119,9 +2127,8 @@ bool mode3_aer_afw_baked_hud_cinema_active() {
 
 // [FIX:AER-CINEMA-EXACT-EYE-CONTRACT V1214 1/12] Normal and manual Cinema
 // use the final post-processed backbuffer for every AER backend and projection
-// layout. Gameplay keeps its established backend-specific source. This is the
-// narrow presenter gate which also admits symmetric DLSS to Cinema without
-// widening its normal gameplay route.
+// layout. V1234 gives normal DLSS gameplay the same projection-agnostic final
+// source; this predicate remains the separate Cinema lifecycle gate.
 bool mode3_aer_cinema_sequential_present_source_active() {
     const bool normal_or_manual_cinema =
         g_force_mono_cinema.load(std::memory_order_relaxed) ||
@@ -8131,7 +8138,7 @@ void capture_puredark_afw_camera(
     if (puredark_afw_mode3_aer_dlss_route_configured() &&
         native_asymmetric_noaa_route_active()) {
         const bool final_source_already_compensated =
-            puredark_afw_mode3_aer_native_dlss_final_source_active();
+            puredark_afw_mode3_aer_dlss_final_source_active();
         const uint32_t destination_eye = 1u - routed_eye;
         const XrFovf source_fov = route_tag.render_view.fov;
         XrFovf destination_fov{};
@@ -16326,12 +16333,16 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         puredark_afw_mode3_aer_any_route_configured();
     const bool puredark_afw_cross_queue_route =
         puredark_afw_mode3_aer_common_transport_configured();
+    // [FIX:UNIFIED-MODE3-TRANSPORT V1234 4/6] Exact command-list identity is
+    // the admission rule. Projection and queue pointer are not. This mirrors
+    // the AFW producer path and lets a secondary DIRECT queue publish the same
+    // immutable temporal transaction as the swapchain queue.
     const bool dlss_cache_execute_publication =
-        dlss_submitted_cache_route_active() &&
-        queue == g_command_queue;
+        w3vr::mode3_transport::submission_queue_eligible(
+            dlss_submitted_cache_route_active(), queue == g_command_queue);
     const bool taau_cache_execute_publication =
-        taau_submitted_resolve_route_active() &&
-        queue == g_command_queue;
+        w3vr::mode3_transport::submission_queue_eligible(
+            taau_submitted_resolve_route_active(), queue == g_command_queue);
     // [FIX:PUREDARK-AFW-CROSS-QUEUE-PUBLICATION V12099 2/6] The pending map
     // is keyed by exact command-list identity, so it is the safe queue filter.
     // Scan every hooked DIRECT queue; unrelated submissions return empty.
@@ -35562,7 +35573,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1233 base=V1232 static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_hud=eye_local full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
+                "witcher3vr canonical build=V1234 base=V1233 mode3_transport=projection_agnostic_exact_temporal_final_color_any_queue static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_hud=eye_local full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss_taau "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -35583,7 +35594,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1233 base=V1232 "
+                "witcher3vr dxgi proxy initialized build=V1234 base=V1233 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
@@ -35595,7 +35606,7 @@ void ensure_initialized() {
                 g_config.raytracing_history_buffers,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
-            log_line("V1233 AFW common_transport=dlss_and_taau taau_color=exact_final_backbuffer taau_motion=normalized_rg16f_previous_minus_current afw_projection=packed_absolute_asymmetric_final_source_centered mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_deferred_command_tag rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic static_hud=launcher_script_dynamic");
+            log_line("V1234 AFW common_transport=dlss_and_taau projection_transport=symmetric_asymmetric_identical final_color=exact_submitted_temporal queue_admission=exact_command_list_any_hooked_queue taau_motion=normalized_rg16f_previous_minus_current afw_projection=packet_owned_camera_fov mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_deferred_command_tag rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic static_hud=launcher_script_dynamic");
             log_line(
                 "V1177 RenderDoc integration=retained ini=optional_default_off capture=F7 system_dxgi_exports=pre_resolved api=1.6.0");
             log_line(
@@ -38806,7 +38817,7 @@ bool update_mode3_aer_eye_cache() {
         select_mode3_afw_queued_producer(
             g_present_count.load(std::memory_order_relaxed),
             queued_producer, nullptr,
-            puredark_afw_mode3_aer_native_dlss_final_source_active());
+            puredark_afw_mode3_aer_dlss_final_source_active());
     if (mode3_common_transport && !queued_producer_selected) {
         // TAAU can enter before its first resolve bundle is submitted. Keep
         // natural AER visible for bootstrap; after AFW owns an immutable pair,
@@ -39874,9 +39885,9 @@ void render_openxr_test_frame(
             g_automatic_full_vr_camera_active.load(
                 std::memory_order_acquire));
     const bool cinema_panel = cinema_mode && !automatic_full_vr_cutscene;
-    // [FIX:AER-FINAL-SOURCE-CINEMA-PAIR V1180 1/7] Mode-3 AER TAAU and
-    // native DLSS deliberately bypass the packed scene-only source during
-    // gameplay. Cinema disables AFW generation, so capture their alternating
+    // [FIX:AER-FINAL-SOURCE-CINEMA-PAIR V1180 1/7] Mode-3 AER temporal
+    // final-source routes bypass the packed scene-only source during gameplay.
+    // Cinema disables AFW generation, so capture their alternating
     // final backbuffers into the already-proven strict Cinema pair instead of
     // waiting forever on a packed source that this route never publishes.
     // [FIX:AER-FULL-VR-COMPLETED-FRAME-AUTHORITY V1209 2/5] Every supported
@@ -41282,11 +41293,10 @@ void render_openxr_test_frame(
                             if (take_bounded_log_slot(
                                     completed_view_match_logs, 32)) {
                                 log_line(
-                                    "Native final-source completed view native=%u present=%llu "
+                                    "Common final-source completed view present=%llu "
                                     "expected=%u/%llu/%u completed=%d/%llu/%u "
                                     "serial=%llu/%llu view=%u pair_aligned=%u "
                                     "match=%u update=%d",
-                                    g_config.native_stereo ? 1u : 0u,
                                     static_cast<unsigned long long>(
                                         current_present),
                                     identity.eye,
@@ -42132,12 +42142,8 @@ void render_openxr_test_frame(
                     const auto sample = aer_submit_view_logs.fetch_add(
                         1, std::memory_order_relaxed);
                     if (sample < 16) {
-                        const char* route_name = g_config.native_stereo
-                            ? (g_config.temporal_backend ==
-                                    TemporalBackend::Dlss
-                                ? "V13044 native DLSS submitted-view"
-                                : "V13044 native completed-view")
-                            : "V13044 symmetric completed-view";
+                        const char* route_name =
+                            "V1234 common submitted/completed-view";
                         log_line(
                             "%s OpenXR submit view sample=%u present=%llu "
                             "eye=%u source_eye=%u origin=%s cache_valid=%d "
