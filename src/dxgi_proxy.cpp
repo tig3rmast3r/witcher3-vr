@@ -16,6 +16,7 @@
 #include <openxr/openxr_platform.h>
 
 #include "aer_scheduler.h"
+#include "aer_presentation_size_policy.h"
 #include "openxr_eye_geometry.h"
 #include "puredark_afw_bridge.h"
 #include "puredark_afw_camera.h"
@@ -26,9 +27,16 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 #include "shadow_cascade_authority_policy.h"
+#include "strict_dlss_smoke_authority_policy.h"
 #include "taau_submission_policy.h"
 
-// V1260 gives both eyes of one exact gameplay pair the first-arriving view only
+// V1262 changes only AER's final OpenXR presentation below size 1: the completed
+// gameplay image is remapped into the same tangent-scaled per-eye FOV and exact
+// 100% source-sized subimage used by strict Stereo. Producer identity, AFW,
+// temporal inputs, scene projection and Cinema are unchanged. V1261 gives
+// strict Stereo DLSS smoke its own exact command eye/pair authority instead of
+// requiring AFW's unrelated render-view payload. V1260 gives both
+// eyes of one exact gameplay pair the first-arriving view only
 // inside REDengine's native shadow-cascade builder. The second eye receives a
 // private renderer snapshot, so scene cameras, projection, engine memory and
 // every non-shadow culling route remain untouched. V1259 prevents a TAAU
@@ -2721,6 +2729,12 @@ thread_local uint64_t g_streamline_dlss_pair_id{UINT64_MAX};
 // through both the emitter and the deferred command execution scopes.
 thread_local EngineFrameTag g_streamline_dlss_route_tag{};
 thread_local bool g_streamline_dlss_route_tag_valid{};
+// [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 1/4] V1231 reused AFW's
+// complete route flag, which also requires render_view_valid. Smoke centring
+// needs only exact task provenance, eye, pair and generation. Keep that
+// narrower contract in a separate TLS scope so AFW remains fail-closed.
+thread_local EngineFrameTag g_strict_dlss_smoke_route_tag{};
+thread_local bool g_strict_dlss_smoke_route_tag_valid{};
 std::atomic<uint32_t> g_ngx_trace_count{};
 thread_local bool g_ngx_creating_feature{};
 std::atomic<uint64_t> g_streamline_reset_last_logged_present{UINT64_MAX};
@@ -14853,6 +14867,36 @@ bool select_real_smoke_offaxis_pipeline(
     }
     const uint64_t present =
         g_present_count.load(std::memory_order_relaxed);
+    // [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 2/4] Consume the
+    // smoke-specific identity before the older AFW-complete route. This stays
+    // exact but no longer rejects a valid DLSS command merely because its
+    // optional render-view payload was unavailable.
+    if (g_strict_dlss_smoke_route_tag_valid) {
+        const EngineFrameTag tag = g_strict_dlss_smoke_route_tag;
+        const uint32_t generation =
+            g_streamline_capture_generation.load(std::memory_order_acquire);
+        if (w3vr::strict_dlss_smoke::valid_exact_identity(
+                tag.task_provenance_valid, tag.eye, tag.pair_id,
+                tag.generation, generation)) {
+            store_native_focus_draw_eye(
+                command_list, present, tag.eye, tag.pair_id);
+            variant_pipeline =
+                g_real_smoke_center_pipelines[tag.eye].load(
+                    std::memory_order_acquire);
+            static std::atomic<uint32_t> exact_logs{};
+            if (g_config.runtime_diagnostics &&
+                take_bounded_log_slot(exact_logs, 64)) {
+                log_line(
+                    "V1261 strict DLSS smoke authority route=exact_command "
+                    "eye=%u pair=%llu generation=%u view_valid=%u "
+                    "command_list=%p present=%llu",
+                    tag.eye, static_cast<unsigned long long>(tag.pair_id),
+                    tag.generation, tag.render_view_valid ? 1u : 0u,
+                    command_list, static_cast<unsigned long long>(present));
+            }
+            return variant_pipeline != nullptr;
+        }
+    }
     // [FIX:STRICT-DLSS-SMOKE-EXACT-EYE V1231 1/2] Sequential DLSS already
     // transports the immutable frame tag from REDengine's exact emitter to
     // the deferred command execution scope. Consume that tag directly while
@@ -19106,6 +19150,20 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
             variant_selected = select_real_smoke_offaxis_pipeline(
                 command_list, variant_pipeline);
             if (!variant_selected) {
+                // [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 4/4]
+                // A bounded marker makes any remaining scope miss explicit.
+                static std::atomic<uint32_t> fallback_logs{};
+                if (g_config.runtime_diagnostics &&
+                    dlss_sequential_mode_active() &&
+                    take_bounded_log_slot(fallback_logs, 32)) {
+                    log_line(
+                        "V1261 strict DLSS smoke authority "
+                        "route=zero_center_fallback command_list=%p "
+                        "present=%llu",
+                        command_list,
+                        static_cast<unsigned long long>(
+                            g_present_count.load(std::memory_order_relaxed)));
+                }
                 // [FIX:WORLD-UP-ZERO-CENTER-FALLBACK V1157 1/1] Off-axis
                 // authority is a spatial refinement, not permission to apply
                 // the independent V1080 world-up rotation fix. V1156 proved
@@ -25337,6 +25395,19 @@ void __fastcall hook_engine_dlss_command_emit(
     const EngineFrameTag previous_route_tag = g_streamline_dlss_route_tag;
     const bool previous_route_tag_valid =
         g_streamline_dlss_route_tag_valid;
+    const EngineFrameTag previous_smoke_route_tag =
+        g_strict_dlss_smoke_route_tag;
+    const bool previous_smoke_route_tag_valid =
+        g_strict_dlss_smoke_route_tag_valid;
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    g_strict_dlss_smoke_route_tag_valid = emitted_tag_valid &&
+        w3vr::strict_dlss_smoke::valid_exact_identity(
+            emitted_tag.task_provenance_valid, emitted_tag.eye,
+            emitted_tag.pair_id, emitted_tag.generation, generation);
+    if (g_strict_dlss_smoke_route_tag_valid) {
+        g_strict_dlss_smoke_route_tag = emitted_tag;
+    }
     g_streamline_dlss_route_tag_valid = emitted_tag_valid &&
         emitted_tag.task_provenance_valid &&
         emitted_tag.render_view_valid;
@@ -25346,6 +25417,9 @@ void __fastcall hook_engine_dlss_command_emit(
     g_engine_dlss_command_emit(renderer, parameters);
     g_streamline_dlss_route_tag = previous_route_tag;
     g_streamline_dlss_route_tag_valid = previous_route_tag_valid;
+    g_strict_dlss_smoke_route_tag = previous_smoke_route_tag;
+    g_strict_dlss_smoke_route_tag_valid =
+        previous_smoke_route_tag_valid;
 }
 
 void install_engine_dlss_command_emit_hook() {
@@ -25449,6 +25523,22 @@ void __fastcall hook_engine_dlss_command(void* context, uint8_t** stream) {
     const EngineFrameTag previous_route_tag = g_streamline_dlss_route_tag;
     const bool previous_route_tag_valid =
         g_streamline_dlss_route_tag_valid;
+    // [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 3/4] The consumer's
+    // queue hit already proves generation. Publish the narrower smoke scope
+    // independently of AFW's render-view validity.
+    const EngineFrameTag previous_smoke_route_tag =
+        g_strict_dlss_smoke_route_tag;
+    const bool previous_smoke_route_tag_valid =
+        g_strict_dlss_smoke_route_tag_valid;
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    g_strict_dlss_smoke_route_tag_valid = route_tag_valid &&
+        w3vr::strict_dlss_smoke::valid_exact_identity(
+            route_tag.task_provenance_valid, route_tag.eye,
+            route_tag.pair_id, route_tag.generation, generation);
+    if (g_strict_dlss_smoke_route_tag_valid) {
+        g_strict_dlss_smoke_route_tag = route_tag;
+    }
     g_streamline_dlss_route_tag_valid = route_tag_valid &&
         route_tag.task_provenance_valid && route_tag.render_view_valid &&
         route_tag.eye <= 1 && route_tag.pair_id != 0 &&
@@ -25459,6 +25549,9 @@ void __fastcall hook_engine_dlss_command(void* context, uint8_t** stream) {
     g_engine_dlss_command(context, stream);
     g_streamline_dlss_route_tag = previous_route_tag;
     g_streamline_dlss_route_tag_valid = previous_route_tag_valid;
+    g_strict_dlss_smoke_route_tag = previous_smoke_route_tag;
+    g_strict_dlss_smoke_route_tag_valid =
+        previous_smoke_route_tag_valid;
     g_streamline_dlss_pair_id = previous_pair;
     g_streamline_forced_eye = previous_forced_eye;
 }
@@ -36293,7 +36386,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1260 base=V1259 "
+                "witcher3vr dxgi proxy initialized build=V1262 base=V1261 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
@@ -36305,7 +36398,7 @@ void ensure_initialized() {
                 g_config.raytracing_history_buffers,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
-            log_line("V1234 AFW common_transport=dlss_and_taau projection_transport=symmetric_asymmetric_identical final_color=exact_submitted_temporal queue_admission=exact_command_list_any_hooked_queue taau_motion=normalized_rg16f_previous_minus_current afw_projection=packet_owned_camera_fov mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_deferred_command_tag rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic static_hud=launcher_script_dynamic");
+            log_line("V1234 AFW common_transport=dlss_and_taau projection_transport=symmetric_asymmetric_identical final_color=exact_submitted_temporal queue_admission=exact_command_list_any_hooked_queue taau_motion=normalized_rg16f_previous_minus_current afw_projection=packet_owned_camera_fov mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_command_eye_pair_independent_of_afw_view aer_presentation_size=final_openxr_scaled_fov_source_extent rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic static_hud=launcher_script_dynamic");
             log_line(
                 "V1177 RenderDoc integration=retained ini=optional_default_off capture=F7 system_dxgi_exports=pre_resolved api=1.6.0");
             log_line(
@@ -40722,6 +40815,8 @@ void render_openxr_test_frame(
     bool native_asymmetric_projection{};
     bool native_asymmetric_direct_copy{};
     bool native_asymmetric_black_frame{};
+    bool aer_asymmetric_final_size_remap{};
+    std::array<XrFovf, 2> aer_scaled_submission_fovs{};
     int32_t projection_eye_shifts_x_px[2]{};
     int32_t projection_eye_shifts_y_px[2]{};
     bool full_surface_projection{};
@@ -41050,6 +41145,32 @@ void render_openxr_test_frame(
                     static_cast<int32_t>(copy_height)};
                 const float requested_scale = std::clamp(
                     g_config.presentation_scale, 0.01f, 1.0f);
+                const bool aer_size_projection_pipeline_ready =
+                    g_xr_cinema_projection_pipeline != nullptr &&
+                    g_xr_cinema_projection_root_signature != nullptr &&
+                    g_xr_cinema_projection_srv_heap != nullptr;
+                aer_asymmetric_final_size_remap =
+                    w3vr::aer_presentation_size_policy::
+                        final_openxr_remap_active({
+                            mode3_aer_presentation_active(),
+                            g_config.native_stereo,
+                            puredark_afw_gameplay_frame,
+                            g_config.hmd_freelook,
+                            aer_size_projection_pipeline_ready,
+                            requested_scale});
+                if (aer_asymmetric_final_size_remap) {
+                    for (uint32_t eye = 0; eye < 2; ++eye) {
+                        if (eye >= g_xr_views.size() ||
+                            !w3vr::openxr_eye_geometry::
+                                scale_asymmetric_projection_fov(
+                                    g_xr_views[eye].fov,
+                                    requested_scale,
+                                    aer_scaled_submission_fovs[eye])) {
+                            aer_asymmetric_final_size_remap = false;
+                            break;
+                        }
+                    }
+                }
 
                 // [FIX:VISIBILITY-MASK-FIT 4/7] The complete REDengine source
                 // is mapped into the runtime frustum at its real angular
@@ -41059,7 +41180,8 @@ void render_openxr_test_frame(
                 // fallback for smaller presentation scales or unusual masks.
                 full_surface_projection =
                     !spatial_panel_active &&
-                    g_config.fullscreen_projection &&
+                    (g_config.fullscreen_projection ||
+                        aer_asymmetric_final_size_remap) &&
                     g_config.hmd_freelook &&
                     g_hmd_render_fov_valid.load(std::memory_order_acquire) &&
                     g_xr_cinema_projection_pipeline != nullptr &&
@@ -41067,6 +41189,7 @@ void render_openxr_test_frame(
                     g_xr_cinema_projection_srv_heap != nullptr;
                 const bool alternate_presentation_resize_active =
                     full_surface_projection &&
+                    !aer_asymmetric_final_size_remap &&
                     g_config.alternate_presentation_resize &&
                     requested_scale < 0.9999f;
 
@@ -41107,6 +41230,16 @@ void render_openxr_test_frame(
                     projection_width = swapchain.width;
                     projection_height = swapchain.height;
                 }
+                // [FIX:AER-FINAL-PRESENTATION-SIZE V1262 1/3] AER's old
+                // legacy-copy presenter encoded reduced Presentation Size by
+                // increasing imageRect (3072 -> 3297 at 0.75 on Quest 3).
+                // Remap the already-completed gameplay image instead and keep
+                // OpenXR's submitted subimage at the exact source extent, as
+                // strict Stereo does. This changes no producer or camera data.
+                if (aer_asymmetric_final_size_remap) {
+                    projection_width = copy_width;
+                    projection_height = copy_height;
+                }
                 projection_image_rect.offset = {
                     static_cast<int32_t>((swapchain.width - projection_width) / 2),
                     static_cast<int32_t>((swapchain.height - projection_height) / 2)};
@@ -41144,13 +41277,19 @@ void render_openxr_test_frame(
                     // contains the entire raw OpenXR view for both eyes.
                     bool all_subimage_crops_valid =
                         all_fit_rects_valid &&
+                        !aer_asymmetric_final_size_remap &&
                         source_desc.Width == copy_width &&
                         source_desc.Height == copy_height &&
                         projection_width == copy_width &&
                         projection_height == copy_height;
                     for (uint32_t eye = 0; eye < 2; ++eye) {
+                        // [FIX:AER-FINAL-PRESENTATION-SIZE V1262 2/3] Fit the
+                        // immutable AER image against the same tangent-scaled
+                        // eye FOV which will be submitted below.
                         const XrFovf& target_fov =
-                            g_xr_views[eye].fov;
+                            aer_asymmetric_final_size_remap
+                            ? aer_scaled_submission_fovs[eye]
+                            : g_xr_views[eye].fov;
                         const float target_left =
                             tanf(target_fov.angleLeft);
                         const float target_right =
@@ -41304,6 +41443,7 @@ void render_openxr_test_frame(
                     // their texture transport differs.
                     scaled_fov_projection =
                         requested_scale < 0.9999f &&
+                        !aer_asymmetric_final_size_remap &&
                         !alternate_presentation_resize_active;
                     if (scaled_fov_projection) {
                         const XrRect2Di scaled_rect{
@@ -41447,6 +41587,27 @@ void render_openxr_test_frame(
                             g_hmd_render_fov_right.load(),
                             g_hmd_render_fov_up.load(),
                             g_hmd_render_fov_down.load());
+                    }
+                    if (aer_asymmetric_final_size_remap) {
+                        static std::atomic<bool> aer_size_remap_logged{};
+                        if (!aer_size_remap_logged.exchange(true)) {
+                            log_line(
+                                "V1262 AER final OpenXR presentation size "
+                                "scale=%.6f subimage=%ux%u swapchain=%ux%u "
+                                "fov0=%.9g,%.9g,%.9g,%.9g "
+                                "fov1=%.9g,%.9g,%.9g,%.9g "
+                                "authority=final_projection_only",
+                                requested_scale, copy_width, copy_height,
+                                swapchain.width, swapchain.height,
+                                aer_scaled_submission_fovs[0].angleLeft,
+                                aer_scaled_submission_fovs[0].angleRight,
+                                aer_scaled_submission_fovs[0].angleUp,
+                                aer_scaled_submission_fovs[0].angleDown,
+                                aer_scaled_submission_fovs[1].angleLeft,
+                                aer_scaled_submission_fovs[1].angleRight,
+                                aer_scaled_submission_fovs[1].angleUp,
+                                aer_scaled_submission_fovs[1].angleDown);
+                        }
                     }
                 }
                 if (g_config.openxr_mono_eye_shift_auto) {
@@ -42962,6 +43123,13 @@ void render_openxr_test_frame(
                     // already owns the submitted pixels and pose. Non-AFW
                     // native routes still select the packed view above.
                     projection_views[eye].fov = render_view->fov;
+                } else if (aer_asymmetric_final_size_remap) {
+                    // [FIX:AER-FINAL-PRESENTATION-SIZE V1262 3/3] The shader
+                    // above remapped the completed symmetric-envelope image
+                    // into this eye's tangent-scaled target. Submit that exact
+                    // target FOV; pose and producer view stay untouched.
+                    projection_views[eye].fov =
+                        aer_scaled_submission_fovs[eye];
                 } else if (scaled_fov_projection) {
                     // [FIX:PRESENTATION-SCALE-FOV 4/5] Pair both the direct
                     // and fallback transports with the exact symmetric FOV
