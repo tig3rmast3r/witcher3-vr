@@ -16,6 +16,52 @@ enum class HudProjectionRoute : uint8_t {
     Cinema,
 };
 
+enum class DlssCompletionOwner : uint8_t {
+    Probe,
+    Ngx,
+    Streamline,
+};
+
+// Public Streamline is the universal Mode-3 DLSS boundary. Projection and
+// presentation policy are deliberately not inputs, so AER and strict Stereo
+// retain the same temporal ownership and remain independent of NVIDIA's private
+// DLL/export topology.
+constexpr bool streamline_dlss_evaluate_callback_active(
+    bool requested,
+    bool openxr_enabled,
+    int openxr_mode,
+    TemporalAdapter backend) noexcept {
+    return requested && openxr_enabled && openxr_mode == 3 &&
+        backend == TemporalAdapter::Dlss;
+}
+
+// V1287 probes both completion boundaries once, then records only the inputs
+// owned by the route that actually completes on this runtime.  If the active
+// topology changes, one held frame is preferable to publishing two temporal
+// producers for the same command list.
+constexpr bool dlss_completion_capture_public_bundle(
+    DlssCompletionOwner owner) noexcept {
+    return owner != DlssCompletionOwner::Ngx;
+}
+
+constexpr bool dlss_completion_apply_public_jitter(
+    DlssCompletionOwner owner) noexcept {
+    return owner == DlssCompletionOwner::Streamline;
+}
+
+constexpr bool dlss_completion_ngx_uses_public_bundle(
+    DlssCompletionOwner owner,
+    bool public_bundle_ready) noexcept {
+    return owner != DlssCompletionOwner::Ngx && public_bundle_ready;
+}
+
+constexpr DlssCompletionOwner dlss_completion_resolved_owner(
+    bool ngx_seen) noexcept {
+    return ngx_seen
+        ? DlssCompletionOwner::Ngx
+        : DlssCompletionOwner::Streamline;
+}
+
 // Projection is intentionally absent from this policy. Symmetric and
 // asymmetric rendering may prepare different camera/FOV/shader inputs, but
 // they must enter the same post-render transport once the temporal producer
@@ -110,6 +156,25 @@ constexpr bool native_hud_source_bootstrap_active(
     bool cinema_active,
     bool strict_stereo_active) noexcept {
     return aer_post_hud_active || cinema_active || strict_stereo_active;
+}
+
+// REDengine can record the retained t1 copy, the final HUD draw and the game
+// backbuffer PRESENT transition on separate command lists. Their queue
+// submission order is authoritative, but worker-thread recording can straddle
+// a Present counter edge. Accept only the same narrow producer interval and
+// leave the native baked HUD visible for every wider or stale join.
+inline constexpr uint64_t kSubmittedHudJoinMaxPresentDistance = 2;
+
+constexpr bool submitted_hud_join_window_matches(
+    uint32_t candidate_generation,
+    uint32_t current_generation,
+    uint64_t candidate_present,
+    uint64_t boundary_present) noexcept {
+    const uint64_t distance = candidate_present > boundary_present
+        ? candidate_present - boundary_present
+        : boundary_present - candidate_present;
+    return candidate_generation == current_generation &&
+        distance <= kSubmittedHudJoinMaxPresentDistance;
 }
 
 // Eye-specific smoke variants need the immutable runtime FOV. The zero-centre

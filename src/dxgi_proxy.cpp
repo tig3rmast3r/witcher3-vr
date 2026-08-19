@@ -29,7 +29,32 @@
 #include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
-// V1267 gives the native Full-VR HUD fallback the same route-specific size and
+// V1290 leaves the complete public Streamline DLSS sequence unchanged. At the
+// final strict-Stereo publication gate only, a successful exact public
+// evaluation credits its routed eye even when that eye needed no jitter
+// rewrite. AER retains the V1289 completion path unchanged.
+// V1289 makes the public Streamline API the sole Mode-3 DLSS owner. Both
+// EvaluateFeature and CreateFeature NGX detours are deliberately absent, so an
+// NVIDIA DLL override cannot leave private cloned histories paired with a
+// public completion callback. Original constants/tags/feature/evaluate calls
+// are forwarded without recipe reconstruction; per-eye viewport identity,
+// REDengine temporal history, reset and exact command routing stay intact.
+// V1277 converts Streamline-normalized motion scale
+// to the NGX/AFW pixel contract and lets two successful public evaluations
+// prove strict Stereo input completion. V1275 completes the opt-in Streamline
+// DLSS callback using
+// Witcher's legacy bool-result ABI and a frame-token constants cache. V1271 bridges
+// Streamline's direct D3D12CreateDevice export call through the
+// optional RenderDoc wrapper and moves capture to F3, leaving F7 exclusively
+// to the HUD editor. The bridge is absent unless RenderDoc is enabled. V1270
+// restores the validated Windows executable-directory lookup used by the
+// optional adjacent RenderDoc loader. V1269 adds a manual, discouraged
+// INI switch which closes the unchanged
+// 0.9.5 Mode-3 DLSS transaction from Streamline slEvaluateFeature instead of
+// this DLL's NGX Evaluate callback. AER/Stereo projection, presentation, AFW
+// and per-eye feature ownership remain on the V1267 path. V1267 gives the
+// native Full-VR HUD fallback
+// the same route-specific size and
 // convergence as the retained projection HUD. This keeps both launcher
 // controls effective while exact scene-only ownership is not yet available.
 // V1266 bounds an unselectable AFW producer queue: after a short grace window
@@ -155,6 +180,7 @@ namespace {
 
 // [CORE] Real DXGI forwarding, shared D3D12 device state, and process lifetime.
 HMODULE g_real_dxgi{};
+HMODULE g_real_d3d12{};
 HMODULE g_openxr_loader{};
 HMODULE g_dxcompiler{};
 HMODULE g_renderdoc_module{};
@@ -174,6 +200,7 @@ FARPROC g_real_dxgi_declare_adapter_removal_support{};
 FARPROC g_real_dxgi_get_debug_interface1{};
 FARPROC g_real_dxgi_disable_vblank_virtualization{};
 thread_local bool g_renderdoc_dxgi_forward_reentry{};
+thread_local bool g_renderdoc_d3d12_forward_reentry{};
 IDxcUtils* g_dxc_utils{};
 IDxcCompiler3* g_dxc_compiler{};
 std::mutex g_log_mutex{};
@@ -372,6 +399,10 @@ struct Config {
     bool streamline_taau_bridge{false};
     bool ngx_trace{false};
     bool dlss_dlaa{false};
+    // Temporary/manual compatibility callback for systems whose NVIDIA global
+    // DLSS override bypasses the canonical NGX Evaluate export. It is absent
+    // from the launcher and defaults off. AER/Stereo/AFW policy is unchanged.
+    bool dlss_streamline_evaluate_callback{false};
     // Optional compatibility/performance route. False regenerates native
     // Depth/MVec for both Sequential eyes; true preserves the old shared-input
     // behavior for users who explicitly prefer its lower cost.
@@ -396,6 +427,10 @@ struct Config {
     // independent from Diagnostic Logging and defaults off so an adjacent
     // renderdoc.dll can remain installed without touching the render path.
     bool renderdoc_capture_enabled{false};
+    // V1286: wrapping Streamline's D3D12 device can change normal frame pacing
+    // even when no capture is active. Keep the loader/hotkey independent and
+    // make the bridge required for full D3D12 capture explicitly opt-in.
+    bool renderdoc_streamline_device_bridge{false};
     // Persistent automatic-family registry. This is independently selectable
     // so shader discovery does not require broad diagnostic logging.
     bool focus_projection_shader_registry{false};
@@ -434,6 +469,22 @@ bool temporal_backend_is_taau() {
 
 bool temporal_backend_is_dlss() {
     return g_config.temporal_backend == TemporalBackend::Dlss;
+}
+
+bool dlss_streamline_evaluate_callback_active() {
+    const auto backend = temporal_backend_is_dlss()
+        ? w3vr::mode3_transport::TemporalAdapter::Dlss
+        : (temporal_backend_is_taau()
+            ? w3vr::mode3_transport::TemporalAdapter::Taau
+            : w3vr::mode3_transport::TemporalAdapter::None);
+    // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 1/8] AER and strict Stereo use the
+    // same public completion boundary. Projection and AFW presentation policy
+    // do not select a different DLSS owner.
+    return w3vr::mode3_transport::streamline_dlss_evaluate_callback_active(
+        true,
+        g_config.openxr_enabled,
+        g_config.openxr_mode,
+        backend);
 }
 
 bool high_frequency_runtime_diagnostics_active() {
@@ -1718,6 +1769,9 @@ CreateShaderResourceViewFn g_create_srv{};
 CreateUnorderedAccessViewFn g_create_uav{};
 CreateRenderTargetViewFn g_create_rtv{};
 CreateDepthStencilViewFn g_create_dsv{};
+D3D12CreateDeviceFn g_real_d3d12_create_device{};
+D3D12CreateDeviceFn g_renderdoc_d3d12_create_device{};
+D3D12CreateDeviceFn g_renderdoc_d3d12_create_device_trampoline{};
 CreateGraphicsPipelineStateFn g_create_graphics_pipeline_state{};
 CreateComputePipelineStateFn g_create_compute_pipeline_state{};
 CopyDescriptorsFn g_copy_descriptors{};
@@ -2387,6 +2441,27 @@ std::atomic<uint32_t> g_native_asymmetric_present_logs{};
 std::atomic<uint32_t> g_native_asymmetric_rejected_pair_logs{};
 std::atomic<uint32_t> g_native_asymmetric_dlss_input_logs{};
 
+struct NativeAsymmetricDlssJitterOverride {
+    bool required{};
+    bool valid{};
+    bool applied{};
+    bool source_was_centered{};
+    uint32_t reason{};
+    uint64_t pair_id{UINT64_MAX};
+    uint32_t generation{UINT32_MAX};
+    uint32_t eye{UINT32_MAX};
+    uint8_t factory_mask{};
+    uint8_t temporal_mask{};
+    float original_x{};
+    float original_y{};
+    float pure_x{};
+    float pure_y{};
+    float center_x{};
+    float center_y{};
+    uint32_t extent_width{};
+    uint32_t extent_height{};
+};
+
 bool native_asymmetric_noaa_route_active() {
     // [TRIAL:NATIVE-STEREO-DLSS V1136] Reuse the validated native-asymmetric
     // geometry ledger with sequential Stereo DLSS. Packed DLSS remains a
@@ -2673,9 +2748,38 @@ uint64_t g_dlss_consumed_submission_serial{};
 // [FIX:AER-AFW-POST-HUD V1189 2/9] The final HUD writer is independent from
 // the TAAU/DLSS scene producer. Keep its immutable natural AER identity on the
 // recording command list until the final PRESENT labels the captured t1 copy.
+// [FIX:AER-AFW-SUBMITTED-HUD-JOIN V1280 1/8] Some REDengine schedulers record
+// the t1 copy, final HUD draw and PRESENT transition on three different command
+// lists. Retain their recording metadata until ExecuteCommandLists supplies the
+// exact queue order; never infer eye identity from Present parity.
+struct Mode3AerAfwHudTagPending {
+    EngineFrameTag tag{};
+    uint64_t recorded_present{};
+};
+struct Mode3AerAfwHudPresentPending {
+    uint32_t generation{};
+    uint64_t recorded_present{};
+};
+struct Mode3AerAfwSubmittedHudTag {
+    EngineFrameTag tag{};
+    ID3D12GraphicsCommandList* command_list{};
+    ID3D12CommandQueue* queue{};
+    uint64_t recorded_present{};
+    uint64_t submission_serial{};
+    bool scene_only_draw_recorded{};
+};
 std::mutex g_mode3_aer_afw_hud_mutex{};
-std::unordered_map<ID3D12GraphicsCommandList*, EngineFrameTag>
+std::unordered_map<ID3D12GraphicsCommandList*, Mode3AerAfwHudTagPending>
     g_mode3_aer_afw_pending_hud_tags{};
+std::unordered_map<ID3D12GraphicsCommandList*, Mode3AerAfwHudPresentPending>
+    g_mode3_aer_afw_pending_hud_presents{};
+std::deque<Mode3AerAfwSubmittedHudTag>
+    g_mode3_aer_afw_submitted_hud_tags{};
+// [PERF:AER-AFW-HUD-ATOMIC-SUBMISSION-ORDER V1284 1/6] Do not serialize
+// renderer workers after every real ExecuteCommandLists. Assign immutable
+// submission order before Execute and let the existing tag/capture locks
+// protect only their own short queues.
+std::atomic<uint64_t> g_mode3_aer_afw_hud_submission_serial{};
 std::atomic<uint32_t> g_dlss_submission_logs{};
 std::atomic<uint32_t> g_dlss_present_authority_logs{};
 // [FIX:AER-TAAU-SUBMITTED-RESOLVE-AUTHORITY V12023 3/9] Keep the exact
@@ -2855,6 +2959,163 @@ struct StreamlineOutputFrameState {
     bool render_view_valid{};
 };
 thread_local StreamlineOutputFrameState g_streamline_output_frame{};
+struct StreamlineDlssEvaluateSnapshot {
+    EngineFrameTag route_tag{};
+    ID3D12Resource* depth{};
+    ID3D12Resource* motion_vectors{};
+    ID3D12Resource* output{};
+    D3D12_RESOURCE_STATES depth_state{
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    D3D12_RESOURCE_STATES motion_state{
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    float motion_scale_x{};
+    float motion_scale_y{};
+    NativeAsymmetricDlssJitterOverride jitter{};
+    bool route_valid{};
+    bool depth_valid{};
+    bool motion_vectors_valid{};
+    bool output_valid{};
+    bool motion_scale_valid{};
+    bool jitter_applied_to_streamline{};
+};
+thread_local StreamlineDlssEvaluateSnapshot
+    g_streamline_dlss_evaluate_snapshot{};
+// [FIX:DLSS-STREAMLINE-CALLBACK V1275 1/4] slSetConstants runs before the
+// deferred engine command exposes its exact eye/pair TLS. Preserve only the
+// constants block under Streamline's own token; slEvaluateFeature will combine
+// it with the exact command route already present at completion.
+constexpr size_t kStreamlineDlssCallbackConstantsSlotCount = 128;
+constexpr size_t kStreamlineDlssCallbackConstantsBytes = 0x1A0;
+struct StreamlineDlssCallbackConstantsSlot {
+    std::array<float, kStreamlineDlssCallbackConstantsBytes / sizeof(float)>
+        constants{};
+    uint32_t frame_token{};
+    uint32_t eye{UINT32_MAX};
+    bool valid{};
+};
+std::mutex g_streamline_dlss_callback_constants_mutex{};
+std::array<StreamlineDlssCallbackConstantsSlot,
+    kStreamlineDlssCallbackConstantsSlotCount>
+    g_streamline_dlss_callback_constants{};
+std::atomic<uint32_t> g_streamline_dlss_callback_constants_logs{};
+std::atomic<bool> g_dlss_completion_auto_hook_logged{};
+
+size_t streamline_dlss_callback_constants_slot(
+    uint32_t frame_token,
+    uint32_t eye) {
+    // Both eyes may legitimately share Streamline's frame token. The viewport
+    // is the public history identity, so the cache must preserve the eye too.
+    return (static_cast<size_t>(frame_token) * 2u + (eye & 1u)) %
+        kStreamlineDlssCallbackConstantsSlotCount;
+}
+
+using DlssCompletionOwner =
+    w3vr::mode3_transport::DlssCompletionOwner;
+std::atomic<DlssCompletionOwner> g_dlss_completion_owner{
+    DlssCompletionOwner::Streamline};
+struct DlssCompletionAutoProbe {
+    uint64_t serial{};
+    DlssCompletionOwner owner_before{DlssCompletionOwner::Probe};
+    bool public_bundle_ready{};
+    bool public_jitter_applied{};
+    bool ngx_seen{};
+    bool ngx_success{};
+    bool ngx_uses_public_bundle{};
+    bool ngx_private_bundle_used{};
+};
+struct DlssCompletionAutoNgxDecision {
+    bool active{};
+    bool public_jitter_applied{};
+    bool use_public_bundle{};
+};
+struct DlssCompletionAutoOutcome {
+    bool valid{};
+    bool ngx_seen{};
+    bool ngx_success{};
+    bool ngx_uses_public_bundle{};
+    bool ngx_private_bundle_used{};
+};
+std::mutex g_dlss_completion_probe_mutex{};
+std::unordered_map<ID3D12GraphicsCommandList*, DlssCompletionAutoProbe>
+    g_dlss_completion_probes{};
+std::atomic<uint64_t> g_dlss_completion_probe_serial{};
+std::atomic<uint32_t> g_dlss_completion_auto_logs{};
+std::atomic<uint64_t> g_dlss_completion_ngx_owned{};
+std::atomic<uint64_t> g_dlss_completion_streamline_owned{};
+std::atomic<uint64_t> g_dlss_completion_owner_switches{};
+
+const char* dlss_completion_owner_name(DlssCompletionOwner owner) {
+    switch (owner) {
+    case DlssCompletionOwner::Ngx:
+        return "ngx";
+    case DlssCompletionOwner::Streamline:
+        return "streamline";
+    default:
+        return "probe";
+    }
+}
+
+uint64_t begin_dlss_completion_auto_probe(
+    ID3D12GraphicsCommandList* command_list,
+    DlssCompletionOwner owner_before,
+    bool public_bundle_ready,
+    bool public_jitter_applied) {
+    if (command_list == nullptr) {
+        return 0;
+    }
+    const uint64_t serial =
+        g_dlss_completion_probe_serial.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+    std::scoped_lock lock{g_dlss_completion_probe_mutex};
+    g_dlss_completion_probes[command_list] = DlssCompletionAutoProbe{
+        serial, owner_before, public_bundle_ready, public_jitter_applied};
+    return serial;
+}
+
+DlssCompletionAutoNgxDecision mark_dlss_completion_auto_ngx_entry(
+    ID3D12GraphicsCommandList* command_list) {
+    std::scoped_lock lock{g_dlss_completion_probe_mutex};
+    const auto found = g_dlss_completion_probes.find(command_list);
+    if (found == g_dlss_completion_probes.end()) {
+        return {};
+    }
+    auto& probe = found->second;
+    probe.ngx_seen = true;
+    const bool use_public_bundle =
+        w3vr::mode3_transport::dlss_completion_ngx_uses_public_bundle(
+            probe.owner_before, probe.public_bundle_ready);
+    probe.ngx_uses_public_bundle |= use_public_bundle;
+    probe.ngx_private_bundle_used |= !use_public_bundle;
+    return {true, probe.public_jitter_applied, use_public_bundle};
+}
+
+void mark_dlss_completion_auto_ngx_result(
+    ID3D12GraphicsCommandList* command_list,
+    bool success) {
+    std::scoped_lock lock{g_dlss_completion_probe_mutex};
+    const auto found = g_dlss_completion_probes.find(command_list);
+    if (found != g_dlss_completion_probes.end()) {
+        found->second.ngx_success |= success;
+    }
+}
+
+DlssCompletionAutoOutcome finish_dlss_completion_auto_probe(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t serial) {
+    if (command_list == nullptr || serial == 0) {
+        return {};
+    }
+    std::scoped_lock lock{g_dlss_completion_probe_mutex};
+    const auto found = g_dlss_completion_probes.find(command_list);
+    if (found == g_dlss_completion_probes.end() ||
+        found->second.serial != serial) {
+        return {};
+    }
+    const auto probe = found->second;
+    g_dlss_completion_probes.erase(found);
+    return {true, probe.ngx_seen, probe.ngx_success,
+        probe.ngx_uses_public_bundle, probe.ngx_private_bundle_used};
+}
 ID3D12Resource* g_stereo_luma_readback[2]{};
 D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_stereo_luma_footprint{};
 uint64_t g_stereo_luma_readback_bytes{};
@@ -3676,11 +3937,37 @@ struct Mode3EarlyHudPending {
     uint32_t slot{UINT32_MAX};
     uint32_t generation{};
     uint64_t capture_serial{};
+    uint64_t recorded_present{};
+    bool aer_afw_submitted_join{};
+};
+// [FIX:AER-AFW-PREEXECUTE-HUD-SNAPSHOT V1282 1/6] Command lists may be reset
+// by another renderer worker as soon as the real ExecuteCommandLists returns.
+// Detach every piece of HUD metadata before that call. V1285 also publishes
+// this immutable snapshot before the queue call so fallback readiness matches
+// the established pointer-exact timing.
+struct Mode3AerAfwHudExecuteSubmission {
+    ID3D12GraphicsCommandList* command_list{};
+    Mode3AerAfwHudTagPending recorded_tag{};
+    Mode3AerAfwHudPresentPending present_boundary{};
+    Mode3EarlyHudPending recorded_capture{};
+    uint64_t submission_serial{};
+    bool has_tag{};
+    bool has_present{};
+    bool has_capture{};
+    bool scene_only_draw_recorded{};
+};
+struct Mode3SubmittedEarlyHudPending {
+    Mode3EarlyHudPending pending{};
+    ID3D12GraphicsCommandList* command_list{};
+    ID3D12CommandQueue* queue{};
+    uint64_t submission_serial{};
 };
 std::array<Mode3EarlyHudSlot, kMode3EarlyHudSlotCount>
     g_mode3_early_hud_slots{};
 std::unordered_map<ID3D12GraphicsCommandList*, Mode3EarlyHudPending>
     g_mode3_early_hud_pending_by_command_list{};
+std::deque<Mode3SubmittedEarlyHudPending>
+    g_mode3_early_hud_submitted{};
 std::mutex g_mode3_early_hud_mutex{};
 D3D12_RESOURCE_DESC g_mode3_early_hud_desc{};
 bool g_mode3_early_hud_desc_valid{};
@@ -3698,6 +3985,16 @@ std::mutex g_hud_composite_pso_creation_mutex{};
 bool mode3_early_hud_pair_ready();
 bool mode3_afw_sequenced_pair_available();
 bool sequential_cinema_pair_available();
+bool label_mode3_early_hud_at_present(
+    ID3D12GraphicsCommandList* command_list,
+    const EngineFrameTag& tag);
+std::vector<Mode3AerAfwHudExecuteSubmission>
+take_mode3_aer_afw_hud_submissions_before_execute(
+    UINT num_command_lists,
+    ID3D12CommandList* const* command_lists);
+void publish_mode3_aer_afw_hud_submissions_before_execute(
+    ID3D12CommandQueue* queue,
+    const std::vector<Mode3AerAfwHudExecuteSubmission>& pending);
 
 bool mode3_hud_pipeline_family(ID3D12PipelineState* pipeline) {
     return pipeline != nullptr &&
@@ -4525,6 +4822,16 @@ int __fastcall hook_sl_set_feature_constants(
     uint32_t feature, const void* constants, uint32_t frame_token, uint32_t viewport);
 int __fastcall hook_sl_evaluate_feature(
     void* command_buffer, uint32_t feature, uint32_t frame_token, uint32_t viewport);
+bool prepare_native_asymmetric_dlss_jitter_override_values(
+    float jitter_x, float jitter_y,
+    float mv_scale_x, float mv_scale_y,
+    unsigned subrect_width, unsigned subrect_height,
+    uint64_t pair_id, uint32_t eye,
+    NativeAsymmetricDlssJitterOverride& override_state);
+bool commit_native_asymmetric_dlss_input(
+    const NativeAsymmetricDlssJitterOverride& override_state);
+bool commit_streamline_native_asymmetric_dlss_input(
+    const EngineFrameTag& route_tag);
 
 void STDMETHODCALLTYPE hook_draw_indexed_instanced(
     ID3D12GraphicsCommandList* command_list,
@@ -7993,7 +8300,7 @@ RENDERDOC_API_1_6_0* initialize_renderdoc_capture_api() {
         const DWORD length = GetModuleFileNameW(
             nullptr, module_path, static_cast<DWORD>(std::size(module_path)));
         if (length != 0 && length < std::size(module_path)) {
-            wchar_t* slash = wcsrchr(module_path, L'/');
+            wchar_t* slash = wcsrchr(module_path, L'\\');
             if (slash != nullptr) {
                 const size_t prefix_length =
                     static_cast<size_t>(slash + 1 - module_path);
@@ -8037,10 +8344,11 @@ RENDERDOC_API_1_6_0* initialize_renderdoc_capture_api() {
 void log_renderdoc_capture_api_status() {
     std::scoped_lock lock{g_renderdoc_api_mutex};
     log_line(
-        "V12103 RenderDoc integration configured=%u attempted=%u "
+        "V1286 RenderDoc integration configured=%u streamline_bridge=%u attempted=%u "
         "available=%u source=%s "
-        "api=%d.%d.%d allow_nvidia_0x10DE=%d hotkey=F7",
+        "api=%d.%d.%d allow_nvidia_0x10DE=%d hotkey=F3",
         g_config.renderdoc_capture_enabled ? 1u : 0u,
+        g_config.renderdoc_streamline_device_bridge ? 1u : 0u,
         g_renderdoc_api_attempted ? 1u : 0u,
         g_renderdoc_api != nullptr ? 1u : 0u,
         !g_config.renderdoc_capture_enabled
@@ -8063,7 +8371,7 @@ void trigger_renderdoc_capture(IDXGISwapChain* swapchain) {
         1, std::memory_order_relaxed) + 1;
     if (api == nullptr) {
         log_line(
-            "V12103 RenderDoc capture unavailable configured=%u "
+            "V1271 RenderDoc capture unavailable configured=%u "
             "request=%llu module=%p",
             g_config.renderdoc_capture_enabled ? 1u : 0u,
             static_cast<unsigned long long>(request), g_renderdoc_module);
@@ -8080,7 +8388,7 @@ void trigger_renderdoc_capture(IDXGISwapChain* swapchain) {
     }
     api->TriggerCapture();
     log_line(
-        "V12103 RenderDoc capture requested request=%llu present=%llu "
+        "V1271 RenderDoc capture requested request=%llu present=%llu "
         "device=%p window=%p nvidia_option=%d",
         static_cast<unsigned long long>(request),
         static_cast<unsigned long long>(
@@ -8231,6 +8539,106 @@ bool current_puredark_afw_direct_route_tag(
         route_tag.eye <= 1 && route_tag.pair_id != 0 &&
         route_tag.pair_id != UINT64_MAX &&
         route_tag.generation == capture_generation;
+}
+
+bool same_streamline_dlss_callback_identity(
+    const EngineFrameTag& lhs,
+    const EngineFrameTag& rhs) {
+    return lhs.task_provenance_valid && rhs.task_provenance_valid &&
+        lhs.eye == rhs.eye && lhs.generation == rhs.generation &&
+        lhs.pair_id == rhs.pair_id;
+}
+
+StreamlineDlssEvaluateSnapshot* acquire_streamline_dlss_evaluate_snapshot(
+    uint32_t routed_eye) {
+    if (!dlss_streamline_evaluate_callback_active() || routed_eye > 1) {
+        return nullptr;
+    }
+    EngineFrameTag route_tag{};
+    if (!current_puredark_afw_direct_route_tag(routed_eye, route_tag)) {
+        return nullptr;
+    }
+    auto& snapshot = g_streamline_dlss_evaluate_snapshot;
+    if (!snapshot.route_valid ||
+        !same_streamline_dlss_callback_identity(
+            snapshot.route_tag, route_tag)) {
+        snapshot = {};
+        snapshot.route_tag = route_tag;
+        snapshot.route_valid = true;
+    }
+    return &snapshot;
+}
+
+bool streamline_dlss_evaluate_snapshot_matches_current(
+    uint32_t routed_eye) {
+    const auto& snapshot = g_streamline_dlss_evaluate_snapshot;
+    return snapshot.route_valid && g_streamline_dlss_route_tag_valid &&
+        routed_eye <= 1 &&
+        same_streamline_dlss_callback_identity(
+            snapshot.route_tag, g_streamline_dlss_route_tag) &&
+        snapshot.route_tag.eye == routed_eye &&
+        snapshot.route_tag.generation ==
+            g_streamline_capture_generation.load(std::memory_order_acquire);
+}
+
+void capture_streamline_dlss_callback_resource(
+    const void* resource,
+    uint32_t tag,
+    uint32_t routed_eye) {
+    if (tag != 0 && tag != 1 && tag != 4) {
+        return;
+    }
+    auto* snapshot = acquire_streamline_dlss_evaluate_snapshot(routed_eye);
+    if (snapshot == nullptr) {
+        return;
+    }
+    ID3D12Resource* native{};
+    uint32_t state = static_cast<uint32_t>(
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (resource != nullptr) {
+        memcpy(&native, static_cast<const uint8_t*>(resource) + 8,
+            sizeof(native));
+        memcpy(&state, static_cast<const uint8_t*>(resource) + 32,
+            sizeof(state));
+    }
+    if (tag == 0) {
+        snapshot->depth = native;
+        snapshot->depth_state = static_cast<D3D12_RESOURCE_STATES>(state);
+        snapshot->depth_valid = native != nullptr;
+    } else if (tag == 1) {
+        snapshot->motion_vectors = native;
+        snapshot->motion_state = static_cast<D3D12_RESOURCE_STATES>(state);
+        snapshot->motion_vectors_valid = native != nullptr;
+    } else {
+        snapshot->output = native;
+        snapshot->output_valid = native != nullptr;
+    }
+}
+
+bool prepare_streamline_dlss_callback_constants(
+    void* constants,
+    uint32_t routed_eye) {
+    if (constants == nullptr) {
+        return false;
+    }
+    auto* snapshot = acquire_streamline_dlss_evaluate_snapshot(routed_eye);
+    if (snapshot == nullptr) {
+        return false;
+    }
+    auto* values = static_cast<float*>(constants);
+    snapshot->motion_scale_x = values[82];
+    snapshot->motion_scale_y = values[83];
+    snapshot->motion_scale_valid =
+        std::isfinite(snapshot->motion_scale_x) &&
+        std::isfinite(snapshot->motion_scale_y);
+    snapshot->jitter = {};
+    snapshot->jitter_applied_to_streamline = false;
+    // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 2/8] Streamline reports normalized
+    // MV scale here, before the tagged motion texture is available. Preserve
+    // the original constants and perform the asymmetric-only jitter correction
+    // immediately before the matching public evaluation, once its exact pixel
+    // extent is known.
+    return false;
 }
 
 void capture_puredark_afw_camera(
@@ -8406,9 +8814,138 @@ void capture_puredark_afw_camera(
     }
 }
 
-int32_t capture_puredark_afw_dlss_inputs(
+// [FIX:DLSS-STREAMLINE-CALLBACK V1275 2/4] At evaluation the deferred engine
+// command already owns exact task provenance. Join that identity to the
+// constants captured under the same public Streamline token, restoring the AFW
+// camera and motion-vector scale without guessing from Present parity.
+bool hydrate_streamline_dlss_callback_constants(
+    uint32_t frame_token,
+    uint32_t routed_eye,
+    StreamlineDlssCallbackConstantsSlot* hydrated) {
+    if (!dlss_streamline_evaluate_callback_active() || routed_eye > 1) {
+        return false;
+    }
+    StreamlineDlssCallbackConstantsSlot cached{};
+    {
+        std::scoped_lock lock{g_streamline_dlss_callback_constants_mutex};
+        cached = g_streamline_dlss_callback_constants[
+            streamline_dlss_callback_constants_slot(frame_token, routed_eye)];
+    }
+    if (!cached.valid || cached.frame_token != frame_token ||
+        cached.eye != routed_eye) {
+        if (take_bounded_log_slot(
+                g_streamline_dlss_callback_constants_logs, 32)) {
+            log_line(
+                "V1275 DLSS Streamline constants miss token=%u eye=%u "
+                "cached_token=%u cached_valid=%u tid=%lu present=%llu",
+                frame_token, routed_eye, cached.frame_token,
+                cached.valid ? 1u : 0u,
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                static_cast<unsigned long long>(g_present_count.load()));
+        }
+        return false;
+    }
+    if (hydrated != nullptr) {
+        *hydrated = cached;
+    }
+    auto* snapshot = acquire_streamline_dlss_evaluate_snapshot(routed_eye);
+    if (snapshot == nullptr) {
+        return false;
+    }
+    const auto* values = cached.constants.data();
+    snapshot->motion_scale_x = values[82];
+    snapshot->motion_scale_y = values[83];
+    snapshot->motion_scale_valid =
+        std::isfinite(snapshot->motion_scale_x) &&
+        std::isfinite(snapshot->motion_scale_y);
+    capture_puredark_afw_camera(cached.constants.data(), routed_eye);
+    if (take_bounded_log_slot(
+            g_streamline_dlss_callback_constants_logs, 64)) {
+        log_line(
+            "V1275 DLSS Streamline constants joined token=%u eye=%u "
+            "pair=%llu scale=%.6f,%.6f valid=%u tid=%lu present=%llu",
+            frame_token, routed_eye,
+            static_cast<unsigned long long>(snapshot->route_tag.pair_id),
+            snapshot->motion_scale_x, snapshot->motion_scale_y,
+            snapshot->motion_scale_valid ? 1u : 0u,
+            static_cast<unsigned long>(GetCurrentThreadId()),
+            static_cast<unsigned long long>(g_present_count.load()));
+    }
+    return snapshot->motion_scale_valid;
+}
+
+bool resubmit_streamline_native_asymmetric_dlss_jitter(
+    const StreamlineDlssCallbackConstantsSlot& cached,
+    uint32_t frame_token,
+    uint32_t routed_viewport,
+    uint32_t routed_eye) {
+    auto& snapshot = g_streamline_dlss_evaluate_snapshot;
+    if (!cached.valid || cached.frame_token != frame_token ||
+        cached.eye != routed_eye || !snapshot.route_valid ||
+        !snapshot.motion_vectors_valid || g_sl_set_constants == nullptr) {
+        return false;
+    }
+
+    auto corrected = cached.constants;
+    auto* values = corrected.data();
+    const auto motion_desc = snapshot.motion_vectors->GetDesc();
+    float pixel_scale_x = values[82];
+    float pixel_scale_y = values[83];
+    if (std::fabs(pixel_scale_x) <= 4.0f && motion_desc.Width > 0) {
+        pixel_scale_x *= static_cast<float>(motion_desc.Width);
+    }
+    if (std::fabs(pixel_scale_y) <= 4.0f && motion_desc.Height > 0) {
+        pixel_scale_y *= static_cast<float>(motion_desc.Height);
+    }
+
+    NativeAsymmetricDlssJitterOverride jitter{};
+    if (!prepare_native_asymmetric_dlss_jitter_override_values(
+            values[80], values[81], pixel_scale_x, pixel_scale_y,
+            static_cast<unsigned>(motion_desc.Width), motion_desc.Height,
+            snapshot.route_tag.pair_id, routed_eye, jitter)) {
+        snapshot.jitter = jitter;
+        return false;
+    }
+
+    values[80] = jitter.pure_x;
+    values[81] = jitter.pure_y;
+    // This is not a reconstructed DLSS recipe. It republishes only the exact
+    // cached constants block to the same token and eye viewport immediately
+    // before the game's original slEvaluateFeature call.
+    const int constants_result = g_sl_set_constants(
+        corrected.data(), frame_token, routed_viewport);
+    jitter.applied = true;
+    snapshot.jitter = jitter;
+    snapshot.jitter_applied_to_streamline = true;
+
+    static std::atomic<uint32_t> jitter_logs{};
+    if (take_bounded_log_slot(jitter_logs, 64)) {
+        log_line(
+            "V1289 DLSS public jitter token=%u viewport=%u eye=%u pair=%llu "
+            "raw=%.6f,%.6f pure=%.6f,%.6f scale=%.3f,%.3f "
+            "extent=%llux%u sl_constants=%d reset=%u",
+            frame_token, routed_viewport, routed_eye,
+            static_cast<unsigned long long>(snapshot.route_tag.pair_id),
+            jitter.original_x, jitter.original_y,
+            jitter.pure_x, jitter.pure_y,
+            pixel_scale_x, pixel_scale_y,
+            static_cast<unsigned long long>(motion_desc.Width),
+            motion_desc.Height, constants_result,
+            static_cast<unsigned>(
+                reinterpret_cast<const uint8_t*>(corrected.data())[0x19F]));
+    }
+    return true;
+}
+
+int32_t capture_puredark_afw_dlss_inputs_from_resources(
     ID3D12GraphicsCommandList* command_list,
-    const NVSDK_NGX_Parameter* parameters,
+    ID3D12Resource* depth,
+    D3D12_RESOURCE_STATES depth_state,
+    ID3D12Resource* motion_vectors,
+    D3D12_RESOURCE_STATES motion_state,
+    ID3D12Resource* output,
+    float motion_scale_x,
+    float motion_scale_y,
     uint32_t routed_eye) {
     const bool route_active = puredark_afw_dlss_route_active();
     const int menu_state =
@@ -8426,17 +8963,17 @@ int32_t capture_puredark_afw_dlss_inputs(
             route_active, menu_state, cinema_active,
             loading_video_active, automatic_full_vr_active);
     if (!gameplay_capture_allowed || command_list == nullptr ||
-        parameters == nullptr || routed_eye > 1) {
+        routed_eye > 1) {
         static std::atomic<uint32_t> capture_gate_reject_logs{};
         if (g_config.runtime_diagnostics &&
             capture_gate_reject_logs.fetch_add(
                 1, std::memory_order_relaxed) < 32) {
             log_line(
                 "V12099 AFW DLSS capture gate reject route=%u command_list=%p "
-                "parameters=%p eye=%u menu=%d cinema=%u loading=%u full_vr=%u "
+                "eye=%u menu=%d cinema=%u loading=%u full_vr=%u "
                 "openxr=%u mode=%d aer=%u backend=%s afw=%u freelook=%u "
                 "stereo_offset=%.6f",
-                route_active ? 1u : 0u, command_list, parameters, routed_eye,
+                route_active ? 1u : 0u, command_list, routed_eye,
                 menu_state, cinema_active ? 1u : 0u,
                 loading_video_active ? 1u : 0u,
                 automatic_full_vr_active ? 1u : 0u,
@@ -8479,21 +9016,10 @@ int32_t capture_puredark_afw_dlss_inputs(
         return -1;
     }
 
-    ID3D12Resource* depth{};
-    ID3D12Resource* motion_vectors{};
-    ID3D12Resource* output{};
-    float motion_scale_x{};
-    float motion_scale_y{};
-    parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
-    parameters->Get(
-        NVSDK_NGX_Parameter_MotionVectors, &motion_vectors);
-    parameters->Get(NVSDK_NGX_Parameter_Output, &output);
-    parameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &motion_scale_x);
-    parameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &motion_scale_y);
     if (depth == nullptr || motion_vectors == nullptr || output == nullptr ||
         !std::isfinite(motion_scale_x) || !std::isfinite(motion_scale_y)) {
         log_puredark_afw_failure(
-            "ngx_inputs", L"DLSS Depth, MotionVectors, Output, or scale is invalid");
+            "dlss_inputs", L"DLSS Depth, MotionVectors, Output, or scale is invalid");
         return -1;
     }
 
@@ -8579,19 +9105,12 @@ int32_t capture_puredark_afw_dlss_inputs(
         return -1;
     }
 
-    const auto tracked_state = [](uint32_t input_index) {
-        const uint32_t state = g_ngx_input_states[input_index].load(
-            std::memory_order_acquire);
-        return state != UINT32_MAX
-            ? static_cast<D3D12_RESOURCE_STATES>(state)
-            : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    };
     w3vr::puredark_afw::TextureDesc depth_source{};
     depth_source.texture = depth;
-    depth_source.initial_state = tracked_state(1);
+    depth_source.initial_state = depth_state;
     w3vr::puredark_afw::TextureDesc motion_source{};
     motion_source.texture = motion_vectors;
-    motion_source.initial_state = tracked_state(2);
+    motion_source.initial_state = motion_state;
     const D3D12_BOX depth_box{
         0, 0, 0, static_cast<UINT>(depth_desc.Width),
         depth_desc.Height, 1};
@@ -8605,7 +9124,7 @@ int32_t capture_puredark_afw_dlss_inputs(
             command_list, captured.motion_vectors, motion_source,
             motion_box, 0, 0, error)) {
         slot.state = PuredarkAfwBundleState::Free;
-        log_puredark_afw_failure("ngx_copy", error);
+        log_puredark_afw_failure("dlss_copy", error);
         return -1;
     }
 
@@ -8641,6 +9160,38 @@ int32_t capture_puredark_afw_dlss_inputs(
             captured.motion_scale[0], captured.motion_scale[1]);
     }
     return static_cast<int32_t>(bundle_slot);
+}
+
+int32_t capture_puredark_afw_dlss_inputs(
+    ID3D12GraphicsCommandList* command_list,
+    const NVSDK_NGX_Parameter* parameters,
+    uint32_t routed_eye) {
+    if (parameters == nullptr) {
+        return -1;
+    }
+    ID3D12Resource* depth{};
+    ID3D12Resource* motion_vectors{};
+    ID3D12Resource* output{};
+    float motion_scale_x{};
+    float motion_scale_y{};
+    parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
+    parameters->Get(
+        NVSDK_NGX_Parameter_MotionVectors, &motion_vectors);
+    parameters->Get(NVSDK_NGX_Parameter_Output, &output);
+    parameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &motion_scale_x);
+    parameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &motion_scale_y);
+    const auto tracked_state = [](uint32_t input_index) {
+        const uint32_t state = g_ngx_input_states[input_index].load(
+            std::memory_order_acquire);
+        return state != UINT32_MAX
+            ? static_cast<D3D12_RESOURCE_STATES>(state)
+            : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    };
+    return capture_puredark_afw_dlss_inputs_from_resources(
+        command_list,
+        depth, tracked_state(1),
+        motion_vectors, tracked_state(2),
+        output, motion_scale_x, motion_scale_y, routed_eye);
 }
 
 bool initialize_puredark_afw_taau_motion_pipeline() {
@@ -9634,6 +10185,12 @@ void reset_aer_cinema_exact_eye_contract() {
 // command-list producer tag; TAAU and deferred HUD lists fall back to the most
 // recently accepted natural gameplay ordinal, adjusted only to the HUD eye
 // already selected by REDengine when that authority exists.
+// [DIAG:AER-AFW-FORCE-PREEXECUTE-HUD-SNAPSHOT V1283 1/2] Disable only the
+// pointer-exact PRESENT join so this isolated build must exercise V1282's
+// pre-Execute snapshot and submitted join. Recording metadata,
+// AFW transport and the configured DLSS callback route remain unchanged.
+constexpr bool kForceMode3AerAfwSubmittedHudJoinBuild = true;
+
 void record_mode3_aer_afw_final_hud_tag(
     ID3D12GraphicsCommandList* command_list,
     int hud_eye) {
@@ -9685,10 +10242,11 @@ void record_mode3_aer_afw_final_hud_tag(
     }
     tag.task_provenance_valid = true;
     std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
-    g_mode3_aer_afw_pending_hud_tags[command_list] = tag;
+    g_mode3_aer_afw_pending_hud_tags[command_list] = {
+        tag, g_present_count.load(std::memory_order_relaxed)};
 }
 
-bool take_mode3_aer_afw_final_hud_tag(
+bool peek_mode3_aer_afw_final_hud_tag(
     ID3D12GraphicsCommandList* command_list,
     EngineFrameTag& tag) {
     if (command_list == nullptr) {
@@ -9700,12 +10258,32 @@ bool take_mode3_aer_afw_final_hud_tag(
     if (found == g_mode3_aer_afw_pending_hud_tags.end()) {
         return false;
     }
-    tag = found->second;
-    g_mode3_aer_afw_pending_hud_tags.erase(found);
+    tag = found->second.tag;
     return tag.task_provenance_valid && tag.eye <= 1 &&
         tag.pair_id != 0 && tag.pair_id != UINT64_MAX &&
         tag.generation == g_streamline_capture_generation.load(
             std::memory_order_acquire);
+}
+
+void consume_mode3_aer_afw_final_hud_tag(
+    ID3D12GraphicsCommandList* command_list) {
+    if (command_list == nullptr) {
+        return;
+    }
+    std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+    g_mode3_aer_afw_pending_hud_tags.erase(command_list);
+}
+
+void queue_mode3_aer_afw_hud_present_boundary(
+    ID3D12GraphicsCommandList* command_list,
+    uint64_t present) {
+    if (command_list == nullptr) {
+        return;
+    }
+    std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+    g_mode3_aer_afw_pending_hud_presents[command_list] = {
+        g_streamline_capture_generation.load(std::memory_order_acquire),
+        present};
 }
 
 void reset_rt_temporal_lineage_for_route_epoch(uint64_t route_epoch) {
@@ -10640,12 +11218,9 @@ void maybe_write_mode3_hud_audit(uint64_t present) {
     fclose(file);
 }
 
-// [DIAG:POSE-TIMELINE 1/4] Mode 3's launcher checkbox owns text diagnostics,
-// not this dormant F7-only POD ring. Keep legacy modes unchanged, but do not
-// pay for a diagnostic that adds no rows to witcher3vr.log in Mode 3.
-// [DIAG:POSE-TIMELINE 2/4] F7 is the only point that performs disk I/O. It
-// writes the bounded history preceding the visible step, so logging cannot
-// perturb the behavior that is being captured.
+// [DIAG:POSE-TIMELINE 1/4] Mode 3's launcher checkbox owns text diagnostics.
+// The former hotkey-only POD writer is dormant, so no diagnostic key performs
+// disk I/O here.
 // [DIAG:TAAU-DROPS 2/3] Bypass the general logging switch only for the
 // dedicated TAAU lines. V728 also routes only bounded cinema detector/aspect
 // samples here, avoiding the thousands of unrelated camera writes that can
@@ -11207,6 +11782,8 @@ void load_config() {
     std::call_once(g_config_once, []() {
         g_config.renderdoc_capture_enabled = read_ini_bool(
             "renderdoc", "enabled", false);
+        g_config.renderdoc_streamline_device_bridge = read_ini_bool(
+            "renderdoc", "streamline_device_bridge", false);
         g_config.openxr_enabled = read_ini_bool("openxr", "enabled", true);
         // Intentionally isolated in its own INI. The launcher never touches
         // this manual test gate; a missing file/key keeps normal AFW enabled.
@@ -11562,6 +12139,8 @@ void load_config() {
             "engine", "streamline_taau_bridge", false);
         g_config.ngx_trace = read_ini_bool("engine", "ngx_trace", false);
         g_config.dlss_dlaa = read_ini_bool("engine", "dlss_dlaa", false);
+        g_config.dlss_streamline_evaluate_callback = read_ini_bool(
+            "engine", "dlss_streamline_evaluate_callback", false);
         g_config.low_budget_dlss = read_ini_bool(
             "engine", "low_budget_dlss", false);
         g_config.world_marker_diagnostics = read_ini_bool(
@@ -11693,9 +12272,11 @@ void load_config() {
             g_config.reverse_copy_max_logs,
             g_config.reverse_stereo_probe,
             g_config.reverse_geometry_shift);
-        log_line("Config engine temporal_backend=%s dlss_dlaa=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_split_viewports=%d streamline_right_temporal_offset=%.4f streamline_temporal_eye=%d streamline_temporal_clip_correction=%.5f streamline_trace=%d streamline_trace_start_frame=%d native_mvec_passthrough=1",
+        log_line("Config engine temporal_backend=%s dlss_dlaa=%d dlss_public_streamline=%d legacy_dlss_callback_ini=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_split_viewports=%d streamline_right_temporal_offset=%.4f streamline_temporal_eye=%d streamline_temporal_clip_correction=%.5f streamline_trace=%d streamline_trace_start_frame=%d native_mvec_passthrough=1",
             temporal_backend_name(),
             g_config.dlss_dlaa,
+            dlss_streamline_evaluate_callback_active() ? 1 : 0,
+            g_config.dlss_streamline_evaluate_callback ? 1 : 0,
             g_config.engine_view_probe, g_config.engine_frame_builder_probe,
             g_config.engine_gameplay_entry_probe,
             g_config.engine_scene_enqueue_probe,
@@ -15079,7 +15660,8 @@ struct EffectPayloadSnapshot {
     bool stable{};
 };
 
-// V1054 performs a target-only, bounded census after F7 has disarmed. All
+// V1054 performs a target-only, bounded census after its capture gate has
+// disarmed. All
 // descriptor resolution, COM metadata queries, mapped reads and logging are
 // Present-side; Draw/Dispatch still copy POD only.
 void scan_cbv_gpu_va(
@@ -16542,6 +17124,18 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         ? take_taau_cache_submissions(
             num_command_lists, command_lists)
         : std::vector<EngineFrameTag>{};
+    // [FIX:AER-AFW-PREEXECUTE-HUD-SNAPSHOT V1282 2/6] Match the established
+    // temporal submission lifecycle above: exact command-list metadata is
+    // removed from reset-sensitive maps before the real queue call.
+    auto aer_afw_hud_pending =
+        take_mode3_aer_afw_hud_submissions_before_execute(
+            num_command_lists, command_lists);
+    // [PERF:AER-AFW-HUD-PREEXECUTE-PUBLISH V1285 1/4] Pointer-exact labels
+    // become visible while REDengine records the PRESENT barrier. Publish the
+    // already-detached fallback snapshot at the matching pre-submit boundary
+    // instead of making renderer workers discover it only after Execute.
+    publish_mode3_aer_afw_hud_submissions_before_execute(
+        queue, aer_afw_hud_pending);
     // RT camera/history overrides borrow the shared tiled-culling upload slots.
     // Their command-list uses must reach the queue-fence retirement below even
     // in a release run; diagnostic mode previously disabled this early return
@@ -18078,6 +18672,7 @@ HRESULT STDMETHODCALLTYPE hook_reset_command_list(
     {
         std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
         g_mode3_aer_afw_pending_hud_tags.erase(command_list);
+        g_mode3_aer_afw_pending_hud_presents.erase(command_list);
     }
     // [FIX:AER-CINEMA-EXACT-EYE-CONTRACT V1214 6/12] A recycled command
     // list cannot inherit the render identity of its preceding recording.
@@ -19513,6 +20108,7 @@ void reset_mode3_early_hud_generation_locked(uint32_t generation) {
     g_mode3_early_hud_generation = generation;
     g_mode3_early_hud_write_cursor = 0;
     g_mode3_early_hud_pending_by_command_list.clear();
+    g_mode3_early_hud_submitted.clear();
     g_mode3_early_hud_latest_slot[0] = UINT32_MAX;
     g_mode3_early_hud_latest_slot[1] = UINT32_MAX;
     g_mode3_early_hud_accepted_slot[0] = UINT32_MAX;
@@ -19583,6 +20179,8 @@ void reset_loading_video_presentation_state(uint64_t present) {
     {
         std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
         g_mode3_aer_afw_pending_hud_tags.clear();
+        g_mode3_aer_afw_pending_hud_presents.clear();
+        g_mode3_aer_afw_submitted_hud_tags.clear();
     }
     {
         std::scoped_lock lock{g_mode3_early_hud_mutex};
@@ -19687,6 +20285,11 @@ bool mode3_early_hud_slot_pending_locked(uint32_t slot_index) {
     for (const auto& pending :
          g_mode3_early_hud_pending_by_command_list) {
         if (pending.second.slot == slot_index) {
+            return true;
+        }
+    }
+    for (const auto& submitted : g_mode3_early_hud_submitted) {
+        if (submitted.pending.slot == slot_index) {
             return true;
         }
     }
@@ -19817,7 +20420,9 @@ bool capture_mode3_early_hud(
         slot.srv_format = source_desc.Format;
     }
     g_mode3_early_hud_pending_by_command_list[command_list] = {
-        slot_index, generation, slot.capture_serial};
+        slot_index, generation, slot.capture_serial,
+        g_present_count.load(std::memory_order_relaxed),
+        mode3_aer_afw_post_hud_gameplay_active()};
     // [DIAG:MODE3-HUD-CONTENT-ORDER 1/2] A resource can receive the correct
     // eye/pair label at PRESENT while still containing pixels frozen before
     // that pair's marker projection ran. Record the immutable copy point and
@@ -19825,73 +20430,48 @@ bool capture_mode3_early_hud(
     return true;
 }
 
-// [FIX:MODE3-EARLY-HUD 2/4] The final routed PRESENT is the first point where
-// the early immutable copy and the authoritative eye/pair tag coexist. Label
-// the copy here and promote only a complete same-pair L/R set.
-bool label_mode3_early_hud_at_present(
-    ID3D12GraphicsCommandList* command_list,
-    const EngineFrameTag& tag) {
-    const uint32_t generation =
-        g_streamline_capture_generation.load(std::memory_order_acquire);
-    if (command_list == nullptr || tag.eye > 1 ||
-        tag.pair_id == 0 || tag.generation != generation) {
-        return false;
-    }
+void record_mode3_scene_only_hud_output(
+    const EngineFrameTag& tag,
+    bool scene_only_draw_recorded) {
     // [FIX:RETAINED-CINEMA-HUD-PREVIOUS-FRAME V1123 3/3] Record complete L/R
-    // scene pairs that actually executed a scene-only HUD
-    // draw. The PSO can legitimately be rebound before this PRESENT barrier,
-    // so the final bound-pipeline snapshot is not draw-history authority.
-    // Keep a short exact history so a retained-pair rescue can still composite
-    // the preceding pair while the next pair has produced only one eye.
-    {
-        std::scoped_lock scene_only_lock{
-            g_mode3_scene_only_output_mutex};
-        bool scene_only_draw_recorded{};
-        const auto draw_marker =
-            g_mode3_scene_only_draw_generations.find(command_list);
-        if (draw_marker != g_mode3_scene_only_draw_generations.end()) {
-            scene_only_draw_recorded =
-                draw_marker->second == tag.generation;
-            g_mode3_scene_only_draw_generations.erase(draw_marker);
-        }
-        if (g_mode3_scene_only_output_generation != tag.generation) {
-            g_mode3_scene_only_output_pairs.fill(0);
-            g_mode3_scene_only_output_generation = tag.generation;
-            g_mode3_scene_only_output_cursor = 0;
-            g_mode3_scene_only_pending_pair = 0;
-            g_mode3_scene_only_pending_eye_mask = 0;
-            g_mode3_scene_only_pending_valid = false;
-        }
-        if (g_mode3_scene_only_pending_pair != tag.pair_id) {
-            g_mode3_scene_only_pending_pair = tag.pair_id;
-            g_mode3_scene_only_pending_eye_mask = 0;
-            g_mode3_scene_only_pending_valid = true;
-        }
-        if (scene_only_draw_recorded) {
-            g_mode3_scene_only_pending_eye_mask |= 1u << tag.eye;
-        } else {
-            g_mode3_scene_only_pending_valid = false;
-        }
-        if (g_mode3_scene_only_pending_valid &&
-            g_mode3_scene_only_pending_eye_mask == 0x3u &&
-            std::find(
-                g_mode3_scene_only_output_pairs.begin(),
-                g_mode3_scene_only_output_pairs.end(), tag.pair_id) ==
-                g_mode3_scene_only_output_pairs.end()) {
-            g_mode3_scene_only_output_pairs[
-                g_mode3_scene_only_output_cursor++ %
-                    kMode3SceneOnlyPairHistory] = tag.pair_id;
-        }
+    // scene pairs that actually executed a scene-only HUD draw. V1280 carries
+    // this proof with the submitted HUD-writer list instead of looking for it
+    // on an unrelated final-PRESENT list.
+    std::scoped_lock scene_only_lock{g_mode3_scene_only_output_mutex};
+    if (g_mode3_scene_only_output_generation != tag.generation) {
+        g_mode3_scene_only_output_pairs.fill(0);
+        g_mode3_scene_only_output_generation = tag.generation;
+        g_mode3_scene_only_output_cursor = 0;
+        g_mode3_scene_only_pending_pair = 0;
+        g_mode3_scene_only_pending_eye_mask = 0;
+        g_mode3_scene_only_pending_valid = false;
     }
-    std::scoped_lock lock{g_mode3_early_hud_mutex};
-    const auto found =
-        g_mode3_early_hud_pending_by_command_list.find(command_list);
-    if (found == g_mode3_early_hud_pending_by_command_list.end() ||
-        found->second.generation != generation) {
-        return false;
+    if (g_mode3_scene_only_pending_pair != tag.pair_id) {
+        g_mode3_scene_only_pending_pair = tag.pair_id;
+        g_mode3_scene_only_pending_eye_mask = 0;
+        g_mode3_scene_only_pending_valid = true;
     }
-    const Mode3EarlyHudPending pending = found->second;
-    g_mode3_early_hud_pending_by_command_list.erase(found);
+    if (scene_only_draw_recorded) {
+        g_mode3_scene_only_pending_eye_mask |= 1u << tag.eye;
+    } else {
+        g_mode3_scene_only_pending_valid = false;
+    }
+    if (g_mode3_scene_only_pending_valid &&
+        g_mode3_scene_only_pending_eye_mask == 0x3u &&
+        std::find(
+            g_mode3_scene_only_output_pairs.begin(),
+            g_mode3_scene_only_output_pairs.end(), tag.pair_id) ==
+            g_mode3_scene_only_output_pairs.end()) {
+        g_mode3_scene_only_output_pairs[
+            g_mode3_scene_only_output_cursor++ %
+                kMode3SceneOnlyPairHistory] = tag.pair_id;
+    }
+}
+
+bool apply_mode3_early_hud_label_locked(
+    const Mode3EarlyHudPending& pending,
+    const EngineFrameTag& tag,
+    uint32_t generation) {
     if (pending.slot >= kMode3EarlyHudSlotCount) {
         return false;
     }
@@ -19904,7 +20484,7 @@ bool label_mode3_early_hud_at_present(
     slot.pair_id = tag.pair_id;
     g_mode3_early_hud_latest_slot[tag.eye] = pending.slot;
     // [DIAG:MODE3-HUD-CONTENT-ORDER 2/2] Pair this authoritative tag with the
-    // exact earlier copy. F7 is still the only disk-I/O point.
+    // exact earlier copy. This path performs no hotkey-driven disk I/O.
     const uint32_t left_index = g_mode3_early_hud_latest_slot[0];
     const uint32_t right_index = g_mode3_early_hud_latest_slot[1];
     if (left_index >= kMode3EarlyHudSlotCount ||
@@ -23521,6 +24101,26 @@ void STDMETHODCALLTYPE hook_resource_barrier(
     const bool clean_mode3_fast_path =
         g_clean_mode3_resource_barrier_fast_path &&
         !g_compute_probe_active.load(std::memory_order_relaxed);
+    if (dlss_streamline_evaluate_callback_active() && barriers != nullptr &&
+        g_streamline_dlss_evaluate_snapshot.route_valid) {
+        auto& snapshot = g_streamline_dlss_evaluate_snapshot;
+        for (UINT barrier_index = 0; barrier_index < num_barriers;
+            ++barrier_index) {
+            const auto& barrier = barriers[barrier_index];
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+                barrier.Transition.pResource == nullptr) {
+                continue;
+            }
+            if (snapshot.depth_valid &&
+                barrier.Transition.pResource == snapshot.depth) {
+                snapshot.depth_state = barrier.Transition.StateAfter;
+            }
+            if (snapshot.motion_vectors_valid &&
+                barrier.Transition.pResource == snapshot.motion_vectors) {
+                snapshot.motion_state = barrier.Transition.StateAfter;
+            }
+        }
+    }
     if (!clean_mode3_fast_path &&
         g_config.ngx_trace && barriers != nullptr) {
         for (UINT barrier_index = 0; barrier_index < num_barriers; ++barrier_index) {
@@ -23776,11 +24376,26 @@ void STDMETHODCALLTYPE hook_resource_barrier(
                 continue;
             }
             EngineFrameTag hud_tag{};
-            const bool tag_found = take_mode3_aer_afw_final_hud_tag(
-                command_list, hud_tag);
+            const uint64_t hud_present =
+                g_present_count.load(std::memory_order_relaxed);
+            // [DIAG:AER-AFW-FORCE-PREEXECUTE-HUD-SNAPSHOT V1283 2/2]
+            // Preserve all metadata while making the fast path miss.
+            const bool force_submitted_join =
+                kForceMode3AerAfwSubmittedHudJoinBuild;
+            const bool tag_found = !force_submitted_join &&
+                peek_mode3_aer_afw_final_hud_tag(command_list, hud_tag);
             const bool labeled = tag_found &&
                 label_mode3_early_hud_at_present(
                     command_list, hud_tag);
+            if (labeled) {
+                consume_mode3_aer_afw_final_hud_tag(command_list);
+            } else {
+                // [FIX:AER-AFW-SUBMITTED-HUD-JOIN V1280 3/8] Preserve the
+                // pointer-exact fast path, but defer a miss until this command
+                // list's real queue submission can join preceding HUD lists.
+                queue_mode3_aer_afw_hud_present_boundary(
+                    command_list, hud_present);
+            }
             if (g_config.runtime_diagnostics) {
                 static std::atomic<uint32_t>
                     mode3_aer_afw_hud_label_logs{};
@@ -23788,16 +24403,17 @@ void STDMETHODCALLTYPE hook_resource_barrier(
                         mode3_aer_afw_hud_label_logs, 32)) {
                     log_line(
                         "V1189 AER AFW retained HUD label eye=%u pair=%llu "
-                        "generation=%u tag=%d labeled=%d command_list=%p "
-                        "present=%llu",
+                        "generation=%u tag=%d labeled=%d deferred=%d "
+                        "forced_submitted=%d "
+                        "command_list=%p present=%llu",
                         hud_tag.eye,
                         static_cast<unsigned long long>(hud_tag.pair_id),
                         hud_tag.generation,
                         tag_found ? 1 : 0, labeled ? 1 : 0,
+                        labeled ? 0 : 1,
+                        force_submitted_join ? 1 : 0,
                         command_list,
-                        static_cast<unsigned long long>(
-                            g_present_count.load(
-                                std::memory_order_relaxed)));
+                        static_cast<unsigned long long>(hud_present));
                 }
             }
             break;
@@ -24039,6 +24655,142 @@ bool initialize_real_dxgi_exports() {
     return g_real_create_dxgi_factory != nullptr &&
         g_real_create_dxgi_factory1 != nullptr &&
         g_real_create_dxgi_factory2 != nullptr;
+}
+
+bool initialize_real_d3d12_create_device_export() {
+    if (g_real_d3d12 == nullptr) {
+        wchar_t system_dir[MAX_PATH]{};
+        const UINT length = GetSystemDirectoryW(
+            system_dir, static_cast<UINT>(std::size(system_dir)));
+        if (length == 0 || length >= std::size(system_dir) ||
+            wcscat_s(system_dir, L"\\d3d12.dll") != 0) {
+            return false;
+        }
+        g_real_d3d12 = LoadLibraryW(system_dir);
+    }
+    if (g_real_d3d12 == nullptr) {
+        return false;
+    }
+    if (g_real_d3d12_create_device == nullptr) {
+        // This runs before the adjacent RenderDoc runtime is loaded. Keep the
+        // true System32 entry point because Streamline obtains the same address
+        // by parsing d3d12.dll's export table instead of using GetProcAddress.
+        g_real_d3d12_create_device =
+            reinterpret_cast<D3D12CreateDeviceFn>(GetProcAddress(
+                g_real_d3d12, "D3D12CreateDevice"));
+    }
+    return g_real_d3d12_create_device != nullptr;
+}
+
+HMODULE module_owning_address(const void* address) {
+    HMODULE module{};
+    if (address != nullptr) {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(address), &module);
+    }
+    return module;
+}
+
+HRESULT WINAPI hook_renderdoc_d3d12_create_device_bridge(
+    IUnknown* adapter,
+    D3D_FEATURE_LEVEL minimum_feature_level,
+    REFIID riid,
+    void** device) {
+    const HMODULE caller = module_owning_address(_ReturnAddress());
+    const bool from_renderdoc = caller != nullptr &&
+        caller == g_renderdoc_module;
+    const bool reentry = g_renderdoc_d3d12_forward_reentry;
+    D3D12CreateDeviceFn target =
+        !from_renderdoc && !reentry &&
+            g_renderdoc_d3d12_create_device != nullptr
+        ? g_renderdoc_d3d12_create_device
+        : g_renderdoc_d3d12_create_device_trampoline;
+    if (target == nullptr) {
+        return E_FAIL;
+    }
+
+    g_renderdoc_d3d12_forward_reentry = true;
+    const HRESULT result = target(
+        adapter, minimum_feature_level, riid, device);
+    g_renderdoc_d3d12_forward_reentry = reentry;
+
+    static std::atomic<uint32_t> log_count{};
+    if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+        HMODULE owner{};
+        if (SUCCEEDED(result) && device != nullptr && *device != nullptr) {
+            auto* unknown = static_cast<IUnknown*>(*device);
+            owner = module_owning_address(
+                (*reinterpret_cast<void***>(unknown))[0]);
+        }
+        log_line(
+            "V1271 RenderDoc D3D12CreateDevice bridge result=0x%08X "
+            "caller=%p from_renderdoc=%u reentry=%u device=%p owner=%p "
+            "renderdoc=%p",
+            static_cast<unsigned>(result), caller,
+            from_renderdoc ? 1u : 0u, reentry ? 1u : 0u,
+            device != nullptr ? *device : nullptr, owner,
+            g_renderdoc_module);
+    }
+    return result;
+}
+
+void install_renderdoc_d3d12_create_device_bridge() {
+    if (!g_config.renderdoc_capture_enabled ||
+        !g_config.renderdoc_streamline_device_bridge ||
+        g_renderdoc_api == nullptr ||
+        g_real_d3d12 == nullptr || g_real_d3d12_create_device == nullptr ||
+        g_renderdoc_d3d12_create_device_trampoline != nullptr) {
+        return;
+    }
+
+    // RenderDoc has patched this proxy's GetProcAddress import by now, so this
+    // lookup returns its D3D12CreateDevice wrapper. Streamline 1.1.1 bypasses
+    // that hook and calls the raw export address frozen above; MinHook catches
+    // only that raw edge and feeds it back through RenderDoc. When RenderDoc's
+    // wrapper invokes its original pointer, caller ownership/reentry selects
+    // the trampoline and terminates the chain.
+    g_renderdoc_d3d12_create_device =
+        reinterpret_cast<D3D12CreateDeviceFn>(GetProcAddress(
+            g_real_d3d12, "D3D12CreateDevice"));
+    if (g_renderdoc_d3d12_create_device == nullptr ||
+        g_renderdoc_d3d12_create_device == g_real_d3d12_create_device) {
+        log_line(
+            "V1271 RenderDoc D3D12CreateDevice bridge unavailable raw=%p "
+            "renderdoc=%p",
+            g_real_d3d12_create_device,
+            g_renderdoc_d3d12_create_device);
+        g_renderdoc_d3d12_create_device = nullptr;
+        return;
+    }
+
+    const MH_STATUS create_status = MH_CreateHook(
+        reinterpret_cast<void*>(g_real_d3d12_create_device),
+        reinterpret_cast<void*>(&hook_renderdoc_d3d12_create_device_bridge),
+        reinterpret_cast<void**>(
+            &g_renderdoc_d3d12_create_device_trampoline));
+    const MH_STATUS enable_status = create_status == MH_OK
+        ? MH_EnableHook(reinterpret_cast<void*>(g_real_d3d12_create_device))
+        : create_status;
+    if (create_status != MH_OK || enable_status != MH_OK) {
+        log_line(
+            "V1271 RenderDoc D3D12CreateDevice bridge failed raw=%p "
+            "renderdoc=%p create=%d enable=%d",
+            g_real_d3d12_create_device,
+            g_renderdoc_d3d12_create_device,
+            static_cast<int>(create_status),
+            static_cast<int>(enable_status));
+        g_renderdoc_d3d12_create_device_trampoline = nullptr;
+        g_renderdoc_d3d12_create_device = nullptr;
+        return;
+    }
+    log_line(
+        "V1271 RenderDoc D3D12CreateDevice bridge installed raw=%p "
+        "renderdoc=%p trampoline=%p",
+        g_real_d3d12_create_device,
+        g_renderdoc_d3d12_create_device,
+        g_renderdoc_d3d12_create_device_trampoline);
 }
 
 FARPROC real_proc(const char* name) {
@@ -24793,6 +25545,360 @@ bool prepare_full_vr_fallback_dlss_temporal_history(
         slot.valid = true;
     }
     return true;
+}
+
+// [FIX:MODE3-EARLY-HUD 2/4] Preserve the original pointer-exact path. It is
+// still the cheapest route when REDengine records t1, the HUD draw and PRESENT
+// on one command list.
+bool label_mode3_early_hud_at_present(
+    ID3D12GraphicsCommandList* command_list,
+    const EngineFrameTag& tag) {
+    const uint32_t generation =
+        g_streamline_capture_generation.load(std::memory_order_acquire);
+    if (command_list == nullptr || tag.eye > 1 ||
+        tag.pair_id == 0 || tag.generation != generation) {
+        return false;
+    }
+    bool labeled{};
+    {
+        std::scoped_lock lock{g_mode3_early_hud_mutex};
+        const auto found =
+            g_mode3_early_hud_pending_by_command_list.find(command_list);
+        if (found == g_mode3_early_hud_pending_by_command_list.end() ||
+            found->second.generation != generation) {
+            return false;
+        }
+        const Mode3EarlyHudPending pending = found->second;
+        g_mode3_early_hud_pending_by_command_list.erase(found);
+        labeled = apply_mode3_early_hud_label_locked(
+            pending, tag, generation);
+    }
+    if (!labeled) {
+        return false;
+    }
+    bool scene_only_draw_recorded{};
+    {
+        std::scoped_lock scene_only_lock{
+            g_mode3_scene_only_output_mutex};
+        const auto draw_marker =
+            g_mode3_scene_only_draw_generations.find(command_list);
+        if (draw_marker != g_mode3_scene_only_draw_generations.end()) {
+            scene_only_draw_recorded =
+                draw_marker->second == tag.generation;
+            g_mode3_scene_only_draw_generations.erase(draw_marker);
+        }
+    }
+    record_mode3_scene_only_hud_output(tag, scene_only_draw_recorded);
+    return true;
+}
+
+// [FIX:AER-AFW-PREEXECUTE-HUD-SNAPSHOT V1282 3/6] V1280 originally inspected
+// these maps after the real ExecuteCommandLists call. A fast worker can legally
+// recycle a submitted command-list object on another thread during that gap;
+// its Reset hook then erases the metadata before publication sees it. Mirror
+// the existing AFW/DLSS transaction: take first, publish after.
+std::vector<Mode3AerAfwHudExecuteSubmission>
+take_mode3_aer_afw_hud_submissions_before_execute(
+    UINT num_command_lists,
+    ID3D12CommandList* const* command_lists) {
+    std::vector<Mode3AerAfwHudExecuteSubmission> pending{};
+    if (!puredark_afw_mode3_aer_common_transport_configured() ||
+        command_lists == nullptr) {
+        return pending;
+    }
+    for (UINT index = 0; index < num_command_lists; ++index) {
+        auto* const command_list =
+            reinterpret_cast<ID3D12GraphicsCommandList*>(
+                command_lists[index]);
+        if (command_list == nullptr) {
+            continue;
+        }
+        Mode3AerAfwHudExecuteSubmission submission{};
+        submission.command_list = command_list;
+        {
+            std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+            const auto tag_found =
+                g_mode3_aer_afw_pending_hud_tags.find(command_list);
+            if (tag_found != g_mode3_aer_afw_pending_hud_tags.end()) {
+                submission.recorded_tag = tag_found->second;
+                g_mode3_aer_afw_pending_hud_tags.erase(tag_found);
+                submission.has_tag = true;
+            }
+            const auto present_found =
+                g_mode3_aer_afw_pending_hud_presents.find(command_list);
+            if (present_found !=
+                g_mode3_aer_afw_pending_hud_presents.end()) {
+                submission.present_boundary = present_found->second;
+                g_mode3_aer_afw_pending_hud_presents.erase(present_found);
+                submission.has_present = true;
+            }
+        }
+        {
+            std::scoped_lock lock{g_mode3_early_hud_mutex};
+            const auto capture_found =
+                g_mode3_early_hud_pending_by_command_list.find(command_list);
+            if (capture_found !=
+                    g_mode3_early_hud_pending_by_command_list.end() &&
+                capture_found->second.aer_afw_submitted_join) {
+                submission.recorded_capture = capture_found->second;
+                g_mode3_early_hud_pending_by_command_list.erase(
+                    capture_found);
+                submission.has_capture = true;
+            }
+        }
+        if (submission.has_tag) {
+            std::scoped_lock scene_only_lock{
+                g_mode3_scene_only_output_mutex};
+            const auto draw_marker =
+                g_mode3_scene_only_draw_generations.find(command_list);
+            if (draw_marker != g_mode3_scene_only_draw_generations.end()) {
+                submission.scene_only_draw_recorded =
+                    draw_marker->second ==
+                        submission.recorded_tag.tag.generation;
+                g_mode3_scene_only_draw_generations.erase(draw_marker);
+            }
+        }
+        if (!submission.has_tag && !submission.has_capture &&
+            !submission.has_present) {
+            continue;
+        }
+        // [PERF:AER-AFW-HUD-ATOMIC-SUBMISSION-ORDER V1284 2/6] Freeze the
+        // traversal order while this exact command-list metadata is detached.
+        // Pre-submit publication can then remain concurrent without relying on
+        // mutex acquisition order.
+        submission.submission_serial =
+            g_mode3_aer_afw_hud_submission_serial.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+        pending.push_back(submission);
+        if (g_config.runtime_diagnostics) {
+            static std::atomic<uint32_t> preexecute_snapshot_logs{};
+            if (take_bounded_log_slot(preexecute_snapshot_logs, 96)) {
+                log_line(
+                    "V1282 AER AFW HUD pre-execute snapshot tag=%d "
+                    "capture=%d present=%d eye=%u pair=%llu generation=%u "
+                    "tag_present=%llu capture_present=%llu "
+                    "boundary_present=%llu submission_serial=%llu "
+                    "command_list=%p",
+                    submission.has_tag ? 1 : 0,
+                    submission.has_capture ? 1 : 0,
+                    submission.has_present ? 1 : 0,
+                    submission.recorded_tag.tag.eye,
+                    static_cast<unsigned long long>(
+                        submission.recorded_tag.tag.pair_id),
+                    submission.recorded_tag.tag.generation,
+                    static_cast<unsigned long long>(
+                        submission.recorded_tag.recorded_present),
+                    static_cast<unsigned long long>(
+                        submission.recorded_capture.recorded_present),
+                    static_cast<unsigned long long>(
+                        submission.present_boundary.recorded_present),
+                    static_cast<unsigned long long>(
+                        submission.submission_serial),
+                    command_list);
+            }
+        }
+    }
+    return pending;
+}
+
+// [PERF:AER-AFW-HUD-PREEXECUTE-PUBLISH V1285 2/4] The pointer-exact path has
+// always labeled HUD resources before their command list reaches the D3D12
+// queue. Do the same with the immutable fallback snapshot. The real Execute
+// immediately follows, so GPU queue order, work and resource transitions are
+// unchanged while CPU-visible readiness no longer trails the submission.
+void publish_mode3_aer_afw_hud_submissions_before_execute(
+    ID3D12CommandQueue* queue,
+    const std::vector<Mode3AerAfwHudExecuteSubmission>& pending) {
+    if (!puredark_afw_mode3_aer_common_transport_configured() ||
+        queue == nullptr || pending.empty()) {
+        return;
+    }
+    for (const auto& submission : pending) {
+        auto* const command_list = submission.command_list;
+        const auto& recorded_tag = submission.recorded_tag;
+        const auto& present_boundary = submission.present_boundary;
+        const auto& recorded_capture = submission.recorded_capture;
+        const bool has_tag = submission.has_tag;
+        const bool has_present = submission.has_present;
+        const bool has_capture = submission.has_capture;
+
+        if (has_capture) {
+            std::scoped_lock lock{g_mode3_early_hud_mutex};
+            g_mode3_early_hud_submitted.push_back({
+                recorded_capture, command_list, queue,
+                submission.submission_serial});
+        }
+        if (has_tag) {
+            std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+            g_mode3_aer_afw_submitted_hud_tags.push_back({
+                recorded_tag.tag, command_list, queue,
+                recorded_tag.recorded_present,
+                submission.submission_serial,
+                submission.scene_only_draw_recorded});
+        }
+        if (!has_present) {
+            continue;
+        }
+
+        const uint32_t generation =
+            g_streamline_capture_generation.load(std::memory_order_acquire);
+        if (present_boundary.generation != generation) {
+            continue;
+        }
+        Mode3AerAfwSubmittedHudTag selected_tag{};
+        bool tag_ready{};
+        {
+            std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+            g_mode3_aer_afw_submitted_hud_tags.erase(
+                std::remove_if(
+                    g_mode3_aer_afw_submitted_hud_tags.begin(),
+                    g_mode3_aer_afw_submitted_hud_tags.end(),
+                    [&](const Mode3AerAfwSubmittedHudTag& candidate) {
+                        return candidate.tag.generation != generation ||
+                            (present_boundary.recorded_present >
+                                    candidate.recorded_present &&
+                                present_boundary.recorded_present -
+                                        candidate.recorded_present >
+                                    w3vr::mode3_transport::
+                                        kSubmittedHudJoinMaxPresentDistance);
+                    }),
+                g_mode3_aer_afw_submitted_hud_tags.end());
+            // [PERF:AER-AFW-HUD-ATOMIC-SUBMISSION-ORDER V1284 4/6]
+            // Concurrent publishers need not append in serial order. Select
+            // the newest immutable submission explicitly.
+            for (const auto& candidate :
+                    g_mode3_aer_afw_submitted_hud_tags) {
+                if (candidate.queue == queue &&
+                    w3vr::mode3_transport::
+                        submitted_hud_join_window_matches(
+                            candidate.tag.generation, generation,
+                            candidate.recorded_present,
+                            present_boundary.recorded_present) &&
+                    (!tag_ready || candidate.submission_serial >
+                        selected_tag.submission_serial)) {
+                    selected_tag = candidate;
+                    tag_ready = true;
+                }
+            }
+        }
+
+        Mode3SubmittedEarlyHudPending selected_capture{};
+        bool capture_ready{};
+        bool labeled{};
+        if (tag_ready && selected_tag.tag.task_provenance_valid &&
+            selected_tag.tag.eye <= 1 && selected_tag.tag.pair_id != 0 &&
+            selected_tag.tag.pair_id != UINT64_MAX) {
+            std::scoped_lock lock{g_mode3_early_hud_mutex};
+            g_mode3_early_hud_submitted.erase(
+                std::remove_if(
+                    g_mode3_early_hud_submitted.begin(),
+                    g_mode3_early_hud_submitted.end(),
+                    [&](const Mode3SubmittedEarlyHudPending& candidate) {
+                        return candidate.pending.generation != generation ||
+                            (present_boundary.recorded_present >
+                                    candidate.pending.recorded_present &&
+                                present_boundary.recorded_present -
+                                        candidate.pending.recorded_present >
+                                    w3vr::mode3_transport::
+                                        kSubmittedHudJoinMaxPresentDistance);
+                    }),
+                g_mode3_early_hud_submitted.end());
+            // [PERF:AER-AFW-HUD-ATOMIC-SUBMISSION-ORDER V1284 5/6] Match the
+            // tag policy above instead of depending on deque insertion order.
+            for (const auto& candidate : g_mode3_early_hud_submitted) {
+                if (candidate.queue == queue &&
+                    w3vr::mode3_transport::
+                        submitted_hud_join_window_matches(
+                            candidate.pending.generation, generation,
+                            candidate.pending.recorded_present,
+                            present_boundary.recorded_present) &&
+                    w3vr::mode3_transport::
+                        submitted_hud_join_window_matches(
+                            candidate.pending.generation, generation,
+                            candidate.pending.recorded_present,
+                            selected_tag.recorded_present) &&
+                    (!capture_ready || candidate.submission_serial >
+                        selected_capture.submission_serial)) {
+                    selected_capture = candidate;
+                    capture_ready = true;
+                }
+            }
+            if (capture_ready) {
+                labeled = apply_mode3_early_hud_label_locked(
+                    selected_capture.pending, selected_tag.tag, generation);
+                if (labeled) {
+                    const uint64_t consumed_serial =
+                        selected_capture.submission_serial;
+                    g_mode3_early_hud_submitted.erase(
+                        std::remove_if(
+                            g_mode3_early_hud_submitted.begin(),
+                            g_mode3_early_hud_submitted.end(),
+                            [&](const Mode3SubmittedEarlyHudPending& candidate) {
+                                return candidate.queue == queue &&
+                                    candidate.submission_serial <=
+                                        consumed_serial;
+                            }),
+                        g_mode3_early_hud_submitted.end());
+                }
+            }
+        }
+        if (labeled) {
+            {
+                std::scoped_lock lock{g_mode3_aer_afw_hud_mutex};
+                const uint64_t consumed_serial =
+                    selected_tag.submission_serial;
+                g_mode3_aer_afw_submitted_hud_tags.erase(
+                    std::remove_if(
+                        g_mode3_aer_afw_submitted_hud_tags.begin(),
+                        g_mode3_aer_afw_submitted_hud_tags.end(),
+                        [&](const Mode3AerAfwSubmittedHudTag& candidate) {
+                            return candidate.queue == queue &&
+                                candidate.submission_serial <=
+                                    consumed_serial;
+                        }),
+                    g_mode3_aer_afw_submitted_hud_tags.end());
+            }
+            record_mode3_scene_only_hud_output(
+                selected_tag.tag,
+                selected_tag.scene_only_draw_recorded);
+        }
+        if (g_config.runtime_diagnostics) {
+            static std::atomic<uint32_t> submitted_hud_join_logs{};
+            if (take_bounded_log_slot(submitted_hud_join_logs, 64)) {
+                // [PERF:AER-AFW-HUD-PREEXECUTE-PUBLISH V1285 3/4]
+                log_line(
+                    "V1285 forced pre-Execute AER AFW submitted HUD join "
+                    "tag=%d capture=%d "
+                    "labeled=%d eye=%u pair=%llu generation=%u "
+                    "tag_command_list=%p capture_command_list=%p "
+                    "present_command_list=%p tag_present=%llu "
+                    "capture_present=%llu boundary_present=%llu "
+                    "tag_serial=%llu capture_serial=%llu present_serial=%llu "
+                    "queue=%p",
+                    tag_ready ? 1 : 0, capture_ready ? 1 : 0,
+                    labeled ? 1 : 0, selected_tag.tag.eye,
+                    static_cast<unsigned long long>(
+                        selected_tag.tag.pair_id),
+                    selected_tag.tag.generation,
+                    selected_tag.command_list,
+                    selected_capture.command_list,
+                    command_list,
+                    static_cast<unsigned long long>(
+                        selected_tag.recorded_present),
+                    static_cast<unsigned long long>(
+                        selected_capture.pending.recorded_present),
+                    static_cast<unsigned long long>(
+                        present_boundary.recorded_present),
+                    static_cast<unsigned long long>(
+                        selected_tag.submission_serial),
+                    static_cast<unsigned long long>(
+                        selected_capture.submission_serial),
+                    static_cast<unsigned long long>(
+                        submission.submission_serial),
+                    queue);
+            }
+        }
+    }
 }
 
 bool prepare_full_vr_frame_camera(
@@ -33699,6 +34805,12 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
         g_sequential_dlss_command_tags.clear();
     }
     {
+        std::scoped_lock lock{g_streamline_dlss_callback_constants_mutex};
+        for (auto& cached : g_streamline_dlss_callback_constants) {
+            cached = {};
+        }
+    }
+    {
         std::scoped_lock lock{g_streamline_command_list_eye_mutex};
         g_streamline_command_list_routes.clear();
     }
@@ -34624,6 +35736,20 @@ void __fastcall hook_sl_set_constants(void* constants, uint32_t frame_token, uin
         asymmetric_sl.thread_id = GetCurrentThreadId();
     }
 
+    prepare_streamline_dlss_callback_constants(constants, eye);
+    // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 3/8] Cache the exact unmodified
+    // constants per token and eye. A matching public evaluation may execute on
+    // another thread, and the two eye viewports may share one frame token.
+    if (dlss_streamline_evaluate_callback_active() && constants != nullptr) {
+        std::scoped_lock lock{g_streamline_dlss_callback_constants_mutex};
+        auto& cached = g_streamline_dlss_callback_constants[
+            streamline_dlss_callback_constants_slot(frame_token, eye)];
+        memcpy(cached.constants.data(), constants,
+            kStreamlineDlssCallbackConstantsBytes);
+        cached.frame_token = frame_token;
+        cached.eye = eye;
+        cached.valid = true;
+    }
     g_sl_set_constants(constants, frame_token, viewport);
 
     if (asymmetric_sl.active) {
@@ -34692,6 +35818,7 @@ int __fastcall hook_sl_set_tag(const void* resource, uint32_t tag, uint32_t view
     if (extent != nullptr && g_config.logging_enabled) {
         memcpy(&tagged_extent, extent, sizeof(tagged_extent));
     }
+    capture_streamline_dlss_callback_resource(resource, tag, eye);
     if (resource != nullptr && (tag == 0 || tag == 1 || tag == 3) &&
         g_config.ngx_trace &&
         !skip_mode3_legacy_sl_tracking) {
@@ -34780,8 +35907,129 @@ int __fastcall hook_sl_evaluate_feature(
         static_cast<ID3D12GraphicsCommandList*>(command_buffer), 3);
     const uint32_t routed_viewport =
         feature == 0 ? streamline_viewport_for_eye(viewport) : viewport;
+    auto* command_list = static_cast<ID3D12GraphicsCommandList*>(
+        command_buffer);
+    const uint32_t eye = streamline_eye();
+    StreamlineDlssCallbackConstantsSlot callback_constants{};
+    bool callback_constants_valid{};
+    if (feature == 0) {
+        callback_constants_valid =
+            hydrate_streamline_dlss_callback_constants(
+                frame_token, eye, &callback_constants);
+    }
+    const bool streamline_completion_active = feature == 0 &&
+        dlss_streamline_evaluate_callback_active() &&
+        command_list != nullptr;
+    const bool streamline_snapshot_active = streamline_completion_active &&
+        streamline_dlss_evaluate_snapshot_matches_current(eye);
+    int32_t puredark_afw_bundle_slot = -1;
+    bool public_jitter_applied{};
+    if (streamline_snapshot_active) {
+        const auto& snapshot = g_streamline_dlss_evaluate_snapshot;
+        record_streamline_command_list_eye(command_list, eye);
+        if (callback_constants_valid) {
+            public_jitter_applied =
+                resubmit_streamline_native_asymmetric_dlss_jitter(
+                    callback_constants, frame_token, routed_viewport, eye);
+        }
+        if (snapshot.depth_valid &&
+            snapshot.motion_vectors_valid &&
+            snapshot.output_valid && snapshot.motion_scale_valid) {
+            // [FIX:DLSS-STREAMLINE-MOTION-SCALE V1277 1/1] Public Streamline
+            // constants describe this game's motion field in normalized
+            // texture units (1,1), while the NGX parameters consumed by the
+            // validated AFW path describe it in input pixels. Convert only at
+            // this alternate callback boundary; the common capture helper then
+            // performs its existing input-to-output extent conversion.
+            const auto motion_desc = snapshot.motion_vectors->GetDesc();
+            float ngx_motion_scale_x = snapshot.motion_scale_x;
+            float ngx_motion_scale_y = snapshot.motion_scale_y;
+            if (std::fabs(ngx_motion_scale_x) <= 4.0f &&
+                motion_desc.Width > 0) {
+                ngx_motion_scale_x *= static_cast<float>(motion_desc.Width);
+            }
+            if (std::fabs(ngx_motion_scale_y) <= 4.0f &&
+                motion_desc.Height > 0) {
+                ngx_motion_scale_y *= static_cast<float>(motion_desc.Height);
+            }
+            static std::atomic<uint32_t> streamline_motion_scale_logs{};
+            if (take_bounded_log_slot(streamline_motion_scale_logs, 32)) {
+                log_line(
+                    "V1277 DLSS Streamline motion scale eye=%u pair=%llu "
+                    "raw=%.6f,%.6f ngx=%.6f,%.6f extent=%llux%u",
+                    eye,
+                    static_cast<unsigned long long>(
+                        snapshot.route_tag.pair_id),
+                    snapshot.motion_scale_x, snapshot.motion_scale_y,
+                    ngx_motion_scale_x, ngx_motion_scale_y,
+                    static_cast<unsigned long long>(motion_desc.Width),
+                    motion_desc.Height);
+            }
+            puredark_afw_bundle_slot =
+                capture_puredark_afw_dlss_inputs_from_resources(
+                    command_list,
+                    snapshot.depth, snapshot.depth_state,
+                    snapshot.motion_vectors, snapshot.motion_state,
+                    snapshot.output,
+                    ngx_motion_scale_x, ngx_motion_scale_y,
+                    eye);
+        }
+    }
+    const bool public_bundle_ready = puredark_afw_bundle_slot >= 0;
     const int result = g_sl_evaluate_feature(
         command_buffer, feature, frame_token, routed_viewport);
+    if (streamline_completion_active) {
+        // Witcher uses the historical Streamline bool ABI: non-zero is success.
+        // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 4/8] This public callback is the
+        // only completion owner, irrespective of the NVIDIA DLL topology.
+        const bool completion_success = result != 0;
+        const NVSDK_NGX_Result completion_result = completion_success
+            ? NVSDK_NGX_Result_Success
+            : NVSDK_NGX_Result_Fail;
+        g_dlss_completion_streamline_owned.fetch_add(
+            1, std::memory_order_relaxed);
+        finalize_puredark_afw_dlss_submission(
+            command_list, puredark_afw_bundle_slot, completion_result);
+        finalize_dlss_cache_submission(command_list, completion_result);
+        if (completion_success && public_jitter_applied) {
+            commit_native_asymmetric_dlss_input(
+                g_streamline_dlss_evaluate_snapshot.jitter);
+            commit_streamline_native_asymmetric_dlss_input(
+                g_streamline_dlss_evaluate_snapshot.route_tag);
+        } else if (completion_success && streamline_snapshot_active &&
+                   !mode3_aer_presentation_active()) {
+            // [FIX:DLSS-STREAMLINE-STRICT-FINAL-PROOF V1290 1/1] The public
+            // evaluation already completed for this exact routed eye. Strict
+            // Stereo only needs that final proof before publishing the pair;
+            // do not make it depend on whether this eye required jitter repair.
+            commit_streamline_native_asymmetric_dlss_input(
+                g_streamline_dlss_evaluate_snapshot.route_tag);
+        }
+        const uint32_t log_index = g_dlss_completion_auto_logs.fetch_add(
+            1, std::memory_order_relaxed);
+        if (g_config.runtime_diagnostics && log_index < 64) {
+            const auto& snapshot = g_streamline_dlss_evaluate_snapshot;
+            log_line(
+                "V1289 DLSS public completion sample=%u raw_sl=%d success=%u "
+                "bundle=%u jitter=%u constants=%u snapshot=%u "
+                "resources=%u,%u,%u,%u eye=%u pair=%llu "
+                "command_list=%p token=%u viewport=%u",
+                log_index, result, completion_success ? 1u : 0u,
+                public_bundle_ready ? 1u : 0u,
+                public_jitter_applied ? 1u : 0u,
+                callback_constants_valid ? 1u : 0u,
+                streamline_snapshot_active ? 1u : 0u,
+                snapshot.depth_valid ? 1u : 0u,
+                snapshot.motion_vectors_valid ? 1u : 0u,
+                snapshot.output_valid ? 1u : 0u,
+                snapshot.motion_scale_valid ? 1u : 0u,
+                eye,
+                static_cast<unsigned long long>(
+                    snapshot.route_valid ? snapshot.route_tag.pair_id : 0),
+                command_list, frame_token, routed_viewport);
+        }
+        g_streamline_dlss_evaluate_snapshot = {};
+    }
     dlss_gpu_profile_mark(
         static_cast<ID3D12GraphicsCommandList*>(command_buffer), 4);
     return result;
@@ -34890,34 +36138,18 @@ void schedule_dlss_output_luminance_readback(
 // side-by-side atlas without changing the source resources' lasting state.
 // [FIX:DLSS-PACKED 7/10] Split the completed atlas into private eye outputs and
 // publish it only after NGX has finished writing the full stereo result.
-struct NativeAsymmetricDlssJitterOverride {
-    bool required{};
-    bool valid{};
-    bool applied{};
-    bool source_was_centered{};
-    uint32_t reason{};
-    uint64_t pair_id{UINT64_MAX};
-    uint32_t generation{UINT32_MAX};
-    uint32_t eye{UINT32_MAX};
-    uint8_t factory_mask{};
-    uint8_t temporal_mask{};
-    float original_x{};
-    float original_y{};
-    float pure_x{};
-    float pure_y{};
-    float center_x{};
-    float center_y{};
-    uint32_t extent_width{};
-    uint32_t extent_height{};
-};
-
 // [TRIAL:NATIVE-STEREO-DLSS V1136] REDengine's shared temporal writer must
 // keep center+jitter so its off-axis projection and world consumers agree.
 // NGX, however, consumes a private pure sub-pixel jitter. Convert only at the
 // final evaluate boundary, using the exact pair FOV and NGX MV scale, and leave
 // every Streamline constant, native motion vector and per-eye history intact.
-bool prepare_native_asymmetric_dlss_jitter_override(
-    const NVSDK_NGX_Parameter* parameters,
+bool prepare_native_asymmetric_dlss_jitter_override_values(
+    float jitter_x,
+    float jitter_y,
+    float mv_scale_x,
+    float mv_scale_y,
+    unsigned subrect_width,
+    unsigned subrect_height,
     uint64_t pair_id,
     uint32_t eye,
     NativeAsymmetricDlssJitterOverride& override_state) {
@@ -34926,7 +36158,7 @@ bool prepare_native_asymmetric_dlss_jitter_override(
     override_state.eye = eye;
     if (!native_asymmetric_noaa_route_active() ||
         g_config.temporal_backend != TemporalBackend::Dlss ||
-        parameters == nullptr || eye > 1 || pair_id == 0 ||
+        eye > 1 || pair_id == 0 ||
         pair_id == UINT64_MAX) {
         override_state.reason = 1;
         return false;
@@ -34956,28 +36188,9 @@ bool prepare_native_asymmetric_dlss_jitter_override(
         return false;
     }
 
-    float mv_scale_x{};
-    float mv_scale_y{};
-    unsigned subrect_width{};
-    unsigned subrect_height{};
-    const bool parameters_valid =
-        NVSDK_NGX_SUCCEED(parameters->Get(
-            NVSDK_NGX_Parameter_Jitter_Offset_X,
-            &override_state.original_x)) &&
-        NVSDK_NGX_SUCCEED(parameters->Get(
-            NVSDK_NGX_Parameter_Jitter_Offset_Y,
-            &override_state.original_y)) &&
-        NVSDK_NGX_SUCCEED(parameters->Get(
-            NVSDK_NGX_Parameter_MV_Scale_X, &mv_scale_x)) &&
-        NVSDK_NGX_SUCCEED(parameters->Get(
-            NVSDK_NGX_Parameter_MV_Scale_Y, &mv_scale_y));
-    parameters->Get(
-        NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
-        &subrect_width);
-    parameters->Get(
-        NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
-        &subrect_height);
-    if (!parameters_valid || !std::isfinite(override_state.original_x) ||
+    override_state.original_x = jitter_x;
+    override_state.original_y = jitter_y;
+    if (!std::isfinite(override_state.original_x) ||
         !std::isfinite(override_state.original_y) ||
         !std::isfinite(mv_scale_x) || !std::isfinite(mv_scale_y)) {
         override_state.reason = 4;
@@ -35044,6 +36257,52 @@ bool prepare_native_asymmetric_dlss_jitter_override(
         return false;
     }
 
+    override_state.valid = true;
+    return true;
+}
+
+bool prepare_native_asymmetric_dlss_jitter_override(
+    const NVSDK_NGX_Parameter* parameters,
+    uint64_t pair_id,
+    uint32_t eye,
+    NativeAsymmetricDlssJitterOverride& override_state) {
+    if (parameters == nullptr) {
+        override_state = {};
+        override_state.pair_id = pair_id;
+        override_state.eye = eye;
+        override_state.reason = 1;
+        return false;
+    }
+
+    float jitter_x{};
+    float jitter_y{};
+    float mv_scale_x{};
+    float mv_scale_y{};
+    unsigned subrect_width{};
+    unsigned subrect_height{};
+    const bool parameters_valid =
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_Jitter_Offset_X, &jitter_x)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitter_y)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_MV_Scale_X, &mv_scale_x)) &&
+        NVSDK_NGX_SUCCEED(parameters->Get(
+            NVSDK_NGX_Parameter_MV_Scale_Y, &mv_scale_y));
+    parameters->Get(
+        NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+        &subrect_width);
+    parameters->Get(
+        NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+        &subrect_height);
+    if (!parameters_valid ||
+        !prepare_native_asymmetric_dlss_jitter_override_values(
+            jitter_x, jitter_y, mv_scale_x, mv_scale_y,
+            subrect_width, subrect_height, pair_id, eye,
+            override_state)) {
+        return false;
+    }
+
     auto* mutable_parameters = const_cast<NVSDK_NGX_Parameter*>(parameters);
     mutable_parameters->Set(
         NVSDK_NGX_Parameter_Jitter_Offset_X, override_state.pure_x);
@@ -35067,7 +36326,6 @@ bool prepare_native_asymmetric_dlss_jitter_override(
         return false;
     }
     override_state.applied = true;
-    override_state.valid = true;
     return true;
 }
 
@@ -35110,6 +36368,39 @@ bool commit_native_asymmetric_dlss_input(
         return false;
     }
     pair_slot.dlss_input_mask.fetch_or(eye_bit, std::memory_order_release);
+    return true;
+}
+
+bool commit_streamline_native_asymmetric_dlss_input(
+    const EngineFrameTag& route_tag) {
+    if (!dlss_streamline_evaluate_callback_active() ||
+        !native_asymmetric_noaa_route_active() || route_tag.eye > 1 ||
+        route_tag.pair_id == 0 || route_tag.pair_id == UINT64_MAX) {
+        return false;
+    }
+    std::scoped_lock slot_lock{g_native_asymmetric_pair_slot_mutex};
+    auto& pair_slot = g_native_asymmetric_pair_slots[
+        route_tag.pair_id % kNativeAsymmetricPairSlotCount];
+    const uint8_t eye_bit = static_cast<uint8_t>(1u << route_tag.eye);
+    if (pair_slot.pair_id.load(std::memory_order_acquire) !=
+            route_tag.pair_id ||
+        pair_slot.generation.load(std::memory_order_acquire) !=
+            route_tag.generation ||
+        (pair_slot.factory_mask.load(std::memory_order_acquire) & eye_bit) == 0 ||
+        (pair_slot.temporal_mask.load(std::memory_order_acquire) & eye_bit) == 0) {
+        return false;
+    }
+    const uint8_t input_mask = pair_slot.dlss_input_mask.fetch_or(
+        eye_bit, std::memory_order_release) | eye_bit;
+    static std::atomic<uint32_t> streamline_completion_logs{};
+    if (take_bounded_log_slot(streamline_completion_logs, 32)) {
+        log_line(
+            "V1277 DLSS Streamline Stereo completion eye=%u pair=%llu "
+            "generation=%u input_mask=0x%X",
+            route_tag.eye,
+            static_cast<unsigned long long>(route_tag.pair_id),
+            route_tag.generation, input_mask);
+    }
     return true;
 }
 
@@ -35230,7 +36521,8 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature_impl(
     ID3D12GraphicsCommandList* command_list,
     const NVSDK_NGX_Handle* handle,
     const NVSDK_NGX_Parameter* parameters,
-    PFN_NVSDK_NGX_ProgressCallback callback) {
+    PFN_NVSDK_NGX_ProgressCallback callback,
+    bool suppress_puredark_afw_submission) {
     if (g_config.runtime_diagnostics) {
         g_ngx_dlss_evaluate_calls.fetch_add(1, std::memory_order_relaxed);
     }
@@ -35312,7 +36604,9 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature_impl(
     // [FEATURE:PUREDARK-AFW-DLSS V12004 3/6] Record immutable Depth/MVec
     // copies before DLSS evaluates and potentially reuses its inputs.
     const int32_t puredark_afw_bundle_slot =
-        capture_puredark_afw_dlss_inputs(
+        suppress_puredark_afw_submission
+        ? -1
+        : capture_puredark_afw_dlss_inputs(
             command_list, parameters, eye);
     const NVSDK_NGX_Handle* evaluation_handle = handle;
     uint64_t history_generation{};
@@ -35442,8 +36736,10 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature_impl(
         // [FIX:PUREDARK-AFW-PRODUCER-PUBLICATION V12016 5/8] The exact
         // bundle becomes only a pending command-list publication here. The
         // queue hook below makes it visible to Present after submission.
-        finalize_puredark_afw_dlss_submission(
-            command_list, puredark_afw_bundle_slot, result);
+        if (!suppress_puredark_afw_submission) {
+            finalize_puredark_afw_dlss_submission(
+                command_list, puredark_afw_bundle_slot, result);
+        }
         finalize_dlss_cache_submission(command_list, result);
         if (reset_overridden) {
             const_cast<NVSDK_NGX_Parameter*>(parameters)->Set(
@@ -35467,8 +36763,10 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature_impl(
         w3vr::pipeline_flight::Phase::TemporalDlss,
         flight_cpu_begin);
     record_dlss_cpu_phase(kDlssCpuNgxEvaluate, evaluate_begin);
-    finalize_puredark_afw_dlss_submission(
-        command_list, puredark_afw_bundle_slot, result);
+    if (!suppress_puredark_afw_submission) {
+        finalize_puredark_afw_dlss_submission(
+            command_list, puredark_afw_bundle_slot, result);
+    }
     finalize_dlss_cache_submission(command_list, result);
     if (g_config.runtime_diagnostics &&
         result == NVSDK_NGX_Result_Success) {
@@ -35488,6 +36786,11 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature(
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback callback) {
     g_ngx_dlss_evaluate_calls.fetch_add(1, std::memory_order_relaxed);
+    // [FIX:DLSS-COMPLETION-AUTO V1287 4/8] A matching public evaluation marks
+    // this exact command list before calling Streamline. That observation is
+    // valid even if the driver invokes NGX from a different thread.
+    const auto completion_auto =
+        mark_dlss_completion_auto_ngx_entry(command_list);
     const uint32_t asymmetric_entry_eye = streamline_eye();
     // [TRIAL:NATIVE-STEREO-DLSS V1136] A deferred NGX command may execute after
     // the REDengine render TLS has advanced.  Only the command-scoped Streamline
@@ -35504,9 +36807,11 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature(
         ? static_cast<uint32_t>(g_streamline_forced_eye)
         : UINT32_MAX;
     NativeAsymmetricDlssJitterOverride native_dlss_jitter{};
-    prepare_native_asymmetric_dlss_jitter_override(
-        parameters, native_dlss_pair, native_dlss_eye,
-        native_dlss_jitter);
+    if (!completion_auto.public_jitter_applied) {
+        prepare_native_asymmetric_dlss_jitter_override(
+            parameters, native_dlss_pair, native_dlss_eye,
+            native_dlss_jitter);
+    }
     AsymmetricNgxEntryAuditScope asymmetric_entry_audit{
         command_list, handle, parameters,
         g_streamline_dlss_pair_id, asymmetric_entry_eye,
@@ -35518,13 +36823,20 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature(
             g_engine_dual_render_active.load(std::memory_order_acquire) &&
             g_engine_menu_state.load(std::memory_order_relaxed) == 0};
     const auto result = hook_ngx_evaluate_feature_impl(
-        command_list, handle, parameters, callback);
-    const bool native_dlss_restore_ok =
-        restore_native_asymmetric_dlss_jitter_override(
-            parameters, native_dlss_jitter);
-    const bool native_dlss_committed =
-        result == NVSDK_NGX_Result_Success && native_dlss_restore_ok &&
-        commit_native_asymmetric_dlss_input(native_dlss_jitter);
+        command_list, handle, parameters, callback,
+        completion_auto.use_public_bundle);
+    mark_dlss_completion_auto_ngx_result(
+        command_list, result == NVSDK_NGX_Result_Success);
+    bool native_dlss_restore_ok = true;
+    bool native_dlss_committed{};
+    if (!completion_auto.public_jitter_applied) {
+        native_dlss_restore_ok =
+            restore_native_asymmetric_dlss_jitter_override(
+                parameters, native_dlss_jitter);
+        native_dlss_committed =
+            result == NVSDK_NGX_Result_Success && native_dlss_restore_ok &&
+            commit_native_asymmetric_dlss_input(native_dlss_jitter);
+    }
     if (native_dlss_jitter.required && g_config.runtime_diagnostics) {
         const uint32_t log_index =
             g_native_asymmetric_dlss_input_logs.fetch_add(
@@ -35651,28 +36963,18 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_create_feature(
 }
 
 void install_ngx_dlss_hook() {
-    if (!temporal_backend_is_dlss() ||
-        (!g_config.ngx_trace && !asymmetric_authority_audit_active() &&
-            !puredark_afw_mode3_aer_dlss_route_configured() &&
-            !dlss_submitted_cache_route_active()) ||
-        g_ngx_evaluate_feature != nullptr) {
+    if (!temporal_backend_is_dlss()) {
         return;
     }
-
-    auto* module = GetModuleHandleW(L"nvngx_dlss.dll");
-    auto* target = module != nullptr ? GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature") : nullptr;
-    auto* create_target = module != nullptr ? GetProcAddress(module, "NVSDK_NGX_D3D12_CreateFeature") : nullptr;
-    if (target != nullptr &&
-        MH_CreateHook(target, reinterpret_cast<void*>(&hook_ngx_evaluate_feature),
-            reinterpret_cast<void**>(&g_ngx_evaluate_feature)) == MH_OK &&
-        MH_EnableHook(target) == MH_OK) {
-        log_line("NGX DLSS EvaluateFeature hook installed target=%p", target);
-    }
-    if (create_target != nullptr && g_ngx_create_feature == nullptr &&
-        MH_CreateHook(create_target, reinterpret_cast<void*>(&hook_ngx_create_feature),
-            reinterpret_cast<void**>(&g_ngx_create_feature)) == MH_OK &&
-        MH_EnableHook(create_target) == MH_OK) {
-        log_line("NGX DLSS CreateFeature hook installed target=%p", create_target);
+    if (!g_dlss_completion_auto_hook_logged.exchange(
+            true, std::memory_order_relaxed)) {
+        // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 5/8] Do not even resolve the
+        // private exports. In particular, CreateFeature must not clone a peer
+        // history while EvaluateFeature completes through a public override.
+        log_line(
+            "V1289 DLSS owner=public_streamline ngx_evaluate_hook=disabled "
+            "ngx_create_hook=disabled split_viewport_history=enabled "
+            "token_eye_constants=enabled legacy_public_bool_success=nonzero");
     }
 }
 
@@ -36351,8 +37653,13 @@ void ensure_initialized() {
         // with the default OFF setting the adjacent DLL is never loaded.
         initialize_real_dxgi_exports();
         load_config();
+        if (g_config.renderdoc_capture_enabled &&
+            g_config.renderdoc_streamline_device_bridge) {
+            initialize_real_d3d12_create_device_export();
+        }
         initialize_renderdoc_capture_api();
         MH_Initialize();
+        install_renderdoc_d3d12_create_device_bridge();
         log_renderdoc_capture_api_status();
         initialize_focus_projection_shader_file();
         reset_asymmetric_authority_audit();
@@ -36411,10 +37718,11 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1267 base=V1266 "
+                "witcher3vr dxgi proxy initialized build=V1290 base=V1289 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
-                "aer_afw_enabled=%d persistent_registry=%d",
+                "aer_afw_enabled=%d persistent_registry=%d dlss_public_streamline=%d "
+                "force_aer_afw_submitted_hud_join=%d",
                 g_config.engine_first_person_anchor_smoothing ? 1 : 0,
                 g_config.engine_first_person_anchor_smoothing_seconds,
                 g_config.engine_first_person_strafe ? 1 : 0,
@@ -36422,10 +37730,36 @@ void ensure_initialized() {
                 g_config.raytracing_enabled ? 1 : 0,
                 g_config.raytracing_history_buffers,
                 g_config.puredark_afw_enabled ? 1 : 0,
-                focus_projection_shader_registry_enabled() ? 1 : 0);
+                focus_projection_shader_registry_enabled() ? 1 : 0,
+                dlss_streamline_evaluate_callback_active() ? 1 : 0,
+                kForceMode3AerAfwSubmittedHudJoinBuild ? 1 : 0);
             log_line("V1234 AFW common_transport=dlss_and_taau projection_transport=symmetric_asymmetric_identical final_color=exact_submitted_temporal queue_admission=exact_command_list_any_hooked_queue taau_motion=normalized_rg16f_previous_minus_current afw_projection=packet_owned_camera_fov mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_deferred_command_tag aer_presentation_size=final_openxr_scaled_fov_source_extent rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic static_hud=launcher_script_dynamic");
             log_line(
-                "V1177 RenderDoc integration=retained ini=optional_default_off capture=F7 system_dxgi_exports=pre_resolved api=1.6.0");
+                "V1271 RenderDoc integration=optional_default_off capture=F3 d3d12_create_device=streamline_raw_export_bridge system_dxgi_exports=pre_resolved api=1.6.0");
+            log_line(
+                "V1280 retained HUD identity=queue_submitted_cross_command_list exact_queue_order=1 present_parity=0");
+            log_line(
+                "V1282 retained HUD lifetime=preexecute_snapshot command_list_reset_race=closed");
+            log_line(
+                "V1283 retained HUD diagnostic=force_preexecute_snapshot pointer_exact_present_join=disabled metadata_capture=unchanged");
+            // [PERF:AER-AFW-HUD-ATOMIC-SUBMISSION-ORDER V1284 6/6]
+            log_line(
+                "V1284 retained HUD performance=submission_atomic_serial outer_join_mutex=removed selection=max_serial");
+            // [PERF:AER-AFW-HUD-PREEXECUTE-PUBLISH V1285 4/4]
+            log_line(
+                "V1285 retained HUD timing=preexecute_snapshot_publish pointer_exact_readiness_matched gpu_work=unchanged");
+            log_line(
+                "V1286 RenderDoc Streamline D3D12CreateDevice bridge=explicit_opt_in default_off full_d3d12_capture=requires_bridge");
+            log_line(
+                "V1287 DLSS completion=per_command_list_auto owner_probe=ngx_or_streamline single_afw_producer=1 legacy_callback_ini=ignored");
+            log_line(
+                "V1288 DLSS private hook=nvngx_dlss_only wrapper_exports=sl_common_and__nvngx_rejected public_fallback=automatic");
+            log_line(
+                "V1289 DLSS owner=public_streamline mode3_aer_and_stereo=1 ngx_evaluate_create_hooks=disabled per_eye_history=split_viewports constants_cache=token_plus_eye asymmetric_jitter=late_exact_resubmit recipe_reconstruction=0 override_compatible=1");
+            log_line(
+                "V1290 strict Stereo final DLSS proof=successful_exact_public_evaluate_per_eye intermediate_dlss=unchanged aer=unchanged");
+            log_line(
+                "V1279 DLSS compatibility=public_streamline_aer_private_history_ngx_stereo legacy_module_agnostic_discovery=disabled_by_V1288");
             log_line(
                 "V1144 native temporal terrain family source=V15018 validated_via=V15017 terrain_match=exact_vs_ds_two_hs_pso_contract material_ps=wildcard terrain_hs=5B33D68BABD52A7E,9ABE7F60D2CFC2EB mode3_taau_native_full_motion=1 taau_terrain_replay=aer_and_stereo native_temporal_terrain_motion=1 diagnostic_independent=1 diagnostic_off_log_io=none locator_code=absent camera_binding=ds_b1_to_ps_b6_alias motion_formula=current_ndc_minus_history_ndc velocity_target=rt3_only overlay_psos=inherit_base_motion afw_compatible=1");
         }
@@ -40530,10 +41864,11 @@ void render_openxr_test_frame(
     // this exact xrEndFrame display target. PairFactory already records the
     // immutable view used to render the scene, OverlayLatch records the camera
     // used by world markers, and HudComposite records the selected HUD pair.
-    // One F7 window can therefore prove HUD/render identity and measure the
+    // One bounded diagnostic window can therefore prove HUD/render identity
+    // and measure the
     // precise rotational delta that remains between rendered marker content
     // and its real OpenXR publication. This is fixed-size in-memory telemetry;
-    // no file I/O occurs until F7.
+    // no file I/O occurs on this path.
     if (isolate_publication_pose && !frame_was_prepared && views_valid) {
         for (uint32_t eye = 0; eye < publication_views.size(); ++eye) {
         }
@@ -43957,7 +45292,7 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             w3vr::pipeline_flight::dump_last_ten_seconds();
         }
     }
-    if ((GetAsyncKeyState(VK_F7) & 1) != 0) {
+    if ((GetAsyncKeyState(VK_F3) & 1) != 0) {
         trigger_renderdoc_capture(swapchain);
     }
     // Toggle only the ABI debug bit. This does not enable AFW, alter
@@ -44093,11 +45428,19 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     }
     if (g_config.runtime_diagnostics && g_config.ngx_trace &&
         frame % 120 == 0) {
-        log_line("DLSS routing totals present=%llu bridge=%llu sl_eval=%llu ngx_hook=%llu",
+        log_line("DLSS routing totals present=%llu bridge=%llu sl_eval=%llu ngx_hook=%llu auto_owner=%s auto_ngx=%llu auto_streamline=%llu auto_switch=%llu",
             static_cast<unsigned long long>(frame),
             static_cast<unsigned long long>(g_streamline_taau_bridge_matches.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_streamline_dlss_evaluate_calls.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_ngx_dlss_evaluate_calls.load(std::memory_order_relaxed)));
+            static_cast<unsigned long long>(g_ngx_dlss_evaluate_calls.load(std::memory_order_relaxed)),
+            dlss_completion_owner_name(
+                g_dlss_completion_owner.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_dlss_completion_ngx_owned.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_dlss_completion_streamline_owned.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(
+                g_dlss_completion_owner_switches.load(std::memory_order_relaxed)));
     }
     const auto bootstrap_until =
         g_taau_descriptor_bootstrap_until_present.load(std::memory_order_relaxed);
@@ -44966,10 +46309,18 @@ extern "C" HRESULT WINAPI DXGIDisableVBlankVirtualization() {
     return hr;
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void*) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, void* reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
     } else if (reason == DLL_PROCESS_DETACH) {
+        // At process termination dependency teardown order is unspecified and
+        // the OS reclaims every object. In particular, RenderDoc may already
+        // be unloaded while these COM pointers still reference its vtables.
+        // Keep explicit FreeLibrary cleanup, but never dereference wrappers
+        // during whole-process teardown.
+        if (reserved != nullptr) {
+            return TRUE;
+        }
         if (g_xr_session != XR_NULL_HANDLE && pfn_xrDestroySession != nullptr) {
             pfn_xrDestroySession(g_xr_session);
         }

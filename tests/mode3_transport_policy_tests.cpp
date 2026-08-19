@@ -4,11 +4,16 @@
 #include <initializer_list>
 
 int main() {
+    using w3vr::mode3_transport::DlssCompletionOwner;
     using w3vr::mode3_transport::HudProjectionRoute;
     using w3vr::mode3_transport::TemporalAdapter;
     using w3vr::mode3_transport::afw_gameplay_capture_allowed;
     using w3vr::mode3_transport::afw_queued_producer_expired;
     using w3vr::mode3_transport::dlss_submission_route_active;
+    using w3vr::mode3_transport::dlss_completion_apply_public_jitter;
+    using w3vr::mode3_transport::dlss_completion_capture_public_bundle;
+    using w3vr::mode3_transport::dlss_completion_ngx_uses_public_bundle;
+    using w3vr::mode3_transport::dlss_completion_resolved_owner;
     using w3vr::mode3_transport::exact_afw_backend;
     using w3vr::mode3_transport::final_backbuffer_route_active;
     using w3vr::mode3_transport::final_color_submission_backend;
@@ -17,6 +22,48 @@ int main() {
     using w3vr::mode3_transport::native_hud_source_bootstrap_active;
     using w3vr::mode3_transport::real_smoke_variant_bootstrap_allowed;
     using w3vr::mode3_transport::submission_queue_eligible;
+    using w3vr::mode3_transport::streamline_dlss_evaluate_callback_active;
+    using w3vr::mode3_transport::submitted_hud_join_window_matches;
+
+    // The public owner is intentionally narrow. Only Mode-3 OpenXR DLSS can
+    // enter it. Projection is not an input, so AER and strict Stereo receive
+    // the same callback policy.
+    assert(streamline_dlss_evaluate_callback_active(
+        true, true, 3, TemporalAdapter::Dlss));
+    assert(!streamline_dlss_evaluate_callback_active(
+        false, true, 3, TemporalAdapter::Dlss));
+    assert(!streamline_dlss_evaluate_callback_active(
+        true, false, 3, TemporalAdapter::Dlss));
+    assert(!streamline_dlss_evaluate_callback_active(
+        true, true, 2, TemporalAdapter::Dlss));
+    assert(!streamline_dlss_evaluate_callback_active(
+        true, true, 3, TemporalAdapter::Taau));
+
+    // The first exact evaluation probes both boundaries. Once an owner is
+    // observed, only that route records a normal per-frame producer. Public
+    // jitter is delayed until the public route has actually been proven.
+    assert(dlss_completion_capture_public_bundle(
+        DlssCompletionOwner::Probe));
+    assert(!dlss_completion_apply_public_jitter(
+        DlssCompletionOwner::Probe));
+    assert(!dlss_completion_capture_public_bundle(
+        DlssCompletionOwner::Ngx));
+    assert(dlss_completion_capture_public_bundle(
+        DlssCompletionOwner::Streamline));
+    assert(dlss_completion_apply_public_jitter(
+        DlssCompletionOwner::Streamline));
+    assert(dlss_completion_ngx_uses_public_bundle(
+        DlssCompletionOwner::Probe, true));
+    assert(!dlss_completion_ngx_uses_public_bundle(
+        DlssCompletionOwner::Ngx, true));
+    assert(dlss_completion_ngx_uses_public_bundle(
+        DlssCompletionOwner::Streamline, true));
+    assert(!dlss_completion_ngx_uses_public_bundle(
+        DlssCompletionOwner::Streamline, false));
+    assert(dlss_completion_resolved_owner(true) ==
+        DlssCompletionOwner::Ngx);
+    assert(dlss_completion_resolved_owner(false) ==
+        DlssCompletionOwner::Streamline);
 
     // Projection is not an input: both symmetric and asymmetric exercise this
     // same policy and must obtain exactly the same answers.
@@ -90,6 +137,17 @@ int main() {
     assert(native_hud_source_bootstrap_active(false, true, false));
     assert(native_hud_source_bootstrap_active(false, false, true));
     assert(!native_hud_source_bootstrap_active(false, false, false));
+
+    // Cross-command-list retained HUD metadata is admitted only inside the
+    // short recording/submission interval for the current renderer generation.
+    // A one- or two-Present skew is possible when worker lists straddle the
+    // counter edge; anything older remains on the baked fail-open path.
+    assert(submitted_hud_join_window_matches(7, 7, 100, 100));
+    assert(submitted_hud_join_window_matches(7, 7, 99, 100));
+    assert(submitted_hud_join_window_matches(7, 7, 98, 100));
+    assert(submitted_hud_join_window_matches(7, 7, 102, 100));
+    assert(!submitted_hud_join_window_matches(7, 7, 97, 100));
+    assert(!submitted_hud_join_window_matches(7, 8, 100, 100));
 
     // Runtime FOV is required only for the two optical-centre variants. The
     // independent world-up fallback must never depend on first-camera timing.
