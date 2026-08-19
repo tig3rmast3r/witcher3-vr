@@ -4,7 +4,9 @@ param(
     [ValidatePattern('^[Vv][0-9]+$')]
     [string] $Version,
 
-    [string] $OutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist')
+    [string] $OutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'),
+
+    [string] $PureDarkPlugin
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +20,14 @@ if (-not $resolvedOutput.StartsWith(
 }
 $OutputDirectory = $resolvedOutput
 $normalizedVersion = $Version.ToUpperInvariant()
+$pureDarkPluginDefault = Join-Path $repositoryRoot `
+    'external/puredark-afw/PDAFWPlugin.dll'
+if ([string]::IsNullOrWhiteSpace($PureDarkPlugin)) {
+    $PureDarkPlugin = $pureDarkPluginDefault
+} else {
+    $PureDarkPlugin = [System.IO.Path]::GetFullPath($PureDarkPlugin)
+}
+$pureDarkIni = Join-Path $repositoryRoot 'puredark_afw.ini'
 $releaseDll = Join-Path $repositoryRoot 'build/release/Release/dxgi.dll'
 $launcher = Join-Path $repositoryRoot 'build/release/launcher/Release/Witcher3VRLauncher.exe'
 $openXrLoaderSource = Join-Path $repositoryRoot 'external/openxr-loader'
@@ -69,6 +79,8 @@ foreach ($requiredFile in @(
         $releaseDll,
         $launcher,
         $openXrLoader,
+        $PureDarkPlugin,
+        $pureDarkIni,
         $exampleIni,
         $readme,
         $license,
@@ -119,6 +131,9 @@ try {
         -Destination (Join-Path $binaryStage 'dxgi.dll')
     Copy-Item -LiteralPath $launcher -Destination $binaryStage
     Copy-Item -LiteralPath $openXrLoader -Destination $binaryStage
+    Copy-Item -LiteralPath $PureDarkPlugin `
+        -Destination (Join-Path $binaryStage 'PDAFWPlugin.dll')
+    Copy-Item -LiteralPath $pureDarkIni -Destination $binaryStage
 
     $modsStage = Join-Path $releaseStage 'mods'
     New-Item -ItemType Directory -Path $modsStage | Out-Null
@@ -164,6 +179,10 @@ try {
     $launcherHash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash
     $openXrLoaderHash =
         (Get-FileHash -LiteralPath $openXrLoader -Algorithm SHA256).Hash
+    $pureDarkPluginHash =
+        (Get-FileHash -LiteralPath $PureDarkPlugin -Algorithm SHA256).Hash
+    $pureDarkIniHash =
+        (Get-FileHash -LiteralPath $pureDarkIni -Algorithm SHA256).Hash
     $movementDlcBundleHash =
         (Get-FileHash -LiteralPath $movementDlcBundle -Algorithm SHA256).Hash
     $movementDlcMetadataHash =
@@ -184,6 +203,8 @@ try {
     $manifestLines += "dll.sha256=$dllHash"
     $manifestLines += "launcher.sha256=$launcherHash"
     $manifestLines += "openxr_loader.sha256=$openXrLoaderHash"
+    $manifestLines += "puredark_plugin.sha256=$pureDarkPluginHash"
+    $manifestLines += "puredark_ini.sha256=$pureDarkIniHash"
     $manifestLines += "movement_dlc_bundle.sha256=$movementDlcBundleHash"
     $manifestLines += "movement_dlc_metadata.sha256=$movementDlcMetadataHash"
     $manifestLines += "hud_editor_script.sha256=$hudEditorScriptHash"
