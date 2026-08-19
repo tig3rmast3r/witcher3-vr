@@ -26,6 +26,14 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
+// V1252 keeps V1251's successful repair for the three reused-camera episodes,
+// but rejects that fallback whenever a Full-VR perspective factory corrected a
+// camera in the last two Presents. This prevents the double camera scale that
+// made ordinary cutscenes miniature and separated terrain/foliage layers.
+// V1251 restores V1242's validated symmetric AER Cinema presentation for
+// ordinary cutscenes and confines the reused-camera repair to the exact
+// automatic Full-VR frame fallback. V1248's broad native-pair promotion made
+// every AER ASYM cutscene fisheye and duplicated HUD/effect geometry.
 // V1245 lets the already-proven Full-VR final-frame fallback establish native
 // asymmetric transport after the opening movie, where no perspective factory
 // callback exists to preflight it. V1212's per-eye factory-mask proof remains
@@ -1152,7 +1160,6 @@ XrView g_sequential_cinema_pending_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 bool g_sequential_cinema_pending_view_valid[2]{};
 bool g_sequential_cinema_present_cache_initialized{};
 bool g_sequential_cinema_pair_valid{};
-bool g_sequential_cinema_pair_native_asymmetric{};
 uint64_t g_sequential_cinema_accepted_pair_id{};
 uint32_t g_sequential_cinema_accepted_generation{};
 uint64_t g_sequential_cinema_entry_pair_floor{};
@@ -1164,7 +1171,6 @@ void reset_sequential_cinema_pair_authority(
     uint64_t pair_floor,
     bool resources_recreated) {
     g_sequential_cinema_pair_valid = false;
-    g_sequential_cinema_pair_native_asymmetric = false;
     g_sequential_cinema_accepted_pair_id = 0;
     g_sequential_cinema_accepted_generation = 0;
     g_sequential_cinema_entry_pair_floor = pair_floor;
@@ -24645,13 +24651,46 @@ void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data
         !g_force_mono_cinema.load(std::memory_order_relaxed);
     const uint64_t last_full_vr_factory =
         g_full_vr_factory_camera_last_present.load(std::memory_order_acquire);
-    const bool mono_full_vr_factory_recent = mono_transport &&
+    const bool full_vr_factory_recent =
         last_full_vr_factory != UINT64_MAX &&
         present >= last_full_vr_factory &&
         present - last_full_vr_factory <= 2;
+    const bool mono_full_vr_factory_recent =
+        mono_transport && full_vr_factory_recent;
+    const bool symmetric_aer_full_vr_fallback =
+        w3vr::native_asymmetric_transport_policy::
+            frame_fallback_uses_symmetric_projection({
+                native_asymmetric_noaa_route_active(),
+                mode3_aer_presentation_active(),
+                automatic_full_vr_active});
+    const bool stereo_fallback_allowed =
+        w3vr::native_asymmetric_transport_policy::
+            stereo_frame_fallback_admissible({
+                stereo_frame_tag_valid,
+                symmetric_aer_full_vr_fallback,
+                full_vr_factory_recent});
+    if (g_config.runtime_diagnostics && frame_data != nullptr &&
+        automatic_full_vr_active && stereo_frame_tag_valid &&
+        symmetric_aer_full_vr_fallback && full_vr_factory_recent) {
+        static std::atomic<uint64_t> factory_bypass_count{};
+        const uint64_t count = factory_bypass_count.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        if (count <= 16 || count % 600 == 0) {
+            log_cinema_camera_diagnostic(
+                "V1252 AER frame fallback bypassed count=%llu present=%llu "
+                "factory_present=%llu factory_age=%llu eye=%d pair=%llu",
+                static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(present),
+                static_cast<unsigned long long>(last_full_vr_factory),
+                static_cast<unsigned long long>(
+                    present - last_full_vr_factory),
+                correction_eye,
+                static_cast<unsigned long long>(correction_pair));
+        }
+    }
     if (frame_data != nullptr && automatic_full_vr_active &&
         g_engine_menu_state.load(std::memory_order_relaxed) == 0 &&
-        (stereo_frame_tag_valid ||
+        (stereo_fallback_allowed ||
             (mono_transport && !mono_full_vr_factory_recent))) {
         fallback_frame_camera_applied = prepare_full_vr_frame_camera(
             frame_data, present, correction_eye, correction_pair,
@@ -26812,6 +26851,23 @@ bool prepare_full_vr_frame_camera(
     const XrFovf* xr_fov = render_view_valid
         ? &render_view.fov
         : (g_xr_views.empty() ? nullptr : &g_xr_views[0].fov);
+    const bool automatic_full_vr =
+        g_config.cinema_full_vr &&
+        g_automatic_full_vr_camera_active.load(std::memory_order_acquire) &&
+        !g_force_mono_cinema.load(std::memory_order_relaxed);
+    // [FIX:AER-CINEMA-FALLBACK-ONLY V1251 1/2] V1242's run proves that
+    // ordinary AER cutscene pairs are already correct under the symmetric
+    // Cinema presenter. The only bad episodes are frames which reuse an
+    // embedded camera and reach this final-frame fallback. Correct those
+    // frames with the same centered envelope, pose and stereo baseline; do
+    // not manufacture a raw off-axis pair that would require V1248's broad
+    // presentation switch and regress every normal cutscene.
+    const bool symmetric_aer_full_vr_fallback =
+        w3vr::native_asymmetric_transport_policy::
+            frame_fallback_uses_symmetric_projection({
+                native_asymmetric_noaa_route_active(),
+                mode3_aer_presentation_active(),
+                automatic_full_vr});
     if (xr_fov != nullptr) {
         const float left = tanf(xr_fov->angleLeft);
         const float right = tanf(xr_fov->angleRight);
@@ -26861,12 +26917,12 @@ bool prepare_full_vr_frame_camera(
                 (180.0f / 3.14159265358979323846f);
             corrected[10] = horizontal_span / vertical_span;
         }
-        // [FIX:FULL-VR-ASYMMETRIC-FALLBACK V1198 1/2] A reused Full-VR
-        // frame must not fall back to the centered symmetric envelope while
-        // Asymmetric Projection is enabled. Publish the same scaled raw-FOV
-        // descriptor and pair slot used by the normal factory path so the
-        // transparent shader selectors retain exact eye authority.
-        if (native_asymmetric_noaa_route_active()) {
+        // [FIX:FULL-VR-ASYMMETRIC-FALLBACK V1198 1/2] Strict Stereo keeps the
+        // scaled raw-FOV descriptor and pair slot used by its normal factory
+        // path. V1251 deliberately exempts the AER reused-camera fallback:
+        // that route retains V1242's symmetric Cinema presentation.
+        if (native_asymmetric_noaa_route_active() &&
+            !symmetric_aer_full_vr_fallback) {
             if (g_game_render_width == 0 || g_game_render_width > 16384 ||
                 g_game_render_height == 0 || g_game_render_height > 16384) {
                 return false;
@@ -26909,6 +26965,7 @@ bool prepare_full_vr_frame_camera(
         }
     }
     if (native_asymmetric_noaa_route_active() &&
+        !symmetric_aer_full_vr_fallback &&
         !native_asymmetric_full_vr_projection_applied) {
         return false;
     }
@@ -27097,13 +27154,14 @@ bool prepare_full_vr_frame_camera(
         1, std::memory_order_relaxed) + 1;
     if (count <= 32 || count % 120 == 0) {
         log_cinema_camera_diagnostic(
-            "Full VR final frame camera applied count=%llu present=%llu eye=%d pair=%llu taau_reset=%d asymmetric=%d matrix_hash=0x%llX pos=%.5f,%.5f,%.5f fov=%.4f aspect=%.6f",
+            "Full VR final frame camera applied count=%llu present=%llu eye=%d pair=%llu taau_reset=%d asymmetric=%d symmetric_aer_fallback=%d matrix_hash=0x%llX pos=%.5f,%.5f,%.5f fov=%.4f aspect=%.6f",
             static_cast<unsigned long long>(count),
             static_cast<unsigned long long>(present),
             eye,
             static_cast<unsigned long long>(pair_id),
             new_fallback_episode ? 1 : 0,
             native_asymmetric_full_vr_projection_applied ? 1 : 0,
+            symmetric_aer_full_vr_fallback ? 1 : 0,
             static_cast<unsigned long long>(fnv1a64(
                 corrected_matrix.data(), sizeof(corrected_matrix))),
             corrected_camera[0], corrected_camera[1], corrected_camera[2],
@@ -38333,67 +38391,6 @@ bool promote_sequential_cinema_pair(
         return false;
     }
 
-    // [FIX:AER-CINEMA-ASYMMETRIC-PAIR-AUTHORITY V1248 1/2] The independent
-    // Cinema cache deliberately leaves strict Stereo's general packed-valid
-    // flag clear. V1245 therefore rendered raw off-axis Full-VR pixels but the
-    // presenter interpreted them as symmetric. Carry the native proof on this
-    // immutable pair itself, and never promote the half-pair observed at the
-    // bootstrap edge (factory_mask=0x2).
-    auto* native_pair = native_asymmetric_pair_slot(pair_id);
-    const bool native_asymmetric_scene =
-        native_asymmetric_noaa_route_active() &&
-        native_asymmetric_full_vr_scene_active();
-    // One coherent symmetric pair is allowed to establish the 1:1 transport
-    // preflight. Once transport is ready, or this candidate already owns a
-    // native slot, it must satisfy the complete off-axis proof below.
-    const bool native_asymmetric_required = native_asymmetric_scene &&
-        (g_native_asymmetric_transport_ready.load(
-             std::memory_order_acquire) ||
-            native_pair != nullptr);
-    const uint32_t native_generation = native_pair != nullptr
-        ? native_pair->generation.load(std::memory_order_acquire)
-        : UINT32_MAX;
-    const uint8_t native_factory_mask = native_pair != nullptr
-        ? native_pair->factory_mask.load(std::memory_order_acquire)
-        : 0;
-    const uint8_t native_temporal_mask = native_pair != nullptr
-        ? native_pair->temporal_mask.load(std::memory_order_acquire)
-        : 0;
-    const uint8_t native_dlss_input_mask = native_pair != nullptr
-        ? native_pair->dlss_input_mask.load(std::memory_order_acquire)
-        : 0;
-    const bool native_slot_matches = native_pair != nullptr &&
-        native_generation == generation &&
-        native_pair->pair_id.load(std::memory_order_acquire) == pair_id;
-    const bool native_dlss_input_required =
-        native_asymmetric_required &&
-        g_config.temporal_backend == TemporalBackend::Dlss;
-    if (!w3vr::native_asymmetric_transport_policy::cinema_pair_admissible({
-            native_asymmetric_required,
-            native_slot_matches,
-            native_factory_mask,
-            native_temporal_mask,
-            native_dlss_input_mask,
-            native_dlss_input_required})) {
-        const uint32_t log_index =
-            g_native_asymmetric_rejected_pair_logs.fetch_add(
-                1, std::memory_order_relaxed);
-        if (g_config.runtime_diagnostics && log_index < 32) {
-            log_line(
-                "V1248 AER cinema asymmetric pair held sample=%u "
-                "pair=%llu generation=%u/%u slot=%u "
-                "factory_mask=0x%X temporal_mask=0x%X "
-                "dlss_input_mask=0x%X",
-                log_index,
-                static_cast<unsigned long long>(pair_id),
-                native_generation, generation,
-                native_slot_matches ? 1u : 0u,
-                native_factory_mask, native_temporal_mask,
-                native_dlss_input_mask);
-        }
-        return false;
-    }
-
     if (g_sequential_cinema_present_cache_initialized) {
         D3D12_RESOURCE_BARRIER accepted_to_dest[2]{};
         for (uint32_t eye = 0; eye < 2; ++eye) {
@@ -38434,8 +38431,6 @@ bool promote_sequential_cinema_pair(
     const bool had_previous_pair = g_sequential_cinema_pair_valid;
     g_sequential_cinema_present_cache_initialized = true;
     g_sequential_cinema_pair_valid = true;
-    g_sequential_cinema_pair_native_asymmetric =
-        native_asymmetric_required;
     g_sequential_cinema_accepted_pair_id = pair_id;
     g_sequential_cinema_accepted_generation = generation;
 
@@ -38444,8 +38439,7 @@ bool promote_sequential_cinema_pair(
     if (diagnostic_index < 64) {
         log_taau_trace_line(
             "AER cinema pair promoted sample=%u present=%llu pair=%llu "
-            "generation=%u floor=%llu had_previous=%d views=%d,%d "
-            "native_asymmetric=%d",
+            "generation=%u floor=%llu had_previous=%d views=%d,%d",
             diagnostic_index,
             static_cast<unsigned long long>(
                 g_present_count.load(std::memory_order_relaxed)),
@@ -38454,8 +38448,7 @@ bool promote_sequential_cinema_pair(
                 g_sequential_cinema_entry_pair_floor),
             had_previous_pair ? 1 : 0,
             g_packed_present_cache_view_valid[0] ? 1 : 0,
-            g_packed_present_cache_view_valid[1] ? 1 : 0,
-            g_sequential_cinema_pair_native_asymmetric ? 1 : 0);
+            g_packed_present_cache_view_valid[1] ? 1 : 0);
     }
     return true;
 }
@@ -41898,7 +41891,9 @@ void render_openxr_test_frame(
                 // already-armed automatic Full-VR fallback as a second preflight
                 // owner. Manual/normal Cinema panels remain rejected, and the
                 // fallback must still write and publish each exact factory bit
-                // before an asymmetric pair can be accepted.
+                // before an asymmetric pair can be accepted. V1251 confines
+                // this native bootstrap to strict Stereo; AER repairs only
+                // the reused-camera frame itself with symmetric geometry.
                 const bool native_asymmetric_transport_preflight =
                     w3vr::native_asymmetric_transport_policy::preflight_ready({
                         native_asymmetric_transport_capable,
@@ -41907,23 +41902,19 @@ void render_openxr_test_frame(
                             std::memory_order_acquire),
                         g_config.cinema_full_vr,
                         g_force_mono_cinema.load(
-                            std::memory_order_relaxed)});
+                            std::memory_order_relaxed),
+                        mode3_aer_presentation_active()});
                 if (native_asymmetric_noaa_route_active()) {
                     g_native_asymmetric_transport_ready.store(
                         native_asymmetric_transport_preflight,
                         std::memory_order_release);
                 }
-                // [FIX:AER-CINEMA-ASYMMETRIC-PAIR-AUTHORITY V1248 2/2]
-                // The sequential Cinema cache is a complete-pair authority of
-                // its own. Couple presentation geometry to that exact pair
-                // without widening strict Stereo's packed-valid ownership.
                 const bool native_pair_fully_built =
                     w3vr::native_asymmetric_transport_policy::
-                        presentation_uses_native_asymmetric(
+                        cinema_presentation_uses_native_asymmetric({
                             g_packed_present_cache_valid &&
                                 g_packed_present_cache_native_asymmetric,
-                            sequential_cinema_pair_available(),
-                            g_sequential_cinema_pair_native_asymmetric);
+                            sequential_cinema_pair_available()});
                 native_asymmetric_projection =
                     native_pair_fully_built && !spatial_panel_active;
                 native_asymmetric_black_frame =

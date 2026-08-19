@@ -1,8 +1,53 @@
 #pragma once
 
-#include <cstdint>
-
 namespace w3vr::native_asymmetric_transport_policy {
+
+struct FullVrFrameFallbackInput {
+    bool native_asymmetric_route{};
+    bool aer_presentation{};
+    bool automatic_full_vr{};
+};
+
+// V1242 proves that ordinary AER Cinema pairs must keep the established
+// symmetric presentation. Only a reused-camera Full-VR frame lacks the normal
+// factory correction; keep that exact fallback symmetric as well instead of
+// manufacturing raw off-axis pixels that the AER Cinema presenter does not
+// own.
+constexpr bool frame_fallback_uses_symmetric_projection(
+    const FullVrFrameFallbackInput& input) noexcept {
+    return input.native_asymmetric_route &&
+        input.aer_presentation && input.automatic_full_vr;
+}
+
+struct StereoFrameFallbackAdmissionInput {
+    bool tagged_stereo_frame{};
+    bool symmetric_aer_full_vr_fallback{};
+    bool full_vr_factory_camera_recent{};
+};
+
+// The final-frame fallback owns only REDengine's reused-camera interval. A
+// recent Full-VR perspective factory has already applied the complete camera
+// for an ordinary cutscene, so rewriting that frame creates a second camera
+// scale and separates terrain/foliage layers.
+constexpr bool stereo_frame_fallback_admissible(
+    const StereoFrameFallbackAdmissionInput& input) noexcept {
+    return input.tagged_stereo_frame &&
+        !(input.symmetric_aer_full_vr_fallback &&
+            input.full_vr_factory_camera_recent);
+}
+
+struct CinemaPresentationInput {
+    bool packed_pair_native_asymmetric{};
+    bool sequential_aer_pair_available{};
+};
+
+// The strict packed cache owns native off-axis presentation. The independent
+// sequential AER Cinema cache is intentionally symmetric, even when a complete
+// pair is available; promoting it was the V1248 regression.
+constexpr bool cinema_presentation_uses_native_asymmetric(
+    const CinemaPresentationInput& input) noexcept {
+    return input.packed_pair_native_asymmetric;
+}
 
 struct PreflightInput {
     bool transport_capable{};
@@ -10,48 +55,18 @@ struct PreflightInput {
     bool automatic_full_vr_camera_active{};
     bool cinema_full_vr_enabled{};
     bool force_mono_cinema{};
+    bool aer_presentation{};
 };
 
 constexpr bool preflight_ready(const PreflightInput& input) noexcept {
     const bool automatic_full_vr =
+        !input.aer_presentation &&
         input.cinema_mode &&
         input.automatic_full_vr_camera_active &&
         input.cinema_full_vr_enabled &&
         !input.force_mono_cinema;
     return input.transport_capable &&
         (!input.cinema_mode || automatic_full_vr);
-}
-
-struct CinemaPairInput {
-    bool native_asymmetric_required{};
-    bool slot_matches_pair_and_generation{};
-    uint8_t factory_mask{};
-    uint8_t temporal_mask{};
-    uint8_t dlss_input_mask{};
-    bool dlss_input_required{};
-};
-
-// Normal/manual Cinema remains symmetric and does not require the native
-// asymmetric ledger. Automatic Full VR may publish off-axis pixels only after
-// both eyes have completed every producer proof required by the backend.
-constexpr bool cinema_pair_admissible(
-    const CinemaPairInput& input) noexcept {
-    if (!input.native_asymmetric_required) {
-        return true;
-    }
-    return input.slot_matches_pair_and_generation &&
-        input.factory_mask == 0x3u &&
-        input.temporal_mask == 0x3u &&
-        (!input.dlss_input_required || input.dlss_input_mask == 0x3u);
-}
-
-constexpr bool presentation_uses_native_asymmetric(
-    bool packed_pair_native_asymmetric,
-    bool sequential_cinema_pair_available,
-    bool sequential_cinema_pair_native_asymmetric) noexcept {
-    return packed_pair_native_asymmetric ||
-        (sequential_cinema_pair_available &&
-            sequential_cinema_pair_native_asymmetric);
 }
 
 }  // namespace w3vr::native_asymmetric_transport_policy
