@@ -13,6 +13,7 @@ int main() {
     using w3vr::mode3_transport::immutable_pair_view_ready;
     using w3vr::mode3_transport::late_hud_composite_source_ready;
     using w3vr::mode3_transport::native_hud_source_bootstrap_active;
+    using w3vr::mode3_transport::real_smoke_variant_bootstrap_allowed;
     using w3vr::mode3_transport::submission_queue_eligible;
 
     // Projection is not an input: both symmetric and asymmetric exercise this
@@ -69,6 +70,16 @@ int main() {
     assert(native_hud_source_bootstrap_active(false, true, false));
     assert(native_hud_source_bootstrap_active(false, false, true));
     assert(!native_hud_source_bootstrap_active(false, false, false));
+
+    // Runtime FOV is required only for the two optical-centre variants. The
+    // independent world-up fallback must never depend on first-camera timing.
+    assert(!real_smoke_variant_bootstrap_allowed(0, false));
+    assert(!real_smoke_variant_bootstrap_allowed(1, false));
+    assert(real_smoke_variant_bootstrap_allowed(2, false));
+    assert(real_smoke_variant_bootstrap_allowed(0, true));
+    assert(real_smoke_variant_bootstrap_allowed(1, true));
+    assert(real_smoke_variant_bootstrap_allowed(2, true));
+    assert(!real_smoke_variant_bootstrap_allowed(3, true));
 
     // AER Cinema keeps its completed pixels in the packed resources without
     // publishing the unrelated strict-Stereo packed-valid bit. Its completed

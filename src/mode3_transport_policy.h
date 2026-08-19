@@ -85,6 +85,16 @@ constexpr bool native_hud_source_bootstrap_active(
     return aer_post_hud_active || cinema_active || strict_stereo_active;
 }
 
+// Eye-specific smoke variants need the immutable runtime FOV. The zero-centre
+// world-up variant does not: it must always exist as the stable fail-open so a
+// startup ordering difference can never restore REDengine's HMD-facing smoke.
+constexpr bool real_smoke_variant_bootstrap_allowed(
+    uint32_t variant_index,
+    bool runtime_views_ready) noexcept {
+    return variant_index == 2 ||
+        (variant_index < 2 && runtime_views_ready);
+}
+
 // Pixels retained in a completed Cinema pair must keep the XrView frozen with
 // that same pair. The sequential AER route deliberately does not set the
 // general packed-pair validity bit, so its independent completion authority

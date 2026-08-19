@@ -25,7 +25,10 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1238 lets strict Stereo discover the native HUD source before its retained
+// V1239 bootstraps the real-smoke world-up PSOs from already-acquired OpenXR
+// views instead of racing the first REDengine HMD camera; its zero-centre
+// fail-open is created even when runtime views are not ready. V1238 lets strict
+// Stereo discover the native HUD source before its retained
 // pair exists, matching AER/Cinema's fail-open bootstrap and breaking the
 // source-ready/scene-only readiness cycle. V1236 adds an INI-controlled
 // ten-second CPU/GPU pipeline flight recorder.
@@ -16888,57 +16891,74 @@ HRESULT STDMETHODCALLTYPE hook_create_graphics_pipeline_state(
         g_real_smoke_pipeline.store(pso, std::memory_order_release);
         if (desc->GS.pShaderBytecode == nullptr &&
             desc->GS.BytecodeLength == 0 &&
-            g_hmd_render_fov_valid.load(std::memory_order_acquire) &&
-            g_real_smoke_center_pipelines[0].load(
-                std::memory_order_acquire) == nullptr &&
-            g_real_smoke_center_pipelines[1].load(
-                std::memory_order_acquire) == nullptr &&
-            g_real_smoke_center_pipelines[2].load(
-                std::memory_order_acquire) == nullptr) {
+            real_smoke_world_up_route_active()) {
+            // [FIX:DETERMINISTIC-SMOKE-PSO-BOOTSTRAP V1239 1/1] OpenXR's
+            // located views are published well before the first gameplay
+            // camera, and they are the actual source used for the two optical
+            // centres below. Depending on g_hmd_render_fov_valid made variant
+            // creation a one-shot race against REDengine's smoke PSO. The
+            // zero-centre world-up PSO is independent of FOV and is therefore
+            // always created as the immutable V1157 fail-open.
+            constexpr XrViewStateFlags kRequiredRuntimeViewFlags =
+                XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+                XR_VIEW_STATE_POSITION_VALID_BIT;
+            const XrViewStateFlags runtime_view_flags =
+                g_xr_render_view_state_flags.load(std::memory_order_acquire);
+            const bool runtime_views_ready =
+                (runtime_view_flags & kRequiredRuntimeViewFlags) ==
+                    kRequiredRuntimeViewFlags;
             std::array<w3vr::openxr_eye_geometry::
                 AsymmetricProjectionDescriptor, 3> projections{};
             std::array<std::vector<uint8_t>, 3> geometry_shaders{};
             std::array<ID3D12PipelineState*, 3> variants{};
-            bool complete = true;
             for (uint32_t variant_index = 0;
-                 variant_index < variants.size() && complete;
+                 variant_index < variants.size();
                  ++variant_index) {
+                if (g_real_smoke_center_pipelines[variant_index].load(
+                        std::memory_order_acquire) != nullptr ||
+                    !w3vr::mode3_transport::
+                        real_smoke_variant_bootstrap_allowed(
+                            variant_index, runtime_views_ready)) {
+                    continue;
+                }
+                bool variant_ready = true;
                 if (variant_index < 2) {
-                    complete = w3vr::openxr_eye_geometry::
+                    variant_ready = w3vr::openxr_eye_geometry::
                         derive_asymmetric_projection_descriptor(
                             g_xr_views[variant_index].fov, 1, 1,
                             projections[variant_index]);
                 }
-                complete = complete &&
+                variant_ready = variant_ready &&
                     compile_real_smoke_center_geometry_shader(
                         projections[variant_index].center_ndc_x,
                         projections[variant_index].center_ndc_y,
                         geometry_shaders[variant_index]);
-                if (!complete) break;
+                if (!variant_ready) {
+                    continue;
+                }
                 auto variant_desc = *desc;
                 variant_desc.GS = D3D12_SHADER_BYTECODE{
                     geometry_shaders[variant_index].data(),
                     geometry_shaders[variant_index].size()};
-                complete = SUCCEEDED(g_create_graphics_pipeline_state(
-                    device, &variant_desc,
-                    IID_PPV_ARGS(&variants[variant_index]))) &&
-                    variants[variant_index] != nullptr;
+                if (FAILED(g_create_graphics_pipeline_state(
+                        device, &variant_desc,
+                        IID_PPV_ARGS(&variants[variant_index])))) {
+                    variants[variant_index] = nullptr;
+                }
             }
-            if (complete) {
+            {
                 std::scoped_lock lock{g_reverse_mutex};
-                if (g_real_smoke_center_pipelines[0].load(
-                    std::memory_order_relaxed) == nullptr &&
-                    g_real_smoke_center_pipelines[1].load(
-                        std::memory_order_relaxed) == nullptr &&
-                    g_real_smoke_center_pipelines[2].load(
-                        std::memory_order_relaxed) == nullptr) {
-                    g_real_smoke_center_pipelines[0].store(
-                        variants[0], std::memory_order_release);
-                    g_real_smoke_center_pipelines[1].store(
-                        variants[1], std::memory_order_release);
-                    g_real_smoke_center_pipelines[2].store(
-                        variants[2], std::memory_order_release);
-                    variants = {};
+                for (uint32_t variant_index = 0;
+                     variant_index < variants.size();
+                     ++variant_index) {
+                    if (variants[variant_index] != nullptr &&
+                        g_real_smoke_center_pipelines[variant_index].load(
+                            std::memory_order_relaxed) == nullptr) {
+                        g_real_smoke_center_pipelines[variant_index].store(
+                            variants[variant_index],
+                            std::memory_order_release);
+                        variants[variant_index] = nullptr;
+                    }
                 }
             }
             for (auto* variant : variants) {
