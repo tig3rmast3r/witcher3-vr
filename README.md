@@ -38,7 +38,7 @@ as a runtime dependency.
 | Resizable HUD and menus | Working |
 | Adjustable in-headset render window | Working |
 | Near-camera view | Working |
-| Experimental first-person exploration view | Available through `F11`, with adaptive on-foot and horse placement plus stationary view-following body rotation |
+| Experimental first-person exploration view | Available through `F11`, with adaptive on-foot and horse placement, stationary view-following body rotation, and persistent local head/hair/accessory hiding |
 | First-person snap turn and headset-based movement | Optional 30/45/60-degree gamepad snap turn with continuous HMD-directed movement |
 | First-person strafe/backpedal movement | Optional and enabled by default |
 | First-person head-bobbing reduction | Optional anchor smoothing, enabled by default |

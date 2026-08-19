@@ -25,7 +25,9 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1239 bootstraps the real-smoke world-up PSOs from already-acquired OpenXR
+// V1240 keeps V1239's renderer and adds a REDscript-owned persistent
+// first-person head/attachment visibility mask. V1239 bootstraps the real-smoke
+// world-up PSOs from already-acquired OpenXR
 // views instead of racing the first REDengine HMD camera; its zero-centre
 // fail-open is created even when runtime views are not ready. V1238 lets strict
 // Stereo discover the native HUD source before its retained
@@ -31316,7 +31318,9 @@ void __fastcall hook_engine_get_head_bone_index(
             // and the always-on stationary body turn. A fourth read carries
             // the independent
             // Geralt-only visibility heartbeat, including during combat and
-            // evades where the deliberately narrow strafe gate is false. A
+            // evades where the deliberately narrow strafe gate is false. It
+            // owns persistent head hiding plus the narrower whole-player evade
+            // clip in REDscript. A
             // fifth read is reserved for the V9526 headset-look-at request.
             // Canonical/older DLLs return the ordinary positive index. The
             // head-pose matrix hook continues to accept arm_count >= 2.
@@ -31383,8 +31387,10 @@ void __fastcall hook_engine_get_head_bone_index(
                     }
                 } else if (g_native_head_pose_arm_count == 4) {
                     // This heartbeat grants only permission to the companion
-                    // script. That script further restricts visibility to
-                    // Geralt's roll/dodge frames and restores fail-visible.
+                    // script. That script keeps Geralt's head attachments
+                    // hidden throughout first person, further restricts the
+                    // whole-player clip to roll/dodge, and restores both
+                    // owners fail-visible.
                     if (provider_gameplay_owner &&
                         !g_engine_loading_screen_video_active.load(
                             std::memory_order_acquire)) {
