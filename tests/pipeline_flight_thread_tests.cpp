@@ -93,7 +93,7 @@ int main() {
 
     bool ok = true;
     ok &= contains(log, "WITCHER3VR_PIPELINE_FLIGHT_V3");
-    ok &= contains(log, "build=V1256 base=V1255");
+    ok &= contains(log, "build=V1258 base=V1257");
     ok &= contains(log, "file_policy=timestamped_create_new_no_overwrite");
     ok &= contains(log, "flags: bit0=asymmetric bit1=rtx bit2=afw "
         "bit3=afw_visual_debug");

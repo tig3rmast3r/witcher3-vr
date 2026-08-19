@@ -28,7 +28,7 @@ function W3VRHudEditor_DebugChannel(): name
 
 function W3VRHudEditor_Version(): string
 {
-  return "V1256";
+  return "V1258";
 }
 
 function W3VRHudEditor_DebugEnabled(): bool

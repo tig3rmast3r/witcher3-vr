@@ -26,7 +26,14 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1256 extends the validated per-eye previous-camera record to strict Stereo
+// V1258 makes V1257's same-Present AER TAAU Cinema identity select the actual
+// per-eye HUD PSO, rather than merely labeling the completed pixels afterward.
+// It also resets private TAAU temporal continuity on the first strictly newer
+// post-loading resolve, so a delayed pre-loading command list cannot strand AFW
+// on the previous scene's final texture. V1257 completes the AER TAAU Cinema
+// HUD/scene identity join when the scene task finishes before the deferred HUD
+// draw in the same Present interval. V1256 extends
+// the validated per-eye previous-camera record to strict Stereo
 // SYM, completing DLSS history coverage for every Mode 3 reused-camera
 // fallback. Geometry and presentation are unchanged. V1255 applies V1252's
 // centered reused-camera fallback and recent-factory gate
@@ -4214,6 +4221,9 @@ std::atomic<uint64_t> g_taau_history_invalidations{};
 std::atomic<bool> g_automatic_full_vr_camera_active{};
 std::atomic<uintptr_t> g_automatic_full_vr_native_camera{};
 std::atomic<uint8_t> g_stereo_taau_history_reset_mask{};
+// Loading can leave a delayed pre-boundary TAAU command list in flight. Keep a
+// separate reset request pending until each eye sees a strictly newer pair.
+std::atomic<uint8_t> g_loading_taau_history_reset_mask{};
 
 // [FIX:FULL-VR-TRANSPARENT-SINGLE-OWNER V1199 1/2] Full-VR cutscenes now use
 // the raw asymmetric factory/frame projection from V1197/V1198. Their scene
@@ -9395,6 +9405,21 @@ bool resolve_aer_cinema_command_list_tag(
     return false;
 }
 
+bool latest_aer_cinema_completed_frame_for_present(
+    uint64_t producer_present,
+    EngineFrameTag& tag) {
+    std::scoped_lock lock{g_aer_cinema_exact_eye_mutex};
+    for (auto it = g_aer_cinema_completed_frames.rbegin();
+         it != g_aer_cinema_completed_frames.rend(); ++it) {
+        if (it->producer_present == producer_present &&
+            valid_aer_cinema_exact_tag(it->tag)) {
+            tag = it->tag;
+            return true;
+        }
+    }
+    return false;
+}
+
 void record_aer_cinema_hud_draw_proof(
     ID3D12GraphicsCommandList* command_list) {
     if (!mode3_aer_cinema_exact_eye_contract_active()) {
@@ -9405,11 +9430,16 @@ void record_aer_cinema_hud_draw_proof(
         resolve_aer_cinema_command_list_tag(command_list, tag);
     const uint64_t producer_present =
         g_present_count.load(std::memory_order_relaxed);
+    const bool same_present_completed_tag =
+        !exact_tag && temporal_backend_is_taau() &&
+        latest_aer_cinema_completed_frame_for_present(
+            producer_present, tag);
     std::scoped_lock lock{g_aer_cinema_exact_eye_mutex};
     auto& proof = g_aer_cinema_hud_proofs[producer_present];
     proof.draw_seen = true;
     const bool resolved_exact_tag =
-        exact_tag && valid_aer_cinema_exact_tag(tag);
+        (exact_tag || same_present_completed_tag) &&
+        valid_aer_cinema_exact_tag(tag);
     if (resolved_exact_tag) {
         // The final HUD draw in this producer interval owns the final
         // backbuffer. Deferred auxiliary draws may precede it, so retain the
@@ -18195,6 +18225,28 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                     hud_eye_authority = "exact_tag_missing";
                 }
             }
+            // [FIX:AER-TAAU-FULL-VR-HUD-PSO V1258 1/1] In automatic Full VR,
+            // the deferred TAAU HUD bind can occur after task TLS has unwound
+            // and its command list has no Streamline tag. V1257 recovered the
+            // exact scene identity only after this bind, so publication opened
+            // around pixels rendered with a stale or original HUD PSO. Select
+            // the actual per-eye PSO from the newest completed task in this
+            // exact producer-Present interval. Missing authority remains
+            // fail-open and is never inferred from parity or another Present.
+            if (automatic_full_vr_hud &&
+                mode3_aer_presentation_active() &&
+                temporal_backend_is_taau()) {
+                EngineFrameTag completed_cinema_hud_tag{};
+                if (latest_aer_cinema_completed_frame_for_present(
+                        g_present_count.load(std::memory_order_relaxed),
+                        completed_cinema_hud_tag)) {
+                    hud_eye = static_cast<int>(
+                        completed_cinema_hud_tag.eye);
+                    hud_pair_id = completed_cinema_hud_tag.pair_id;
+                    hud_eye_authority =
+                        "taau_same_present_completed";
+                }
+            }
             record_mode3_aer_afw_final_hud_tag(command_list, hud_eye);
             if (hud_eye == 0) {
                 if (automatic_stereo_cinema_hud) {
@@ -19398,6 +19450,27 @@ void reset_loading_video_presentation_state(uint64_t present) {
         static_cast<unsigned long long>(present), generation,
         static_cast<unsigned long long>(pair_floor),
         g_engine_dual_render_active.load(std::memory_order_acquire) ? 1 : 0);
+}
+
+void arm_post_loading_taau_history_reset(uint64_t present) {
+    if (!taau_stereo_route_active()) {
+        return;
+    }
+
+    // [FIX:POST-LOADING-TAAU-HISTORY V1258 1/3] Revoke submission identities
+    // from the preceding scene immediately, but retain the private textures.
+    // The per-eye reset bit is consumed only by a strictly newer incoming pair,
+    // so a delayed pre-loading command list cannot seed the new epoch.
+    g_loading_taau_history_reset_mask.store(0x3, std::memory_order_release);
+    g_taau_last_submitted_pair[0].store(0, std::memory_order_release);
+    g_taau_last_submitted_pair[1].store(0, std::memory_order_release);
+    {
+        std::scoped_lock lock{g_taau_recorded_resolve_mutex};
+        g_taau_recorded_resolves.clear();
+    }
+    log_line(
+        "V1258 post-loading TAAU history reset armed present=%llu mask=0x3",
+        static_cast<unsigned long long>(present));
 }
 
 bool ensure_mode3_early_hud_resources_locked(
@@ -21782,6 +21855,66 @@ bool dispatch_taau_inplace_marker(
                 1, std::memory_order_relaxed);
             log_taau_trace_line(
                 "TAAU Full VR history reset applied present=%llu eye=%d previous_pair=%llu incoming_pair=%llu",
+                static_cast<unsigned long long>(
+                    g_present_count.load(std::memory_order_relaxed)),
+                expected_eye,
+                static_cast<unsigned long long>(invalidated_pair),
+                static_cast<unsigned long long>(expected_pair_id));
+        }
+
+        // [FIX:POST-LOADING-TAAU-HISTORY V1258 2/3] A native list recorded
+        // before loading can execute after the video exits. Do not let that
+        // older pair consume the boundary reset. Leave the eye bit armed until
+        // the first uninitialized or strictly forward resolve arrives, then
+        // invalidate only temporal metadata and reuse the allocated texture.
+        uint8_t pending_loading_reset =
+            g_loading_taau_history_reset_mask.load(
+                std::memory_order_acquire);
+        bool claimed_loading_reset{};
+        while ((pending_loading_reset & eye_mask) != 0) {
+            bool incoming_pair_is_forward{};
+            {
+                std::scoped_lock lock{g_taau_eye_history_mutex};
+                const auto& history = g_taau_eye_histories[
+                    static_cast<size_t>(expected_eye)];
+                incoming_pair_is_forward = !history.initialized ||
+                    history.last_pair_id == 0 ||
+                    expected_pair_id > history.last_pair_id;
+            }
+            if (!incoming_pair_is_forward) {
+                break;
+            }
+            const uint8_t remaining = static_cast<uint8_t>(
+                pending_loading_reset &
+                static_cast<uint8_t>(~eye_mask));
+            if (g_loading_taau_history_reset_mask.compare_exchange_weak(
+                    pending_loading_reset, remaining,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                claimed_loading_reset = true;
+                break;
+            }
+        }
+        if (claimed_loading_reset) {
+            uint64_t invalidated_pair{};
+            {
+                std::scoped_lock lock{g_taau_eye_history_mutex};
+                auto& history = g_taau_eye_histories[
+                    static_cast<size_t>(expected_eye)];
+                invalidated_pair = history.last_pair_id;
+                history.initialized = false;
+                history.last_pair_id = 0;
+                history.last_present = 0;
+                history.last_command_list = nullptr;
+                history.last_native_output = nullptr;
+                history.last_native_history = nullptr;
+                history.last_cb10_gpu_va = 0;
+                history.last_cb10_hash = 0;
+            }
+            g_taau_history_invalidations.fetch_add(
+                1, std::memory_order_relaxed);
+            log_taau_trace_line(
+                "V1258 post-loading TAAU history reset applied present=%llu eye=%d previous_pair=%llu incoming_pair=%llu",
                 static_cast<unsigned long long>(
                     g_present_count.load(std::memory_order_relaxed)),
                 expected_eye,
@@ -32081,9 +32214,12 @@ void __fastcall hook_engine_is_loading_screen_video_playing(
     const bool previous = g_engine_loading_screen_video_active.exchange(
         active, std::memory_order_acq_rel);
     if (active && !previous) {
+        g_loading_taau_history_reset_mask.store(
+            0, std::memory_order_release);
         g_post_loading_auto_recenter_deadline_ms.store(
             0, std::memory_order_release);
     } else if (!active && previous) {
+        arm_post_loading_taau_history_reset(present);
         g_post_loading_auto_recenter_deadline_ms.store(
             GetTickCount64() + kPostLoadingAutoRecenterDelayMs,
             std::memory_order_release);
@@ -32168,9 +32304,13 @@ bool poll_engine_loading_screen_video_state() {
     const bool previous = g_engine_loading_screen_video_active.exchange(
         active, std::memory_order_acq_rel);
     if (active && !previous) {
+        g_loading_taau_history_reset_mask.store(
+            0, std::memory_order_release);
         g_post_loading_auto_recenter_deadline_ms.store(
             0, std::memory_order_release);
     } else if (!active && previous) {
+        arm_post_loading_taau_history_reset(
+            g_present_count.load(std::memory_order_relaxed));
         g_post_loading_auto_recenter_deadline_ms.store(
             GetTickCount64() + kPostLoadingAutoRecenterDelayMs,
             std::memory_order_release);
@@ -33235,6 +33375,7 @@ void apply_engine_dual_render_transition(bool enabled, const char* source) {
     g_automatic_full_vr_camera_active.store(false, std::memory_order_release);
     g_automatic_full_vr_native_camera.store(0, std::memory_order_release);
     g_stereo_taau_history_reset_mask.store(0, std::memory_order_release);
+    g_loading_taau_history_reset_mask.store(0, std::memory_order_release);
     g_full_vr_frame_camera_last_pair[0].store(0, std::memory_order_release);
     g_full_vr_frame_camera_last_pair[1].store(0, std::memory_order_release);
     g_full_vr_factory_camera_last_present.store(
