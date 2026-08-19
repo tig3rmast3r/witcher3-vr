@@ -23,6 +23,7 @@ int main() {
     using w3vr::mode3_transport::real_smoke_variant_bootstrap_allowed;
     using w3vr::mode3_transport::submission_queue_eligible;
     using w3vr::mode3_transport::streamline_dlss_evaluate_callback_active;
+    using w3vr::mode3_transport::submitted_hud_join_route_active;
     using w3vr::mode3_transport::submitted_hud_join_window_matches;
 
     // The public owner is intentionally narrow. Only Mode-3 OpenXR DLSS can
@@ -148,6 +149,23 @@ int main() {
     assert(submitted_hud_join_window_matches(7, 7, 102, 100));
     assert(!submitted_hud_join_window_matches(7, 7, 97, 100));
     assert(!submitted_hud_join_window_matches(7, 8, 100, 100));
+
+    // AER retains its AFW-scoped contract. Strict Stereo uses the same
+    // submitted-order safety net for both temporal backends, but not No AA.
+    assert(submitted_hud_join_route_active(
+        true, true, true, TemporalAdapter::Dlss));
+    assert(submitted_hud_join_route_active(
+        true, true, true, TemporalAdapter::Taau));
+    assert(!submitted_hud_join_route_active(
+        true, true, false, TemporalAdapter::Dlss));
+    assert(submitted_hud_join_route_active(
+        true, false, false, TemporalAdapter::Dlss));
+    assert(submitted_hud_join_route_active(
+        true, false, false, TemporalAdapter::Taau));
+    assert(!submitted_hud_join_route_active(
+        true, false, false, TemporalAdapter::None));
+    assert(!submitted_hud_join_route_active(
+        false, false, false, TemporalAdapter::Dlss));
 
     // Runtime FOV is required only for the two optical-centre variants. The
     // independent world-up fallback must never depend on first-camera timing.

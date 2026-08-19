@@ -29,6 +29,11 @@
 #include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
+// V1293 extends the queue-submitted retained-HUD safety net from AER+AFW to
+// strict Stereo DLSS/TAAU. Stereo keeps its pointer-exact fast path; only a
+// miss joins the immutable HUD tag, t1 capture and PRESENT boundary by exact
+// queue order, generation and the existing two-Present window. AER retains
+// V1291's inherited forced diagnostic route unchanged; V1292 was skipped.
 // V1291 makes AER+TAAU Presentation Size a final OpenXR FOV-only control. Its
 // swapchain and submitted source extent remain at the selected 100% resolution
 // for every slider value, including scale 1, which bypasses the legacy 80%
@@ -690,6 +695,25 @@ bool retained_hud_projection_route_configured() {
     return (mode3_stereo_transport_active() &&
             !mode3_aer_final_present_source_active()) ||
         puredark_afw_mode3_aer_common_transport_configured();
+}
+
+bool mode3_submitted_hud_join_route_configured() {
+    const auto backend = temporal_backend_is_dlss()
+        ? w3vr::mode3_transport::TemporalAdapter::Dlss
+        : (temporal_backend_is_taau()
+            ? w3vr::mode3_transport::TemporalAdapter::Taau
+            : w3vr::mode3_transport::TemporalAdapter::None);
+    return w3vr::mode3_transport::submitted_hud_join_route_active(
+        mode3_stereo_transport_active(),
+        mode3_aer_presentation_active(),
+        puredark_afw_mode3_aer_common_transport_configured(),
+        backend);
+}
+
+bool mode3_strict_stereo_submitted_hud_join_active() {
+    return mode3_submitted_hud_join_route_configured() &&
+        !mode3_aer_presentation_active() &&
+        retained_hud_projection_route_active();
 }
 
 bool mode3_taau_afw_final_source_active() {
@@ -3942,7 +3966,7 @@ struct Mode3EarlyHudPending {
     uint32_t generation{};
     uint64_t capture_serial{};
     uint64_t recorded_present{};
-    bool aer_afw_submitted_join{};
+    bool submitted_join{};
 };
 // [FIX:AER-AFW-PREEXECUTE-HUD-SNAPSHOT V1282 1/6] Command lists may be reset
 // by another renderer worker as soon as the real ExecuteCommandLists returns.
@@ -10197,8 +10221,13 @@ constexpr bool kForceMode3AerAfwSubmittedHudJoinBuild = true;
 
 void record_mode3_aer_afw_final_hud_tag(
     ID3D12GraphicsCommandList* command_list,
-    int hud_eye) {
-    if (!mode3_aer_afw_post_hud_gameplay_active() ||
+    int hud_eye,
+    uint64_t hud_pair_id = 0) {
+    const bool aer_afw_route =
+        mode3_aer_afw_post_hud_gameplay_active();
+    const bool strict_stereo_route =
+        mode3_strict_stereo_submitted_hud_join_active();
+    if ((!aer_afw_route && !strict_stereo_route) ||
         command_list == nullptr) {
         return;
     }
@@ -10206,15 +10235,39 @@ void record_mode3_aer_afw_final_hud_tag(
     const uint32_t generation =
         g_streamline_capture_generation.load(std::memory_order_acquire);
     EngineFrameTag tag{};
-    bool exact_tag = lookup_dlss_recording_producer(
-        command_list, tag) ||
+    bool exact_tag = (strict_stereo_route &&
+            current_exact_engine_render_tag(tag)) ||
+        lookup_dlss_recording_producer(command_list, tag) ||
         lookup_streamline_command_list_route(command_list, tag);
     exact_tag = exact_tag && tag.eye <= 1 && tag.pair_id != 0 &&
         tag.pair_id != UINT64_MAX && tag.generation == generation &&
         (hud_eye < 0 || hud_eye > 1 ||
             tag.eye == static_cast<uint32_t>(hud_eye));
 
+    // [FIX:MODE3-SUBMITTED-HUD-STEREO V1293 1/6] TAAU has no Streamline
+    // command tag. Its strict-Stereo HUD selector already obtained an exact
+    // pair from the completed-task queue; recover that same immutable tag by
+    // pair and eye. Never substitute a newer queue entry or Present parity.
+    if (!exact_tag && strict_stereo_route && hud_pair_id != 0 &&
+        hud_pair_id != UINT64_MAX && hud_eye >= 0 && hud_eye <= 1) {
+        std::scoped_lock lock{g_engine_completed_tag_queue_mutex};
+        for (const auto& completed : g_engine_completed_tag_queue) {
+            if (completed.eye != static_cast<uint32_t>(hud_eye) ||
+                completed.pair_id != hud_pair_id ||
+                completed.generation != generation) {
+                continue;
+            }
+            tag = completed;
+            tag.task_provenance_valid = true;
+            exact_tag = true;
+            break;
+        }
+    }
+
     if (!exact_tag) {
+        if (!aer_afw_route) {
+            return;
+        }
         const uint64_t next_ordinal =
             g_mode3_afw_natural_render_ordinal.load(
                 std::memory_order_acquire);
@@ -19004,7 +19057,8 @@ void STDMETHODCALLTYPE hook_set_pipeline_state(
                         "taau_same_present_completed";
                 }
             }
-            record_mode3_aer_afw_final_hud_tag(command_list, hud_eye);
+            record_mode3_aer_afw_final_hud_tag(
+                command_list, hud_eye, hud_pair_id);
             if (hud_eye == 0) {
                 if (automatic_stereo_cinema_hud) {
                     bound_pipeline_state =
@@ -20426,7 +20480,8 @@ bool capture_mode3_early_hud(
     g_mode3_early_hud_pending_by_command_list[command_list] = {
         slot_index, generation, slot.capture_serial,
         g_present_count.load(std::memory_order_relaxed),
-        mode3_aer_afw_post_hud_gameplay_active()};
+        mode3_aer_afw_post_hud_gameplay_active() ||
+            mode3_strict_stereo_submitted_hud_join_active()};
     // [DIAG:MODE3-HUD-CONTENT-ORDER 1/2] A resource can receive the correct
     // eye/pair label at PRESENT while still containing pixels frozen before
     // that pair's marker projection ran. Record the immutable copy point and
@@ -24297,8 +24352,25 @@ void STDMETHODCALLTYPE hook_resource_barrier(
                 }
                 if (mode3_stereo_transport_active() &&
                     packed_route_valid) {
-                    label_mode3_early_hud_at_present(
+                    const bool hud_labeled =
+                        label_mode3_early_hud_at_present(
                         command_list, packed_engine_route_tag);
+                    if (mode3_strict_stereo_submitted_hud_join_active()) {
+                        if (hud_labeled) {
+                            consume_mode3_aer_afw_final_hud_tag(
+                                command_list);
+                        } else {
+                            // [FIX:MODE3-SUBMITTED-HUD-STEREO V1293 2/6]
+                            // The packed tag is exact, but its PRESENT list may
+                            // differ from the HUD writer and t1 copy lists.
+                            // Queue only the boundary here; submitted queue
+                            // order joins it to the exact writer tag above.
+                            queue_mode3_aer_afw_hud_present_boundary(
+                                command_list,
+                                g_present_count.load(
+                                    std::memory_order_relaxed));
+                        }
+                    }
                 }
             }
             if (packed_route_valid) {
@@ -25606,7 +25678,7 @@ take_mode3_aer_afw_hud_submissions_before_execute(
     UINT num_command_lists,
     ID3D12CommandList* const* command_lists) {
     std::vector<Mode3AerAfwHudExecuteSubmission> pending{};
-    if (!puredark_afw_mode3_aer_common_transport_configured() ||
+    if (!mode3_submitted_hud_join_route_configured() ||
         command_lists == nullptr) {
         return pending;
     }
@@ -25643,7 +25715,7 @@ take_mode3_aer_afw_hud_submissions_before_execute(
                 g_mode3_early_hud_pending_by_command_list.find(command_list);
             if (capture_found !=
                     g_mode3_early_hud_pending_by_command_list.end() &&
-                capture_found->second.aer_afw_submitted_join) {
+                capture_found->second.submitted_join) {
                 submission.recorded_capture = capture_found->second;
                 g_mode3_early_hud_pending_by_command_list.erase(
                     capture_found);
@@ -25678,7 +25750,7 @@ take_mode3_aer_afw_hud_submissions_before_execute(
             static std::atomic<uint32_t> preexecute_snapshot_logs{};
             if (take_bounded_log_slot(preexecute_snapshot_logs, 96)) {
                 log_line(
-                    "V1282 AER AFW HUD pre-execute snapshot tag=%d "
+                    "V1293 Mode-3 HUD pre-execute snapshot tag=%d "
                     "capture=%d present=%d eye=%u pair=%llu generation=%u "
                     "tag_present=%llu capture_present=%llu "
                     "boundary_present=%llu submission_serial=%llu "
@@ -25713,7 +25785,7 @@ take_mode3_aer_afw_hud_submissions_before_execute(
 void publish_mode3_aer_afw_hud_submissions_before_execute(
     ID3D12CommandQueue* queue,
     const std::vector<Mode3AerAfwHudExecuteSubmission>& pending) {
-    if (!puredark_afw_mode3_aer_common_transport_configured() ||
+    if (!mode3_submitted_hud_join_route_configured() ||
         queue == nullptr || pending.empty()) {
         return;
     }
@@ -25871,7 +25943,7 @@ void publish_mode3_aer_afw_hud_submissions_before_execute(
             if (take_bounded_log_slot(submitted_hud_join_logs, 64)) {
                 // [PERF:AER-AFW-HUD-PREEXECUTE-PUBLISH V1285 3/4]
                 log_line(
-                    "V1285 forced pre-Execute AER AFW submitted HUD join "
+                    "V1293 pre-Execute Mode-3 submitted HUD join "
                     "tag=%d capture=%d "
                     "labeled=%d eye=%u pair=%llu generation=%u "
                     "tag_command_list=%p capture_command_list=%p "
@@ -37722,7 +37794,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1291 base=V1290 "
+                "witcher3vr dxgi proxy initialized build=V1293 base=V1291 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d dlss_public_streamline=%d "
@@ -37764,6 +37836,8 @@ void ensure_initialized() {
                 "V1290 strict Stereo final DLSS proof=successful_exact_public_evaluate_per_eye intermediate_dlss=unchanged aer=unchanged");
             log_line(
                 "V1291 AER TAAU presentation=source_resolution_fixed_100_percent slider=fov_only scale1_legacy_cover_crop=bypassed dlss_stereo_unchanged=1");
+            log_line(
+                "V1293 retained HUD submitted fallback=aer_afw_plus_strict_stereo_dlss_taau pointer_exact_stereo_first=1 exact_queue_generation_window=1 v1292=skipped aer_force_inherited=1");
             log_line(
                 "V1279 DLSS compatibility=public_streamline_aer_private_history_ngx_stereo legacy_module_agnostic_discovery=disabled_by_V1288");
             log_line(

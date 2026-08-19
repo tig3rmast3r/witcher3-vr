@@ -177,6 +177,26 @@ constexpr bool submitted_hud_join_window_matches(
         distance <= kSubmittedHudJoinMaxPresentDistance;
 }
 
+// The submitted-order fallback repairs a D3D12 command-list topology, not an
+// AFW or DLSS algorithm. AER enters it only when its validated AFW retained-HUD
+// route is configured. Strict Stereo can use the same queue/generation/window
+// contract for either temporal backend; No AA keeps its existing pointer-exact
+// path until an affected scheduler proves that broader route necessary.
+constexpr bool submitted_hud_join_route_active(
+    bool mode3_transport,
+    bool aer_presentation,
+    bool aer_afw_common_transport,
+    TemporalAdapter backend) noexcept {
+    if (!mode3_transport) {
+        return false;
+    }
+    if (aer_presentation) {
+        return aer_afw_common_transport;
+    }
+    return backend == TemporalAdapter::Dlss ||
+        backend == TemporalAdapter::Taau;
+}
+
 // Eye-specific smoke variants need the immutable runtime FOV. The zero-centre
 // world-up variant does not: it must always exist as the stable fail-open so a
 // startup ordering difference can never restore REDengine's HMD-facing smoke.
