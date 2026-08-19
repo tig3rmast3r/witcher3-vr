@@ -25,8 +25,13 @@
 #include "native_asymmetric_transport_policy.h"
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
+#include "taau_submission_policy.h"
 
-// V1258 makes V1257's same-Present AER TAAU Cinema identity select the actual
+// V1259 prevents a TAAU command list already classified and rendered as a
+// stale private-history replay from regressing submitted-pair authority. The
+// V12049 exact submission gate remains unchanged and fail-closed; only normal
+// resolves can publish a new authority. V1258 makes V1257's same-Present AER
+// TAAU Cinema identity select the actual
 // per-eye HUD PSO, rather than merely labeling the completed pixels afterward.
 // It also resets private TAAU temporal continuity on the first strictly newer
 // post-loading resolve, so a delayed pre-loading command list cannot strand AFW
@@ -4257,6 +4262,8 @@ struct TaauRecordedResolveIdentity {
     int eye{-1};
     uint64_t pair_id{};
     uint64_t recorded_present{};
+    // Functional even when diagnostics are disabled: a stale resolve copies
+    // private history and therefore cannot publish its old producer identity.
     uint64_t history_pair_at_record{};
     uint64_t cb10_hash{};
     ID3D12Resource* native_output{};
@@ -16618,13 +16625,24 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
             }
             auto& last = g_taau_last_submitted_pair[
                 static_cast<size_t>(submitted.eye)];
+            const uint64_t observed_previous = last.load(
+                std::memory_order_acquire);
+            const auto authority =
+                w3vr::taau_submission::decide_authority(
+                    observed_previous, submitted.pair_id,
+                    submitted.replayed_as_stale);
+            uint64_t previous = observed_previous;
+            if (!authority.preserve_previous) {
+                previous = last.exchange(
+                    submitted.pair_id, std::memory_order_acq_rel);
+            }
             if (!taau_resolve_runtime_diagnostics_active() &&
                 !taau_drop_diagnostics_active()) {
-                last.store(submitted.pair_id, std::memory_order_relaxed);
                 continue;
             }
-            const uint64_t previous = last.exchange(
-                submitted.pair_id, std::memory_order_relaxed);
+            const uint64_t effective_pair = authority.preserve_previous
+                ? last.load(std::memory_order_acquire)
+                : submitted.pair_id;
             const uint64_t submitted_count = g_taau_submitted_resolve_count.fetch_add(
                 1, std::memory_order_relaxed) + 1;
             const bool non_forward = previous != 0 &&
@@ -16632,16 +16650,18 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
             if (submitted_count <= 128 || non_forward ||
                 submitted.replayed_as_stale || submitted_count % 240 == 0) {
                 log_line(
-                    "TAAU submitted resolve count=%llu execute=%llu eye=%d pair=%llu previous_submitted=%llu non_forward=%u recorded_present=%llu history_at_record=%llu recovered=%u stale_replay=%u cmd=%p output=%p cbhash=0x%llX",
+                    "TAAU submitted resolve count=%llu execute=%llu eye=%d pair=%llu previous_submitted=%llu effective_submitted=%llu non_forward=%u recorded_present=%llu history_at_record=%llu recovered=%u stale_replay=%u preserved_stale=%u cmd=%p output=%p cbhash=0x%llX",
                     static_cast<unsigned long long>(submitted_count),
                     static_cast<unsigned long long>(count), submitted.eye,
                     static_cast<unsigned long long>(submitted.pair_id),
                     static_cast<unsigned long long>(previous),
+                    static_cast<unsigned long long>(effective_pair),
                     non_forward ? 1u : 0u,
                     static_cast<unsigned long long>(submitted.recorded_present),
                     static_cast<unsigned long long>(submitted.history_pair_at_record),
                     submitted.recovered ? 1u : 0u,
                     submitted.replayed_as_stale ? 1u : 0u,
+                    authority.preserve_previous ? 1u : 0u,
                     command_lists[index], submitted.native_output,
                     static_cast<unsigned long long>(submitted.cb10_hash));
             }
@@ -21963,11 +21983,11 @@ bool dispatch_taau_inplace_marker(
             expected_eye, expected_pair_id,
             resolve_diagnostics
                 ? g_present_count.load(std::memory_order_relaxed) : 0,
-            resolve_diagnostics ? expected_history_pair_id : 0,
+            expected_history_pair_id,
             cb10_hash,
             resolve_diagnostics ? native_output.resource : nullptr,
             resolve_diagnostics && identity_recovered,
-            resolve_diagnostics && replayed_as_stale};
+            replayed_as_stale};
     }
 
     // Command recording can finish out of order across stereo worker threads.
