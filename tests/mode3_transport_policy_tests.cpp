@@ -10,6 +10,7 @@ int main() {
     using w3vr::mode3_transport::exact_afw_backend;
     using w3vr::mode3_transport::final_backbuffer_route_active;
     using w3vr::mode3_transport::final_color_submission_backend;
+    using w3vr::mode3_transport::immutable_pair_view_ready;
     using w3vr::mode3_transport::late_hud_composite_source_ready;
     using w3vr::mode3_transport::submission_queue_eligible;
 
@@ -59,5 +60,14 @@ int main() {
         HudProjectionRoute::Cinema, false));
     assert(late_hud_composite_source_ready(
         HudProjectionRoute::Cinema, true));
+
+    // AER Cinema keeps its completed pixels in the packed resources without
+    // publishing the unrelated strict-Stereo packed-valid bit. Its completed
+    // pair authority must still select the matching immutable XrView. During
+    // the next half-pair, advancing staging views must never replace it.
+    assert(immutable_pair_view_ready(true, false, true));
+    assert(!immutable_pair_view_ready(true, false, false));
+    assert(immutable_pair_view_ready(false, true, true));
+    assert(!immutable_pair_view_ready(false, false, true));
     return 0;
 }

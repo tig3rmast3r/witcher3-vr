@@ -74,4 +74,16 @@ constexpr bool late_hud_composite_source_ready(
         scene_only_pair_ready;
 }
 
+// Pixels retained in a completed Cinema pair must keep the XrView frozen with
+// that same pair. The sequential AER route deliberately does not set the
+// general packed-pair validity bit, so its independent completion authority
+// must be sufficient to select the packed view as well as the packed texture.
+constexpr bool immutable_pair_view_ready(
+    bool sequential_cinema_pair_available,
+    bool packed_pair_available,
+    bool packed_view_valid) noexcept {
+    return (sequential_cinema_pair_available || packed_pair_available) &&
+        packed_view_valid;
+}
+
 }  // namespace w3vr::mode3_transport

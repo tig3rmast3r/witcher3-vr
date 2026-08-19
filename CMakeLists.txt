@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1235.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1237.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -45,6 +45,7 @@ add_library(witcher3vr_dxgi SHARED
     src/dxgi_proxy.cpp
     src/dxgi_proxy.def
     src/openxr_eye_geometry.cpp
+    src/pipeline_flight_recorder.cpp
     src/puredark_afw_bridge.cpp
     src/puredark_afw_camera.cpp
     src/rt_ingress_join.cpp

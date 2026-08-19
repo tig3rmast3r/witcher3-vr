@@ -22,9 +22,13 @@
 #include "first_person_combat_lock.h"
 #include "first_person_anchor_smoothing.h"
 #include "mode3_transport_policy.h"
+#include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1235 requires exact scene-only pair proof before automatic Full VR receives
+// V1236 adds an INI-controlled ten-second CPU/GPU pipeline flight recorder.
+// It is independent from broad Diagnostic Logging, never waits for GPU query
+// data on the game path, and writes only when F2 is pressed. V1235 requires
+// exact scene-only pair proof before automatic Full VR receives
 // the retained late HUD. A cutscene boundary can otherwise leave the native
 // subtitle baked into one asymmetric eye and then composite it a second time.
 // V1234 makes Mode-3 post-render transport projection-agnostic: symmetric and
@@ -313,6 +317,9 @@ struct Config {
     // optimized DLL follows the normal low-overhead gaming path.
     bool logging_enabled{false};
     bool runtime_diagnostics{false};
+    // Lightweight ten-second CPU/GPU phase recorder. Independent from broad
+    // Diagnostic Logging; F2 is the only operation which writes its file.
+    bool pipeline_flight_recorder{false};
     // Optional in-process RenderDoc integration. This is deliberately
     // independent from Diagnostic Logging and defaults off so an adjacent
     // renderdoc.dll can remain installed without touching the render path.
@@ -6031,6 +6038,10 @@ bool dispatch_rt_symmetric_dlss_per_eye_ao_output_publish(
     if (!reader && !writer) {
         return false;
     }
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::RtxAo};
+    w3vr::pipeline_flight::GpuScope flight_gpu{
+        w3vr::pipeline_flight::Phase::RtxAo, command_list};
 
     uint32_t eye{};
     uint64_t pair_id{};
@@ -6658,6 +6669,10 @@ bool dispatch_rt_symmetric_dlss_per_eye_sigma_shadow_history(
     if (!reader && !writer) {
         return false;
     }
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::RtxShadow};
+    w3vr::pipeline_flight::GpuScope flight_gpu{
+        w3vr::pipeline_flight::Phase::RtxShadow, command_list};
 
     uint32_t eye{};
     uint64_t pair_id{};
@@ -7159,6 +7174,10 @@ bool dispatch_rt_symmetric_dlss_per_eye_specular_history(
         pipeline_info.cs_hash != kSpecularTemporalAccumulationCs) {
         return false;
     }
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::RtxReflection};
+    w3vr::pipeline_flight::GpuScope flight_gpu{
+        w3vr::pipeline_flight::Phase::RtxReflection, command_list};
 
     uint32_t eye{};
     uint64_t pair_id{};
@@ -7581,6 +7600,10 @@ bool dispatch_rt_symmetric_dlss_specular_stabilization_camera_translation(
         pipeline_info.cs_hash != kSpecularTemporalStabilizationCs) {
         return false;
     }
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::RtxStabilize};
+    w3vr::pipeline_flight::GpuScope flight_gpu{
+        w3vr::pipeline_flight::Phase::RtxStabilize, command_list};
 
     uint32_t eye{};
     uint64_t pair_id{};
@@ -9717,6 +9740,8 @@ bool evaluate_puredark_afw_mode3_common(
     uint64_t pair_id,
     uint64_t present_count,
     PuredarkAfwPresentResult& result) {
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::Afw};
     result = {};
     record_rt_flight(
         w3vr::rt_flight::EventCode::AfwEvaluateBegin,
@@ -9925,6 +9950,8 @@ bool evaluate_puredark_afw_mode3_common(
     }
     const auto depth_desc = captured.depth.texture->GetDesc();
     const auto motion_desc = captured.motion_vectors.texture->GetDesc();
+    w3vr::pipeline_flight::GpuScope flight_gpu{
+        w3vr::pipeline_flight::Phase::Afw, command_list};
     auto input = g_puredark_afw_eye_buffers.eye_frame_buffers[real_eye];
     w3vr::puredark_afw::TextureDesc color_source{};
     color_source.texture = exact_source_color;
@@ -11407,6 +11434,10 @@ void load_config() {
         g_config.logging_enabled = read_ini_bool(
             "debug", "logging_enabled", false);
         g_config.runtime_diagnostics = read_ini_bool("debug", "runtime_diagnostics", false);
+        g_config.pipeline_flight_recorder = read_ini_bool(
+            "debug", "pipeline_flight_recorder", false);
+        w3vr::pipeline_flight::set_enabled(
+            g_config.pipeline_flight_recorder);
         g_config.focus_projection_shader_registry = read_ini_bool(
             "focus_projection", "shader_registry_enabled", false);
         g_config.cinema_camera_diagnostics = read_ini_bool(
@@ -16387,7 +16418,13 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         !rt_slot_retirement_needed) {
         // Keep the gaming path narrower than the temporal detour: no TAAU
         // tracking, readback scan, slot fence or diagnostic atomics.
-        g_execute_command_lists(queue, num_command_lists, command_lists);
+        {
+            w3vr::pipeline_flight::CpuScope flight_cpu{
+                w3vr::pipeline_flight::Phase::QueueSubmit};
+            g_execute_command_lists(queue, num_command_lists, command_lists);
+        }
+        w3vr::pipeline_flight::on_execute(
+            queue, num_command_lists, command_lists);
         publish_puredark_afw_submissions_after_execute(
             queue, puredark_afw_pending);
         publish_dlss_cache_submissions(dlss_cache_pending);
@@ -16546,7 +16583,13 @@ void STDMETHODCALLTYPE hook_execute_command_lists(
         }
     }
 
-    g_execute_command_lists(queue, num_command_lists, command_lists);
+    {
+        w3vr::pipeline_flight::CpuScope flight_cpu{
+            w3vr::pipeline_flight::Phase::QueueSubmit};
+        g_execute_command_lists(queue, num_command_lists, command_lists);
+    }
+    w3vr::pipeline_flight::on_execute(
+        queue, num_command_lists, command_lists);
     publish_puredark_afw_submissions_after_execute(
         queue, puredark_afw_pending);
     publish_dlss_cache_submissions(dlss_cache_pending);
@@ -21218,6 +21261,10 @@ bool dispatch_taau_inplace_marker(
     if (g_engine_menu_state.load(std::memory_order_relaxed) != 0) {
         return false;
     }
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::TemporalTaau};
+    w3vr::pipeline_flight::GpuScope flight_gpu{
+        w3vr::pipeline_flight::Phase::TemporalTaau, command_list};
     // [FIX:STEREO-CINEMA-TEMPORAL 1/2] Cinema now produces a real geometry
     // pair. Keep TAAU's private per-eye histories active instead of falling
     // back to the native mono resolve and invalidating both histories.
@@ -33044,6 +33091,8 @@ size_t copy_readable_scene_descriptor(
 }
 
 void* __fastcall hook_engine_frame_data_factory(void* render_context, void* render_settings, void* scene_descriptor) {
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::FrameFactory};
     // [FIX:OPENXR-PAIR-BOUND-LIFECYCLE 1/3] Mode 3 binds one OpenXR frame to
     // one real stereo pair. Do not begin a runtime frame for every auxiliary
     // REDengine factory call; fire and other multi-pass effects can issue
@@ -34629,8 +34678,16 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature_impl(
                 static_cast<unsigned long long>(g_present_count.load()));
         }
         const int64_t evaluate_begin = dlss_cpu_profile_now();
+        const int64_t flight_cpu_begin =
+            w3vr::pipeline_flight::cpu_begin();
+        const auto flight_gpu = w3vr::pipeline_flight::gpu_begin(
+            w3vr::pipeline_flight::Phase::TemporalDlss, command_list);
         const auto result = g_ngx_evaluate_feature(
             command_list, evaluation_handle, parameters, callback);
+        w3vr::pipeline_flight::gpu_end(flight_gpu, command_list);
+        w3vr::pipeline_flight::cpu_end(
+            w3vr::pipeline_flight::Phase::TemporalDlss,
+            flight_cpu_begin);
         record_dlss_cpu_phase(kDlssCpuNgxEvaluate, evaluate_begin);
         // [FIX:PUREDARK-AFW-PRODUCER-PUBLICATION V12016 5/8] The exact
         // bundle becomes only a pending command-list publication here. The
@@ -34650,8 +34707,15 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature_impl(
         return result;
     }
     const int64_t evaluate_begin = dlss_cpu_profile_now();
+    const int64_t flight_cpu_begin = w3vr::pipeline_flight::cpu_begin();
+    const auto flight_gpu = w3vr::pipeline_flight::gpu_begin(
+        w3vr::pipeline_flight::Phase::TemporalDlss, command_list);
     const auto result = g_ngx_evaluate_feature(
         command_list, evaluation_handle, parameters, callback);
+    w3vr::pipeline_flight::gpu_end(flight_gpu, command_list);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::TemporalDlss,
+        flight_cpu_begin);
     record_dlss_cpu_phase(kDlssCpuNgxEvaluate, evaluate_begin);
     finalize_puredark_afw_dlss_submission(
         command_list, puredark_afw_bundle_slot, result);
@@ -35576,7 +35640,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1235 base=V1234 full_vr_hud=eye_local_scene_only_pair_proven mode3_transport=projection_agnostic_exact_temporal_final_color_any_queue static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
+                "witcher3vr canonical build=V1236 base=V1235 pipeline_flight=ini_cpu_all_gpu_async_every4_f2_last10s full_vr_hud=eye_local_scene_only_pair_proven mode3_transport=projection_agnostic_exact_temporal_final_color_any_queue static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss_taau "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -35660,6 +35724,8 @@ void capture_d3d12_objects(IUnknown* dxgi_device_parameter) {
 }
 
 void wait_for_xr_gpu() {
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::XrAllocatorWait};
     DlssCpuScope cpu_scope{kDlssCpuXrGpuWait};
     if (g_xr_fence == nullptr || g_command_queue == nullptr || g_xr_fence_event == nullptr) {
         return;
@@ -35681,6 +35747,8 @@ void wait_for_xr_gpu() {
 // everything the game has queued. Frames the GPU already finished with cost
 // nothing here.
 bool wait_for_xr_command_allocator(size_t index) {
+    w3vr::pipeline_flight::CpuScope flight_cpu{
+        w3vr::pipeline_flight::Phase::XrAllocatorWait};
     if (g_xr_fence == nullptr || g_xr_fence_event == nullptr ||
         index >= kXrCommandAllocatorCount) {
         return false;
@@ -37768,7 +37836,11 @@ void prepare_openxr_render_frame(uint32_t origin) {
     XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
     XrResult result{};
+    const int64_t flight_wait_begin = w3vr::pipeline_flight::cpu_begin();
     result = pfn_xrWaitFrame(g_xr_session, &wait_info, &frame_state);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::XrWaitFrame,
+        flight_wait_begin);
     if (XR_FAILED(result)) {
         log_taau_trace_line("OpenXR pre-render xrWaitFrame result=%s (%d)", xr_result_name(result), result);
         return;
@@ -39585,6 +39657,8 @@ bool native_stereo_capture_ready() {
 void render_openxr_test_frame(
     PoseTimelineEvent trace_reason = PoseTimelineEvent::SubmitOther,
     uint64_t trace_pair_id = 0) {
+    w3vr::pipeline_flight::CpuScope flight_frame_cpu{
+        w3vr::pipeline_flight::Phase::XrFrame};
     if (!g_xr_resources_ready || !g_xr_session_running) {
         poll_openxr_events();
         return;
@@ -39613,8 +39687,13 @@ void render_openxr_test_frame(
             std::memory_order_acquire);
     } else {
         XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
+        const int64_t flight_wait_begin =
+            w3vr::pipeline_flight::cpu_begin();
         result = pfn_xrWaitFrame(
             g_xr_session, &wait_info, &frame_state);
+        w3vr::pipeline_flight::cpu_end(
+            w3vr::pipeline_flight::Phase::XrWaitFrame,
+            flight_wait_begin);
         if (XR_FAILED(result)) {
             log_taau_trace_line("OpenXR xrWaitFrame result=%s (%d)", xr_result_name(result), result);
             return;
@@ -40080,6 +40159,8 @@ void render_openxr_test_frame(
         uint32_t image_index{};
         bool acquired{};
         bool command_list_recording{};
+        int64_t flight_xr_record_begin{};
+        w3vr::pipeline_flight::GpuToken flight_xr_gpu{};
         const auto mode = g_config.openxr_mode;
         Mode3AfwTemporalBackend temporal_backend_to_consume{
             Mode3AfwTemporalBackend::None};
@@ -40130,8 +40211,13 @@ void render_openxr_test_frame(
         if (submitted) {
             XrSwapchainImageWaitInfo wait_swapchain_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
             wait_swapchain_info.timeout = XR_INFINITE_DURATION;
+            const int64_t flight_swapchain_wait_begin =
+                w3vr::pipeline_flight::cpu_begin();
             result = pfn_xrWaitSwapchainImage(
                 swapchain.handle, &wait_swapchain_info);
+            w3vr::pipeline_flight::cpu_end(
+                w3vr::pipeline_flight::Phase::XrWaitSwapchain,
+                flight_swapchain_wait_begin);
             if (XR_FAILED(result)) {
                 submitted = false;
             }
@@ -40151,6 +40237,11 @@ void render_openxr_test_frame(
                 submitted = false;
             } else {
                 command_list_recording = true;
+                flight_xr_record_begin =
+                    w3vr::pipeline_flight::cpu_begin();
+                flight_xr_gpu = w3vr::pipeline_flight::gpu_begin(
+                    w3vr::pipeline_flight::Phase::XrRecordComposite,
+                    g_xr_command_list);
             }
         }
 
@@ -42126,8 +42217,21 @@ void render_openxr_test_frame(
                         &g_stereo_eye_cache_views[render_source_eye];
                     render_view_origin = "mode3_afw_sequenced";
                 } else if (mode == 3 &&
-                    g_packed_present_cache_valid &&
-                    g_packed_present_cache_view_valid[render_source_eye]) {
+                    w3vr::mode3_transport::immutable_pair_view_ready(
+                        sequential_cinema_pair_active &&
+                            sequential_cinema_pair_available(),
+                        g_packed_present_cache_valid,
+                        g_packed_present_cache_view_valid[
+                            render_source_eye])) {
+                    // [FIX:AER-CINEMA-IMMUTABLE-PAIR-VIEW V1237 1/1]
+                    // The sequential Cinema route presents the last complete
+                    // packed pair while the next eye is already entering the
+                    // staging cache. Select the XrView frozen with those
+                    // packed pixels even though this independent AER route
+                    // intentionally leaves strict Stereo's general packed-
+                    // valid bit clear. Otherwise every first half-pair mixes
+                    // retained pixels with the following render pose, causing
+                    // head-motion flicker and defeating rotational timewarp.
                     render_view = &g_packed_present_cache_views[render_source_eye];
                     render_view_origin = "packed_cache";
                 } else if (mode == 3 &&
@@ -42478,6 +42582,11 @@ void render_openxr_test_frame(
         bool puredark_afw_bundle_submitted{};
         uint64_t puredark_afw_bundle_fence{};
         if (command_list_recording) {
+            w3vr::pipeline_flight::gpu_end(
+                flight_xr_gpu, g_xr_command_list);
+            w3vr::pipeline_flight::cpu_end(
+                w3vr::pipeline_flight::Phase::XrRecordComposite,
+                flight_xr_record_begin);
             const HRESULT close_result = g_xr_command_list->Close();
             if (SUCCEEDED(close_result)) {
                 ID3D12CommandList* lists[] = {g_xr_command_list};
@@ -42768,7 +42877,12 @@ void render_openxr_test_frame(
             g_config.menu_distance, spatial_panel_scale,
             static_cast<unsigned long long>(current_present));
     }
+    const int64_t flight_end_frame_begin =
+        w3vr::pipeline_flight::cpu_begin();
     result = pfn_xrEndFrame(g_xr_session, &end_info);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::XrEndFrame,
+        flight_end_frame_begin);
     if (XR_SUCCEEDED(result)) {
         // [FIX:OPENXR-QUANTIZED-PAIR-POSE 3/3] This completed runtime frame is
         // the sole clock authority for the next REDengine pair prediction.
@@ -42930,6 +43044,12 @@ void try_log_dlss_output_luminance_readback() {
 }
 
 HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
+    if (w3vr::pipeline_flight::enabled()) {
+        w3vr::pipeline_flight::process_gpu();
+        if ((GetAsyncKeyState(VK_F2) & 1) != 0) {
+            w3vr::pipeline_flight::dump_last_ten_seconds();
+        }
+    }
     if ((GetAsyncKeyState(VK_F7) & 1) != 0) {
         trigger_renderdoc_capture(swapchain);
     }
@@ -42965,6 +43085,11 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     }
 
     const auto frame = ++g_present_count;
+    w3vr::pipeline_flight::begin_frame(
+        frame, g_config.openxr_mode,
+        static_cast<int>(g_config.temporal_backend),
+        g_config.native_stereo, g_config.raytracing_enabled,
+        g_config.puredark_afw_enabled);
     record_rt_flight(
         w3vr::rt_flight::EventCode::Present,
         UINT32_MAX, 0, 0, w3vr::rt_flight::RejectReason::None,
@@ -43689,8 +43814,13 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             g_config.disable_desktop_vsync && g_xr_session_running
         ? 0u
         : sync_interval;
+    const int64_t flight_present_begin =
+        w3vr::pipeline_flight::cpu_begin();
     const HRESULT present_result =
         g_present(swapchain, effective_sync_interval, flags);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::Present,
+        flight_present_begin);
     flush_asymmetric_authority_audit();
     return present_result;
 }
@@ -43700,7 +43830,18 @@ HRESULT STDMETHODCALLTYPE hook_present1(
     UINT sync_interval,
     UINT flags,
     const DXGI_PRESENT_PARAMETERS* params) {
+    if (w3vr::pipeline_flight::enabled()) {
+        w3vr::pipeline_flight::process_gpu();
+        if ((GetAsyncKeyState(VK_F2) & 1) != 0) {
+            w3vr::pipeline_flight::dump_last_ten_seconds();
+        }
+    }
     const auto frame = ++g_present_count;
+    w3vr::pipeline_flight::begin_frame(
+        frame, g_config.openxr_mode,
+        static_cast<int>(g_config.temporal_backend),
+        g_config.native_stereo, g_config.raytracing_enabled,
+        g_config.puredark_afw_enabled);
     record_rt_flight(
         w3vr::rt_flight::EventCode::Present,
         UINT32_MAX, 0, 0, w3vr::rt_flight::RejectReason::None,
@@ -43724,7 +43865,14 @@ HRESULT STDMETHODCALLTYPE hook_present1(
             static_cast<unsigned>(desc.Format));
     }
 
-    return g_present1(swapchain, sync_interval, flags, params);
+    const int64_t flight_present_begin =
+        w3vr::pipeline_flight::cpu_begin();
+    const HRESULT result =
+        g_present1(swapchain, sync_interval, flags, params);
+    w3vr::pipeline_flight::cpu_end(
+        w3vr::pipeline_flight::Phase::Present,
+        flight_present_begin);
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE hook_create_swapchain_for_hwnd(
