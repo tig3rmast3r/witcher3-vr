@@ -1152,6 +1152,7 @@ XrView g_sequential_cinema_pending_views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 bool g_sequential_cinema_pending_view_valid[2]{};
 bool g_sequential_cinema_present_cache_initialized{};
 bool g_sequential_cinema_pair_valid{};
+bool g_sequential_cinema_pair_native_asymmetric{};
 uint64_t g_sequential_cinema_accepted_pair_id{};
 uint32_t g_sequential_cinema_accepted_generation{};
 uint64_t g_sequential_cinema_entry_pair_floor{};
@@ -1163,6 +1164,7 @@ void reset_sequential_cinema_pair_authority(
     uint64_t pair_floor,
     bool resources_recreated) {
     g_sequential_cinema_pair_valid = false;
+    g_sequential_cinema_pair_native_asymmetric = false;
     g_sequential_cinema_accepted_pair_id = 0;
     g_sequential_cinema_accepted_generation = 0;
     g_sequential_cinema_entry_pair_floor = pair_floor;
@@ -38331,6 +38333,67 @@ bool promote_sequential_cinema_pair(
         return false;
     }
 
+    // [FIX:AER-CINEMA-ASYMMETRIC-PAIR-AUTHORITY V1248 1/2] The independent
+    // Cinema cache deliberately leaves strict Stereo's general packed-valid
+    // flag clear. V1245 therefore rendered raw off-axis Full-VR pixels but the
+    // presenter interpreted them as symmetric. Carry the native proof on this
+    // immutable pair itself, and never promote the half-pair observed at the
+    // bootstrap edge (factory_mask=0x2).
+    auto* native_pair = native_asymmetric_pair_slot(pair_id);
+    const bool native_asymmetric_scene =
+        native_asymmetric_noaa_route_active() &&
+        native_asymmetric_full_vr_scene_active();
+    // One coherent symmetric pair is allowed to establish the 1:1 transport
+    // preflight. Once transport is ready, or this candidate already owns a
+    // native slot, it must satisfy the complete off-axis proof below.
+    const bool native_asymmetric_required = native_asymmetric_scene &&
+        (g_native_asymmetric_transport_ready.load(
+             std::memory_order_acquire) ||
+            native_pair != nullptr);
+    const uint32_t native_generation = native_pair != nullptr
+        ? native_pair->generation.load(std::memory_order_acquire)
+        : UINT32_MAX;
+    const uint8_t native_factory_mask = native_pair != nullptr
+        ? native_pair->factory_mask.load(std::memory_order_acquire)
+        : 0;
+    const uint8_t native_temporal_mask = native_pair != nullptr
+        ? native_pair->temporal_mask.load(std::memory_order_acquire)
+        : 0;
+    const uint8_t native_dlss_input_mask = native_pair != nullptr
+        ? native_pair->dlss_input_mask.load(std::memory_order_acquire)
+        : 0;
+    const bool native_slot_matches = native_pair != nullptr &&
+        native_generation == generation &&
+        native_pair->pair_id.load(std::memory_order_acquire) == pair_id;
+    const bool native_dlss_input_required =
+        native_asymmetric_required &&
+        g_config.temporal_backend == TemporalBackend::Dlss;
+    if (!w3vr::native_asymmetric_transport_policy::cinema_pair_admissible({
+            native_asymmetric_required,
+            native_slot_matches,
+            native_factory_mask,
+            native_temporal_mask,
+            native_dlss_input_mask,
+            native_dlss_input_required})) {
+        const uint32_t log_index =
+            g_native_asymmetric_rejected_pair_logs.fetch_add(
+                1, std::memory_order_relaxed);
+        if (g_config.runtime_diagnostics && log_index < 32) {
+            log_line(
+                "V1248 AER cinema asymmetric pair held sample=%u "
+                "pair=%llu generation=%u/%u slot=%u "
+                "factory_mask=0x%X temporal_mask=0x%X "
+                "dlss_input_mask=0x%X",
+                log_index,
+                static_cast<unsigned long long>(pair_id),
+                native_generation, generation,
+                native_slot_matches ? 1u : 0u,
+                native_factory_mask, native_temporal_mask,
+                native_dlss_input_mask);
+        }
+        return false;
+    }
+
     if (g_sequential_cinema_present_cache_initialized) {
         D3D12_RESOURCE_BARRIER accepted_to_dest[2]{};
         for (uint32_t eye = 0; eye < 2; ++eye) {
@@ -38371,6 +38434,8 @@ bool promote_sequential_cinema_pair(
     const bool had_previous_pair = g_sequential_cinema_pair_valid;
     g_sequential_cinema_present_cache_initialized = true;
     g_sequential_cinema_pair_valid = true;
+    g_sequential_cinema_pair_native_asymmetric =
+        native_asymmetric_required;
     g_sequential_cinema_accepted_pair_id = pair_id;
     g_sequential_cinema_accepted_generation = generation;
 
@@ -38379,7 +38444,8 @@ bool promote_sequential_cinema_pair(
     if (diagnostic_index < 64) {
         log_taau_trace_line(
             "AER cinema pair promoted sample=%u present=%llu pair=%llu "
-            "generation=%u floor=%llu had_previous=%d views=%d,%d",
+            "generation=%u floor=%llu had_previous=%d views=%d,%d "
+            "native_asymmetric=%d",
             diagnostic_index,
             static_cast<unsigned long long>(
                 g_present_count.load(std::memory_order_relaxed)),
@@ -38388,7 +38454,8 @@ bool promote_sequential_cinema_pair(
                 g_sequential_cinema_entry_pair_floor),
             had_previous_pair ? 1 : 0,
             g_packed_present_cache_view_valid[0] ? 1 : 0,
-            g_packed_present_cache_view_valid[1] ? 1 : 0);
+            g_packed_present_cache_view_valid[1] ? 1 : 0,
+            g_sequential_cinema_pair_native_asymmetric ? 1 : 0);
     }
     return true;
 }
@@ -41846,9 +41913,17 @@ void render_openxr_test_frame(
                         native_asymmetric_transport_preflight,
                         std::memory_order_release);
                 }
+                // [FIX:AER-CINEMA-ASYMMETRIC-PAIR-AUTHORITY V1248 2/2]
+                // The sequential Cinema cache is a complete-pair authority of
+                // its own. Couple presentation geometry to that exact pair
+                // without widening strict Stereo's packed-valid ownership.
                 const bool native_pair_fully_built =
-                    g_packed_present_cache_valid &&
-                    g_packed_present_cache_native_asymmetric;
+                    w3vr::native_asymmetric_transport_policy::
+                        presentation_uses_native_asymmetric(
+                            g_packed_present_cache_valid &&
+                                g_packed_present_cache_native_asymmetric,
+                            sequential_cinema_pair_available(),
+                            g_sequential_cinema_pair_native_asymmetric);
                 native_asymmetric_projection =
                     native_pair_fully_built && !spatial_panel_active;
                 native_asymmetric_black_frame =
