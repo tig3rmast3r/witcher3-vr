@@ -31,11 +31,12 @@ as a runtime dependency.
 | TAAU | Working |
 | DLSS | Working |
 | DLAA | Working |
-| Ray tracing | Launcher-controlled on AER + AFW - DLSS only |
+| Ray tracing | Experimental on AER + AFW - TAAU and AER + AFW - DLSS |
 | Custom render resolutions | Working |
 | 6DoF HMD free look | Synchronized with OpenXR |
 | Crossbow HMD aiming | Working |
-| Resizable HUD and menus | Working |
+| Movable and resizable HUD, dialogue text, and subtitles | Working |
+| Hide static HUD outside combat | Optional; disabled by default |
 | Adjustable in-headset render window | Working |
 | Near-camera view | Working |
 | Experimental first-person exploration view | Available through `F11`, with adaptive on-foot and horse placement, stationary view-following body rotation, and persistent local head/hair/accessory hiding |
@@ -75,6 +76,10 @@ The ForceDLAA parameter-query and resolution-override approach is adapted from
 | Meta Quest 3 | Virtual Desktop | Primary development configuration |
 | Pimax 5K | OpenXR via SteamVR | Native canted views validated with Parallel Projection disabled |
 
+Pimax OpenXR may cap Stereo mode at half the headset refresh rate, for example
+45 FPS on a 90 Hz display. AER is not affected. Use SteamVR's OpenXR for proper
+Stereo mode.
+
 ### Not supported or not fully tested
 
 - Motion blur
@@ -82,6 +87,14 @@ The ForceDLAA parameter-query and resolution-override approach is adapted from
 - Lens flare
 - Third-party mod compatibility
 - Other headset and OpenXR-path combinations
+
+### Known issues
+
+- Ray Tracing may cause occasional flickering in the rendered image or HUD.
+- Ray Tracing may produce temporary visual artifacts when transitioning into or out of cutscenes.
+- Some Full VR cutscenes may show floating or unstable landscapes and terrain.
+- First Person movement may behave unexpectedly when walking backward with Strafe Movement enabled.
+- Sometimes the game wrongly allocate threads on CPU cores during startup and affect performance. The game needs to be restarted.
 
 You are free to use other mods, but third-party mod compatibility is not
 supported during this stage of development. Before reporting a Witcher 3 VR
@@ -140,14 +153,13 @@ frame generation for the highest-performance route with minimal artifacts,
 while Stereo renders both eyes for the most stable result.
 
 The **Ray Tracing** option owns both REDengine's master switch and the
-Witcher 3 VR renderer flag. It can be enabled only with
+Witcher 3 VR renderer flag. It can be enabled with **AER + AFW - TAAU** or
 **AER + AFW - DLSS** and is forced off when any other render mode is saved or
-launched, preventing an incompatible startup configuration.
+launched.
 
-If `witcher3vr.ini` does not exist, the launcher creates it automatically. The
-first run inherits the game's current supported AA choice as **Stereo No AA /
-FXAA**, **Stereo TAAU**, or **Stereo DLSS**. An unknown AA mode falls back to
-**Stereo No AA / FXAA**. Resolution defaults to **AUTO**: immediately before
+If `witcher3vr.ini` does not exist, the launcher creates it automatically with
+**AER + AFW - DLSS**, **Performance** DLSS quality, and **Asymmetric
+Projection** enabled. Resolution defaults to **AUTO**: immediately before
 Save or Save & Launch, the launcher asks the active OpenXR runtime for its
 current recommended per-eye dimensions and writes that exact resolution to
 both REDengine and `witcher3vr.ini`. The saved dimensions remain visible while
@@ -181,7 +193,8 @@ The presentation controls remain independent:
 - **Asymmetric Projection** enables native off-axis stereo geometry for every
   AER + AFW and Stereo No AA/TAAU/DLSS choice. Presentation Size remains adjustable: the
   renderer scales each eye's off-axis FOV around its optical center and submits
-  that exact scaled FOV through the same presentation path.
+  that exact scaled FOV through the same presentation path. It is enabled by
+  default.
 - **Fullscreen Projection** changes the presentation method for every render
   mode. It defaults to off, so all modes use the validated legacy presenter.
 - **Alternate Presentation Resize** opts into the PR-style resize needed for
@@ -218,18 +231,19 @@ currently recommended.
 
 | Setting | Value |
 |---|---|
-| Ray tracing | Optional only with AER + AFW - DLSS; otherwise forced Off |
+| Ray tracing | Experimental with AER + AFW - TAAU or AER + AFW - DLSS; otherwise forced Off |
 | Screen Space Reflections | Off or Low |
 | Motion blur | Off |
-| Shadow quality | Extreme+ |
+| Shadow quality | High |
 
 The launcher controls Ray Tracing and automatically disables it outside the
-supported AER + AFW - DLSS route. It still warns when SSR High is detected; set
-Screen Space Reflections to Low or Off before launching VR.
+supported AER + AFW - TAAU and AER + AFW - DLSS routes. It still warns when SSR
+High is detected; set Screen Space Reflections to Low or Off before launching
+VR.
 
-The bundled VR profile uses Extreme+ shadows. Lower shadow presets can expose
-VR cascade flicker; Extreme+ is the validated default even though it carries a
-higher GPU cost.
+The bundled VR profile uses High shadows. V1260 gives both eyes the same
+shadow-cascade culling view, so Extreme+ is no longer required to hide an
+inter-eye cascade mismatch and remains an optional higher-cost setting.
 
 All remaining settings can be adjusted to preference, but configurations
 different from the provided VR preset may not have been tested.
@@ -281,16 +295,33 @@ and every line that must be added.
 | `X` | Reset the active profile to `X=0`, `Y=0`, scale `1.0` |
 | `F7` | Manually switch between VR and Cinema3D banks; the editor may be open or closed |
 
-`Gameplay Subtitles Size` and `Cutscene Text and Dialog Choices Size` are
-scale-only panels: the mouse wheel changes their local size, while the arrow
-keys intentionally leave their full-screen layout untouched. Selecting either
-panel shows a guarded example. The dialog example uses the internal Flash-data
-path and never requests a cursor, changes input mode, or sends a story-scene
-choice; previews are suppressed whenever a real dialog, cutscene, or menu owns
-the UI.
+The HUD Editor can independently move and resize Gameplay/Cutscene subtitles
+and Gameplay/Cutscene dialogue text and choices. Separate settings are saved
+for the VR and Cinema3D HUD profiles. The editor also displays preview text,
+allowing these elements to be adjusted without entering a dialogue or
+cutscene. These controls affect the actual text used during cutscenes, so users
+with customized HUD or Cinema settings may need to readjust subtitle and
+dialogue size or position after updating.
 
 Profile selection remains manual; the renderer does not switch the HUD bank
 automatically. `F7` works both inside and outside HUD editing mode.
+
+### Hide Static HUD Outside Combat
+
+The optional **Hide static HUD outside combat** setting can hide:
+
+- Minimap
+- Quest tracker
+- Buffs
+- Health and Wolf Head
+- Equipped items and item information
+- Companion status
+- Damaged-item warnings
+- Control feedback
+
+The required HUD elements return automatically during combat or while using
+Witcher Sense. Horse races also restore the Minimap and Quest tracker. This
+option is disabled by default.
 
 The First-Person view is experimental and intended for exploration only. It
 uses DLL-controlled placement profiles for idle movement, walking, sprinting,

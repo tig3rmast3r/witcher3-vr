@@ -6,6 +6,7 @@
 int main() {
     using w3vr::mode3_transport::HudProjectionRoute;
     using w3vr::mode3_transport::TemporalAdapter;
+    using w3vr::mode3_transport::afw_gameplay_capture_allowed;
     using w3vr::mode3_transport::dlss_submission_route_active;
     using w3vr::mode3_transport::exact_afw_backend;
     using w3vr::mode3_transport::final_backbuffer_route_active;
@@ -45,6 +46,16 @@ int main() {
     assert(submission_queue_eligible(true, false));
     assert(!submission_queue_eligible(false, true));
     assert(!submission_queue_eligible(false, false));
+
+    // Native automatic Full VR can start before the debounced Cinema flag.
+    // That early ownership edge must stop gameplay capture by itself so no
+    // producer can be stranded while the final cutscene route is active.
+    assert(afw_gameplay_capture_allowed(true, 0, false, false, false));
+    assert(!afw_gameplay_capture_allowed(false, 0, false, false, false));
+    assert(!afw_gameplay_capture_allowed(true, 1, false, false, false));
+    assert(!afw_gameplay_capture_allowed(true, 0, true, false, false));
+    assert(!afw_gameplay_capture_allowed(true, 0, false, true, false));
+    assert(!afw_gameplay_capture_allowed(true, 0, false, false, true));
 
     // Gameplay continuously removes the baked HUD. A cutscene or Cinema
     // boundary must fail open on its native HUD until the exact final pair

@@ -63,6 +63,20 @@ constexpr bool submission_queue_eligible(
     return route_active;
 }
 
+// Automatic Full VR takes ownership before the legacy Cinema detector can
+// cross its debounce window. Stop admitting AFW gameplay producers on that
+// native edge as well, otherwise the unconsumed producer FIFO can fill before
+// Cinema becomes visible to the older gate.
+constexpr bool afw_gameplay_capture_allowed(
+    bool route_active,
+    int menu_state,
+    bool cinema_active,
+    bool loading_active,
+    bool automatic_full_vr_active) noexcept {
+    return route_active && menu_state == 0 && !cinema_active &&
+        !loading_active && !automatic_full_vr_active;
+}
+
 // Gameplay owns the validated continuously scene-only contract. Cinema and
 // automatic Full VR can cross their activation boundary between the two AER
 // renders, so their late HUD is safe only when the exact published pair proves

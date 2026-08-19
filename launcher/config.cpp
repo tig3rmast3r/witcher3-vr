@@ -81,6 +81,10 @@ void RemoveObsoleteSettings(IniDocument& ini) {
     ini.Remove("openxr", "cinema_subtitle_stereo_shift_px");
     ini.Remove("engine", "streamline_ps93_learning_log");
     ini.Remove("engine", "first_person_stationary_turn");
+    // V1243's hard P-core isolation was runtime rejected and removed when the
+    // normal line returned to V1242. Drop the now-unread trial key while
+    // retaining the established soft performance-core preference.
+    ini.Remove("engine", "critical_thread_core_isolation");
     ini.Remove("engine", "gamepad_select_recenter");
     ini.Remove("engine", "gamepad_select_first_person");
     ini.Remove("engine", "streamline_mvec_probe");
@@ -1203,26 +1207,9 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         error = LastErrorMessage(L"Checking configuration", paths.vr_ini);
         return false;
     }
-    // First-run AA inheritance: keep the user's supported native AA choice,
-    // but always initialize its stereo Mode 3 route. Unknown/unsupported AA
-    // values deliberately fall back to the safest release default, No AA.
-    auto first_run = defaults;
-    std::wstring game_error;
-    if (const auto game = IniDocument::Load(paths.game_settings, game_error)) {
-        const int aa_mode = ReadInt(*game, "PostProcess", "AAMode", 0);
-        const bool allow_dlss =
-            ReadBool(*game, "Rendering", "AllowDLSS", false);
-        const char* backend = "none";
-        if (aa_mode == 3) {
-            backend = "taau";
-        } else if (aa_mode == 6 && allow_dlss) {
-            backend = "dlss";
-        }
-        first_run.Set("openxr", "mode", "3");
-        first_run.Set("engine", "dual_render_probe", "1");
-        first_run.Set("engine", "dual_render_start", "1");
-        first_run.Set("engine", "temporal_backend", backend);
-    }
+    // New installations use the release defaults verbatim. Existing INIs
+    // continue to preserve their selected route through the migration path.
+    const auto& first_run = defaults;
     if (!AtomicWriteWithBackup(
             paths.vr_ini, first_run.Serialize(), error)) {
         return false;

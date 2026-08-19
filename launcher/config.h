@@ -51,11 +51,11 @@ struct ModeSettings {
 };
 
 struct LauncherState {
-    RenderMode mode{RenderMode::StereoNone};
+    RenderMode mode{RenderMode::AerAfwDlss};
     bool resolution_auto{true};
     int width{2688};
     int height{2784};
-    int dlss_quality{1};
+    int dlss_quality{3};
     bool ray_tracing{};
     int hud_convergence_delta{-20};
     float presentation_scale{1.0f};
@@ -78,7 +78,7 @@ struct LauncherState {
     CameraFollowPolicy camera_follow_policy{CameraFollowPolicy::HorseBoatOnly};
     bool hide_static_hud_outside_combat{};
     bool fast_movement_transitions{true};
-    bool native_stereo{};
+    bool native_stereo{true};
     bool fullscreen_projection{};
     bool alternate_presentation_resize{};
     bool diagnostic_logging{};

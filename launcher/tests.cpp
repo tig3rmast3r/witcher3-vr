@@ -126,6 +126,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "first_person_strafe=0\r\n"
         "first_person_anchor_smoothing=0\r\n"
         "first_person_anchor_smoothing_seconds=0.125000\r\n"
+        "critical_thread_core_isolation=1\r\n"
         "streamline_ps93_learning_log=1\r\n"
         "gamepad_select_recenter=1\r\n"
         "gamepad_select_first_person=1\r\n"
@@ -286,7 +287,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "obsolete OpenXR trial keys were not removed");
         Require(!vr.Get("engine", "streamline_ps93_learning_log").has_value(),
             "obsolete engine learning-log key was not removed");
-        Require(!vr.Get("engine", "gamepad_select_recenter").has_value() &&
+        Require(!vr.Get("engine", "critical_thread_core_isolation").has_value() &&
+            !vr.Get("engine", "gamepad_select_recenter").has_value() &&
             !vr.Get("engine", "gamepad_select_first_person").has_value() &&
             !vr.Get("engine", "streamline_mvec_probe").has_value() &&
             !vr.Get("engine", "streamline_output_probe").has_value() &&
@@ -535,9 +537,10 @@ void TestProportionalCutsceneConvergence() {
 
 void TestReleaseDefaults() {
     const w3vr::LauncherState defaults;
-    Require(defaults.mode == w3vr::RenderMode::StereoNone &&
+    Require(defaults.mode == w3vr::RenderMode::AerAfwDlss &&
+        defaults.dlss_quality == 3 &&
         defaults.width == 2688 && defaults.height == 2784,
-        "mode and resolution release defaults changed");
+        "AER DLSS Performance and resolution release defaults changed");
     Require(defaults.presentation_scale == 1.0f,
         "Presentation Size must default to 1.00");
     Require(defaults.full_vr_hud_scale == 1.0f &&
@@ -568,8 +571,8 @@ void TestReleaseDefaults() {
         "static-HUD hiding must remain opt-in");
     Require(defaults.fast_movement_transitions,
         "faster movement transitions must default to enabled");
-    Require(!defaults.native_stereo,
-        "experimental native stereo must default to disabled");
+    Require(defaults.native_stereo,
+        "asymmetric projection must default to enabled");
     Require(!defaults.fullscreen_projection,
         "experimental fullscreen projection must default to disabled");
     Require(!defaults.alternate_presentation_resize,
@@ -578,25 +581,26 @@ void TestReleaseDefaults() {
         "diagnostic logging must default to disabled");
 }
 
-void TestVrProfileExtremePlusShadows() {
+void TestVrProfileHighShadows() {
     std::wstring error;
     const auto profile_path =
         fs::path(__FILE__).parent_path() / "vr_dx12user.settings";
     const auto profile = w3vr::IniDocument::Load(profile_path, error);
     Require(profile.has_value(),
         "bundled Prepare Settings for VR profile could not be loaded");
-    Require(profile->Get("Rendering", "CascadeShadowDistanceScale0") == "1.8" &&
-        profile->Get("Rendering", "CascadeShadowDistanceScale1") == "1.5" &&
-        profile->Get("Rendering", "CascadeShadowDistanceScale2") == "1.5" &&
-        profile->Get("Rendering", "CascadeShadowDistanceScale3") == "1.5" &&
+    Require(profile->Get("PostProcess", "DLSSQuality") == "3" &&
+        profile->Get("Rendering", "CascadeShadowDistanceScale0") == "1" &&
+        profile->Get("Rendering", "CascadeShadowDistanceScale1") == "1" &&
+        profile->Get("Rendering", "CascadeShadowDistanceScale2") == "1.2" &&
+        profile->Get("Rendering", "CascadeShadowDistanceScale3") == "1.2" &&
         profile->Get("Rendering", "CascadeShadowFadeTreshold") == "1" &&
-        profile->Get("Rendering", "CascadeShadowmapSize") == "4096" &&
+        profile->Get("Rendering", "CascadeShadowmapSize") == "2048" &&
         profile->Get("Rendering", "CascadeShadowQuality") == "1" &&
         profile->Get("Rendering", "MaxTerrainShadowAtlasCount") == "4" &&
         profile->Get("Rendering/RT", "Shadows") == "true" &&
         profile->Get(
             "Rendering/SpeedTree", "FoliageShadowDistanceScale") == "16",
-        "Prepare Settings for VR no longer carries the Extreme+ shadow profile");
+        "Prepare Settings for VR no longer carries Performance DLSS and High shadows");
 }
 
 void TestEmbeddedLauncherDefaults() {
@@ -607,10 +611,14 @@ void TestEmbeddedLauncherDefaults() {
     Require(defaults.has_value(),
         "embedded launcher INI defaults could not be loaded");
     Require(defaults->Get("meta", "config_version") == "13" &&
+        defaults->Get("openxr", "mode3_aer_presentation") == "1" &&
         defaults->Get("openxr", "resolution_auto") == "1" &&
         defaults->Get("openxr", "presentation_scale") == "1.000" &&
+        defaults->Get("openxr", "native_stereo") == "1" &&
+        defaults->Get("engine", "temporal_backend") == "dlss" &&
         defaults->Get("engine", "first_person_combat_exit") == "0" &&
-        defaults->Get("engine", "raytracing_history_buffers") == "8",
+        defaults->Get("engine", "raytracing_history_buffers") == "8" &&
+        defaults->Get("debug", "pipeline_flight_recorder") == "0",
         "embedded launcher defaults do not match schema 13 release policy");
 }
 
@@ -965,6 +973,12 @@ void TestInconsistentWarning(const w3vr::ConfigPaths& paths) {
 void TestFirstRunConfiguration(const fs::path& root) {
     const auto paths = MakePaths(root / "first-run");
     fs::create_directories(paths.launcher_directory);
+    Write(paths.game_settings,
+        "[PostProcess]\r\n"
+        "AAMode=3\r\n"
+        "DLSSQuality=1\r\n"
+        "[Rendering]\r\n"
+        "AllowDLSS=false\r\n");
     bool created{};
     std::wstring error;
     const std::string defaults =
@@ -972,11 +986,11 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "config_version=13\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
-        "mode3_aer_presentation=0\r\n"
+        "mode3_aer_presentation=1\r\n"
         "resolution_auto=1\r\n"
         "render_width=2688\r\n"
         "render_height=2784\r\n"
-        "native_stereo=0\r\n"
+        "native_stereo=1\r\n"
         "fullscreen_projection=0\r\n"
         "alternate_presentation_resize=0\r\n"
         "hud_horizontal_scale=1.000\r\n"
@@ -987,7 +1001,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "manual_cinema_hud_scale=1.600\r\n"
         "cinema_full_vr=1\r\n"
         "[engine]\r\n"
-        "temporal_backend=taau\r\n"
+        "temporal_backend=dlss\r\n"
         "dual_render_probe=1\r\n"
         "dual_render_start=1\r\n"
         "raytracing_enabled=0\r\n"
@@ -1003,7 +1017,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "first-run INI creation failed");
     Require(created, "first-run INI was not reported as created");
     Require(Read(paths.vr_ini) == defaults,
-        "first-run INI does not match embedded defaults");
+        "first-run INI did not preserve the embedded release defaults");
 
     Write(paths.vr_ini,
         "; old alpha user file\r\n"
@@ -1383,7 +1397,7 @@ int main() {
         TestProportionalCutsceneConvergence();
         TestReleaseDefaults();
         TestEmbeddedLauncherDefaults();
-        TestVrProfileExtremePlusShadows();
+        TestVrProfileHighShadows();
         TestHudEditorSetup(temporary.path);
         TestAllModes(paths);
         TestControlledRayTracingAndAlternateResize(paths);

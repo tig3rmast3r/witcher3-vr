@@ -24,7 +24,7 @@ $openXrLoaderSource = Join-Path $repositoryRoot 'external/openxr-loader'
 $openXrLoaderBuild = Join-Path $repositoryRoot 'build/openxr-loader'
 $openXrLoader = Join-Path $openXrLoaderBuild `
     'src/loader/Release/openxr_loader.dll'
-$exampleIni = Join-Path $repositoryRoot 'config/witcher3vr.example.ini'
+$exampleIni = Join-Path $repositoryRoot 'witcher3vr.example.ini'
 $readme = Join-Path $repositoryRoot 'README.md'
 $license = Join-Path $repositoryRoot 'LICENSE'
 $thirdPartyNotices = Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md'

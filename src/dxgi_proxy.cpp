@@ -27,15 +27,22 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 #include "shadow_cascade_authority_policy.h"
-#include "strict_dlss_smoke_authority_policy.h"
 #include "taau_submission_policy.h"
 
-// V1262 changes only AER's final OpenXR presentation below size 1: the completed
+// V1265 stops AFW gameplay producer admission on the native automatic Full-VR
+// ownership edge instead of waiting for the debounced Cinema detector. This
+// keeps the six-slot producer FIFO available when gameplay resumes and avoids
+// dropping the HUD back to its baked fail-open path. V1264 changes only the
+// launcher and packaged configuration defaults to AER +
+// DLSS Performance with Asymmetric Projection enabled. The renderer remains
+// V1263's release-candidate cleanup: V1261's runtime-rejected smoke TLS is
+// removed, the pipeline flight recorder remains available but defaults off, and
+// the launcher's bundled shadow profile returns to High now that V1260 shares
+// cascade culling between the eyes. V1262 changes only AER's final OpenXR
+// presentation below size 1: the completed
 // gameplay image is remapped into the same tangent-scaled per-eye FOV and exact
 // 100% source-sized subimage used by strict Stereo. Producer identity, AFW,
-// temporal inputs, scene projection and Cinema are unchanged. V1261 gives
-// strict Stereo DLSS smoke its own exact command eye/pair authority instead of
-// requiring AFW's unrelated render-view payload. V1260 gives both
+// temporal inputs, scene projection and Cinema are unchanged. V1260 gives both
 // eyes of one exact gameplay pair the first-arriving view only
 // inside REDengine's native shadow-cascade builder. The second eye receives a
 // private renderer snapshot, so scene cameras, projection, engine memory and
@@ -2729,12 +2736,6 @@ thread_local uint64_t g_streamline_dlss_pair_id{UINT64_MAX};
 // through both the emitter and the deferred command execution scopes.
 thread_local EngineFrameTag g_streamline_dlss_route_tag{};
 thread_local bool g_streamline_dlss_route_tag_valid{};
-// [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 1/4] V1231 reused AFW's
-// complete route flag, which also requires render_view_valid. Smoke centring
-// needs only exact task provenance, eye, pair and generation. Keep that
-// narrower contract in a separate TLS scope so AFW remains fail-closed.
-thread_local EngineFrameTag g_strict_dlss_smoke_route_tag{};
-thread_local bool g_strict_dlss_smoke_route_tag_valid{};
 std::atomic<uint32_t> g_ngx_trace_count{};
 thread_local bool g_ngx_creating_feature{};
 std::atomic<uint64_t> g_streamline_reset_last_logged_present{UINT64_MAX};
@@ -8405,21 +8406,29 @@ int32_t capture_puredark_afw_dlss_inputs(
         g_cinema_mode_active.load(std::memory_order_relaxed);
     const bool loading_video_active =
         g_engine_loading_screen_video_active.load(std::memory_order_acquire);
-    if (!route_active || command_list == nullptr || parameters == nullptr ||
-        routed_eye > 1 || menu_state != 0 || cinema_active ||
-        loading_video_active) {
+    const bool automatic_full_vr_active =
+        !g_force_mono_cinema.load(std::memory_order_relaxed) &&
+        g_config.cinema_full_vr &&
+        g_automatic_full_vr_camera_active.load(std::memory_order_acquire);
+    const bool gameplay_capture_allowed =
+        w3vr::mode3_transport::afw_gameplay_capture_allowed(
+            route_active, menu_state, cinema_active,
+            loading_video_active, automatic_full_vr_active);
+    if (!gameplay_capture_allowed || command_list == nullptr ||
+        parameters == nullptr || routed_eye > 1) {
         static std::atomic<uint32_t> capture_gate_reject_logs{};
         if (g_config.runtime_diagnostics &&
             capture_gate_reject_logs.fetch_add(
                 1, std::memory_order_relaxed) < 32) {
             log_line(
                 "V12099 AFW DLSS capture gate reject route=%u command_list=%p "
-                "parameters=%p eye=%u menu=%d cinema=%u loading=%u "
+                "parameters=%p eye=%u menu=%d cinema=%u loading=%u full_vr=%u "
                 "openxr=%u mode=%d aer=%u backend=%s afw=%u freelook=%u "
                 "stereo_offset=%.6f",
                 route_active ? 1u : 0u, command_list, parameters, routed_eye,
                 menu_state, cinema_active ? 1u : 0u,
                 loading_video_active ? 1u : 0u,
+                automatic_full_vr_active ? 1u : 0u,
                 g_config.openxr_enabled ? 1u : 0u, g_config.openxr_mode,
                 mode3_aer_presentation_active() ? 1u : 0u,
                 temporal_backend_name(),
@@ -8941,11 +8950,18 @@ bool capture_puredark_afw_mode3_taau_inputs(
     const bool loading_active =
         g_engine_loading_screen_video_active.load(
             std::memory_order_acquire);
-    if (!route_configured || command_list == nullptr ||
+    const bool automatic_full_vr_active =
+        !g_force_mono_cinema.load(std::memory_order_relaxed) &&
+        g_config.cinema_full_vr &&
+        g_automatic_full_vr_camera_active.load(std::memory_order_acquire);
+    const bool gameplay_capture_allowed =
+        w3vr::mode3_transport::afw_gameplay_capture_allowed(
+            route_configured, menu_state, cinema_active,
+            loading_active, automatic_full_vr_active);
+    if (!gameplay_capture_allowed || command_list == nullptr ||
         depth.resource == nullptr || motion_vectors.resource == nullptr ||
         eye > 1 || pair_id == 0 || pair_id == UINT64_MAX ||
-        generation != current_generation || menu_state != 0 ||
-        cinema_active || loading_active) {
+        generation != current_generation) {
         return false;
     }
 
@@ -14867,36 +14883,6 @@ bool select_real_smoke_offaxis_pipeline(
     }
     const uint64_t present =
         g_present_count.load(std::memory_order_relaxed);
-    // [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 2/4] Consume the
-    // smoke-specific identity before the older AFW-complete route. This stays
-    // exact but no longer rejects a valid DLSS command merely because its
-    // optional render-view payload was unavailable.
-    if (g_strict_dlss_smoke_route_tag_valid) {
-        const EngineFrameTag tag = g_strict_dlss_smoke_route_tag;
-        const uint32_t generation =
-            g_streamline_capture_generation.load(std::memory_order_acquire);
-        if (w3vr::strict_dlss_smoke::valid_exact_identity(
-                tag.task_provenance_valid, tag.eye, tag.pair_id,
-                tag.generation, generation)) {
-            store_native_focus_draw_eye(
-                command_list, present, tag.eye, tag.pair_id);
-            variant_pipeline =
-                g_real_smoke_center_pipelines[tag.eye].load(
-                    std::memory_order_acquire);
-            static std::atomic<uint32_t> exact_logs{};
-            if (g_config.runtime_diagnostics &&
-                take_bounded_log_slot(exact_logs, 64)) {
-                log_line(
-                    "V1261 strict DLSS smoke authority route=exact_command "
-                    "eye=%u pair=%llu generation=%u view_valid=%u "
-                    "command_list=%p present=%llu",
-                    tag.eye, static_cast<unsigned long long>(tag.pair_id),
-                    tag.generation, tag.render_view_valid ? 1u : 0u,
-                    command_list, static_cast<unsigned long long>(present));
-            }
-            return variant_pipeline != nullptr;
-        }
-    }
     // [FIX:STRICT-DLSS-SMOKE-EXACT-EYE V1231 1/2] Sequential DLSS already
     // transports the immutable frame tag from REDengine's exact emitter to
     // the deferred command execution scope. Consume that tag directly while
@@ -19150,20 +19136,6 @@ void STDMETHODCALLTYPE hook_draw_indexed_instanced(
             variant_selected = select_real_smoke_offaxis_pipeline(
                 command_list, variant_pipeline);
             if (!variant_selected) {
-                // [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 4/4]
-                // A bounded marker makes any remaining scope miss explicit.
-                static std::atomic<uint32_t> fallback_logs{};
-                if (g_config.runtime_diagnostics &&
-                    dlss_sequential_mode_active() &&
-                    take_bounded_log_slot(fallback_logs, 32)) {
-                    log_line(
-                        "V1261 strict DLSS smoke authority "
-                        "route=zero_center_fallback command_list=%p "
-                        "present=%llu",
-                        command_list,
-                        static_cast<unsigned long long>(
-                            g_present_count.load(std::memory_order_relaxed)));
-                }
                 // [FIX:WORLD-UP-ZERO-CENTER-FALLBACK V1157 1/1] Off-axis
                 // authority is a spatial refinement, not permission to apply
                 // the independent V1080 world-up rotation fix. V1156 proved
@@ -25395,19 +25367,6 @@ void __fastcall hook_engine_dlss_command_emit(
     const EngineFrameTag previous_route_tag = g_streamline_dlss_route_tag;
     const bool previous_route_tag_valid =
         g_streamline_dlss_route_tag_valid;
-    const EngineFrameTag previous_smoke_route_tag =
-        g_strict_dlss_smoke_route_tag;
-    const bool previous_smoke_route_tag_valid =
-        g_strict_dlss_smoke_route_tag_valid;
-    const uint32_t generation =
-        g_streamline_capture_generation.load(std::memory_order_acquire);
-    g_strict_dlss_smoke_route_tag_valid = emitted_tag_valid &&
-        w3vr::strict_dlss_smoke::valid_exact_identity(
-            emitted_tag.task_provenance_valid, emitted_tag.eye,
-            emitted_tag.pair_id, emitted_tag.generation, generation);
-    if (g_strict_dlss_smoke_route_tag_valid) {
-        g_strict_dlss_smoke_route_tag = emitted_tag;
-    }
     g_streamline_dlss_route_tag_valid = emitted_tag_valid &&
         emitted_tag.task_provenance_valid &&
         emitted_tag.render_view_valid;
@@ -25417,9 +25376,6 @@ void __fastcall hook_engine_dlss_command_emit(
     g_engine_dlss_command_emit(renderer, parameters);
     g_streamline_dlss_route_tag = previous_route_tag;
     g_streamline_dlss_route_tag_valid = previous_route_tag_valid;
-    g_strict_dlss_smoke_route_tag = previous_smoke_route_tag;
-    g_strict_dlss_smoke_route_tag_valid =
-        previous_smoke_route_tag_valid;
 }
 
 void install_engine_dlss_command_emit_hook() {
@@ -25523,22 +25479,6 @@ void __fastcall hook_engine_dlss_command(void* context, uint8_t** stream) {
     const EngineFrameTag previous_route_tag = g_streamline_dlss_route_tag;
     const bool previous_route_tag_valid =
         g_streamline_dlss_route_tag_valid;
-    // [FIX:STRICT-DLSS-SMOKE-COMMAND-AUTHORITY V1261 3/4] The consumer's
-    // queue hit already proves generation. Publish the narrower smoke scope
-    // independently of AFW's render-view validity.
-    const EngineFrameTag previous_smoke_route_tag =
-        g_strict_dlss_smoke_route_tag;
-    const bool previous_smoke_route_tag_valid =
-        g_strict_dlss_smoke_route_tag_valid;
-    const uint32_t generation =
-        g_streamline_capture_generation.load(std::memory_order_acquire);
-    g_strict_dlss_smoke_route_tag_valid = route_tag_valid &&
-        w3vr::strict_dlss_smoke::valid_exact_identity(
-            route_tag.task_provenance_valid, route_tag.eye,
-            route_tag.pair_id, route_tag.generation, generation);
-    if (g_strict_dlss_smoke_route_tag_valid) {
-        g_strict_dlss_smoke_route_tag = route_tag;
-    }
     g_streamline_dlss_route_tag_valid = route_tag_valid &&
         route_tag.task_provenance_valid && route_tag.render_view_valid &&
         route_tag.eye <= 1 && route_tag.pair_id != 0 &&
@@ -25549,9 +25489,6 @@ void __fastcall hook_engine_dlss_command(void* context, uint8_t** stream) {
     g_engine_dlss_command(context, stream);
     g_streamline_dlss_route_tag = previous_route_tag;
     g_streamline_dlss_route_tag_valid = previous_route_tag_valid;
-    g_strict_dlss_smoke_route_tag = previous_smoke_route_tag;
-    g_strict_dlss_smoke_route_tag_valid =
-        previous_smoke_route_tag_valid;
     g_streamline_dlss_pair_id = previous_pair;
     g_streamline_forced_eye = previous_forced_eye;
 }
@@ -36386,7 +36323,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1262 base=V1261 "
+                "witcher3vr dxgi proxy initialized build=V1265 base=V1264 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d",
@@ -36398,7 +36335,7 @@ void ensure_initialized() {
                 g_config.raytracing_history_buffers,
                 g_config.puredark_afw_enabled ? 1 : 0,
                 focus_projection_shader_registry_enabled() ? 1 : 0);
-            log_line("V1234 AFW common_transport=dlss_and_taau projection_transport=symmetric_asymmetric_identical final_color=exact_submitted_temporal queue_admission=exact_command_list_any_hooked_queue taau_motion=normalized_rg16f_previous_minus_current afw_projection=packet_owned_camera_fov mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_command_eye_pair_independent_of_afw_view aer_presentation_size=final_openxr_scaled_fov_source_extent rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic static_hud=launcher_script_dynamic");
+            log_line("V1234 AFW common_transport=dlss_and_taau projection_transport=symmetric_asymmetric_identical final_color=exact_submitted_temporal queue_admission=exact_command_list_any_hooked_queue taau_motion=normalized_rg16f_previous_minus_current afw_projection=packet_owned_camera_fov mode3_afw_bundle_fifo=exact_submitted_temporal mode3_afw_order=temporal_bundle_then_shared_xr_evaluate_copy_draw strict_dlss_smoke_eye=exact_deferred_command_tag aer_presentation_size=final_openxr_scaled_fov_source_extent rt_identity=order_independent_open_transactions rt_ingress_packet=removed rt_flight=removed rt_gpu_history=exact_previous_pair_configurable_4_to_16_default_8 afw_visual_debug=F6 camera_follow=launcher_script_dynamic static_hud=launcher_script_dynamic");
             log_line(
                 "V1177 RenderDoc integration=retained ini=optional_default_off capture=F7 system_dxgi_exports=pre_resolved api=1.6.0");
             log_line(
