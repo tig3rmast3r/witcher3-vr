@@ -74,6 +74,17 @@ constexpr bool late_hud_composite_source_ready(
         scene_only_pair_ready;
 }
 
+// Retained HUD capture must be able to discover REDengine's native t1 source
+// before the scene-only pair exists. AER and Cinema already admit the complete
+// HUD pipeline family during that fail-open interval; strict Stereo needs the
+// same bootstrap or it can never produce the pair that enables scene-only.
+constexpr bool native_hud_source_bootstrap_active(
+    bool aer_post_hud_active,
+    bool cinema_active,
+    bool strict_stereo_active) noexcept {
+    return aer_post_hud_active || cinema_active || strict_stereo_active;
+}
+
 // Pixels retained in a completed Cinema pair must keep the XrView frozen with
 // that same pair. The sequential AER route deliberately does not set the
 // general packed-pair validity bit, so its independent completion authority

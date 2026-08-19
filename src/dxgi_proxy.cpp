@@ -25,7 +25,10 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1236 adds an INI-controlled ten-second CPU/GPU pipeline flight recorder.
+// V1238 lets strict Stereo discover the native HUD source before its retained
+// pair exists, matching AER/Cinema's fail-open bootstrap and breaking the
+// source-ready/scene-only readiness cycle. V1236 adds an INI-controlled
+// ten-second CPU/GPU pipeline flight recorder.
 // It is independent from broad Diagnostic Logging, never waits for GPU query
 // data on the game path, and writes only when F2 is pressed. V1235 requires
 // exact scene-only pair proof before automatic Full VR receives
@@ -19887,13 +19890,25 @@ bool publish_mode3_hud_source(
     auto* const bound_pipeline = load_command_list_pipeline(command_list);
     const bool mode3_aer_afw_post_hud =
         mode3_aer_afw_post_hud_gameplay_active();
+    const bool strict_stereo_hud_bootstrap =
+        mode3_stereo_transport_active() &&
+        !mode3_aer_presentation_active();
     // [FIX:AER-AFW-HUD-SOURCE V12009 3/3] During fail-open bootstrap the
     // native/eye HUD family still owns the draw. It carries the same t1
     // binding as scene-only, so accept it solely for AER source discovery.
     // [FIX:AER-AFW-POST-HUD V1189 5/9] Bootstrap from the original HUD family
     // before a retained pair exists. Restricting discovery to scene-only made
     // TAAU's fail-open permanent and gave native DLSS no source to extract.
-    const bool eligible_hud_pipeline = mode3_aer_afw_post_hud || cinema_active
+    // [FIX:STEREO-HUD-BOOTSTRAP V1238 1/1] Strict Stereo has the same retained
+    // HUD dependency as AER: accept native t1 while the baked draw is still the
+    // visible fail-open owner. Once both eyes exist, the established PSO gate
+    // switches to scene-only and this family continues to accept that PSO.
+    const bool native_hud_source_bootstrap =
+        w3vr::mode3_transport::native_hud_source_bootstrap_active(
+            mode3_aer_afw_post_hud,
+            cinema_active,
+            strict_stereo_hud_bootstrap);
+    const bool eligible_hud_pipeline = native_hud_source_bootstrap
         ? mode3_hud_pipeline_family(bound_pipeline)
         : bound_pipeline ==
             g_mode3_scene_only_pso.load(std::memory_order_acquire);

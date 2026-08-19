@@ -12,6 +12,7 @@ int main() {
     using w3vr::mode3_transport::final_color_submission_backend;
     using w3vr::mode3_transport::immutable_pair_view_ready;
     using w3vr::mode3_transport::late_hud_composite_source_ready;
+    using w3vr::mode3_transport::native_hud_source_bootstrap_active;
     using w3vr::mode3_transport::submission_queue_eligible;
 
     // Projection is not an input: both symmetric and asymmetric exercise this
@@ -60,6 +61,14 @@ int main() {
         HudProjectionRoute::Cinema, false));
     assert(late_hud_composite_source_ready(
         HudProjectionRoute::Cinema, true));
+
+    // Every retained-HUD route must be able to discover native t1 before the
+    // first complete scene-only pair exists. Strict Stereo previously omitted
+    // its bootstrap and could not transition away from the baked HUD.
+    assert(native_hud_source_bootstrap_active(true, false, false));
+    assert(native_hud_source_bootstrap_active(false, true, false));
+    assert(native_hud_source_bootstrap_active(false, false, true));
+    assert(!native_hud_source_bootstrap_active(false, false, false));
 
     // AER Cinema keeps its completed pixels in the packed resources without
     // publishing the unrelated strict-Stereo packed-valid bit. Its completed
