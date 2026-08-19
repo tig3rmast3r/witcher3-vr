@@ -28,7 +28,7 @@ function W3VRHudEditor_DebugChannel(): name
 
 function W3VRHudEditor_Version(): string
 {
-  return "V1210";
+  return "V1233";
 }
 
 function W3VRHudEditor_DebugEnabled(): bool
@@ -192,6 +192,8 @@ class W3VRHudEditorSlot
   var visualStateCaptured: bool;
   var originalAlpha: float;
   var originalVisible: bool;
+  var staticHudMaskOwned: bool;
+  var staticHudOriginalVisible: bool;
 
   public function Configure(
     inModule: CR4HudModuleBase,
@@ -396,6 +398,38 @@ class W3VRHudEditorSlot
     }
     visualStateCaptured = false;
   }
+
+  public function ApplyStaticHudMask(masked: bool)
+  {
+    var root: CScriptedFlashSprite;
+
+    if (!module)
+    {
+      return;
+    }
+    root = module.GetModuleFlash();
+    if (!root)
+    {
+      return;
+    }
+
+    if (masked)
+    {
+      if (!staticHudMaskOwned)
+      {
+        staticHudOriginalVisible = root.GetVisible();
+        staticHudMaskOwned = true;
+      }
+      // Vanilla continues updating the module and its children underneath the
+      // hidden root. Reassert after the HUD tick in case Scaleform rebuilt it.
+      root.SetVisible(false);
+    }
+    else if (staticHudMaskOwned)
+    {
+      root.SetVisible(staticHudOriginalVisible);
+      staticHudMaskOwned = false;
+    }
+  }
 }
 
 class W3VRHudEditorController
@@ -417,6 +451,11 @@ class W3VRHudEditorController
   private var lastDebugSlotCount: int;
   private var movementTraceSequence: int;
   private var tutorialPreviewRequested: bool;
+  private var hideStaticHudOutsideCombat: bool;
+  private var minimapDynamicPolicyOwned: bool;
+  private var minimapDynamicPolicyOriginal: bool;
+  private var objectiveDynamicPolicyOwned: bool;
+  private var objectiveDynamicPolicyOriginal: bool;
 
   public function BeginHudInitialization(ownerHud: CR4ScriptedHud)
   {
@@ -430,6 +469,7 @@ class W3VRHudEditorController
       StopEditor();
     }
 
+    ReleaseStaticHudMasks();
     RemoveRegistryTransforms();
     slots.Clear();
     initialized = false;
@@ -1034,9 +1074,134 @@ class W3VRHudEditorController
       return;
     }
 
+    ApplyStaticHudVisibilityPolicy();
+
     if (editing)
     {
       RefreshEditorVisuals();
+    }
+  }
+
+  private function IsStaticHudSlot(slot: W3VRHudEditorSlot): bool
+  {
+    if (!slot)
+    {
+      return false;
+    }
+    return slot.moduleName == "ControlsFeedbackModule" ||
+      slot.moduleName == "QuestsModule" ||
+      slot.moduleName == "BuffsModule" ||
+      slot.moduleName == "WolfHeadModule" ||
+      slot.moduleName == "ItemInfoModule" ||
+      slot.moduleName == "Minimap2Module" ||
+      slot.moduleName == "CompanionModule" ||
+      slot.moduleName == "DamagedItemsModule";
+  }
+
+  private function IsNavigationHudSlot(slot: W3VRHudEditorSlot): bool
+  {
+    if (!slot)
+    {
+      return false;
+    }
+
+    return slot.moduleName == "Minimap2Module" ||
+      slot.moduleName == "QuestsModule";
+  }
+
+  private function ApplyNavigationDynamicPolicy(wanted: bool)
+  {
+    var slot: W3VRHudEditorSlot;
+    var minimap: CR4HudModuleMinimap2;
+    var objectives: CR4HudModuleQuests;
+
+    slot = FindSlot("Minimap2Module");
+    if (slot && slot.module)
+    {
+      minimap = (CR4HudModuleMinimap2)slot.module;
+      if (wanted && !minimapDynamicPolicyOwned)
+      {
+        minimapDynamicPolicyOriginal =
+          minimap.GetMinimapDuringFocusCombat();
+        minimap.SetMinimapDuringFocusCombat(true);
+        minimapDynamicPolicyOwned = true;
+      }
+      else if (!wanted && minimapDynamicPolicyOwned)
+      {
+        minimap.SetMinimapDuringFocusCombat(
+          minimapDynamicPolicyOriginal
+        );
+        minimapDynamicPolicyOwned = false;
+      }
+    }
+
+    slot = FindSlot("QuestsModule");
+    if (slot && slot.module)
+    {
+      objectives = (CR4HudModuleQuests)slot.module;
+      if (wanted && !objectiveDynamicPolicyOwned)
+      {
+        objectiveDynamicPolicyOriginal =
+          objectives.GetObjectiveDuringFocusCombat();
+        objectives.SetObjectiveDuringFocusCombat(true);
+        objectiveDynamicPolicyOwned = true;
+      }
+      else if (!wanted && objectiveDynamicPolicyOwned)
+      {
+        objectives.SetObjectiveDuringFocusCombat(
+          objectiveDynamicPolicyOriginal
+        );
+        objectiveDynamicPolicyOwned = false;
+      }
+    }
+  }
+
+  private function ReleaseStaticHudMasks()
+  {
+    var i: int;
+
+    for (i = 0; i < slots.Size(); i += 1)
+    {
+      if (IsStaticHudSlot(slots[i]))
+      {
+        slots[i].ApplyStaticHudMask(false);
+      }
+    }
+    ApplyNavigationDynamicPolicy(false);
+  }
+
+  private function ApplyStaticHudVisibilityPolicy()
+  {
+    var i: int;
+    var revealStatic: bool;
+    var revealNavigation: bool;
+
+    if (!hideStaticHudOutsideCombat || editing || !thePlayer)
+    {
+      ReleaseStaticHudMasks();
+      return;
+    }
+
+    // REDengine's dynamic navigation path rebuilds minimap/objective contents
+    // on Focus, combat and horse races. Own it only while this policy is live.
+    ApplyNavigationDynamicPolicy(true);
+
+    revealStatic = thePlayer.IsInCombat() || theGame.IsFocusModeActive();
+    revealNavigation = revealStatic || thePlayer.GetIsHorseRacing();
+    for (i = 0; i < slots.Size(); i += 1)
+    {
+      if (!IsStaticHudSlot(slots[i]))
+      {
+        continue;
+      }
+      if (IsNavigationHudSlot(slots[i]))
+      {
+        slots[i].ApplyStaticHudMask(!revealNavigation);
+      }
+      else
+      {
+        slots[i].ApplyStaticHudMask(!revealStatic);
+      }
     }
   }
 
@@ -1284,6 +1449,7 @@ class W3VRHudEditorController
       return;
     }
 
+    ReleaseStaticHudMasks();
     editing = true;
 
     for (i = 0; i < slots.Size(); i += 1)
@@ -1944,10 +2110,15 @@ class W3VRHudEditorController
     // Until the renderer becomes authoritative, always start gameplay on the
     // safe VR bank. Tab changes only the current runtime/editor preview.
     activeProfile = 0;
+    hideStaticHudOutsideCombat = false;
     if (!config)
     {
       return;
     }
+
+    hideStaticHudOutsideCombat = ReadConfigBool(
+      config, 'W3VRSettings', 'HideStaticHudOutsideCombat', false
+    );
 
     for (i = 0; i < slots.Size(); i += 1)
     {
@@ -2048,6 +2219,23 @@ class W3VRHudEditorController
       return fallback;
     }
     return StringToFloat(value);
+  }
+
+  private function ReadConfigBool(
+    config: CInGameConfigWrapper,
+    groupName: name,
+    varName: name,
+    fallback: bool
+  ): bool
+  {
+    var value: string;
+
+    value = config.GetVarValue(groupName, varName);
+    if (value == "")
+    {
+      return fallback;
+    }
+    return value == "true" || value == "1";
   }
 
   private function ClampScale(value: float): float

@@ -4,10 +4,12 @@
     <PresetsArray>
       <Preset id="0" displayName="Defaults">
         <Entry varId="CameraFollowPolicy" value="1"/>
+        <Entry varId="HideStaticHudOutsideCombat" value="false"/>
       </Preset>
     </PresetsArray>
     <VisibleVars>
       <Var id="CameraFollowPolicy" displayName="Camera follow policy" displayType="SLIDER;0;2;2" visibilityCondition="hideAlways"/>
+      <Var id="HideStaticHudOutsideCombat" displayName="Hide static HUD outside combat" displayType="TOGGLE" visibilityCondition="hideAlways"/>
     </VisibleVars>
   </Group>
 

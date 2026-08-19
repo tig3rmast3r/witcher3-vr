@@ -122,6 +122,7 @@ EnableUberMovement=1
 AutoCameraCenter=false
 [W3VRSettings]
 CameraFollowPolicy=1
+HideStaticHudOutsideCombat=false
 [LevelOfDetail]
 SwarmHideDistance=200
 DecalsHideDistance=40

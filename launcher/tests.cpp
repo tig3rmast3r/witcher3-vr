@@ -197,6 +197,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.first_person_anchor_smoothing = index % 2 == 0;
         state.camera_follow_policy = static_cast<w3vr::CameraFollowPolicy>(
             index % 3);
+        state.hide_static_hud_outside_combat = index % 2 == 0;
         state.fast_movement_transitions = index % 2 == 0;
         state.native_stereo = true;
         state.fullscreen_projection = true;
@@ -341,6 +342,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(game.Get("Gameplay", "AutoCameraCenter") ==
                 std::string(index % 3 == 0 ? "true" : "false"),
             "native camera-follow bootstrap is inconsistent");
+        Require(game.Get("W3VRSettings", "HideStaticHudOutsideCombat") ==
+                std::string(index % 2 == 0 ? "true" : "false"),
+            "dynamic static-HUD policy missing");
         Require(vr.Get("debug", "logging_enabled") == "1",
             "diagnostic log writer flag missing");
         Require(vr.Get("debug", "runtime_diagnostics") == "1",
@@ -413,6 +417,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(loaded.state.camera_follow_policy ==
                 state.camera_follow_policy,
             "round-trip dynamic camera-follow policy mismatch");
+        Require(loaded.state.hide_static_hud_outside_combat ==
+                state.hide_static_hud_outside_combat,
+            "round-trip dynamic static-HUD policy mismatch");
         Require(loaded.state.cinema_hud_scale == state.cinema_hud_scale &&
             loaded.state.cinema_hud_convergence_offset ==
                 state.cinema_hud_convergence_offset,
@@ -548,6 +555,8 @@ void TestReleaseDefaults() {
     Require(defaults.camera_follow_policy ==
             w3vr::CameraFollowPolicy::HorseBoatOnly,
         "camera follow must default to the vehicle-only policy");
+    Require(!defaults.hide_static_hud_outside_combat,
+        "static-HUD hiding must remain opt-in");
     Require(defaults.fast_movement_transitions,
         "faster movement transitions must default to enabled");
     Require(!defaults.native_stereo,
@@ -875,6 +884,7 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     Write(paths.vr_ini, vr->Serialize());
     game->Remove("DLC", "DlcEnabled_movementinputfix");
     game->Remove("W3VRSettings", "CameraFollowPolicy");
+    game->Remove("W3VRSettings", "HideStaticHudOutsideCombat");
     game->Set("Gameplay", "AutoCameraCenter", "false");
     Write(paths.game_settings, game->Serialize());
     const auto missing_flags = w3vr::LoadConfiguration(paths);
@@ -893,6 +903,8 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     Require(missing_flags.state.camera_follow_policy ==
             w3vr::CameraFollowPolicy::HorseBoatOnly,
         "legacy disabled camera follow must migrate to vehicle-only");
+    Require(!missing_flags.state.hide_static_hud_outside_combat,
+        "missing static-HUD policy must default to disabled");
     Require(missing_flags.state.fast_movement_transitions,
         "missing faster-transitions DLC flag must default to enabled");
     Require(!missing_flags.state.diagnostic_logging,

@@ -1424,6 +1424,8 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
             ? CameraFollowPolicy::AlwaysOn
             : CameraFollowPolicy::HorseBoatOnly;
     }
+    result.state.hide_static_hud_outside_combat = ReadBool(
+        *game, "W3VRSettings", "HideStaticHudOutsideCombat", false);
     result.state.fast_movement_transitions = ReadBool(
         *game, "DLC", "DlcEnabled_movementinputfix", true);
     result.state.native_stereo = ReadBool(
@@ -1552,6 +1554,8 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         camera_follow_policy ==
                 static_cast<int>(CameraFollowPolicy::AlwaysOn)
             ? "true" : "false");
+    game_settings.Set("W3VRSettings", "HideStaticHudOutsideCombat",
+        state.hide_static_hud_outside_combat ? "true" : "false");
     const bool dlss_dlaa = ModeUsesDlss(state.mode) && state.dlss_quality == 0;
     vr_ini.Set("engine", "dlss_dlaa", dlss_dlaa ? "1" : "0");
     // [DEBUG 1/2] One launcher switch owns the log writer and every bounded

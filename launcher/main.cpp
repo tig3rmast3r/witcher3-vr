@@ -62,6 +62,7 @@ enum ControlId {
     IdFirstPersonStrafe,
     IdFirstPersonAnchorSmoothing,
     IdCameraFollow,
+    IdHideStaticHudOutsideCombat,
     IdFastMovementTransitions,
     IdCinemaFullVr,
     IdSteadyIcons,
@@ -408,6 +409,8 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
     state.camera_follow_policy = static_cast<CameraFollowPolicy>(std::clamp(
         static_cast<int>(SendMessageW(
             Item(IdCameraFollow), CB_GETCURSEL, 0, 0)), 0, 2));
+    state.hide_static_hud_outside_combat = SendMessageW(
+        Item(IdHideStaticHudOutsideCombat), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.fast_movement_transitions = SendMessageW(
         Item(IdFastMovementTransitions), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.cinema_full_vr = SendMessageW(
@@ -727,6 +730,9 @@ void RestoreLauncherDefaults() {
         defaults.first_person_anchor_smoothing ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCameraFollow), CB_SETCURSEL,
         static_cast<int>(defaults.camera_follow_policy), 0);
+    SendMessageW(Item(IdHideStaticHudOutsideCombat), BM_SETCHECK,
+        defaults.hide_static_hud_outside_combat
+            ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         defaults.fast_movement_transitions ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdCinemaFullVr), BM_SETCHECK,
@@ -884,6 +890,9 @@ void PopulateControls() {
             ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(camera_follow, CB_SETCURSEL,
         static_cast<int>(loaded.state.camera_follow_policy), 0);
+    SendMessageW(Item(IdHideStaticHudOutsideCombat), BM_SETCHECK,
+        loaded.state.hide_static_hud_outside_combat
+            ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdFastMovementTransitions), BM_SETCHECK,
         loaded.state.fast_movement_transitions
             ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1045,9 +1054,13 @@ void CreateInterface(HWND window) {
         IdNativeStereo),
         L"Improves image quality at zero performance cost by matching the projection to your headset. The improvement depends on the headset and may be minimal or negligible on some models. Because it is experimental, it may cause visual artifacts or duplicated shader effects. It works with both AER + AFW and Stereo.");
     AddTooltip(AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 626, 410, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 626, 300, 26,
         IdDiagnosticLogging),
         L"Writes witcher3vr.log and enables bounded runtime diagnostics. Use it for troubleshooting because it may affect performance.");
+    AddTooltip(AddControl(L"BUTTON", L"Hide Static HUD Outside Combat",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 365, 626, 315, 26,
+        IdHideStaticHudOutsideCombat),
+        L"Hides the minimap, tracked objectives, vitality, buffs, equipped items, damaged-item status, companion panel, and control hints outside combat. Witcher Sense reveals them; combat and horse races preserve navigation information.");
 
     AddTooltip(AddControl(L"BUTTON", L"First Person and camera", BS_GROUPBOX,
         20, 682, 680, 178),

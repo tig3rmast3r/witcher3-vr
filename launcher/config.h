@@ -34,6 +34,13 @@ constexpr bool CameraFollowEnabled(
     return policy == CameraFollowPolicy::AlwaysOn && !first_person;
 }
 
+constexpr bool StaticHudModuleVisible(
+    bool policy_enabled, bool in_combat, bool witcher_sense,
+    bool horse_racing, bool navigation_module) {
+    return !policy_enabled || in_combat || witcher_sense ||
+        (navigation_module && horse_racing);
+}
+
 struct ModeSettings {
     int openxr_mode{};
     bool dual_render{};
@@ -68,6 +75,7 @@ struct LauncherState {
     bool first_person_strafe{true};
     bool first_person_anchor_smoothing{true};
     CameraFollowPolicy camera_follow_policy{CameraFollowPolicy::HorseBoatOnly};
+    bool hide_static_hud_outside_combat{};
     bool fast_movement_transitions{true};
     bool native_stereo{};
     bool fullscreen_projection{};
