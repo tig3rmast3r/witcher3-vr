@@ -29,6 +29,10 @@
 #include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
+// V1291 makes AER+TAAU Presentation Size a final OpenXR FOV-only control. Its
+// swapchain and submitted source extent remain at the selected 100% resolution
+// for every slider value, including scale 1, which bypasses the legacy 80%
+// cover crop. DLSS, strict Stereo, producer resolution and AFW are unchanged.
 // V1290 leaves the complete public Streamline DLSS sequence unchanged. At the
 // final strict-Stereo publication gate only, a successful exact public
 // evaluation credits its routed eye even when that eye needed no jitter
@@ -37718,7 +37722,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1290 base=V1289 "
+                "witcher3vr dxgi proxy initialized build=V1291 base=V1290 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d dlss_public_streamline=%d "
@@ -37758,6 +37762,8 @@ void ensure_initialized() {
                 "V1289 DLSS owner=public_streamline mode3_aer_and_stereo=1 ngx_evaluate_create_hooks=disabled per_eye_history=split_viewports constants_cache=token_plus_eye asymmetric_jitter=late_exact_resubmit recipe_reconstruction=0 override_compatible=1");
             log_line(
                 "V1290 strict Stereo final DLSS proof=successful_exact_public_evaluate_per_eye intermediate_dlss=unchanged aer=unchanged");
+            log_line(
+                "V1291 AER TAAU presentation=source_resolution_fixed_100_percent slider=fov_only scale1_legacy_cover_crop=bypassed dlss_stereo_unchanged=1");
             log_line(
                 "V1279 DLSS compatibility=public_streamline_aer_private_history_ngx_stereo legacy_module_agnostic_discovery=disabled_by_V1288");
             log_line(
@@ -39308,10 +39314,23 @@ bool create_openxr_swapchains() {
     const uint32_t source_height = requested_height > 0
         ? requested_height
         : scaled_height;
-    const uint32_t presentation_width = static_cast<uint32_t>(ceilf(
-        static_cast<float>(source_width) / presentation_scale));
-    const uint32_t presentation_height = static_cast<uint32_t>(ceilf(
-        static_cast<float>(source_height) / presentation_scale));
+    const bool aer_taau_fixed_resolution =
+        w3vr::aer_presentation_size_policy::fixed_resolution_route_active({
+            mode3_aer_presentation_active(),
+            g_config.native_stereo,
+            temporal_backend_is_taau()});
+    // [FIX:AER-TAAU-FIXED-RESOLUTION-PRESENTATION V1291 1/3]
+    // TAAU already produced the selected full-resolution pair. Do not divide
+    // the swapchain extent by Presentation Size; that slider is an angular
+    // zoom-out control on this route, not a supersampling control.
+    const uint32_t presentation_width = aer_taau_fixed_resolution
+        ? source_width
+        : static_cast<uint32_t>(ceilf(
+            static_cast<float>(source_width) / presentation_scale));
+    const uint32_t presentation_height = aer_taau_fixed_resolution
+        ? source_height
+        : static_cast<uint32_t>(ceilf(
+            static_cast<float>(source_height) / presentation_scale));
     swapchain.width = std::min(
         std::max(scaled_width, presentation_width), config.maxImageRectWidth);
     swapchain.height = std::min(
@@ -39339,7 +39358,7 @@ bool create_openxr_swapchains() {
 
     result = pfn_xrCreateSwapchain(g_xr_session, &swapchain_info, &swapchain.handle);
     g_xr_eye_swapchains[1].handle = swapchain.handle;
-    log_line("OpenXR xrCreateSwapchain stereo-array result=%s (%d) size=%ux%u recommended=%ux%u requested=%ux%u presentation=%.3f max=%ux%u format=%u samples=%u",
+    log_line("OpenXR xrCreateSwapchain stereo-array result=%s (%d) size=%ux%u recommended=%ux%u requested=%ux%u presentation=%.3f aer_taau_fixed_resolution=%d max=%ux%u format=%u samples=%u",
         xr_result_name(result),
         result,
         swapchain.width,
@@ -39349,6 +39368,7 @@ bool create_openxr_swapchains() {
         requested_width,
         requested_height,
         presentation_scale,
+        aer_taau_fixed_resolution ? 1 : 0,
         config.maxImageRectWidth,
         config.maxImageRectHeight,
         static_cast<unsigned>(selected_format),
@@ -42556,6 +42576,7 @@ void render_openxr_test_frame(
                         final_openxr_remap_active({
                             mode3_aer_presentation_active(),
                             g_config.native_stereo,
+                            temporal_backend_is_taau(),
                             puredark_afw_gameplay_frame,
                             g_config.hmd_freelook,
                             aer_size_projection_pipeline_ready,
@@ -42632,6 +42653,10 @@ void render_openxr_test_frame(
                     projection_width = swapchain.width;
                     projection_height = swapchain.height;
                 }
+                // [FIX:AER-TAAU-FIXED-RESOLUTION-PRESENTATION V1291 2/3]
+                // TAAU takes this route at scale 1 as well: the source extent
+                // remains exact and the legacy cover crop cannot report or
+                // submit the image as 80%. Below 1 only the target FOV changes.
                 // [FIX:AER-FINAL-PRESENTATION-SIZE V1262 1/3] AER's old
                 // legacy-copy presenter encoded reduced Presentation Size by
                 // increasing imageRect (3072 -> 3297 at 0.75 on Quest 3).
@@ -44526,6 +44551,10 @@ void render_openxr_test_frame(
                     // native routes still select the packed view above.
                     projection_views[eye].fov = render_view->fov;
                 } else if (aer_asymmetric_final_size_remap) {
+                    // [FIX:AER-TAAU-FIXED-RESOLUTION-PRESENTATION V1291 3/3]
+                    // Scale 1 submits the raw runtime FOV; lower slider values
+                    // submit only the tangent-scaled FOV. Pixel extent stays
+                    // identical in both cases.
                     // [FIX:AER-FINAL-PRESENTATION-SIZE V1262 3/3] The shader
                     // above remapped the completed symmetric-envelope image
                     // into this eye's tangent-scaled target. Submit that exact

@@ -18,7 +18,7 @@ void require(bool condition, const char* message) {
 
 int main() {
     const policy::FinalOpenXrRemapInput active{
-        true, true, true, true, true, 0.75f};
+        true, true, false, true, true, true, 0.75f};
     require(policy::final_openxr_remap_active(active),
         "AER asymmetric gameplay below scale 1 must use the final OpenXR remap");
 
@@ -41,7 +41,25 @@ int main() {
     input = active;
     input.presentation_scale = 1.0f;
     require(!policy::final_openxr_remap_active(input),
-        "scale 1 must retain the established AER submission exactly");
+        "non-TAAU scale 1 must retain the established AER submission exactly");
+
+    input = active;
+    input.taau_backend = true;
+    input.presentation_scale = 1.0f;
+    require(policy::final_openxr_remap_active(input),
+        "AER TAAU scale 1 must bypass the legacy cover crop");
+
+    const policy::FixedResolutionRouteInput fixed_taau{true, true, true};
+    require(policy::fixed_resolution_route_active(fixed_taau),
+        "AER TAAU must keep the OpenXR swapchain at source resolution");
+    auto route = fixed_taau;
+    route.taau_backend = false;
+    require(!policy::fixed_resolution_route_active(route),
+        "the TAAU resolution policy must not change AER DLSS");
+    route = fixed_taau;
+    route.mode3_aer = false;
+    require(!policy::fixed_resolution_route_active(route),
+        "the TAAU resolution policy must not change strict Stereo");
 
     std::cout << "AER presentation size policy tests passed\n";
     return 0;
