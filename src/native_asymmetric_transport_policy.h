@@ -4,24 +4,22 @@ namespace w3vr::native_asymmetric_transport_policy {
 
 struct FullVrFrameFallbackInput {
     bool native_asymmetric_route{};
-    bool aer_presentation{};
     bool automatic_full_vr{};
 };
 
-// V1242 proves that ordinary AER Cinema pairs must keep the established
-// symmetric presentation. Only a reused-camera Full-VR frame lacks the normal
-// factory correction; keep that exact fallback symmetric as well instead of
-// manufacturing raw off-axis pixels that the AER Cinema presenter does not
-// own.
+// V1242/V1252 prove that the final-frame repair owns only a reused-camera
+// Full-VR interval. AER already needs centered fallback pixels, and V1254's
+// strict Stereo trace proves that its failed native pair is also consumed by
+// the symmetric presenter. Keep that exact fallback centered in either
+// presentation route; ordinary factory-built asymmetric pairs never reach it.
 constexpr bool frame_fallback_uses_symmetric_projection(
     const FullVrFrameFallbackInput& input) noexcept {
-    return input.native_asymmetric_route &&
-        input.aer_presentation && input.automatic_full_vr;
+    return input.native_asymmetric_route && input.automatic_full_vr;
 }
 
 struct StereoFrameFallbackAdmissionInput {
     bool tagged_stereo_frame{};
-    bool symmetric_aer_full_vr_fallback{};
+    bool symmetric_asymmetric_full_vr_fallback{};
     bool full_vr_factory_camera_recent{};
 };
 
@@ -32,7 +30,7 @@ struct StereoFrameFallbackAdmissionInput {
 constexpr bool stereo_frame_fallback_admissible(
     const StereoFrameFallbackAdmissionInput& input) noexcept {
     return input.tagged_stereo_frame &&
-        !(input.symmetric_aer_full_vr_fallback &&
+        !(input.symmetric_asymmetric_full_vr_fallback &&
             input.full_vr_factory_camera_recent);
 }
 

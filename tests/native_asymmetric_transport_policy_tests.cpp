@@ -14,30 +14,27 @@ void require(bool condition, const char* message) {
 
 int main() {
     require(!policy::frame_fallback_uses_symmetric_projection(
-            {false, true, true}),
+            {false, true}),
         "an unconfigured asymmetric route needs no fallback override");
     require(!policy::frame_fallback_uses_symmetric_projection(
-            {true, true, false}),
-        "AER gameplay must keep its established asymmetric route");
-    require(!policy::frame_fallback_uses_symmetric_projection(
-            {true, false, true}),
-        "strict Stereo Full VR must remain on its asymmetric route");
+            {true, false}),
+        "asymmetric gameplay must keep its established factory route");
     require(policy::frame_fallback_uses_symmetric_projection(
-            {true, true, true}),
-        "only the AER Full VR frame fallback must be symmetric");
+            {true, true}),
+        "an asymmetric Full VR frame fallback must be symmetric");
 
     require(!policy::stereo_frame_fallback_admissible(
             {false, true, false}),
         "an untagged frame cannot own the stereo fallback");
     require(policy::stereo_frame_fallback_admissible(
             {true, true, false}),
-        "AER must repair a reused Full VR camera when the factory is stale");
+        "an asymmetric route must repair a reused camera when the factory is stale");
     require(!policy::stereo_frame_fallback_admissible(
             {true, true, true}),
-        "AER must not rewrite an ordinary recent factory camera");
+        "an asymmetric route must not rewrite an ordinary factory camera");
     require(policy::stereo_frame_fallback_admissible(
             {true, false, true}),
-        "strict Stereo keeps its established internal fallback proof");
+        "a symmetric route keeps its established internal fallback proof");
 
     require(!policy::cinema_presentation_uses_native_asymmetric(
             {false, true}),

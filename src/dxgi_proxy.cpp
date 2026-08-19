@@ -26,13 +26,11 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1254 extends V1253's runtime-validated native per-eye DLSS history from AER
-// SYM to AER ASYM reused-camera fallbacks. Strict Stereo remains unchanged for
-// separate validation. V1253 gives only the AER SYM DLSS reused-camera fallback the same native
-// per-eye temporal-camera history used by the normal factory route. The
-// fallback now rebuilds motion from its corrected HMD/IPD camera instead of
-// inheriting the stale embedded-camera record. AER ASYM and strict Stereo are
-// deliberately unchanged for separate validation. V1252 keeps V1251's
+// V1255 applies V1252's centered reused-camera fallback and recent-factory gate
+// to strict Stereo ASYM. It also extends V1254's native per-eye DLSS fallback
+// history to that exact route. Normal factory-built Stereo pairs remain on the
+// established native off-axis path. V1254 extends V1253's runtime-validated
+// native per-eye DLSS history from AER SYM to AER ASYM. V1252 keeps V1251's
 // successful repair for the three reused-camera episodes,
 // but rejects that fallback whenever a Full-VR perspective factory corrected a
 // camera in the last two Presents. This prevents the double camera scale that
@@ -24431,21 +24429,23 @@ void install_engine_temporal_writer_hook() {
     }
 }
 
-// [FIX:AER-FALLBACK-DLSS-HISTORY V1254 1/2] Reused-camera cutscenes do
+// [FIX:ASYM-FALLBACK-DLSS-HISTORY V1255 1/2] Reused-camera cutscenes do
 // not reach hook_engine_view_rebuild(), so V9416/V14003 cannot install the
 // previous corrected camera before REDengine derives native motion vectors.
 // Reuse that same native 0xB0 record on the private final-frame camera. Keep
-// the first frame of each fallback episode self-seeded. V1254 admits both AER
-// projection policies while strict Stereo remains untouched.
-bool prepare_aer_full_vr_fallback_dlss_temporal_history(
+// the first frame of each fallback episode self-seeded. V1255 retains both AER
+// projection policies and additionally admits strict Stereo ASYM.
+bool prepare_full_vr_fallback_dlss_temporal_history(
     float* view,
     int eye,
     uint64_t pair_id,
     bool& continued) {
     continued = false;
+    const bool supported_route = mode3_aer_presentation_active() ||
+        native_asymmetric_noaa_route_active();
     if (view == nullptr || eye < 0 || eye > 1 || pair_id == 0 ||
         pair_id == UINT64_MAX || !dlss_sequential_mode_active() ||
-        !mode3_aer_presentation_active() ||
+        !supported_route ||
         g_engine_temporal_camera_build == nullptr ||
         !g_engine_temporal_camera_build_time_valid.load(
             std::memory_order_acquire)) {
@@ -24729,35 +24729,35 @@ void __fastcall hook_engine_frame_builder(void* render_context, void* frame_data
         present - last_full_vr_factory <= 2;
     const bool mono_full_vr_factory_recent =
         mono_transport && full_vr_factory_recent;
-    const bool symmetric_aer_full_vr_fallback =
+    const bool symmetric_asymmetric_full_vr_fallback =
         w3vr::native_asymmetric_transport_policy::
             frame_fallback_uses_symmetric_projection({
                 native_asymmetric_noaa_route_active(),
-                mode3_aer_presentation_active(),
                 automatic_full_vr_active});
     const bool stereo_fallback_allowed =
         w3vr::native_asymmetric_transport_policy::
             stereo_frame_fallback_admissible({
                 stereo_frame_tag_valid,
-                symmetric_aer_full_vr_fallback,
+                symmetric_asymmetric_full_vr_fallback,
                 full_vr_factory_recent});
     if (g_config.runtime_diagnostics && frame_data != nullptr &&
         automatic_full_vr_active && stereo_frame_tag_valid &&
-        symmetric_aer_full_vr_fallback && full_vr_factory_recent) {
+        symmetric_asymmetric_full_vr_fallback && full_vr_factory_recent) {
         static std::atomic<uint64_t> factory_bypass_count{};
         const uint64_t count = factory_bypass_count.fetch_add(
             1, std::memory_order_relaxed) + 1;
         if (count <= 16 || count % 600 == 0) {
             log_cinema_camera_diagnostic(
-                "V1252 AER frame fallback bypassed count=%llu present=%llu "
-                "factory_present=%llu factory_age=%llu eye=%d pair=%llu",
+                "V1255 asymmetric frame fallback bypassed count=%llu present=%llu "
+                "factory_present=%llu factory_age=%llu eye=%d pair=%llu aer=%u",
                 static_cast<unsigned long long>(count),
                 static_cast<unsigned long long>(present),
                 static_cast<unsigned long long>(last_full_vr_factory),
                 static_cast<unsigned long long>(
                     present - last_full_vr_factory),
                 correction_eye,
-                static_cast<unsigned long long>(correction_pair));
+                static_cast<unsigned long long>(correction_pair),
+                mode3_aer_presentation_active() ? 1u : 0u);
         }
     }
     if (frame_data != nullptr && automatic_full_vr_active &&
@@ -26927,18 +26927,16 @@ bool prepare_full_vr_frame_camera(
         g_config.cinema_full_vr &&
         g_automatic_full_vr_camera_active.load(std::memory_order_acquire) &&
         !g_force_mono_cinema.load(std::memory_order_relaxed);
-    // [FIX:AER-CINEMA-FALLBACK-ONLY V1251 1/2] V1242's run proves that
-    // ordinary AER cutscene pairs are already correct under the symmetric
-    // Cinema presenter. The only bad episodes are frames which reuse an
-    // embedded camera and reach this final-frame fallback. Correct those
-    // frames with the same centered envelope, pose and stereo baseline; do
-    // not manufacture a raw off-axis pair that would require V1248's broad
-    // presentation switch and regress every normal cutscene.
-    const bool symmetric_aer_full_vr_fallback =
+    // [FIX:ASYM-CINEMA-FALLBACK-ONLY V1255 1/2] Ordinary cutscene pairs are
+    // already correct through their normal factory route. The only bad
+    // episodes reuse an embedded camera and reach this final-frame fallback.
+    // Correct those frames with the centered envelope, pose and stereo
+    // baseline consumed by the fallback presenter; never manufacture an
+    // incomplete raw off-axis pair.
+    const bool symmetric_asymmetric_full_vr_fallback =
         w3vr::native_asymmetric_transport_policy::
             frame_fallback_uses_symmetric_projection({
                 native_asymmetric_noaa_route_active(),
-                mode3_aer_presentation_active(),
                 automatic_full_vr});
     if (xr_fov != nullptr) {
         const float left = tanf(xr_fov->angleLeft);
@@ -26989,12 +26987,12 @@ bool prepare_full_vr_frame_camera(
                 (180.0f / 3.14159265358979323846f);
             corrected[10] = horizontal_span / vertical_span;
         }
-        // [FIX:FULL-VR-ASYMMETRIC-FALLBACK V1198 1/2] Strict Stereo keeps the
-        // scaled raw-FOV descriptor and pair slot used by its normal factory
-        // path. V1251 deliberately exempts the AER reused-camera fallback:
-        // that route retains V1242's symmetric Cinema presentation.
+        // [FIX:FULL-VR-ASYMMETRIC-FALLBACK V1255 1/2] Normal factory pairs keep
+        // their raw-FOV descriptor. A reused-camera fallback is centered in
+        // both AER and strict Stereo because neither presenter owns a complete
+        // native pair for that interval.
         if (native_asymmetric_noaa_route_active() &&
-            !symmetric_aer_full_vr_fallback) {
+            !symmetric_asymmetric_full_vr_fallback) {
             if (g_game_render_width == 0 || g_game_render_width > 16384 ||
                 g_game_render_height == 0 || g_game_render_height > 16384) {
                 return false;
@@ -27037,7 +27035,7 @@ bool prepare_full_vr_frame_camera(
         }
     }
     if (native_asymmetric_noaa_route_active() &&
-        !symmetric_aer_full_vr_fallback &&
+        !symmetric_asymmetric_full_vr_fallback &&
         !native_asymmetric_full_vr_projection_applied) {
         return false;
     }
@@ -27152,7 +27150,7 @@ bool prepare_full_vr_frame_camera(
 
     bool dlss_temporal_history_continued{};
     const bool dlss_temporal_history_applied =
-        prepare_aer_full_vr_fallback_dlss_temporal_history(
+        prepare_full_vr_fallback_dlss_temporal_history(
             corrected.data(), eye, pair_id,
             dlss_temporal_history_continued);
     if (!safe_rebuild_shadow_view(corrected.data())) {
@@ -27232,13 +27230,14 @@ bool prepare_full_vr_frame_camera(
                 1, std::memory_order_relaxed) + 1;
         if (history_count <= 32 || history_count % 120 == 0) {
             log_cinema_camera_diagnostic(
-                "V1254 AER Full VR fallback DLSS history applied "
+                "V1255 Full VR fallback DLSS history applied "
                 "count=%llu present=%llu eye=%d pair=%llu asymmetric=%u "
-                "continued=%u",
+                "aer=%u continued=%u",
                 static_cast<unsigned long long>(history_count),
                 static_cast<unsigned long long>(present), eye,
                 static_cast<unsigned long long>(pair_id),
                 native_asymmetric_noaa_route_active() ? 1u : 0u,
+                mode3_aer_presentation_active() ? 1u : 0u,
                 dlss_temporal_history_continued ? 1u : 0u);
         }
     }
@@ -27248,14 +27247,14 @@ bool prepare_full_vr_frame_camera(
         1, std::memory_order_relaxed) + 1;
     if (count <= 32 || count % 120 == 0) {
         log_cinema_camera_diagnostic(
-            "Full VR final frame camera applied count=%llu present=%llu eye=%d pair=%llu taau_reset=%d asymmetric=%d symmetric_aer_fallback=%d matrix_hash=0x%llX pos=%.5f,%.5f,%.5f fov=%.4f aspect=%.6f",
+            "Full VR final frame camera applied count=%llu present=%llu eye=%d pair=%llu taau_reset=%d asymmetric=%d symmetric_asym_fallback=%d matrix_hash=0x%llX pos=%.5f,%.5f,%.5f fov=%.4f aspect=%.6f",
             static_cast<unsigned long long>(count),
             static_cast<unsigned long long>(present),
             eye,
             static_cast<unsigned long long>(pair_id),
             new_fallback_episode ? 1 : 0,
             native_asymmetric_full_vr_projection_applied ? 1 : 0,
-            symmetric_aer_full_vr_fallback ? 1 : 0,
+            symmetric_asymmetric_full_vr_fallback ? 1 : 0,
             static_cast<unsigned long long>(fnv1a64(
                 corrected_matrix.data(), sizeof(corrected_matrix))),
             corrected_camera[0], corrected_camera[1], corrected_camera[2],
