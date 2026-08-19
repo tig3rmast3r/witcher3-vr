@@ -26,7 +26,10 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1255 applies V1252's centered reused-camera fallback and recent-factory gate
+// V1256 extends the validated per-eye previous-camera record to strict Stereo
+// SYM, completing DLSS history coverage for every Mode 3 reused-camera
+// fallback. Geometry and presentation are unchanged. V1255 applies V1252's
+// centered reused-camera fallback and recent-factory gate
 // to strict Stereo ASYM. It also extends V1254's native per-eye DLSS fallback
 // history to that exact route. Normal factory-built Stereo pairs remain on the
 // established native off-axis path. V1254 extends V1253's runtime-validated
@@ -24429,23 +24432,20 @@ void install_engine_temporal_writer_hook() {
     }
 }
 
-// [FIX:ASYM-FALLBACK-DLSS-HISTORY V1255 1/2] Reused-camera cutscenes do
+// [FIX:MODE3-FALLBACK-DLSS-HISTORY V1256 1/2] Reused-camera cutscenes do
 // not reach hook_engine_view_rebuild(), so V9416/V14003 cannot install the
 // previous corrected camera before REDengine derives native motion vectors.
 // Reuse that same native 0xB0 record on the private final-frame camera. Keep
-// the first frame of each fallback episode self-seeded. V1255 retains both AER
-// projection policies and additionally admits strict Stereo ASYM.
+// the first frame of each fallback episode self-seeded. V1256 admits every
+// Mode 3 DLSS fallback: AER SYM/ASYM and strict Stereo SYM/ASYM.
 bool prepare_full_vr_fallback_dlss_temporal_history(
     float* view,
     int eye,
     uint64_t pair_id,
     bool& continued) {
     continued = false;
-    const bool supported_route = mode3_aer_presentation_active() ||
-        native_asymmetric_noaa_route_active();
     if (view == nullptr || eye < 0 || eye > 1 || pair_id == 0 ||
         pair_id == UINT64_MAX || !dlss_sequential_mode_active() ||
-        !supported_route ||
         g_engine_temporal_camera_build == nullptr ||
         !g_engine_temporal_camera_build_time_valid.load(
             std::memory_order_acquire)) {
@@ -27230,7 +27230,7 @@ bool prepare_full_vr_frame_camera(
                 1, std::memory_order_relaxed) + 1;
         if (history_count <= 32 || history_count % 120 == 0) {
             log_cinema_camera_diagnostic(
-                "V1255 Full VR fallback DLSS history applied "
+                "V1256 Full VR fallback DLSS history applied "
                 "count=%llu present=%llu eye=%d pair=%llu asymmetric=%u "
                 "aer=%u continued=%u",
                 static_cast<unsigned long long>(history_count),
