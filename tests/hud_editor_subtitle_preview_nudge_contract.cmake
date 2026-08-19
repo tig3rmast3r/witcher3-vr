@@ -5,7 +5,7 @@ endif()
 file(READ "${HUD_EDITOR_SCRIPT}" hud_editor)
 
 set(required_fragments
-    "return \"V1252\";"
+    "return \"V1253\";"
     "function BootstrapSubtitlePreviewLayout("
     "slot.moduleName != \"SubtitlesModule\""
     "temporaryY = savedY + 1.0f;"
