@@ -1,4 +1,5 @@
 #include "config.h"
+#include "openxr_resolution.h"
 #include "resources.h"
 
 #include <Windows.h>
@@ -32,6 +33,7 @@ constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
 enum ControlId {
     IdMode = 100,
     IdResolution,
+    IdResolutionAuto,
     IdWidth,
     IdHeight,
     IdDlssQuality,
@@ -324,16 +326,28 @@ void SetEditInteger(HWND edit, int value) {
     SetWindowTextW(edit, std::to_wstring(value).c_str());
 }
 
+bool ResolutionAutoEnabled() {
+    return SendMessageW(
+        Item(IdResolutionAuto), BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+void UpdateResolutionControls() {
+    const bool automatic = ResolutionAutoEnabled();
+    const int selection = static_cast<int>(SendMessageW(
+        Item(IdResolution), CB_GETCURSEL, 0, 0));
+    EnableWindow(Item(IdResolution), !automatic);
+    EnableWindow(Item(IdWidth), !automatic && selection == 3);
+    EnableWindow(Item(IdHeight), !automatic && selection == 3);
+}
+
 void ApplyResolutionPreset(int selection) {
     constexpr std::array<std::pair<int, int>, 3> presets{{
         {2496, 2592}, {2688, 2784}, {3072, 3216}}};
-    const bool custom = selection == 3;
     if (selection >= 0 && selection < 3) {
         SetEditInteger(Item(IdWidth), presets[selection].first);
         SetEditInteger(Item(IdHeight), presets[selection].second);
     }
-    EnableWindow(Item(IdWidth), custom);
-    EnableWindow(Item(IdHeight), custom);
+    UpdateResolutionControls();
 }
 
 int ResolutionPresetFor(int width, int height) {
@@ -361,10 +375,34 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         return false;
     }
     state.mode = static_cast<RenderMode>(mode);
-    if (!ReadInteger(Item(IdWidth), state.width) ||
-        !ReadInteger(Item(IdHeight), state.height) ||
-        state.width < 640 || state.width > 8192 ||
-        state.height < 640 || state.height > 8192) {
+    state.resolution_auto = ResolutionAutoEnabled();
+    if (state.resolution_auto) {
+        w3vr::OpenXrRecommendedResolution recommended{};
+        if (!w3vr::QueryOpenXrRecommendedResolution(
+                g_app.paths.launcher_directory, recommended, error)) {
+            error = L"OpenXR AUTO resolution failed. " + error +
+                L"\n\nStart or wake your OpenXR runtime/headset, then try again; "
+                L"or disable AUTO and select a manual resolution.";
+            return false;
+        }
+        state.width = recommended.width;
+        state.height = recommended.height;
+        if (state.width <= 0 || state.width > 16384 ||
+            state.height <= 0 || state.height > 16384) {
+            error = L"OpenXR returned an invalid recommended resolution: " +
+                std::to_wstring(state.width) + L" x " +
+                std::to_wstring(state.height) + L".";
+            return false;
+        }
+        SetEditInteger(Item(IdWidth), state.width);
+        SetEditInteger(Item(IdHeight), state.height);
+        SendMessageW(Item(IdResolution), CB_SETCURSEL,
+            ResolutionPresetFor(state.width, state.height), 0);
+        UpdateResolutionControls();
+    } else if (!ReadInteger(Item(IdWidth), state.width) ||
+            !ReadInteger(Item(IdHeight), state.height) ||
+            state.width < 640 || state.width > 8192 ||
+            state.height < 640 || state.height > 8192) {
         error = L"Resolution must contain whole numbers between 640 and 8192.";
         return false;
     }
@@ -627,6 +665,16 @@ void ConfigureSettingsForVr() {
             MB_OK | MB_ICONWARNING);
         return;
     }
+    if (state.resolution_auto &&
+        w3vr::DlssNearSquareCompatibleWidth(state).has_value()) {
+        MessageBoxW(g_app.window,
+            L"OpenXR AUTO returned an exact square or near-square resolution, "
+            L"which REDengine cannot use with scaled DLSS.\n\nSelect DLAA, "
+            L"or disable AUTO and use the launcher's 48-pixel compatibility "
+            L"adjustment.",
+            L"DLSS resolution compatibility", MB_OK | MB_ICONWARNING);
+        return;
+    }
     const auto profile = LoadVrSettingsTemplate();
     if (!profile) {
         MessageBoxW(g_app.window, L"The embedded VR settings profile is missing.",
@@ -689,10 +737,11 @@ void RestoreLauncherDefaults() {
     SendMessageW(Item(IdMode), CB_SETCURSEL,
         static_cast<int>(defaults.mode), 0);
     SendMessageW(Item(IdResolution), CB_SETCURSEL, 1, 0);
+    SendMessageW(Item(IdResolutionAuto), BM_SETCHECK,
+        defaults.resolution_auto ? BST_CHECKED : BST_UNCHECKED, 0);
     SetEditInteger(Item(IdWidth), defaults.width);
     SetEditInteger(Item(IdHeight), defaults.height);
-    EnableWindow(Item(IdWidth), FALSE);
-    EnableWindow(Item(IdHeight), FALSE);
+    UpdateResolutionControls();
     SendMessageW(Item(IdDlssQuality), CB_SETCURSEL, defaults.dlss_quality, 0);
     SendMessageW(Item(IdRayTracing), BM_SETCHECK,
         defaults.ray_tracing ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -770,6 +819,17 @@ void Save(bool launch) {
     }
     if (const auto compatible_width =
             w3vr::DlssNearSquareCompatibleWidth(state)) {
+        if (state.resolution_auto) {
+            MessageBoxW(g_app.window,
+                L"OpenXR AUTO returned an exact square or near-square "
+                L"resolution, which REDengine cannot use with scaled DLSS."
+                L"\n\nSelect DLAA, or disable AUTO and press Save again to "
+                L"apply the launcher's 48-pixel compatibility adjustment.",
+                L"DLSS resolution compatibility",
+                MB_OK | MB_ICONWARNING);
+            SetStatus(L"OpenXR AUTO resolution is incompatible with scaled DLSS.");
+            return;
+        }
         const std::wstring adjusted_resolution =
             std::to_wstring(*compatible_width) + L" x " +
             std::to_wstring(state.height);
@@ -796,7 +856,11 @@ void Save(bool launch) {
     }
     g_app.loaded = state;
     g_app.fullscreen_projection = state.fullscreen_projection;
-    SetStatus(L"Settings saved. Backups use the .w3vr.bak suffix.");
+    SetStatus(state.resolution_auto
+        ? (L"Settings saved. OpenXR AUTO applied " +
+            std::to_wstring(state.width) + L" x " +
+            std::to_wstring(state.height) + L".")
+        : L"Settings saved. Backups use the .w3vr.bak suffix.");
     if (launch) {
         if (!LaunchGame(error)) {
             MessageBoxW(g_app.window, error.c_str(), L"Launch failed",
@@ -845,10 +909,11 @@ void PopulateControls() {
     SendMessageW(mode, CB_SETCURSEL, static_cast<int>(loaded.state.mode), 0);
     const int preset = ResolutionPresetFor(loaded.state.width, loaded.state.height);
     SendMessageW(resolution, CB_SETCURSEL, preset, 0);
+    SendMessageW(Item(IdResolutionAuto), BM_SETCHECK,
+        loaded.state.resolution_auto ? BST_CHECKED : BST_UNCHECKED, 0);
     SetEditInteger(Item(IdWidth), loaded.state.width);
     SetEditInteger(Item(IdHeight), loaded.state.height);
-    EnableWindow(Item(IdWidth), preset == 3);
-    EnableWindow(Item(IdHeight), preset == 3);
+    UpdateResolutionControls();
     SendMessageW(quality, CB_SETCURSEL, loaded.state.dlss_quality, 0);
     SendMessageW(Item(IdRayTracing), BM_SETCHECK,
         loaded.state.ray_tracing ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -947,9 +1012,11 @@ void CreateInterface(HWND window) {
         {AddLabel(L"DLSS preset", 470, 40, 100, 22),
          AddCombo(565, 36, 125, IdDlssQuality)});
     AddTooltips(
-        L"Set the render resolution recommended for your own headset. High, Ultra, and Godlike are presets only for Quest 3 with Virtual Desktop; use Custom for other headsets or runtimes.",
+        L"AUTO queries the active OpenXR runtime immediately before saving or launching and applies its exact recommended per-eye resolution. Disable AUTO to use the Quest 3 presets or a custom resolution.",
         {AddLabel(L"Resolution", 38, 80, 150, 22),
-         AddCombo(190, 76, 260, IdResolution),
+         AddCombo(190, 76, 190, IdResolution),
+         AddControl(L"BUTTON", L"AUTO", BS_AUTOCHECKBOX | WS_TABSTOP,
+             392, 76, 76, 25, IdResolutionAuto),
          AddControl(L"EDIT", L"", WS_BORDER | ES_NUMBER | ES_CENTER |
              WS_TABSTOP, 485, 76, 82, 25, IdWidth, WS_EX_CLIENTEDGE),
          AddLabel(L"x", 571, 80, 15, 22, 0, SS_CENTER),
@@ -1162,6 +1229,9 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam, LPARA
         if (id == IdResolution && notification == CBN_SELCHANGE) {
             ApplyResolutionPreset(static_cast<int>(SendMessageW(
                 Item(IdResolution), CB_GETCURSEL, 0, 0)));
+        }
+        if (id == IdResolutionAuto && notification == BN_CLICKED) {
+            UpdateResolutionControls();
         }
         if (id == IdSave && notification == BN_CLICKED) Save(false);
         if (id == IdSaveLaunch && notification == BN_CLICKED) Save(true);

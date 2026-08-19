@@ -28,6 +28,15 @@ enum class Phase : uint32_t {
     Count
 };
 
+// Exact inline observation points in REDengine's stereo path. These describe
+// where the instrumented code was scheduled at that instant; they do not infer
+// placement for the rest of the engine worker pool.
+enum class ThreadPoint : uint32_t {
+    ProducerExit,
+    RenderWorkerEntry,
+    Count
+};
+
 struct GpuToken {
     uint32_t slot{UINT32_MAX};
     uint32_t generation{};
@@ -42,7 +51,15 @@ void begin_frame(
     int temporal_backend,
     bool native_asymmetric,
     bool raytracing,
-    bool afw);
+    bool afw,
+    bool afw_visual_debug);
+
+// Lock-free hot-path sample. CPU topology is cached when the recorder is
+// enabled, and thread priority is refreshed at a low fixed cadence.
+void record_thread_sample(
+    ThreadPoint point,
+    uint64_t pair_id = 0,
+    int eye = -1);
 
 int64_t cpu_begin();
 void cpu_end(Phase phase, int64_t begin, uint64_t frame = UINT64_MAX);

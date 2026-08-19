@@ -25,8 +25,12 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1240 keeps V1239's renderer and adds a REDscript-owned persistent
-// first-person head/attachment visibility mask. V1239 bootstraps the real-smoke
+// V1242 keeps V1241's renderer, allows the AFW F6 visual diagnostic whenever
+// the independent flight recorder is active, and adds launcher-owned OpenXR
+// automatic resolution. V1241 extends the lightweight F2 recorder with exact
+// producer/render-worker CPU placement telemetry. V1240 adds a
+// REDscript-owned persistent first-person head/attachment visibility mask.
+// V1239 bootstraps the real-smoke
 // world-up PSOs from already-acquired OpenXR
 // views instead of racing the first REDengine HMD camera; its zero-centre
 // fail-open is created even when runtime views are not ready. V1238 lets strict
@@ -25334,6 +25338,14 @@ void __fastcall hook_engine_gameplay_frame_entry(void* frame_task) {
         apply_performance_cpu_sets_to_current_thread(
             "render-worker", g_render_worker_performance_cpu_sets_applied);
     }
+    if (w3vr::pipeline_flight::enabled() &&
+        g_engine_dual_render_active.load(std::memory_order_acquire) &&
+        g_engine_render_eye >= 0) {
+        w3vr::pipeline_flight::record_thread_sample(
+            w3vr::pipeline_flight::ThreadPoint::RenderWorkerEntry,
+            g_engine_render_pair_id,
+            g_engine_render_eye);
+    }
     if (g_config.ngx_trace) {
         static std::atomic<uint32_t> dlss_task_route_logs{};
         if (take_bounded_log_slot(dlss_task_route_logs, 8)) {
@@ -25704,6 +25716,13 @@ void __fastcall hook_engine_render_scene_setup(void* renderer, float delta_time)
     g_engine_render_scene_setup(renderer, delta_time);
     const auto produced_pair = g_engine_producer_pair_id;
     g_engine_producer_pair_id = previous_pair;
+    if (w3vr::pipeline_flight::enabled() &&
+        g_engine_dual_render_active.load(std::memory_order_acquire)) {
+        w3vr::pipeline_flight::record_thread_sample(
+            w3vr::pipeline_flight::ThreadPoint::ProducerExit,
+            produced_pair,
+            -1);
+    }
     // [FIX:MODE3-AER-PRESENTATION V12032 3/7] AER does not hold the Mode-3
     // producer tick until both members complete. V12033's explicit false flag
     // restores the original strict Mode-3 barrier.
@@ -43084,6 +43103,23 @@ void try_log_dlss_output_luminance_readback() {
     }
 }
 
+void handle_puredark_afw_visual_debug_hotkey() {
+    // [DEBUG:PUREDARK-AFW-VISUAL-F6 V1242] Flight-recorder captures need the
+    // ABI visual diagnostic without enabling broad timing-altering probes.
+    if (!(g_config.runtime_diagnostics ||
+            g_config.pipeline_flight_recorder) ||
+        (GetAsyncKeyState(VK_F6) & 1) == 0) {
+        return;
+    }
+    const bool enabled = !g_puredark_afw_visual_debug.load(
+        std::memory_order_relaxed);
+    g_puredark_afw_visual_debug.store(enabled, std::memory_order_relaxed);
+    log_line("PureDark AFW visual debug=%u hotkey=F6 present=%llu",
+        enabled ? 1u : 0u,
+        static_cast<unsigned long long>(
+            g_present_count.load(std::memory_order_relaxed)));
+}
+
 HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
     if (w3vr::pipeline_flight::enabled()) {
         w3vr::pipeline_flight::process_gpu();
@@ -43094,20 +43130,9 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
     if ((GetAsyncKeyState(VK_F7) & 1) != 0) {
         trigger_renderdoc_capture(swapchain);
     }
-    // [DEBUG:PUREDARK-AFW-VISUAL-F6 V12052 3/3] Toggle only the ABI debug
-    // bit. This does not enable AFW, alter identities or change publication;
-    // the next successful Evaluate reflects the new visual diagnostic state.
-    if (g_config.runtime_diagnostics &&
-        (GetAsyncKeyState(VK_F6) & 1) != 0) {
-        const bool enabled = !g_puredark_afw_visual_debug.load(
-            std::memory_order_relaxed);
-        g_puredark_afw_visual_debug.store(
-            enabled, std::memory_order_relaxed);
-        log_line("PureDark AFW visual debug=%u hotkey=F6 present=%llu",
-            enabled ? 1u : 0u,
-            static_cast<unsigned long long>(
-                g_present_count.load(std::memory_order_relaxed)));
-    }
+    // Toggle only the ABI debug bit. This does not enable AFW, alter
+    // identities or change publication; the next Evaluate reflects it.
+    handle_puredark_afw_visual_debug_hotkey();
     if (g_config.runtime_diagnostics && temporal_backend_is_dlss()) {
         process_dlss_gpu_profile();
         try_log_dlss_output_luminance_readback();
@@ -43130,7 +43155,8 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
         frame, g_config.openxr_mode,
         static_cast<int>(g_config.temporal_backend),
         g_config.native_stereo, g_config.raytracing_enabled,
-        g_config.puredark_afw_enabled);
+        g_config.puredark_afw_enabled,
+        g_puredark_afw_visual_debug.load(std::memory_order_relaxed));
     record_rt_flight(
         w3vr::rt_flight::EventCode::Present,
         UINT32_MAX, 0, 0, w3vr::rt_flight::RejectReason::None,
@@ -43877,12 +43903,14 @@ HRESULT STDMETHODCALLTYPE hook_present1(
             w3vr::pipeline_flight::dump_last_ten_seconds();
         }
     }
+    handle_puredark_afw_visual_debug_hotkey();
     const auto frame = ++g_present_count;
     w3vr::pipeline_flight::begin_frame(
         frame, g_config.openxr_mode,
         static_cast<int>(g_config.temporal_backend),
         g_config.native_stereo, g_config.raytracing_enabled,
-        g_config.puredark_afw_enabled);
+        g_config.puredark_afw_enabled,
+        g_puredark_afw_visual_debug.load(std::memory_order_relaxed));
     record_rt_flight(
         w3vr::rt_flight::EventCode::Present,
         UINT32_MAX, 0, 0, w3vr::rt_flight::RejectReason::None,

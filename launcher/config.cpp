@@ -24,7 +24,7 @@ constexpr std::array<ModeSettings, 5> kModes{{
     {3, true, false, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 12;
+constexpr int kCurrentConfigVersion = 13;
 constexpr char kDefaultRayTracingHistoryBuffers[] = "8";
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
@@ -339,6 +339,8 @@ void NormalizeLauncherOwnedConfiguration(IniDocument& ini) {
     ini.Set("openxr", "enabled", "1");
     ini.Set("openxr", "mode", "3");
     ini.Set("openxr", "mode3_aer_presentation", aer ? "1" : "0");
+    ini.Set("openxr", "resolution_auto",
+        ReadBool(ini, "openxr", "resolution_auto", true) ? "1" : "0");
     ini.Set("engine", "temporal_backend", backend);
     ini.Set("engine", "dual_render_probe", "1");
     ini.Set("engine", "dual_render_start", "1");
@@ -422,6 +424,17 @@ void NormalizeLauncherOwnedConfiguration(IniDocument& ini) {
 void MigrateConfigurationToV12(IniDocument& ini) {
     // Full normalization runs after missing values have been materialized from
     // the embedded defaults, so a partial legacy INI retains its migrated mode.
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "12");
+}
+
+void MigrateConfigurationToV13(IniDocument& ini) {
+    // AUTO is the new safe launcher default. Preserve an explicit value from
+    // hand-authored or partially updated INIs, otherwise enable the pre-launch
+    // OpenXR recommended-resolution query.
+    if (!ini.Get("openxr", "resolution_auto").has_value()) {
+        ini.Set("openxr", "resolution_auto", "1");
+    }
     RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
@@ -1167,6 +1180,9 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         if (existing_version < 12) {
             MigrateConfigurationToV12(migrated);
         }
+        if (existing_version < 13) {
+            MigrateConfigurationToV13(migrated);
+        }
         // This is deliberately independent from version migration: extending
         // the default template must heal a partial current-version INI on the
         // very next launcher start, without overwriting manual tuning.
@@ -1349,6 +1365,8 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
                 L"mode is displayed; no files are changed until Save.";
     }
 
+    result.state.resolution_auto = ReadBool(
+        *vr, "openxr", "resolution_auto", true);
     result.state.width = ReadInt(*vr, "openxr", "render_width", 2688);
     result.state.height = ReadInt(*vr, "openxr", "render_height", 2784);
     const int saved_dlss_quality = std::clamp(
@@ -1467,6 +1485,8 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "mode", std::to_string(mode.openxr_mode));
     vr_ini.Set("openxr", "mode3_aer_presentation",
         mode.mode3_aer_presentation ? "1" : "0");
+    vr_ini.Set("openxr", "resolution_auto",
+        state.resolution_auto ? "1" : "0");
     vr_ini.Set("openxr", "render_width", std::to_string(state.width));
     vr_ini.Set("openxr", "render_height", std::to_string(state.height));
     // Native asymmetric geometry is independent from the presentation route,

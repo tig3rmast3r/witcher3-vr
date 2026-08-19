@@ -1,15 +1,21 @@
 #include "pipeline_flight_recorder.h"
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace w3vr::pipeline_flight {
@@ -17,11 +23,14 @@ namespace {
 
 constexpr size_t kPhaseCount = static_cast<size_t>(Phase::Count);
 constexpr size_t kFrameCapacity = 4096;
+constexpr size_t kThreadSampleCapacity = 8192;
 constexpr size_t kGpuSampleCapacity = 1024;
 constexpr size_t kQueueCapacity = 8;
 constexpr uint64_t kGpuSampleStride = 4;
+constexpr uint32_t kThreadPriorityRefreshStride = 64;
 constexpr double kWindowSeconds = 10.0;
 constexpr uint64_t kResetSequence = UINT64_MAX;
+constexpr int32_t kUnknownThreadPriority = INT32_MAX;
 
 constexpr std::array<const char*, kPhaseCount> kPhaseNames{
     "frame_factory",
@@ -40,6 +49,13 @@ constexpr std::array<const char*, kPhaseCount> kPhaseNames{
     "xr_frame",
     "queue_submit",
     "present"
+};
+
+constexpr size_t kThreadPointCount =
+    static_cast<size_t>(ThreadPoint::Count);
+constexpr std::array<const char*, kThreadPointCount> kThreadPointNames{
+    "producer_exit",
+    "render_worker_entry"
 };
 
 struct FrameSlot {
@@ -66,6 +82,62 @@ struct FrameSnapshot {
     std::array<uint32_t, kPhaseCount> gpu_calls{};
 };
 
+struct CpuTopologyEntry {
+    uint32_t cpu_set_id{};
+    uint16_t group{};
+    uint16_t logical_processor{};
+    int32_t core_index{-1};
+    int32_t efficiency_class{-1};
+    int32_t scheduling_class{-1};
+    uint32_t flags{};
+};
+
+struct ThreadSampleSlot {
+    std::atomic<uint64_t> sequence{kResetSequence};
+    std::atomic<int64_t> qpc{};
+    std::atomic<uint64_t> frame{};
+    std::atomic<uint64_t> pair_id{};
+    std::atomic<uint32_t> point{};
+    std::atomic<int32_t> eye{-1};
+    std::atomic<uint32_t> thread_id{};
+    std::atomic<uint32_t> group{};
+    std::atomic<uint32_t> logical_processor{};
+    std::atomic<int32_t> core_index{-1};
+    std::atomic<int32_t> efficiency_class{-1};
+    std::atomic<int32_t> scheduling_class{-1};
+    std::atomic<int32_t> thread_priority{kUnknownThreadPriority};
+};
+
+struct ThreadSampleSnapshot {
+    uint64_t sequence{};
+    int64_t qpc{};
+    uint64_t frame{};
+    uint64_t pair_id{};
+    uint32_t point{};
+    int32_t eye{-1};
+    uint32_t thread_id{};
+    uint32_t group{};
+    uint32_t logical_processor{};
+    int32_t core_index{-1};
+    int32_t efficiency_class{-1};
+    int32_t scheduling_class{-1};
+    int32_t thread_priority{kUnknownThreadPriority};
+};
+
+struct ProcessThreadSnapshot {
+    uint32_t thread_id{};
+    int32_t base_priority{};
+    int32_t delta_priority{};
+    int32_t relative_priority{kUnknownThreadPriority};
+    int32_t priority_boost_disabled{-1};
+    int32_t affinity_group{-1};
+    uint64_t affinity_mask{};
+    int32_t ideal_group{-1};
+    int32_t ideal_processor{-1};
+    std::string selected_cpu_sets{};
+    std::string description{};
+};
+
 struct QueueState {
     ID3D12CommandQueue* queue{};
     ID3D12Fence* fence{};
@@ -88,6 +160,10 @@ struct GpuSample {
 std::atomic<bool> g_enabled{};
 std::atomic<uint64_t> g_current_frame{};
 std::array<FrameSlot, kFrameCapacity> g_frames{};
+std::atomic<uint64_t> g_thread_sample_sequence{};
+std::array<ThreadSampleSlot, kThreadSampleCapacity> g_thread_samples{};
+std::once_flag g_cpu_topology_once{};
+std::vector<CpuTopologyEntry> g_cpu_topology{};
 
 std::mutex g_gpu_mutex{};
 ID3D12QueryHeap* g_query_heap{};
@@ -116,6 +192,177 @@ int64_t qpc_frequency() {
         return frequency.QuadPart;
     }();
     return value;
+}
+
+void initialize_cpu_topology() {
+    std::call_once(g_cpu_topology_once, []() {
+        ULONG required_bytes{};
+        GetSystemCpuSetInformation(
+            nullptr, 0, &required_bytes, GetCurrentProcess(), 0);
+        if (required_bytes < sizeof(SYSTEM_CPU_SET_INFORMATION)) {
+            return;
+        }
+
+        std::vector<uint8_t> buffer(required_bytes);
+        if (!GetSystemCpuSetInformation(
+                reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                required_bytes, &required_bytes, GetCurrentProcess(), 0)) {
+            return;
+        }
+
+        size_t offset{};
+        while (offset + sizeof(ULONG) <= required_bytes) {
+            const auto* entry =
+                reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(
+                    buffer.data() + offset);
+            if (entry->Size < sizeof(ULONG) ||
+                offset + entry->Size > required_bytes) {
+                break;
+            }
+            if (entry->Type == CpuSetInformation) {
+                CpuTopologyEntry topology{};
+                topology.cpu_set_id = entry->CpuSet.Id;
+                topology.group = entry->CpuSet.Group;
+                topology.logical_processor =
+                    entry->CpuSet.LogicalProcessorIndex;
+                topology.core_index = entry->CpuSet.CoreIndex;
+                topology.efficiency_class = entry->CpuSet.EfficiencyClass;
+                topology.scheduling_class = entry->CpuSet.SchedulingClass;
+                topology.flags = entry->CpuSet.AllFlags;
+                g_cpu_topology.push_back(topology);
+            }
+            offset += entry->Size;
+        }
+        std::sort(g_cpu_topology.begin(), g_cpu_topology.end(),
+            [](const auto& left, const auto& right) {
+                return std::tie(left.group, left.logical_processor) <
+                    std::tie(right.group, right.logical_processor);
+            });
+    });
+}
+
+const CpuTopologyEntry* find_cpu_topology(
+    uint16_t group,
+    uint16_t logical_processor) {
+    const auto found = std::lower_bound(
+        g_cpu_topology.begin(), g_cpu_topology.end(),
+        std::pair{group, logical_processor},
+        [](const CpuTopologyEntry& entry, const auto& key) {
+            return entry.group < key.first ||
+                (entry.group == key.first &&
+                    entry.logical_processor < key.second);
+        });
+    return found != g_cpu_topology.end() && found->group == group &&
+            found->logical_processor == logical_processor
+        ? &*found
+        : nullptr;
+}
+
+const char* thread_point_name(uint32_t point) {
+    return point < kThreadPointCount
+        ? kThreadPointNames[point]
+        : "unknown";
+}
+
+std::string csv_safe_utf8(const wchar_t* text) {
+    if (text == nullptr || *text == L'\0') {
+        return {};
+    }
+    const int bytes = WideCharToMultiByte(
+        CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 1) {
+        return {};
+    }
+    std::string result(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(
+        CP_UTF8, 0, text, -1, result.data(), bytes, nullptr, nullptr);
+    result.pop_back();
+    for (char& character : result) {
+        if (character == ',' || character == '\r' || character == '\n') {
+            character = ' ';
+        }
+    }
+    return result;
+}
+
+std::vector<ProcessThreadSnapshot> snapshot_process_threads() {
+    std::vector<ProcessThreadSnapshot> snapshots{};
+    const DWORD process_id = GetCurrentProcessId();
+    const HANDLE toolhelp = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (toolhelp == INVALID_HANDLE_VALUE) {
+        return snapshots;
+    }
+
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    if (Thread32First(toolhelp, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID != process_id) {
+                continue;
+            }
+            ProcessThreadSnapshot snapshot{};
+            snapshot.thread_id = entry.th32ThreadID;
+            snapshot.base_priority = entry.tpBasePri;
+            snapshot.delta_priority = entry.tpDeltaPri;
+
+            const HANDLE thread = OpenThread(
+                THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+                entry.th32ThreadID);
+            if (thread != nullptr) {
+                snapshot.relative_priority = GetThreadPriority(thread);
+                BOOL boost_disabled{};
+                if (GetThreadPriorityBoost(thread, &boost_disabled)) {
+                    snapshot.priority_boost_disabled = boost_disabled ? 1 : 0;
+                }
+                GROUP_AFFINITY affinity{};
+                if (GetThreadGroupAffinity(thread, &affinity)) {
+                    snapshot.affinity_group = affinity.Group;
+                    snapshot.affinity_mask = affinity.Mask;
+                }
+                PROCESSOR_NUMBER ideal{};
+                if (GetThreadIdealProcessorEx(thread, &ideal)) {
+                    snapshot.ideal_group = ideal.Group;
+                    snapshot.ideal_processor = ideal.Number;
+                }
+
+                ULONG required_cpu_sets{};
+                GetThreadSelectedCpuSets(
+                    thread, nullptr, 0, &required_cpu_sets);
+                if (required_cpu_sets != 0) {
+                    std::vector<ULONG> cpu_sets(required_cpu_sets);
+                    if (GetThreadSelectedCpuSets(
+                            thread, cpu_sets.data(),
+                            static_cast<ULONG>(cpu_sets.size()),
+                            &required_cpu_sets)) {
+                        std::ostringstream selected{};
+                        for (size_t index = 0; index < required_cpu_sets;
+                             ++index) {
+                            if (index != 0) {
+                                selected << ';';
+                            }
+                            selected << cpu_sets[index];
+                        }
+                        snapshot.selected_cpu_sets = selected.str();
+                    }
+                }
+
+                PWSTR description{};
+                if (SUCCEEDED(GetThreadDescription(thread, &description)) &&
+                    description != nullptr) {
+                    snapshot.description = csv_safe_utf8(description);
+                    LocalFree(description);
+                }
+                CloseHandle(thread);
+            }
+            snapshots.push_back(std::move(snapshot));
+        } while (Thread32Next(toolhelp, &entry));
+    }
+    CloseHandle(toolhelp);
+    std::sort(snapshots.begin(), snapshots.end(),
+        [](const auto& left, const auto& right) {
+            return left.thread_id < right.thread_id;
+        });
+    return snapshots;
 }
 
 FrameSlot* find_frame(uint64_t frame) {
@@ -267,6 +514,9 @@ bool flight_log_path(wchar_t (&path)[MAX_PATH]) {
 } // namespace
 
 void set_enabled(bool enabled_value) {
+    if (enabled_value) {
+        initialize_cpu_topology();
+    }
     g_enabled.store(enabled_value, std::memory_order_release);
 }
 
@@ -280,7 +530,8 @@ void begin_frame(
     int temporal_backend,
     bool native_asymmetric,
     bool raytracing,
-    bool afw) {
+    bool afw,
+    bool afw_visual_debug) {
     if (!enabled()) {
         return;
     }
@@ -296,12 +547,75 @@ void begin_frame(
     if (native_asymmetric) flags |= 1u << 0;
     if (raytracing) flags |= 1u << 1;
     if (afw) flags |= 1u << 2;
+    if (afw_visual_debug) flags |= 1u << 3;
     slot.qpc.store(qpc_now(), std::memory_order_relaxed);
     slot.openxr_mode.store(openxr_mode, std::memory_order_relaxed);
     slot.temporal_backend.store(temporal_backend, std::memory_order_relaxed);
     slot.flags.store(flags, std::memory_order_relaxed);
     slot.sequence.store(frame, std::memory_order_release);
     g_current_frame.store(frame, std::memory_order_release);
+}
+
+void record_thread_sample(
+    ThreadPoint point,
+    uint64_t pair_id,
+    int eye) {
+    if (!enabled() ||
+        static_cast<uint32_t>(point) >=
+            static_cast<uint32_t>(ThreadPoint::Count)) {
+        return;
+    }
+
+    PROCESSOR_NUMBER processor{};
+    GetCurrentProcessorNumberEx(&processor);
+    const DWORD thread_id = GetCurrentThreadId();
+
+    // GetThreadPriority is deliberately not called on every frame. REDengine
+    // threads are long-lived, while refreshing every 64 observations still
+    // catches configuration changes inside a ten-second flight window.
+    struct PriorityCache {
+        DWORD thread_id{};
+        uint32_t samples{};
+        int32_t priority{kUnknownThreadPriority};
+    };
+    thread_local PriorityCache priority_cache{};
+    if (priority_cache.thread_id != thread_id ||
+        priority_cache.samples % kThreadPriorityRefreshStride == 0) {
+        priority_cache.thread_id = thread_id;
+        priority_cache.priority = GetThreadPriority(GetCurrentThread());
+    }
+    ++priority_cache.samples;
+
+    int32_t core_index{-1};
+    int32_t efficiency_class{-1};
+    int32_t scheduling_class{-1};
+    if (const auto* topology = find_cpu_topology(
+            processor.Group, processor.Number)) {
+        core_index = topology->core_index;
+        efficiency_class = topology->efficiency_class;
+        scheduling_class = topology->scheduling_class;
+    }
+
+    const uint64_t sequence = g_thread_sample_sequence.fetch_add(
+        1, std::memory_order_relaxed);
+    auto& slot = g_thread_samples[sequence % kThreadSampleCapacity];
+    slot.sequence.store(kResetSequence, std::memory_order_release);
+    slot.qpc.store(qpc_now(), std::memory_order_relaxed);
+    slot.frame.store(
+        g_current_frame.load(std::memory_order_acquire),
+        std::memory_order_relaxed);
+    slot.pair_id.store(pair_id, std::memory_order_relaxed);
+    slot.point.store(static_cast<uint32_t>(point), std::memory_order_relaxed);
+    slot.eye.store(eye, std::memory_order_relaxed);
+    slot.thread_id.store(thread_id, std::memory_order_relaxed);
+    slot.group.store(processor.Group, std::memory_order_relaxed);
+    slot.logical_processor.store(processor.Number, std::memory_order_relaxed);
+    slot.core_index.store(core_index, std::memory_order_relaxed);
+    slot.efficiency_class.store(efficiency_class, std::memory_order_relaxed);
+    slot.scheduling_class.store(scheduling_class, std::memory_order_relaxed);
+    slot.thread_priority.store(
+        priority_cache.priority, std::memory_order_relaxed);
+    slot.sequence.store(sequence, std::memory_order_release);
 }
 
 int64_t cpu_begin() {
@@ -535,6 +849,45 @@ bool dump_last_ten_seconds() {
             return left.qpc < right.qpc;
         });
 
+    std::vector<ThreadSampleSnapshot> thread_snapshots{};
+    thread_snapshots.reserve(4096);
+    for (const auto& slot : g_thread_samples) {
+        const uint64_t sequence = slot.sequence.load(std::memory_order_acquire);
+        if (sequence == kResetSequence) {
+            continue;
+        }
+        ThreadSampleSnapshot snapshot{};
+        snapshot.sequence = sequence;
+        snapshot.qpc = slot.qpc.load(std::memory_order_relaxed);
+        if (snapshot.qpc < oldest || snapshot.qpc > now) {
+            continue;
+        }
+        snapshot.frame = slot.frame.load(std::memory_order_relaxed);
+        snapshot.pair_id = slot.pair_id.load(std::memory_order_relaxed);
+        snapshot.point = slot.point.load(std::memory_order_relaxed);
+        snapshot.eye = slot.eye.load(std::memory_order_relaxed);
+        snapshot.thread_id = slot.thread_id.load(std::memory_order_relaxed);
+        snapshot.group = slot.group.load(std::memory_order_relaxed);
+        snapshot.logical_processor = slot.logical_processor.load(
+            std::memory_order_relaxed);
+        snapshot.core_index = slot.core_index.load(std::memory_order_relaxed);
+        snapshot.efficiency_class = slot.efficiency_class.load(
+            std::memory_order_relaxed);
+        snapshot.scheduling_class = slot.scheduling_class.load(
+            std::memory_order_relaxed);
+        snapshot.thread_priority = slot.thread_priority.load(
+            std::memory_order_relaxed);
+        if (slot.sequence.load(std::memory_order_acquire) == sequence) {
+            thread_snapshots.push_back(snapshot);
+        }
+    }
+    std::sort(thread_snapshots.begin(), thread_snapshots.end(),
+        [](const auto& left, const auto& right) {
+            return std::tie(left.qpc, left.sequence) <
+                std::tie(right.qpc, right.sequence);
+        });
+    const auto process_threads = snapshot_process_threads();
+
     wchar_t path[MAX_PATH]{};
     if (!flight_log_path(path)) {
         return false;
@@ -544,21 +897,38 @@ bool dump_last_ten_seconds() {
         return false;
     }
 
-    fprintf(file, "WITCHER3VR_PIPELINE_FLIGHT_V1\n");
-    fprintf(file, "build=V1240 window_seconds=10 cpu_sampling=every_call "
+    fprintf(file, "WITCHER3VR_PIPELINE_FLIGHT_V2\n");
+    fprintf(file, "build=V1242 window_seconds=10 cpu_sampling=every_call "
         "gpu_sampling=every_4th_frame gpu_readback=asynchronous "
-        "diagnostic_logging_required=0\n");
-    fprintf(file, "frames=%zu qpc_frequency=%lld gpu_dropped=%llu "
-        "gpu_invalid=%llu\n",
-        snapshots.size(), static_cast<long long>(frequency),
+        "thread_sampling=producer_exit+render_worker_entry "
+        "thread_priority_refresh=64_samples diagnostic_logging_required=0\n");
+    fprintf(file, "frames=%zu thread_samples=%zu process_threads=%zu "
+        "thread_capacity=%zu thread_total=%llu qpc_frequency=%lld "
+        "gpu_dropped=%llu gpu_invalid=%llu\n",
+        snapshots.size(), thread_snapshots.size(), process_threads.size(),
+        kThreadSampleCapacity,
+        static_cast<unsigned long long>(
+            g_thread_sample_sequence.load(std::memory_order_relaxed)),
+        static_cast<long long>(frequency),
         static_cast<unsigned long long>(
             g_gpu_dropped_samples.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
             g_gpu_invalid_samples.load(std::memory_order_relaxed)));
     fprintf(file, "backend: 0=none 1=taau 2=dlss; flags: bit0=asymmetric "
-        "bit1=rtx bit2=afw\n");
+        "bit1=rtx bit2=afw bit3=afw_visual_debug\n");
     fprintf(file, "NOTE: xr_record_composite is the enclosing XR GPU list and "
         "can overlap the nested AFW value. Do not add nested phases together.\n\n");
+    fprintf(file, "NOTE: THREAD rows are exact samples only for the inline "
+        "producer/render-worker hooks, not the complete REDengine worker pool. "
+        "Use ETW for whole-process scheduling.\n");
+    fprintf(file, "NOTE: thread_priority is the configured Win32 relative "
+        "priority returned by GetThreadPriority, not the scheduler's dynamic "
+        "boosted priority; 2147483647 means unavailable.\n");
+    fprintf(file, "NOTE: PROCESS_THREAD_CONFIG is a dump-time policy snapshot "
+        "for every process thread (affinity/ideal CPU/selected CPU sets), not "
+        "a sample of the CPU where each thread was running.\n");
+    fprintf(file, "NOTE: core_index is topology-local to processor_group; SMT "
+        "siblings share group+core_index.\n\n");
 
     fprintf(file, "SUMMARY,kind,phase,active_frames,calls,avg_ms_per_active_frame,"
         "avg_ms_per_call,p95_frame_ms,p99_frame_ms,max_frame_ms\n");
@@ -598,6 +968,112 @@ bool dump_last_ten_seconds() {
         }
     }
 
+    using PlacementKey = std::tuple<
+        uint32_t, uint32_t, uint32_t, uint32_t,
+        int32_t, int32_t, int32_t, int32_t>;
+    std::map<PlacementKey, size_t> placement_counts{};
+    std::array<size_t, kThreadPointCount> point_totals{};
+    std::array<std::set<uint32_t>, kThreadPointCount> point_threads{};
+    std::array<std::set<uint64_t>, kThreadPointCount> point_logical_cpus{};
+    std::array<std::set<uint64_t>, kThreadPointCount> point_physical_cores{};
+    std::array<size_t, kThreadPointCount> logical_migrations{};
+    std::array<size_t, kThreadPointCount> physical_migrations{};
+    using ThreadIdentity = std::pair<uint32_t, uint32_t>;
+    using ThreadLocation = std::tuple<uint32_t, uint32_t, int32_t>;
+    std::map<ThreadIdentity, ThreadLocation> previous_locations{};
+    for (const auto& sample : thread_snapshots) {
+        if (sample.point >= kThreadPointCount) {
+            continue;
+        }
+        const size_t point = sample.point;
+        ++point_totals[point];
+        point_threads[point].insert(sample.thread_id);
+        point_logical_cpus[point].insert(
+            (static_cast<uint64_t>(sample.group) << 32) |
+            sample.logical_processor);
+        if (sample.core_index >= 0) {
+            point_physical_cores[point].insert(
+                (static_cast<uint64_t>(sample.group) << 32) |
+                static_cast<uint32_t>(sample.core_index));
+        }
+        ++placement_counts[PlacementKey{
+            sample.point, sample.thread_id, sample.group,
+            sample.logical_processor, sample.core_index,
+            sample.efficiency_class, sample.scheduling_class,
+            sample.thread_priority}];
+
+        const ThreadIdentity identity{sample.point, sample.thread_id};
+        const ThreadLocation location{
+            sample.group, sample.logical_processor, sample.core_index};
+        const auto previous = previous_locations.find(identity);
+        if (previous != previous_locations.end()) {
+            const auto& [old_group, old_logical, old_core] = previous->second;
+            if (old_group != sample.group ||
+                old_logical != sample.logical_processor) {
+                ++logical_migrations[point];
+            }
+            if (old_core >= 0 && sample.core_index >= 0 &&
+                (old_group != sample.group || old_core != sample.core_index)) {
+                ++physical_migrations[point];
+            }
+        }
+        previous_locations[identity] = location;
+    }
+
+    fprintf(file, "\nTHREAD_ROLE_SUMMARY,point,samples,unique_tids,"
+        "unique_logical_cpus,unique_physical_cores,logical_migrations,"
+        "physical_migrations\n");
+    for (size_t point = 0; point < kThreadPointCount; ++point) {
+        if (point_totals[point] == 0) {
+            continue;
+        }
+        fprintf(file, "THREAD_ROLE_SUMMARY,%s,%zu,%zu,%zu,%zu,%zu,%zu\n",
+            kThreadPointNames[point], point_totals[point],
+            point_threads[point].size(), point_logical_cpus[point].size(),
+            point_physical_cores[point].size(), logical_migrations[point],
+            physical_migrations[point]);
+    }
+
+    fprintf(file, "\nTHREAD_PLACEMENT_SUMMARY,point,tid,group,logical_cpu,"
+        "core_index,efficiency_class,scheduling_class,thread_priority,samples,"
+        "share_of_point_pct\n");
+    for (const auto& [key, count] : placement_counts) {
+        const auto& [point, thread_id, group, logical_processor, core_index,
+            efficiency_class, scheduling_class, thread_priority] = key;
+        const double share = point < kThreadPointCount && point_totals[point] != 0
+            ? static_cast<double>(count) * 100.0 /
+                static_cast<double>(point_totals[point])
+            : 0.0;
+        fprintf(file,
+            "THREAD_PLACEMENT_SUMMARY,%s,%u,%u,%u,%d,%d,%d,%d,%zu,%.3f\n",
+            thread_point_name(point), thread_id, group, logical_processor,
+            core_index, efficiency_class, scheduling_class, thread_priority,
+            count, share);
+    }
+
+    fprintf(file, "\nPROCESS_THREAD_CONFIG,tid,base_priority,delta_priority,"
+        "relative_priority,priority_boost_disabled,affinity_group,"
+        "affinity_mask,ideal_group,ideal_cpu,selected_cpu_sets,name\n");
+    for (const auto& thread : process_threads) {
+        fprintf(file,
+            "PROCESS_THREAD_CONFIG,%u,%d,%d,%d,%d,%d,0x%016llX,%d,%d,%s,%s\n",
+            thread.thread_id, thread.base_priority, thread.delta_priority,
+            thread.relative_priority, thread.priority_boost_disabled,
+            thread.affinity_group,
+            static_cast<unsigned long long>(thread.affinity_mask),
+            thread.ideal_group, thread.ideal_processor,
+            thread.selected_cpu_sets.c_str(), thread.description.c_str());
+    }
+
+    fprintf(file, "\nCPU_TOPOLOGY,group,logical_cpu,core_index,"
+        "efficiency_class,scheduling_class,cpu_set_id,flags\n");
+    for (const auto& topology : g_cpu_topology) {
+        fprintf(file, "CPU_TOPOLOGY,%u,%u,%d,%d,%d,%u,%u\n",
+            topology.group, topology.logical_processor, topology.core_index,
+            topology.efficiency_class, topology.scheduling_class,
+            topology.cpu_set_id, topology.flags);
+    }
+
     fprintf(file, "\nFRAME,frame,age_ms,interval_ms,mode,backend,flags");
     for (const char* name : kPhaseNames) fprintf(file, ",cpu_%s_ms", name);
     for (const char* name : kPhaseNames) fprintf(file, ",gpu_%s_ms", name);
@@ -629,6 +1105,25 @@ bool dump_last_ten_seconds() {
             }
         }
         fprintf(file, "\n");
+    }
+
+    fprintf(file, "\nTHREAD,event,age_ms,frame,pair,point,eye,tid,group,"
+        "logical_cpu,core_index,efficiency_class,scheduling_class,"
+        "thread_priority\n");
+    for (const auto& sample : thread_snapshots) {
+        const double age_ms = frequency > 0
+            ? static_cast<double>(sample.qpc - now) * 1000.0 /
+                static_cast<double>(frequency)
+            : 0.0;
+        fprintf(file,
+            "THREAD,%llu,%.3f,%llu,%llu,%s,%d,%u,%u,%u,%d,%d,%d,%d\n",
+            static_cast<unsigned long long>(sample.sequence), age_ms,
+            static_cast<unsigned long long>(sample.frame),
+            static_cast<unsigned long long>(sample.pair_id),
+            thread_point_name(sample.point), sample.eye, sample.thread_id,
+            sample.group, sample.logical_processor, sample.core_index,
+            sample.efficiency_class, sample.scheduling_class,
+            sample.thread_priority);
     }
     fclose(file);
     return true;

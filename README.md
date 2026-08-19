@@ -147,16 +147,21 @@ launched, preventing an incompatible startup configuration.
 If `witcher3vr.ini` does not exist, the launcher creates it automatically. The
 first run inherits the game's current supported AA choice as **Stereo No AA /
 FXAA**, **Stereo TAAU**, or **Stereo DLSS**. An unknown AA mode falls back to
-**Stereo No AA / FXAA**. Resolution defaults to **Ultra 2688 × 2784** and 5:4
-Cinema framing; the launcher can switch Cinema to 4:3. Older INIs receive a one-time configuration update
+**Stereo No AA / FXAA**. Resolution defaults to **AUTO**: immediately before
+Save or Save & Launch, the launcher asks the active OpenXR runtime for its
+current recommended per-eye dimensions and writes that exact resolution to
+both REDengine and `witcher3vr.ini`. The saved dimensions remain visible while
+the manual dropdown is disabled. Cinema defaults to 5:4 framing and can be
+switched to 4:3. Older INIs receive a one-time configuration update
 that preserves the selected rendering mode, resolution, Full VR cutscene
 choice, and unrelated custom settings. Later manual tuning is not overwritten
 at launcher startup.
 
-The launcher includes three resolution presets intended for Quest 3 with
-Virtual Desktop. If you use a different headset or runtime, select **Custom**
-and enter the recommended per-eye resolution reported by your OpenXR or
-SteamVR runtime.
+Disable **AUTO** to use the three manual resolution presets intended for
+Quest 3 with Virtual Desktop, or select **Custom**. If the runtime returns a
+square or near-square resolution while scaled DLSS is selected, the launcher
+preserves the exact AUTO value and asks you to select DLAA or disable AUTO for
+the existing 48-pixel REDengine compatibility adjustment.
 
 For the current release, preserve the recommended aspect ratio. A different
 resolution with the same ratio can be used to trade image quality for

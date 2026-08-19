@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(witcher3vr VERSION 0.1240.0 LANGUAGES C CXX)
+project(witcher3vr VERSION 0.1242.0 LANGUAGES C CXX)
 
 include(CTest)
 
@@ -176,6 +176,27 @@ if(BUILD_TESTING)
     add_test(
         NAME renderer_mode3_transport_policy
         COMMAND w3vr_mode3_transport_policy_tests
+    )
+
+    add_executable(w3vr_pipeline_flight_thread_tests
+        tests/pipeline_flight_thread_tests.cpp
+        src/pipeline_flight_recorder.cpp
+    )
+    target_include_directories(w3vr_pipeline_flight_thread_tests PRIVATE
+        src
+        "${W3VR_DIRECTX_HEADERS_DIR}/include"
+    )
+    target_compile_definitions(w3vr_pipeline_flight_thread_tests PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(w3vr_pipeline_flight_thread_tests PRIVATE
+        d3d12
+        dxguid
+    )
+    add_test(
+        NAME pipeline_flight_thread_placement
+        COMMAND w3vr_pipeline_flight_thread_tests
     )
 endif()
 

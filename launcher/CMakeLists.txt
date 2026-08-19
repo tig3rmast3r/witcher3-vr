@@ -12,10 +12,15 @@ target_link_libraries(w3vr_launcher_config PUBLIC shell32 ole32)
 
 add_executable(Witcher3VRLauncher WIN32
     main.cpp
+    openxr_resolution.cpp
+    openxr_resolution.h
     launcher.rc
     resources.h
     witcher3vr.default.ini
     vr_dx12user.settings
+)
+target_include_directories(Witcher3VRLauncher PRIVATE
+    "${W3VR_OPENXR_DIR}/include"
 )
 target_compile_definitions(Witcher3VRLauncher PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(Witcher3VRLauncher PRIVATE /W4 /permissive-)

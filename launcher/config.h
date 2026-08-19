@@ -52,6 +52,7 @@ struct ModeSettings {
 
 struct LauncherState {
     RenderMode mode{RenderMode::StereoNone};
+    bool resolution_auto{true};
     int width{2688};
     int height{2784};
     int dlss_quality{1};
