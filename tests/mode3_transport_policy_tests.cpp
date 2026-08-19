@@ -4,11 +4,13 @@
 #include <initializer_list>
 
 int main() {
+    using w3vr::mode3_transport::HudProjectionRoute;
     using w3vr::mode3_transport::TemporalAdapter;
     using w3vr::mode3_transport::dlss_submission_route_active;
     using w3vr::mode3_transport::exact_afw_backend;
     using w3vr::mode3_transport::final_backbuffer_route_active;
     using w3vr::mode3_transport::final_color_submission_backend;
+    using w3vr::mode3_transport::late_hud_composite_source_ready;
     using w3vr::mode3_transport::submission_queue_eligible;
 
     // Projection is not an input: both symmetric and asymmetric exercise this
@@ -40,5 +42,22 @@ int main() {
     assert(submission_queue_eligible(true, false));
     assert(!submission_queue_eligible(false, true));
     assert(!submission_queue_eligible(false, false));
+
+    // Gameplay continuously removes the baked HUD. A cutscene or Cinema
+    // boundary must fail open on its native HUD until the exact final pair
+    // proves both eyes were rendered scene-only; otherwise the late layer
+    // would draw the same subtitle a second time.
+    assert(late_hud_composite_source_ready(
+        HudProjectionRoute::Gameplay, false));
+    assert(late_hud_composite_source_ready(
+        HudProjectionRoute::Gameplay, true));
+    assert(!late_hud_composite_source_ready(
+        HudProjectionRoute::FullVr, false));
+    assert(late_hud_composite_source_ready(
+        HudProjectionRoute::FullVr, true));
+    assert(!late_hud_composite_source_ready(
+        HudProjectionRoute::Cinema, false));
+    assert(late_hud_composite_source_ready(
+        HudProjectionRoute::Cinema, true));
     return 0;
 }

@@ -10,6 +10,12 @@ enum class TemporalAdapter : uint8_t {
     Taau,
 };
 
+enum class HudProjectionRoute : uint8_t {
+    Gameplay,
+    FullVr,
+    Cinema,
+};
+
 // Projection is intentionally absent from this policy. Symmetric and
 // asymmetric rendering may prepare different camera/FOV/shader inputs, but
 // they must enter the same post-render transport once the temporal producer
@@ -55,6 +61,17 @@ constexpr bool submission_queue_eligible(
     bool route_active,
     bool /*queue_is_primary*/) noexcept {
     return route_active;
+}
+
+// Gameplay owns the validated continuously scene-only contract. Cinema and
+// automatic Full VR can cross their activation boundary between the two AER
+// renders, so their late HUD is safe only when the exact published pair proves
+// that both final eyes were rendered without a baked native HUD.
+constexpr bool late_hud_composite_source_ready(
+    HudProjectionRoute route,
+    bool scene_only_pair_ready) noexcept {
+    return route == HudProjectionRoute::Gameplay ||
+        scene_only_pair_ready;
 }
 
 }  // namespace w3vr::mode3_transport

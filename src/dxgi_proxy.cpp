@@ -24,6 +24,9 @@
 #include "mode3_transport_policy.h"
 #include "rt_ingress_join.h"
 
+// V1235 requires exact scene-only pair proof before automatic Full VR receives
+// the retained late HUD. A cutscene boundary can otherwise leave the native
+// subtitle baked into one asymmetric eye and then composite it a second time.
 // V1234 makes Mode-3 post-render transport projection-agnostic: symmetric and
 // asymmetric DLSS/TAAU feed the same exact submitted-temporal/final-color
 // transaction, and exact command-list publication may come from any hooked
@@ -35573,7 +35576,7 @@ void ensure_initialized() {
         // descriptor/binding hooks do not depend on Diagnostic Logging.
         if (g_config.runtime_diagnostics) {
             log_line(
-                "witcher3vr canonical build=V1234 base=V1233 mode3_transport=projection_agnostic_exact_temporal_final_color_any_queue static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_hud=eye_local full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
+                "witcher3vr canonical build=V1235 base=V1234 full_vr_hud=eye_local_scene_only_pair_proven mode3_transport=projection_agnostic_exact_temporal_final_color_any_queue static_hud=outside_combat_mask_witcher_sense_reveal_combat_and_race_navigation camera_follow=launcher_policy_dynamic_vehicle_and_first_person taau_afw=V12128 raytracing=V13044 temporal_afw=common_final_color_transaction_dlss_taau rt_identity=order_independent_open_transactions rt_flight=removed strict_dlss_smoke_eye=exact_deferred_command_tag_then_legacy_camera_match aer_afw_post_hud=scene_only_then_late afw_cinema_hud=exact_completed_task_deferred_join aer_cinema_eye_contract=exact_completed_frame_hud_destination_all_backends taau_afw_smoke=upstream_center_zero_center_world_up taau_afw_camera=resolve_matrix_matched_raw_streamline_recovery noaa_taau_hud_eye=completed_tag_all_strict_stereo asymmetric_bootstrap_hud=visibility_optical_center_xy_launcher_shift_and_symmetric_angular_size asymmetric_taau_scene_descriptor=stable_prefix_zero_tail asymmetric_fire_resolver=thread_local_registry_epoch_cache full_vr_final_source=exact_completed_eye_pair_generation_view_all_aer_backends full_vr_asymmetric_fallback=requires_factory_mask hud_text_bootstrap=scale_then_position "
                 "rt_scope=symmetric_and_native_asymmetric_mode3_aer_dlss_taau "
                 "rt_temporal=ao_sigma_shadow_reblur_specular_per_eye "
                 "rt_camera=nrd_same_eye_rotation_translation "
@@ -35972,11 +35975,8 @@ float4 ps_main(PixelInput input) : SV_Target0 {
 // source into the unequivocal left/right slices of the current projection
 // image. Eye-specific convergence is applied here; no independent XR layer is
 // submitted and no scene resource is retained.
-enum class Mode3HudProjectionRoute : uint32_t {
-    Gameplay,
-    FullVr,
-    Cinema,
-};
+using Mode3HudProjectionRoute =
+    w3vr::mode3_transport::HudProjectionRoute;
 
 struct CinemaHudProjectionParameters {
     const XrView* eye_views{};
@@ -40050,16 +40050,25 @@ void render_openxr_test_frame(
         : (mode3_final_source_gameplay_pair_ready
             ? g_mode3_afw_sequenced_pair
             : trace_pair_id);
-    const bool cinema_hud_source_ready = !cinema_panel ||
-        (sequential_cinema_pair_active
-            ? mode3_scene_only_output_pair_ready(hud_scene_pair_id)
-            : mode3_scene_only_output_pair_ready(trace_pair_id));
+    const uint64_t hud_source_pair_id = sequential_cinema_pair_active
+        ? hud_scene_pair_id
+        : trace_pair_id;
+    const bool scene_only_hud_source_ready =
+        mode3_scene_only_output_pair_ready(hud_source_pair_id);
+    // [FIX:FULL-VR-HUD-SINGLE-OWNER V1235 1/1] Automatic Full VR can become
+    // active after one asymmetric eye has already baked the native subtitle.
+    // Do not add the retained HUD to that mixed pair. Fail open on the native
+    // pixels until both exact final eyes prove a scene-only HUD draw, matching
+    // the already-safe Cinema contract.
+    const bool hud_source_ready =
+        w3vr::mode3_transport::late_hud_composite_source_ready(
+            hud_projection_route, scene_only_hud_source_ready);
     bool hud_composite_ready = submitted && !fullscreen_menu &&
         retained_hud_projection_route_active() &&
         post_loading_stereo_pair_ready &&
         g_mode3_hud_layer_available.load(std::memory_order_acquire) &&
         mode3_early_hud_pair_ready() &&
-        cinema_hud_source_ready;
+        hud_source_ready;
 
     if (submitted) {
         if (!g_xr_first_frame_logged) {
