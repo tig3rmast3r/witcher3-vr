@@ -203,7 +203,6 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.fast_movement_transitions = index % 2 == 0;
         state.native_stereo = true;
         state.fullscreen_projection = true;
-        state.alternate_presentation_resize = true;
         state.diagnostic_logging = true;
 
         w3vr::IniDocument vr;
@@ -266,8 +265,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "native stereo must remain enabled in every stereo mode");
         Require(vr.Get("openxr", "fullscreen_projection") == "1",
             "fullscreen projection must remain available in every render mode");
-        Require(vr.Get("openxr", "alternate_presentation_resize") == "0",
-            "alternate presentation resize must be disabled by asymmetric projection");
+        Require(!vr.Get(
+                "openxr", "alternate_presentation_resize").has_value(),
+            "removed alternate presentation resize key was retained");
         Require(vr.Get("openxr", "hud_horizontal_scale") == "0.500",
             "removed HUD X control must preserve the existing INI value");
         Require(vr.Get("openxr", "hud_vertical_scale") == "0.500",
@@ -317,7 +317,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             vr.Get("openxr", "cinema_5x4") ==
                 std::string(expected_five_four ? "1" : "0"),
             "Cinema aspect and compatibility mirror mismatch");
-        Require(vr.Get("meta", "config_version") == "13",
+        Require(vr.Get("meta", "config_version") == "14",
             "configuration version marker missing");
         Require(vr.Get("openxr", "resolution_auto") ==
             std::string(state.resolution_auto ? "1" : "0"),
@@ -400,8 +400,6 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "round-trip native stereo mode gate mismatch");
         Require(loaded.state.fullscreen_projection,
             "round-trip fullscreen projection mismatch");
-        Require(!loaded.state.alternate_presentation_resize,
-            "round-trip alternate presentation resize gate mismatch");
         Require(loaded.state.ray_tracing == expected_ray_tracing,
             "round-trip Ray Tracing mode gate mismatch");
         if (w3vr::ModeUsesDlss(state.mode)) {
@@ -452,7 +450,6 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
     native_legacy.mode = w3vr::RenderMode::StereoNone;
     native_legacy.native_stereo = true;
     native_legacy.fullscreen_projection = false;
-    native_legacy.alternate_presentation_resize = false;
     w3vr::IniDocument vr;
     w3vr::IniDocument game;
     std::wstring error;
@@ -461,41 +458,32 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         "independent presentation document build failed");
     Require(vr.Get("openxr", "native_stereo") == "1" &&
         vr.Get("openxr", "fullscreen_projection") == "0" &&
-        vr.Get("openxr", "alternate_presentation_resize") == "0",
+        !vr.Get("openxr", "alternate_presentation_resize").has_value(),
         "Native Stereo still implies a presentation experiment");
 }
 
-void TestControlledRayTracingAndAlternateResize(
+void TestControlledRayTracing(
     const w3vr::ConfigPaths& paths) {
     Require(w3vr::ModeSupportsRayTracing(w3vr::RenderMode::AerAfwDlss) &&
             w3vr::ModeSupportsRayTracing(w3vr::RenderMode::AerAfwTaau) &&
             !w3vr::ModeSupportsRayTracing(
                 w3vr::RenderMode::StereoDlssSequential),
         "Ray Tracing support predicate does not match the AER + AFW temporal modes");
-    Require(w3vr::AlternatePresentationResizeAvailable(
-            w3vr::RenderMode::StereoTaau, false, 0.85f) &&
-            !w3vr::AlternatePresentationResizeAvailable(
-                w3vr::RenderMode::StereoTaau, false, 1.0f) &&
-            !w3vr::AlternatePresentationResizeAvailable(
-                w3vr::RenderMode::StereoTaau, true, 0.85f),
-        "alternate resize availability does not follow size/asymmetric gates");
-
     WriteBaseFixtures(paths);
     w3vr::LauncherState state;
     state.mode = w3vr::RenderMode::StereoTaau;
     state.presentation_scale = 0.85f;
     state.native_stereo = false;
     state.fullscreen_projection = false;
-    state.alternate_presentation_resize = true;
     state.ray_tracing = true;
     w3vr::IniDocument vr;
     w3vr::IniDocument game;
     std::wstring error;
     Require(w3vr::BuildUpdatedDocuments(paths, state, vr, game, error),
         "controlled renderer-option document build failed");
-    Require(vr.Get("openxr", "fullscreen_projection") == "1" &&
-            vr.Get("openxr", "alternate_presentation_resize") == "1",
-        "alternate resize did not activate its required fullscreen presenter");
+    Require(vr.Get("openxr", "fullscreen_projection") == "0" &&
+            !vr.Get("openxr", "alternate_presentation_resize").has_value(),
+        "removed alternate resize route was retained");
     Require(vr.Get("engine", "raytracing_enabled") == "0" &&
             game.Get("Rendering/RT", "EnableRT") == "false",
         "incompatible render mode did not force both Ray Tracing flags off");
@@ -512,12 +500,11 @@ void TestControlledRayTracingAndAlternateResize(
             game.Get("Rendering/RT", "EnableRT") == "true",
         "AER + AFW - DLSS did not enable both Ray Tracing flags");
 
-    state.presentation_scale = 1.0f;
-    state.fullscreen_projection = false;
+    state.fullscreen_projection = true;
     Require(w3vr::BuildUpdatedDocuments(paths, state, vr, game, error) &&
-            vr.Get("openxr", "fullscreen_projection") == "0" &&
-            vr.Get("openxr", "alternate_presentation_resize") == "0",
-        "scale 1.00 did not sanitize the alternate presentation route");
+            vr.Get("openxr", "fullscreen_projection") == "1" &&
+            !vr.Get("openxr", "alternate_presentation_resize").has_value(),
+        "advanced fullscreen projection did not remain independent");
 }
 
 void TestProportionalCutsceneConvergence() {
@@ -575,8 +562,6 @@ void TestReleaseDefaults() {
         "asymmetric projection must default to enabled");
     Require(!defaults.fullscreen_projection,
         "experimental fullscreen projection must default to disabled");
-    Require(!defaults.alternate_presentation_resize,
-        "alternate presentation resize must default to disabled");
     Require(!defaults.diagnostic_logging,
         "diagnostic logging must default to disabled");
 }
@@ -610,16 +595,18 @@ void TestEmbeddedLauncherDefaults() {
     const auto defaults = w3vr::IniDocument::Load(defaults_path, error);
     Require(defaults.has_value(),
         "embedded launcher INI defaults could not be loaded");
-    Require(defaults->Get("meta", "config_version") == "13" &&
+    Require(defaults->Get("meta", "config_version") == "14" &&
         defaults->Get("openxr", "mode3_aer_presentation") == "1" &&
         defaults->Get("openxr", "resolution_auto") == "1" &&
         defaults->Get("openxr", "presentation_scale") == "1.000" &&
         defaults->Get("openxr", "native_stereo") == "1" &&
+        !defaults->Get(
+            "openxr", "alternate_presentation_resize").has_value() &&
         defaults->Get("engine", "temporal_backend") == "dlss" &&
         defaults->Get("engine", "first_person_combat_exit") == "0" &&
         defaults->Get("engine", "raytracing_history_buffers") == "8" &&
         defaults->Get("debug", "pipeline_flight_recorder") == "0",
-        "embedded launcher defaults do not match schema 13 release policy");
+        "embedded launcher defaults do not match schema 14 release policy");
 }
 
 void TestHudEditorSetup(const fs::path& root) {
@@ -983,7 +970,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     std::wstring error;
     const std::string defaults =
         "[meta]\r\n"
-        "config_version=13\r\n"
+        "config_version=14\r\n"
         "[openxr]\r\n"
         "mode=3\r\n"
         "mode3_aer_presentation=1\r\n"
@@ -992,7 +979,6 @@ void TestFirstRunConfiguration(const fs::path& root) {
         "render_height=2784\r\n"
         "native_stereo=1\r\n"
         "fullscreen_projection=0\r\n"
-        "alternate_presentation_resize=0\r\n"
         "hud_horizontal_scale=1.000\r\n"
         "hud_vertical_scale=1.000\r\n"
         "cinema_aspect=5x4\r\n"
@@ -1041,13 +1027,13 @@ void TestFirstRunConfiguration(const fs::path& root) {
     Require(!created, "migrated INI must not be reported as newly created");
     auto migrated = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated.has_value(), "migrated INI could not be read");
-    Require(migrated->Get("meta", "config_version") == "13",
+    Require(migrated->Get("meta", "config_version") == "14",
         "old INI was not versioned");
     Require(migrated->Get("openxr", "resolution_auto") == "1",
         "old INI did not receive the OpenXR AUTO default");
     Require(migrated->Get("openxr", "native_stereo") == "0" &&
         migrated->Get("openxr", "fullscreen_projection") == "0" &&
-        migrated->Get("openxr", "alternate_presentation_resize") == "0",
+        !migrated->Get("openxr", "alternate_presentation_resize").has_value(),
         "old INI did not receive safe independent presentation defaults");
     Require(migrated->Get(
             "focus_projection", "shader_registry_enabled") == "0",
@@ -1148,14 +1134,15 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "V11-to-V12 normalization failed");
     const auto normalized_v12 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(normalized_v12.has_value() &&
-        normalized_v12->Get("meta", "config_version") == "13" &&
+        normalized_v12->Get("meta", "config_version") == "14" &&
         normalized_v12->Get("openxr", "enabled") == "1" &&
         normalized_v12->Get("openxr", "mode") == "3" &&
         normalized_v12->Get("openxr", "mode3_aer_presentation") == "0" &&
         normalized_v12->Get("openxr", "resolution_auto") == "0" &&
         normalized_v12->Get("openxr", "presentation_scale") == "1.000" &&
         normalized_v12->Get("openxr", "native_stereo") == "1" &&
-        normalized_v12->Get("openxr", "alternate_presentation_resize") == "0" &&
+        !normalized_v12->Get(
+            "openxr", "alternate_presentation_resize").has_value() &&
         normalized_v12->Get("engine", "temporal_backend") == "none" &&
         normalized_v12->Get("engine", "raytracing_enabled") == "0" &&
         normalized_v12->Get("engine", "dual_render_probe") == "1" &&
@@ -1189,7 +1176,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "V2-to-V11 migration failed");
     auto migrated_v4 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_v4.has_value() &&
-        migrated_v4->Get("meta", "config_version") == "13" &&
+        migrated_v4->Get("meta", "config_version") == "14" &&
         migrated_v4->Get("openxr", "cinema_hud_stereo_shift_px") == "-91" &&
         migrated_v4->Get("openxr", "cinema_hud_scale") == "1.100" &&
         migrated_v4->Get("openxr", "full_vr_hud_stereo_shift_px") == "-26" &&
@@ -1216,7 +1203,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "V3-to-V11 migration failed");
     auto migrated_from_v3 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v3.has_value() &&
-        migrated_from_v3->Get("meta", "config_version") == "13" &&
+        migrated_from_v3->Get("meta", "config_version") == "14" &&
         migrated_from_v3->Get("openxr", "hud_horizontal_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "hud_vertical_scale") == "1.000" &&
         migrated_from_v3->Get("openxr", "custom_user_value") == "keep",
@@ -1233,10 +1220,11 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "V6-to-V11 migration failed");
     auto migrated_from_v6 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v6.has_value() &&
-        migrated_from_v6->Get("meta", "config_version") == "13" &&
+        migrated_from_v6->Get("meta", "config_version") == "14" &&
         migrated_from_v6->Get("openxr", "native_stereo") == "1" &&
         migrated_from_v6->Get("openxr", "fullscreen_projection") == "0" &&
-        migrated_from_v6->Get("openxr", "alternate_presentation_resize") == "0" &&
+        !migrated_from_v6->Get(
+            "openxr", "alternate_presentation_resize").has_value() &&
         migrated_from_v6->Get("openxr", "mode3_aer_presentation") == "0",
         "V6 combined flag was not split safely");
 
@@ -1256,7 +1244,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
     auto migrated_rt_incompatible = w3vr::IniDocument::Load(
         paths.vr_ini, error);
     Require(migrated_rt_incompatible.has_value() &&
-            migrated_rt_incompatible->Get("meta", "config_version") == "13" &&
+            migrated_rt_incompatible->Get("meta", "config_version") == "14" &&
             migrated_rt_incompatible->Get(
                 "engine", "raytracing_enabled") == "0",
         "V11 migration retained Ray Tracing on an incompatible mode");
@@ -1273,7 +1261,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "supported V10-to-V11 RT migration failed");
     auto migrated_rt_supported = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_rt_supported.has_value() &&
-            migrated_rt_supported->Get("meta", "config_version") == "13" &&
+            migrated_rt_supported->Get("meta", "config_version") == "14" &&
             migrated_rt_supported->Get(
                 "engine", "raytracing_enabled") == "1",
         "V11 migration removed the supported AER + AFW / TAAU RT opt-in");
@@ -1292,7 +1280,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "V9-to-V11 migration failed");
     auto migrated_from_v9 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v9.has_value() &&
-        migrated_from_v9->Get("meta", "config_version") == "13" &&
+        migrated_from_v9->Get("meta", "config_version") == "14" &&
         !migrated_from_v9->Get(
             "engine", "first_person_stationary_turn").has_value() &&
         migrated_from_v9->Get("engine", "first_person_strafe") == "0" &&
@@ -1313,7 +1301,7 @@ void TestFirstRunConfiguration(const fs::path& root) {
         paths, defaults, created, error), "V8-to-V11 migration failed");
     auto migrated_from_v8 = w3vr::IniDocument::Load(paths.vr_ini, error);
     Require(migrated_from_v8.has_value() &&
-        migrated_from_v8->Get("meta", "config_version") == "13" &&
+        migrated_from_v8->Get("meta", "config_version") == "14" &&
         migrated_from_v8->Get("openxr", "cinema_aspect") == "4x3" &&
         migrated_from_v8->Get("openxr", "cinema_5x4") == "0",
         "V8 Cinema framing choice was not migrated to 4:3");
@@ -1400,7 +1388,7 @@ int main() {
         TestVrProfileHighShadows();
         TestHudEditorSetup(temporary.path);
         TestAllModes(paths);
-        TestControlledRayTracingAndAlternateResize(paths);
+        TestControlledRayTracing(paths);
         TestDlssLabelsAndLegacyAuto(paths);
         TestFallbackAndAtomicSave(paths);
         TestInconsistentWarning(paths);

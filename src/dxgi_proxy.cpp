@@ -29,6 +29,9 @@
 #include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
+// V1295 removes the obsolete alternate-resize experiment. Virtual Desktop
+// foveated rendering no longer needs its special full-surface letterbox route;
+// Presentation Size and the normal legacy/fullscreen presenters are unchanged.
 // V1294 merges PR #13 without rewriting its original commit. First-person
 // camera translation and bridge offsets update once per Present only under
 // Mode-3 AER, where a stereo pair spans two distinct frames. Strict Stereo
@@ -266,9 +269,6 @@ struct Config {
     // The visibility-mask envelope/fit route is opt-in. Missing keys retain
     // the proven legacy crop-and-copy presentation path.
     bool fullscreen_projection{false};
-    // Optional runtime-FOV letterbox used by Virtual Desktop foveated
-    // rendering. This changes only reduced-size fullscreen presentation.
-    bool alternate_presentation_resize{false};
     int openxr_mono_eye_shift_px{160};
     bool openxr_mono_eye_shift_auto{true};
     int render_width{0};
@@ -11877,8 +11877,6 @@ void load_config() {
         g_config.fullscreen_projection = native_stereo_key_present
             ? legacy_combined_projection
             : false;
-        g_config.alternate_presentation_resize = read_ini_bool(
-            "openxr", "alternate_presentation_resize", false);
         g_config.openxr_mono_eye_shift_px = std::clamp(read_ini_int("openxr", "mono_eye_shift_px", 160), -512, 512);
         g_config.openxr_mono_eye_shift_auto = read_ini_bool("openxr", "mono_eye_shift_auto", true);
         g_config.render_width = std::max(0, read_ini_int("openxr", "render_width", 0));
@@ -12308,14 +12306,13 @@ void load_config() {
                 g_config.runtime_diagnostics ? 1 : 0);
         }
 
-        log_line("Config openxr enabled=%d mode=%d resolution_scale=%.3f presentation_scale=%.3f native_stereo=%d fullscreen_projection=%d alternate_presentation_resize=%d mono_shift=%d reverse enabled=%d periodic=%d unmap=%d cbv=%d active_nudge=%d nudge=%.3f start=%d cycle=%d pulse=%d orbit_probe=%d orbit_interval=%d orbit_max=%d copy_probe=%d copy_max=%d stereo_probe=%d geometry_shift=%d",
+        log_line("Config openxr enabled=%d mode=%d resolution_scale=%.3f presentation_scale=%.3f native_stereo=%d fullscreen_projection=%d mono_shift=%d reverse enabled=%d periodic=%d unmap=%d cbv=%d active_nudge=%d nudge=%.3f start=%d cycle=%d pulse=%d orbit_probe=%d orbit_interval=%d orbit_max=%d copy_probe=%d copy_max=%d stereo_probe=%d geometry_shift=%d",
             g_config.openxr_enabled,
             g_config.openxr_mode,
             g_config.resolution_scale,
             g_config.presentation_scale,
             g_config.native_stereo ? 1 : 0,
             g_config.fullscreen_projection ? 1 : 0,
-            g_config.alternate_presentation_resize ? 1 : 0,
             g_config.openxr_mono_eye_shift_px,
             g_config.reverse_enabled,
             g_config.reverse_scan_periodic,
@@ -37811,7 +37808,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1294 base=V1293 "
+                "witcher3vr dxgi proxy initialized build=V1295 base=V1294 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d dlss_public_streamline=%d "
@@ -37857,6 +37854,8 @@ void ensure_initialized() {
                 "V1293 retained HUD submitted fallback=aer_afw_plus_strict_stereo_dlss_taau pointer_exact_stereo_first=1 exact_queue_generation_window=1 v1292=skipped aer_force_inherited=1");
             log_line(
                 "V1294 first-person camera anchor cadence=aer_per_present strict_stereo_pair_frozen backend_independent=1 pr=13");
+            log_line(
+                "V1295 alternate presentation resize=removed vd_foveated_special_route=removed presentation_size=unchanged fullscreen_ini=preserved");
             log_line(
                 "V1279 DLSS compatibility=public_streamline_aer_private_history_ngx_stereo legacy_module_agnostic_discovery=disabled_by_V1288");
             log_line(
@@ -42703,12 +42702,6 @@ void render_openxr_test_frame(
                     g_xr_cinema_projection_pipeline != nullptr &&
                     g_xr_cinema_projection_root_signature != nullptr &&
                     g_xr_cinema_projection_srv_heap != nullptr;
-                const bool alternate_presentation_resize_active =
-                    full_surface_projection &&
-                    !aer_asymmetric_final_size_remap &&
-                    g_config.alternate_presentation_resize &&
-                    requested_scale < 0.9999f;
-
                 // [FIX:PRESENTATION-COVER-SCALE 1/4] Rebase the slider around
                 // the largest uniform crop that preserves each runtime optical
                 // center while excluding the permanent bands created by the
@@ -42736,16 +42729,6 @@ void render_openxr_test_frame(
                 UINT projection_height = std::min(swapchain.height,
                     std::max(copy_height, static_cast<UINT>(lroundf(
                         static_cast<float>(copy_height) / effective_vertical_scale))));
-                // [TRIAL:ALTERNATE-PRESENTATION-RESIZE V1119] Virtual Desktop
-                // foveated rendering needs the runtime xrLocateViews FOV to
-                // remain unchanged. Keep the full swapchain as the submitted
-                // angular surface and letterbox the reduced REDengine image
-                // into its exact tangent-space rectangle. The default-off
-                // flag preserves V1118's validated reduced-FOV direct route.
-                if (alternate_presentation_resize_active) {
-                    projection_width = swapchain.width;
-                    projection_height = swapchain.height;
-                }
                 // [FIX:AER-TAAU-FIXED-RESOLUTION-PRESENTATION V1291 2/3]
                 // TAAU takes this route at scale 1 as well: the source extent
                 // remains exact and the legacy cover crop cannot report or
@@ -42963,8 +42946,7 @@ void render_openxr_test_frame(
                     // their texture transport differs.
                     scaled_fov_projection =
                         requested_scale < 0.9999f &&
-                        !aer_asymmetric_final_size_remap &&
-                        !alternate_presentation_resize_active;
+                        !aer_asymmetric_final_size_remap;
                     if (scaled_fov_projection) {
                         const XrRect2Di scaled_rect{
                             {static_cast<int32_t>(centered_x),
@@ -44199,14 +44181,13 @@ void render_openxr_test_frame(
                     if (!symmetric_subimage_route_logged.exchange(true)) {
                         log_line(
                             "V1119 presentation route scale=%.3f "
-                            "fullscreen=%d alternate_resize=%d "
+                            "fullscreen=%d "
                             "scale1_direct=%d scaled_fov=%d scaled_direct=%d "
                             "native_asymmetric=%d native_direct=%d "
                             "crop0=%d,%d %dx%d crop1=%d,%d %dx%d "
                             "source=%ux%u target=%ux%u",
                             requested_scale,
                             full_surface_projection ? 1 : 0,
-                            alternate_presentation_resize_active ? 1 : 0,
                             symmetric_subimage_copy ? 1 : 0,
                             scaled_fov_projection ? 1 : 0,
                             scaled_fov_direct_copy ? 1 : 0,
@@ -44368,11 +44349,10 @@ void render_openxr_test_frame(
                             projection_eye_float_fit_rects);
                     if (!fit_projection_ready) {
                         log_line(
-                            "V1119 fallback projection render failed image=%u present=%llu scaled_fov=%d alternate_resize=%d native_asymmetric=%d",
+                            "V1119 fallback projection render failed image=%u present=%llu scaled_fov=%d native_asymmetric=%d",
                             image_index,
                             static_cast<unsigned long long>(current_present),
                             scaled_fov_projection ? 1 : 0,
-                            alternate_presentation_resize_active ? 1 : 0,
                             native_asymmetric_projection ? 1 : 0);
                     }
                     if (live_backbuffer_source) {

@@ -80,7 +80,6 @@ struct LauncherState {
     bool fast_movement_transitions{true};
     bool native_stereo{true};
     bool fullscreen_projection{};
-    bool alternate_presentation_resize{};
     bool diagnostic_logging{};
 };
 
@@ -131,8 +130,6 @@ const wchar_t* ModeDisplayName(RenderMode mode);
 bool ModeUsesDlss(RenderMode mode);
 bool ModeUsesStereo(RenderMode mode);
 bool ModeSupportsRayTracing(RenderMode mode);
-bool AlternatePresentationResizeAvailable(
-    RenderMode mode, bool native_stereo, float presentation_scale);
 std::optional<int> DlssNearSquareCompatibleWidth(const LauncherState& state);
 int CinemaHudConvergenceShift(float hud_scale, int offset);
 int FullVrHudConvergenceShift(float hud_scale, int offset);

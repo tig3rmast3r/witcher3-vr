@@ -26,7 +26,7 @@ using w3vr::CameraFollowPolicy;
 
 constexpr wchar_t kWindowClass[] = L"Witcher3VRLauncherWindow";
 constexpr int kClientWidth = 720;
-constexpr int kClientHeight = 1152;
+constexpr int kClientHeight = 1120;
 constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
     WS_MINIMIZEBOX;
 
@@ -68,7 +68,6 @@ enum ControlId {
     IdFastMovementTransitions,
     IdCinemaFullVr,
     IdSteadyIcons,
-    IdAlternatePresentationResize,
     IdNativeStereo,
     IdDiagnosticLogging,
     IdStatus,
@@ -286,20 +285,7 @@ void UpdateModeControls() {
     const bool native_stereo_available = selected_valid &&
         w3vr::ModeUsesStereo(selected_mode);
     EnableWindow(Item(IdNativeStereo), native_stereo_available);
-    const bool native_stereo_active = native_stereo_available &&
-        SendMessageW(Item(IdNativeStereo), BM_GETCHECK, 0, 0) == BST_CHECKED;
     EnableWindow(Item(IdPresentationScale), TRUE);
-    const float presentation_scale = static_cast<float>(SendMessageW(
-        Item(IdPresentationScale), TBM_GETPOS, 0, 0)) / 100.0f;
-    const bool alternate_resize_available = selected_valid &&
-        w3vr::AlternatePresentationResizeAvailable(
-            selected_mode, native_stereo_active, presentation_scale);
-    if (!alternate_resize_available) {
-        SendMessageW(Item(IdAlternatePresentationResize),
-            BM_SETCHECK, BST_UNCHECKED, 0);
-    }
-    EnableWindow(Item(IdAlternatePresentationResize),
-        alternate_resize_available);
     UpdateTrackLabels();
 }
 
@@ -455,11 +441,7 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdCinemaFullVr), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.steady_icons = SendMessageW(
         Item(IdSteadyIcons), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    state.alternate_presentation_resize = SendMessageW(
-        Item(IdAlternatePresentationResize), BM_GETCHECK, 0, 0) == BST_CHECKED;
-    state.fullscreen_projection = state.alternate_presentation_resize ||
-        (g_app.fullscreen_projection &&
-            !g_app.loaded.alternate_presentation_resize);
+    state.fullscreen_projection = g_app.fullscreen_projection;
     state.native_stereo = SendMessageW(
         Item(IdNativeStereo), BM_GETCHECK, 0, 0) == BST_CHECKED;
     state.diagnostic_logging = SendMessageW(
@@ -789,8 +771,6 @@ void RestoreLauncherDefaults() {
     SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
         defaults.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
     g_app.fullscreen_projection = defaults.fullscreen_projection;
-    SendMessageW(Item(IdAlternatePresentationResize), BM_SETCHECK,
-        defaults.alternate_presentation_resize ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdNativeStereo), BM_SETCHECK,
         defaults.native_stereo ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK, BST_UNCHECKED, 0);
@@ -965,9 +945,6 @@ void PopulateControls() {
         loaded.state.cinema_full_vr ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdSteadyIcons), BM_SETCHECK,
         loaded.state.steady_icons ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageW(Item(IdAlternatePresentationResize), BM_SETCHECK,
-        loaded.state.alternate_presentation_resize
-            ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdNativeStereo), BM_SETCHECK,
         loaded.state.native_stereo ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(Item(IdDiagnosticLogging), BM_SETCHECK,
@@ -1111,85 +1088,80 @@ void CreateInterface(HWND window) {
         IdFastMovementTransitions),
         L"Enables the bundled movement-input fix DLC for faster transitions between movement states.");
 
-    AddTooltip(AddControl(L"BUTTON",
-        L"Alternate Presentation Resize (Experimental; VD foveated rendering)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 562, 640, 26,
-        IdAlternatePresentationResize),
-        L"Available when Presentation Size is below 1.00 and Asymmetric Projection is off. It keeps the runtime FOV unchanged and letterboxes the reduced image, enabling Virtual Desktop foveated-rendering experiments.");
     AddTooltip(AddControl(L"BUTTON", L"Asymmetric Projection (Experimental)",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 594, 610, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 562, 610, 26,
         IdNativeStereo),
         L"Improves image quality at zero performance cost by matching the projection to your headset. The improvement depends on the headset and may be minimal or negligible on some models. Because it is experimental, it may cause visual artifacts or duplicated shader effects. It works with both AER + AFW and Stereo.");
     AddTooltip(AddControl(L"BUTTON", L"Diagnostic Logging",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 626, 300, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 594, 300, 26,
         IdDiagnosticLogging),
         L"Writes witcher3vr.log and enables bounded runtime diagnostics. Use it for troubleshooting because it may affect performance.");
     AddTooltip(AddControl(L"BUTTON", L"Hide Static HUD Outside Combat",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 365, 626, 315, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 365, 594, 315, 26,
         IdHideStaticHudOutsideCombat),
         L"Hides the minimap, tracked objectives, vitality, buffs, equipped items, damaged-item status, companion panel, and control hints outside combat. Witcher Sense reveals them; combat and horse races preserve navigation information.");
 
     AddTooltip(AddControl(L"BUTTON", L"First Person and camera", BS_GROUPBOX,
-        20, 682, 680, 178),
+        20, 650, 680, 178),
         L"First Person comfort controls and the dynamic REDengine camera-follow policy.");
     AddTooltip(AddControl(L"BUTTON", L"Gamepad Snap Turn + Head Follow",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 708, 420, 28,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 676, 420, 28,
         IdFirstPersonGamepadHeadFollow),
         L"Turns the body in fixed gamepad steps and makes movement follow the headset direction while First Person is active.");
     AddTooltips(
         L"Select the number of degrees applied by each First Person gamepad snap turn.",
-        {AddLabel(L"Angle", 475, 712, 60, 22),
-         AddCombo(540, 704, 135, IdFirstPersonSnapTurnDegrees)});
+        {AddLabel(L"Angle", 475, 680, 60, 22),
+         AddCombo(540, 672, 135, IdFirstPersonSnapTurnDegrees)});
     AddTooltip(AddControl(L"BUTTON", L"Auto switch to third person during combats",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 740, 630, 28,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 708, 630, 28,
         IdFirstPersonCombatExit),
         L"Leaves First Person when combat begins and returns after combat has safely ended. Manual view changes cancel the pending automatic return.");
     AddTooltip(AddControl(L"BUTTON", L"Strafe Movement",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 772, 310, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 740, 310, 26,
         IdFirstPersonStrafe),
         L"Keeps lateral input as strafing instead of turning Geralt while First Person is active.");
     AddTooltip(AddControl(L"BUTTON", L"Reduce Head Bobbing",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 365, 772, 310, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 365, 740, 310, 26,
         IdFirstPersonAnchorSmoothing),
         L"Smooths lateral and vertical First Person camera-anchor motion while preserving deliberate view rotation.");
 
     AddTooltips(
         L"Controls REDengine camera follow dynamically. Always On is disabled while on foot in First Person, but remains enabled on a horse or boat. Only Horse/Boat disables it everywhere else. Always Off never enables it.",
-        {AddLabel(L"Camera Follow", 38, 808, 170, 22),
-         AddCombo(205, 800, 260, IdCameraFollow)});
+        {AddLabel(L"Camera Follow", 38, 776, 170, 22),
+         AddCombo(205, 768, 260, IdCameraFollow)});
 
     AddTooltip(AddControl(L"BUTTON", L"Bindings", BS_GROUPBOX,
-        20, 874, 680, 112),
+        20, 842, 680, 112),
         L"Keyboard shortcuts available while Witcher 3 VR is running.");
     AddTooltip(AddLabel(
         L"F8  Standard / Near    F9  Recenter    F10  Cinema    F11  First Person (Experimental)",
-        38, 900, 650, 24),
+        38, 868, 650, 24),
         L"Runtime view shortcuts: cycle the standard/near camera, recenter the headset, toggle Cinema3D, or toggle First Person.");
     AddTooltip(AddLabel(
         L"HUD editor: INS open / save and close    Q/E select panel    Arrow keys move    Wheel scales",
-        38, 924, 650, 24),
+        38, 892, 650, 24),
         L"HUD editor controls: open or save with Insert, select a panel with Q/E, move it with the arrow keys, and resize it with the mouse wheel.");
     AddTooltip(AddLabel(
         L"R reset panel    X reset profile    F7 switch VR / Cinema3D (editor open or closed)",
-        38, 948, 650, 24),
+        38, 916, 650, 24),
         L"HUD editor reset and preview controls: reset the current panel, reset the profile, or switch between Full VR and Cinema3D.");
 
-    AddTooltip(AddLabel(L"", 20, 994, 680, 26, IdStatus, SS_LEFT),
+    AddTooltip(AddLabel(L"", 20, 962, 680, 26, IdStatus, SS_LEFT),
         L"Shows validation results, saved changes, and launch status.");
     AddTooltip(AddControl(L"BUTTON", L"Configure Settings for VR",
-        BS_PUSHBUTTON | WS_TABSTOP, 20, 1024, 220, 34, IdConfigureVr),
+        BS_PUSHBUTTON | WS_TABSTOP, 20, 992, 220, 34, IdConfigureVr),
         L"Installs the complete recommended VR graphics baseline, then reapplies the selected render mode and resolution.");
     AddTooltip(AddControl(L"BUTTON", L"Restore Original Settings",
-        BS_PUSHBUTTON | WS_TABSTOP, 252, 1024, 220, 34, IdRestoreOriginal),
+        BS_PUSHBUTTON | WS_TABSTOP, 252, 992, 220, 34, IdRestoreOriginal),
         L"Restores the original dx12user.settings backup created by Configure Settings for VR.");
     AddTooltip(AddControl(L"BUTTON", L"Restore Defaults",
-        BS_PUSHBUTTON | WS_TABSTOP, 484, 1024, 216, 34, IdRestoreDefaults),
+        BS_PUSHBUTTON | WS_TABSTOP, 484, 992, 216, 34, IdRestoreDefaults),
         L"Loads Witcher 3 VR launcher defaults into the controls. Press Save to apply them.");
     AddTooltip(AddControl(L"BUTTON", L"Save Only",
-        BS_PUSHBUTTON | WS_TABSTOP, 406, 1070, 130, 36, IdSave),
+        BS_PUSHBUTTON | WS_TABSTOP, 406, 1038, 130, 36, IdSave),
         L"Writes the selected launcher, renderer, and game settings without starting the game.");
     AddTooltip(AddControl(L"BUTTON", L"Save && Launch",
-        BS_DEFPUSHBUTTON | WS_TABSTOP, 550, 1070, 150, 36, IdSaveLaunch),
+        BS_DEFPUSHBUTTON | WS_TABSTOP, 550, 1038, 150, 36, IdSaveLaunch),
         L"Writes all settings, enforces render-mode compatibility, and starts The Witcher 3.");
 
     PopulateControls();

@@ -197,10 +197,6 @@ The presentation controls remain independent:
   default.
 - **Fullscreen Projection** changes the presentation method for every render
   mode. It defaults to off, so all modes use the validated legacy presenter.
-- **Alternate Presentation Resize** opts into the PR-style resize needed for
-  Virtual Desktop foveated-rendering experiments. The launcher enables it when
-  Presentation Size is below `1.00` and Asymmetric Projection is off, and turns
-  on its required Fullscreen Projection route automatically.
 
 ## Recommended game settings
 

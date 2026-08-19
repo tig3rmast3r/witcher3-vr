@@ -24,7 +24,7 @@ constexpr std::array<ModeSettings, 5> kModes{{
     {3, true, false, "dlss", 6, true},
 }};
 
-constexpr int kCurrentConfigVersion = 13;
+constexpr int kCurrentConfigVersion = 14;
 constexpr char kDefaultRayTracingHistoryBuffers[] = "8";
 constexpr float kCinemaHudReferenceScale = 1.30f;
 constexpr int kCinemaHudReferenceShift = -72;
@@ -79,6 +79,7 @@ void RemoveObsoleteSettings(IniDocument& ini) {
     ini.Remove("openxr", "cinema_subtitle_scale");
     ini.Remove("openxr", "full_vr_subtitle_scale");
     ini.Remove("openxr", "cinema_subtitle_stereo_shift_px");
+    ini.Remove("openxr", "alternate_presentation_resize");
     ini.Remove("engine", "streamline_ps93_learning_log");
     ini.Remove("engine", "first_person_stationary_turn");
     // V1243's hard P-core isolation was runtime rejected and removed when the
@@ -236,7 +237,6 @@ void MigrateConfigurationToV7(IniDocument& ini) {
         ini, "openxr", "fullscreen_projection", false);
     ini.Set("openxr", "native_stereo", legacy_native_stereo ? "1" : "0");
     ini.Set("openxr", "fullscreen_projection", "0");
-    ini.Set("openxr", "alternate_presentation_resize", "0");
     RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", "7");
 }
@@ -363,16 +363,9 @@ void NormalizeLauncherOwnedConfiguration(IniDocument& ini) {
 
     const bool native_stereo = ReadBool(
         ini, "openxr", "native_stereo", false);
-    const float presentation_scale = ReadFloat(
-        ini, "openxr", "presentation_scale", 1.0f);
-    const bool alternate_resize =
-        !native_stereo && presentation_scale < 0.9999f && ReadBool(
-            ini, "openxr", "alternate_presentation_resize", false);
-    const bool fullscreen_projection = alternate_resize || ReadBool(
+    const bool fullscreen_projection = ReadBool(
         ini, "openxr", "fullscreen_projection", false);
     ini.Set("openxr", "native_stereo", native_stereo ? "1" : "0");
-    ini.Set("openxr", "alternate_presentation_resize",
-        alternate_resize ? "1" : "0");
     ini.Set("openxr", "fullscreen_projection",
         fullscreen_projection ? "1" : "0");
 
@@ -439,6 +432,14 @@ void MigrateConfigurationToV13(IniDocument& ini) {
     if (!ini.Get("openxr", "resolution_auto").has_value()) {
         ini.Set("openxr", "resolution_auto", "1");
     }
+    RemoveObsoleteSettings(ini);
+    ini.Set("meta", "config_version", "13");
+}
+
+void MigrateConfigurationToV14(IniDocument& ini) {
+    // The alternate resize experiment is no longer required for Virtual
+    // Desktop foveated rendering. Remove its launcher-owned key; the normal
+    // Presentation Size and advanced Fullscreen Projection paths stay intact.
     RemoveObsoleteSettings(ini);
     ini.Set("meta", "config_version", std::to_string(kCurrentConfigVersion));
 }
@@ -1042,12 +1043,6 @@ bool ModeSupportsRayTracing(RenderMode mode) {
         mode == RenderMode::AerAfwDlss;
 }
 
-bool AlternatePresentationResizeAvailable(
-    RenderMode mode, bool native_stereo, float presentation_scale) {
-    return ModeUsesStereo(mode) && !native_stereo &&
-        std::isfinite(presentation_scale) && presentation_scale < 0.9999f;
-}
-
 int CinemaHudConvergenceShift(float hud_scale, int offset) {
     return ProportionalHudConvergenceShift(
         hud_scale, kCinemaHudReferenceScale,
@@ -1186,6 +1181,9 @@ bool EnsureVrConfiguration(const ConfigPaths& paths,
         }
         if (existing_version < 13) {
             MigrateConfigurationToV13(migrated);
+        }
+        if (existing_version < 14) {
+            MigrateConfigurationToV14(migrated);
         }
         // This is deliberately independent from version migration: extending
         // the default template must heal a partial current-version INI on the
@@ -1437,8 +1435,6 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         *vr, "openxr", "native_stereo", false);
     result.state.fullscreen_projection = ReadBool(
         *vr, "openxr", "fullscreen_projection", false);
-    result.state.alternate_presentation_resize = ReadBool(
-        *vr, "openxr", "alternate_presentation_resize", false);
     result.state.diagnostic_logging =
         ReadBool(*vr, "debug", "logging_enabled", false) &&
         ReadBool(*vr, "debug", "runtime_diagnostics", false);
@@ -1481,17 +1477,10 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     // geometry in every supported stereo mode.
     const bool native_stereo_active =
         state.native_stereo && ModeUsesStereo(state.mode);
-    const bool alternate_presentation_resize_active =
-        state.alternate_presentation_resize &&
-        AlternatePresentationResizeAvailable(
-            state.mode, native_stereo_active, state.presentation_scale);
     vr_ini.Set("openxr", "native_stereo",
         native_stereo_active ? "1" : "0");
     vr_ini.Set("openxr", "fullscreen_projection",
-        state.fullscreen_projection || alternate_presentation_resize_active
-            ? "1" : "0");
-    vr_ini.Set("openxr", "alternate_presentation_resize",
-        alternate_presentation_resize_active ? "1" : "0");
+        state.fullscreen_projection ? "1" : "0");
     vr_ini.Set("openxr", "hud_stereo_shift_px",
         std::to_string(std::clamp(state.hud_convergence_delta - 16, -256, 256)));
     vr_ini.Set("openxr", "presentation_scale", FloatString(
