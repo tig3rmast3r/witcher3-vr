@@ -29399,7 +29399,15 @@ bool acquire_pair_frozen_native_head_pose(
     combat_lock_yaw = 0.0f;
     const uint32_t generation =
         g_native_head_pose_session_generation.load(std::memory_order_acquire);
-    const bool key_is_pair = g_engine_producer_pair_id != 0 &&
+    // [FIX:FIRST-PERSON-AER-ANCHOR-CADENCE 1/2] Pair freezing exists so both
+    // eyes of one stereo pair share a single head sample. Under Mode-3 AER a
+    // pair spans two consecutive Presents ~11 ms apart, so the same key would
+    // hold the first-person camera position still for one frame and then jump
+    // two frames' worth of player motion. Orientation is never frozen here,
+    // which is why only translation (strafing worst) judders. Sample per
+    // Present whenever the render identity is one eye per frame.
+    const bool key_is_pair = !mode3_aer_presentation_active() &&
+        g_engine_producer_pair_id != 0 &&
         g_engine_producer_pair_id != UINT64_MAX;
     const uint64_t key = key_is_pair ? g_engine_producer_pair_id : present;
 
@@ -29812,7 +29820,12 @@ void update_first_person_native_snap_turn(
 // The small blend removes a one-frame camera step without waiting for measured
 // world velocity, so the correction starts with the animation state itself.
 void update_first_person_bridge_offsets(uint64_t present) {
-    if (g_engine_factory_eye == 1) {
+    // [FIX:FIRST-PERSON-AER-ANCHOR-CADENCE 2/2] The eye-1 guard assumes eye 1
+    // is the same instant as eye 0, which only holds when one Present carries
+    // both eyes. Under Mode-3 AER eye 1 is its own frame, and skipping it
+    // halves the rate of the state-offset blend below. The present dedupe
+    // already prevents a second update inside one frame.
+    if (g_engine_factory_eye == 1 && !mode3_aer_presentation_active()) {
         return;
     }
 
