@@ -26,7 +26,9 @@
 #include "pipeline_flight_recorder.h"
 #include "rt_ingress_join.h"
 
-// V1253 gives only the AER SYM DLSS reused-camera fallback the same native
+// V1254 extends V1253's runtime-validated native per-eye DLSS history from AER
+// SYM to AER ASYM reused-camera fallbacks. Strict Stereo remains unchanged for
+// separate validation. V1253 gives only the AER SYM DLSS reused-camera fallback the same native
 // per-eye temporal-camera history used by the normal factory route. The
 // fallback now rebuilds motion from its corrected HMD/IPD camera instead of
 // inheriting the stale embedded-camera record. AER ASYM and strict Stereo are
@@ -24429,13 +24431,13 @@ void install_engine_temporal_writer_hook() {
     }
 }
 
-// [FIX:AER-SYM-FALLBACK-DLSS-HISTORY V1253 1/2] Reused-camera cutscenes do
+// [FIX:AER-FALLBACK-DLSS-HISTORY V1254 1/2] Reused-camera cutscenes do
 // not reach hook_engine_view_rebuild(), so V9416/V14003 cannot install the
 // previous corrected camera before REDengine derives native motion vectors.
 // Reuse that same native 0xB0 record on the private final-frame camera. Keep
-// the first frame of each fallback episode self-seeded and keep this trial
-// strictly on AER SYM; AER ASYM and strict Stereo remain untouched.
-bool prepare_aer_sym_full_vr_fallback_dlss_temporal_history(
+// the first frame of each fallback episode self-seeded. V1254 admits both AER
+// projection policies while strict Stereo remains untouched.
+bool prepare_aer_full_vr_fallback_dlss_temporal_history(
     float* view,
     int eye,
     uint64_t pair_id,
@@ -24444,7 +24446,6 @@ bool prepare_aer_sym_full_vr_fallback_dlss_temporal_history(
     if (view == nullptr || eye < 0 || eye > 1 || pair_id == 0 ||
         pair_id == UINT64_MAX || !dlss_sequential_mode_active() ||
         !mode3_aer_presentation_active() ||
-        native_asymmetric_noaa_route_active() ||
         g_engine_temporal_camera_build == nullptr ||
         !g_engine_temporal_camera_build_time_valid.load(
             std::memory_order_acquire)) {
@@ -27151,7 +27152,7 @@ bool prepare_full_vr_frame_camera(
 
     bool dlss_temporal_history_continued{};
     const bool dlss_temporal_history_applied =
-        prepare_aer_sym_full_vr_fallback_dlss_temporal_history(
+        prepare_aer_full_vr_fallback_dlss_temporal_history(
             corrected.data(), eye, pair_id,
             dlss_temporal_history_continued);
     if (!safe_rebuild_shadow_view(corrected.data())) {
@@ -27231,11 +27232,13 @@ bool prepare_full_vr_frame_camera(
                 1, std::memory_order_relaxed) + 1;
         if (history_count <= 32 || history_count % 120 == 0) {
             log_cinema_camera_diagnostic(
-                "V1253 AER SYM Full VR fallback DLSS history applied "
-                "count=%llu present=%llu eye=%d pair=%llu continued=%u",
+                "V1254 AER Full VR fallback DLSS history applied "
+                "count=%llu present=%llu eye=%d pair=%llu asymmetric=%u "
+                "continued=%u",
                 static_cast<unsigned long long>(history_count),
                 static_cast<unsigned long long>(present), eye,
                 static_cast<unsigned long long>(pair_id),
+                native_asymmetric_noaa_route_active() ? 1u : 0u,
                 dlss_temporal_history_continued ? 1u : 0u);
         }
     }

@@ -1270,7 +1270,7 @@ bool dump_last_ten_seconds() {
     }
 
     fprintf(file, "WITCHER3VR_PIPELINE_FLIGHT_V3\n");
-    fprintf(file, "build=V1253 base=V1252 window_seconds=10 "
+    fprintf(file, "build=V1254 base=V1253 window_seconds=10 "
         "cpu_sampling=every_call "
         "gpu_sampling=every_4th_frame gpu_readback=asynchronous "
         "thread_sampling=producer_exit+render_worker_entry "
