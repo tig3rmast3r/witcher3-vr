@@ -29,6 +29,10 @@
 #include "shadow_cascade_authority_policy.h"
 #include "taau_submission_policy.h"
 
+// V1294 merges PR #13 without rewriting its original commit. First-person
+// camera translation and bridge offsets update once per Present only under
+// Mode-3 AER, where a stereo pair spans two distinct frames. Strict Stereo
+// keeps pair-frozen sampling because both eyes still represent one instant.
 // V1293 extends the queue-submitted retained-HUD safety net from AER+AFW to
 // strict Stereo DLSS/TAAU. Stereo keeps its pointer-exact fast path; only a
 // miss joins the immutable HUD tag, t1 capture and PRESENT boundary by exact
@@ -30581,7 +30585,15 @@ bool acquire_pair_frozen_native_head_pose(
     combat_lock_yaw = 0.0f;
     const uint32_t generation =
         g_native_head_pose_session_generation.load(std::memory_order_acquire);
-    const bool key_is_pair = g_engine_producer_pair_id != 0 &&
+    // [FIX:FIRST-PERSON-AER-ANCHOR-CADENCE 1/2] Pair freezing exists so both
+    // eyes of one stereo pair share a single head sample. Under Mode-3 AER a
+    // pair spans two consecutive Presents ~11 ms apart, so the same key would
+    // hold the first-person camera position still for one frame and then jump
+    // two frames' worth of player motion. Orientation is never frozen here,
+    // which is why only translation (strafing worst) judders. Sample per
+    // Present whenever the render identity is one eye per frame.
+    const bool key_is_pair = !mode3_aer_presentation_active() &&
+        g_engine_producer_pair_id != 0 &&
         g_engine_producer_pair_id != UINT64_MAX;
     const uint64_t key = key_is_pair ? g_engine_producer_pair_id : present;
 
@@ -30994,7 +31006,12 @@ void update_first_person_native_snap_turn(
 // The small blend removes a one-frame camera step without waiting for measured
 // world velocity, so the correction starts with the animation state itself.
 void update_first_person_bridge_offsets(uint64_t present) {
-    if (g_engine_factory_eye == 1) {
+    // [FIX:FIRST-PERSON-AER-ANCHOR-CADENCE 2/2] The eye-1 guard assumes eye 1
+    // is the same instant as eye 0, which only holds when one Present carries
+    // both eyes. Under Mode-3 AER eye 1 is its own frame, and skipping it
+    // halves the rate of the state-offset blend below. The present dedupe
+    // already prevents a second update inside one frame.
+    if (g_engine_factory_eye == 1 && !mode3_aer_presentation_active()) {
         return;
     }
 
@@ -37794,7 +37811,7 @@ void ensure_initialized() {
                 "focus_fire_b1=stereo_structural_aer_upstream_owner "
                 "aer_taau_hud=scene_and_retained_pair_fail_open");
             log_line(
-                "witcher3vr dxgi proxy initialized build=V1293 base=V1291 "
+                "witcher3vr dxgi proxy initialized build=V1294 base=V1293 "
                 "anchor_smoothing_ini=%d anchor_smoothing_seconds=%.4f "
                 "first_person_strafe_ini=%d mode3_aer_presentation=%d raytracing_enabled=%d raytracing_history_buffers=%d "
                 "aer_afw_enabled=%d persistent_registry=%d dlss_public_streamline=%d "
@@ -37838,6 +37855,8 @@ void ensure_initialized() {
                 "V1291 AER TAAU presentation=source_resolution_fixed_100_percent slider=fov_only scale1_legacy_cover_crop=bypassed dlss_stereo_unchanged=1");
             log_line(
                 "V1293 retained HUD submitted fallback=aer_afw_plus_strict_stereo_dlss_taau pointer_exact_stereo_first=1 exact_queue_generation_window=1 v1292=skipped aer_force_inherited=1");
+            log_line(
+                "V1294 first-person camera anchor cadence=aer_per_present strict_stereo_pair_frozen backend_independent=1 pr=13");
             log_line(
                 "V1279 DLSS compatibility=public_streamline_aer_private_history_ngx_stereo legacy_module_agnostic_discovery=disabled_by_V1288");
             log_line(
