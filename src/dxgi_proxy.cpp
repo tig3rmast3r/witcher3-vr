@@ -9827,10 +9827,148 @@ bool capture_puredark_afw_mode3_taau_inputs(
     return true;
 }
 
+// [FIX:STREAMLINE-COMMAND-LIST-UNWRAP 1/3] Streamline's interposer can hand the
+// application wrapper objects rather than the D3D12 runtime's own. When it
+// does, slEvaluateFeature receives an sl.interposer.dll-owned command list while
+// the real ID3D12CommandQueue::ExecuteCommandLists this proxy hooks receives the
+// underlying D3D12Core.dll object. The AFW producer transport joins a producer
+// to its presentation by exact command-list pointer, so on such a runtime the
+// key registered at capture can never match the key seen at submission: every
+// bundle strands in PendingSubmission and the six-slot ring starves for the rest
+// of the session.
+//
+// Recover the underlying object instead of changing the transport contract.
+// The scan is self-validating -- a candidate is accepted only if its own vtable
+// belongs to the D3D12 runtime -- so it does not depend on a hardcoded
+// Streamline struct layout, and a runtime that hands over unwrapped lists (or
+// any layout this fails to decode) keeps exactly the present behaviour.
+HMODULE module_owning_address(const void* address);
+
+bool address_is_readable(const void* address, size_t bytes) {
+    if (address == nullptr) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) == 0 ||
+        info.State != MEM_COMMIT) {
+        return false;
+    }
+    constexpr DWORD readable =
+        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+        PAGE_EXECUTE_WRITECOPY;
+    if ((info.Protect & readable) == 0 ||
+        (info.Protect & PAGE_GUARD) != 0) {
+        return false;
+    }
+    const auto* start = static_cast<const uint8_t*>(info.BaseAddress);
+    const auto* end = start + info.RegionSize;
+    const auto* want = static_cast<const uint8_t*>(address) + bytes;
+    return want <= end;
+}
+
+bool module_base_name_is(HMODULE module, const wchar_t* expected) {
+    if (module == nullptr) {
+        return false;
+    }
+    wchar_t path[MAX_PATH]{};
+    if (GetModuleFileNameW(module, path, MAX_PATH) == 0) {
+        return false;
+    }
+    const wchar_t* slash = wcsrchr(path, 0x5C);
+    const wchar_t* base = slash != nullptr ? slash + 1 : path;
+    return _wcsicmp(base, expected) == 0;
+}
+
+HMODULE vtable_owner_of(const void* object) {
+    if (!address_is_readable(object, sizeof(void*))) {
+        return nullptr;
+    }
+    void* const* vtable = *reinterpret_cast<void* const* const*>(object);
+    if (!address_is_readable(vtable, sizeof(void*))) {
+        return nullptr;
+    }
+    return module_owning_address(vtable[0]);
+}
+
+bool command_list_is_d3d12_runtime(const void* object) {
+    const HMODULE owner = vtable_owner_of(object);
+    return module_base_name_is(owner, L"D3D12Core.dll") ||
+        module_base_name_is(owner, L"d3d12.dll");
+}
+
+// Offset of the native pointer inside the wrapper, once proven. UINT32_MAX means
+// "not yet resolved"; the scan runs until one candidate validates.
+std::atomic<uint32_t> g_streamline_command_list_native_offset{UINT32_MAX};
+std::atomic<uint32_t> g_streamline_unwrap_logs{};
+
+// [FIX:STREAMLINE-COMMAND-LIST-UNWRAP 2/3]
+ID3D12GraphicsCommandList* resolve_native_command_list(
+    ID3D12GraphicsCommandList* command_list) {
+    if (command_list == nullptr ||
+        command_list_is_d3d12_runtime(command_list)) {
+        return command_list;
+    }
+    if (!module_base_name_is(
+            vtable_owner_of(command_list), L"sl.interposer.dll")) {
+        return command_list;
+    }
+
+    const auto* bytes = reinterpret_cast<const uint8_t*>(command_list);
+    const uint32_t known =
+        g_streamline_command_list_native_offset.load(
+            std::memory_order_acquire);
+    if (known != UINT32_MAX) {
+        if (address_is_readable(bytes + known, sizeof(void*))) {
+            auto* candidate = *reinterpret_cast<ID3D12GraphicsCommandList* const*>(
+                bytes + known);
+            if (command_list_is_d3d12_runtime(candidate)) {
+                return candidate;
+            }
+        }
+        return command_list;
+    }
+
+    constexpr uint32_t kMaxWrapperScanBytes = 256;
+    for (uint32_t offset = sizeof(void*); offset <= kMaxWrapperScanBytes;
+         offset += sizeof(void*)) {
+        if (!address_is_readable(bytes + offset, sizeof(void*))) {
+            break;
+        }
+        auto* candidate = *reinterpret_cast<ID3D12GraphicsCommandList* const*>(
+            bytes + offset);
+        if (!command_list_is_d3d12_runtime(candidate)) {
+            continue;
+        }
+        g_streamline_command_list_native_offset.store(
+            offset, std::memory_order_release);
+        log_line(
+            "Streamline command-list unwrap resolved offset=%u wrapper=%p "
+            "native=%p",
+            offset, command_list, candidate);
+        return candidate;
+    }
+
+    if (take_bounded_log_slot(g_streamline_unwrap_logs, 8)) {
+        log_line(
+            "Streamline command-list unwrap failed wrapper=%p scan_bytes=%u "
+            "(producer join will use the wrapper, as before)",
+            command_list, kMaxWrapperScanBytes);
+    }
+    return command_list;
+}
+
 void finalize_puredark_afw_dlss_submission(
-    ID3D12GraphicsCommandList* command_list,
+    ID3D12GraphicsCommandList* wrapped_command_list,
     int32_t bundle_slot,
     NVSDK_NGX_Result result) {
+    // [FIX:STREAMLINE-COMMAND-LIST-UNWRAP 3/3] The producer must be registered
+    // under the pointer ExecuteCommandLists will actually present, not the
+    // interposer wrapper the temporal callback was handed. Unwrapped lists and
+    // the NGX boundary return unchanged, so this is identity for every runtime
+    // that already worked.
+    ID3D12GraphicsCommandList* const command_list =
+        resolve_native_command_list(wrapped_command_list);
     if (!puredark_afw_dlss_route_active() || command_list == nullptr) {
         return;
     }
