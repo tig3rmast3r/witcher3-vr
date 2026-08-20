@@ -38878,9 +38878,18 @@ float3 srgb_to_linear(float3 value) {
         step(value, float3(0.04045, 0.04045, 0.04045)));
 }
 float4 ps_main(PixelInput input) : SV_Target0 {
-    float4 cinema = cinema_texture.SampleLevel(
-        linear_sampler, saturate(input.uv), 0.0);
-    cinema.rgb = srgb_to_linear(cinema.rgb);
+    uint source_width, source_height;
+    cinema_texture.GetDimensions(source_width, source_height);
+    float2 texel = 1.0 / max(float2(source_width, source_height), 1.0);
+    // The outermost source row can retain uninitialised or NaN-poisoned
+    // pixels that the sRGB target then shows as a persistent bright frame.
+    // Sample from the first fully valid texel centres inward instead.
+    float2 uv = saturate(input.uv) * (1.0 - 3.0 * texel) + 1.5 * texel;
+    float4 cinema = cinema_texture.SampleLevel(linear_sampler, uv, 0.0);
+    if (!all(isfinite(cinema.rgb))) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    cinema.rgb = srgb_to_linear(saturate(cinema.rgb));
     cinema.a = 1.0;
     return cinema;
 }
