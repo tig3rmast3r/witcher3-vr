@@ -412,10 +412,6 @@ struct Config {
     bool streamline_taau_bridge{false};
     bool ngx_trace{false};
     bool dlss_dlaa{false};
-    // Temporary/manual compatibility callback for systems whose NVIDIA global
-    // DLSS override bypasses the canonical NGX Evaluate export. It is absent
-    // from the launcher and defaults off. AER/Stereo/AFW policy is unchanged.
-    bool dlss_streamline_evaluate_callback{false};
     // Optional compatibility/performance route. False regenerates native
     // Depth/MVec for both Sequential eyes; true preserves the old shared-input
     // behavior for users who explicitly prefer its lower cost.
@@ -493,16 +489,14 @@ bool dlss_streamline_evaluate_callback_active() {
     // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 1/8] AER and strict Stereo use the
     // same public completion boundary. Projection and AFW presentation policy
     // do not select a different DLSS owner.
-    // [FIX:DLSS-NGX-PRODUCER-TAP 1/2] Honour the configured request instead of
-    // forcing the route on. The public callback captures the AFW producer from
-    // the command list Streamline passes to slEvaluateFeature, which is not
-    // always the list that reaches the hooked ExecuteCommandLists. Where it is
-    // not, every recorded bundle stalls in PendingSubmission and the six-slot
-    // producer ring starves permanently. Keep this route available for the
-    // driver-override systems it was written for, but let the canonical NGX
-    // boundary own completion by default.
+    // [FIX:DLSS-COMPLETION-ARBITRATION 1/5] Arm the public route on every
+    // Mode-3 DLSS runtime. It is the only boundary that exists when the NVIDIA
+    // global DLSS override bypasses the NGX export, and observing it costs
+    // nothing where NGX does complete: producer capture is arbitrated below, so
+    // arming both cannot publish two producers for the same image. No user
+    // setting selects a boundary any more.
     return w3vr::mode3_transport::streamline_dlss_evaluate_callback_active(
-        g_config.dlss_streamline_evaluate_callback,
+        true,
         g_config.openxr_enabled,
         g_config.openxr_mode,
         backend);
@@ -1192,6 +1186,10 @@ struct PuredarkAfwBundleSlot {
     uint64_t route_epoch{};
     uint64_t submission_serial{};
     uint64_t ready_present{UINT64_MAX};
+    // [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 1/6] Present at which this slot
+    // entered Recording. Only InFlight slots retire on a fence, so this is the
+    // sole way to notice a slot whose command list never reached the queue.
+    uint64_t recorded_present{UINT64_MAX};
     // V12099: null/zero means the producer ran on the primary OpenXR queue.
     // Otherwise these identify the dedicated per-queue fence signal placed
     // immediately after this bundle's actual NGX ExecuteCommandLists call.
@@ -1259,6 +1257,11 @@ std::atomic<uint64_t> g_puredark_afw_cross_queue_waits{};
 // visual warp diagnostic in its Evaluate ABI. Keep it opt-in and process-local
 // so ordinary AFW output is byte-for-byte unchanged until the user presses F6.
 std::atomic<bool> g_puredark_afw_visual_debug{};
+// [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 3/6] Non-zero means some producer
+// bundles never reached ExecuteCommandLists and had to be reclaimed by age.
+// A steadily climbing value indicates the active temporal boundary is recording
+// on a command list this proxy does not observe.
+std::atomic<uint64_t> g_puredark_afw_unsubmitted_reclaims{};
 std::atomic<uint64_t> g_puredark_afw_recorded_candidates{};
 std::atomic<uint64_t> g_puredark_afw_submitted_candidates{};
 std::atomic<uint64_t> g_puredark_afw_ready_candidates{};
@@ -3093,6 +3096,41 @@ const char* dlss_completion_owner_name(DlssCompletionOwner owner) {
     default:
         return "probe";
     }
+}
+
+void log_line(const char* fmt, ...);
+
+// [FIX:DLSS-COMPLETION-ARBITRATION 2/5] V1287's per-command-list probe cannot
+// arbitrate these two boundaries: it is keyed by the command list, and the case
+// that needs arbitrating is exactly the one where the two boundaries see
+// different command lists. (It is also unreachable -- nothing ever called
+// begin_dlss_completion_auto_probe.) Ownership is instead a sticky, process-wide
+// observation, because which boundary completes DLSS is a property of the
+// installed DLL topology rather than of any single frame.
+void note_dlss_completion_ngx_boundary() {
+    g_dlss_completion_ngx_owned.fetch_add(1, std::memory_order_relaxed);
+    const auto previous =
+        g_dlss_completion_owner.load(std::memory_order_relaxed);
+    const auto resolved =
+        w3vr::mode3_transport::dlss_completion_observed_owner(previous, true);
+    if (resolved == previous) {
+        return;
+    }
+    g_dlss_completion_owner.store(resolved, std::memory_order_relaxed);
+    g_dlss_completion_owner_switches.fetch_add(1, std::memory_order_relaxed);
+    log_line(
+        "DLSS completion owner resolved from=%s to=%s "
+        "(NGX EvaluateFeature observed; public Streamline capture stands down)",
+        dlss_completion_owner_name(previous),
+        dlss_completion_owner_name(resolved));
+}
+
+// [FIX:DLSS-COMPLETION-ARBITRATION 3/5] The public callback keeps capturing
+// until a real NGX evaluation is seen, so a runtime whose NGX export is bypassed
+// still bootstraps its producers from frame one.
+bool dlss_public_producer_capture_allowed() {
+    return w3vr::mode3_transport::dlss_completion_capture_public_bundle(
+        g_dlss_completion_owner.load(std::memory_order_relaxed));
 }
 
 uint64_t begin_dlss_completion_auto_probe(
@@ -9083,6 +9121,8 @@ int32_t capture_puredark_afw_dlss_inputs_from_resources(
     }
 
     uint32_t bundle_slot = UINT32_MAX;
+    const uint64_t capture_present =
+        g_present_count.load(std::memory_order_relaxed);
     const uint64_t completed_fence = g_xr_fence != nullptr
         ? g_xr_fence->GetCompletedValue()
         : 0;
@@ -9099,6 +9139,27 @@ int32_t capture_puredark_afw_dlss_inputs_from_resources(
             slot.input.valid = false;
             slot.submission_serial = 0;
             slot.ready_present = UINT64_MAX;
+            slot.recorded_present = UINT64_MAX;
+            slot.producer_queue_fence = nullptr;
+            slot.producer_queue_fence_value = 0;
+            slot.retire_fence = 0;
+        }
+        // [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 2/6] A slot still Recording or
+        // PendingSubmission after this many Presents was never seen at
+        // ExecuteCommandLists, so no fence will ever retire it. Reclaiming it
+        // only discards an input snapshot whose GPU work the transport already
+        // gave up on; leaving it occupies the ring forever.
+        if ((slot.state == PuredarkAfwBundleState::Recording ||
+                slot.state == PuredarkAfwBundleState::PendingSubmission) &&
+            w3vr::mode3_transport::afw_unsubmitted_producer_expired(
+                capture_present, slot.recorded_present)) {
+            g_puredark_afw_unsubmitted_reclaims.fetch_add(
+                1, std::memory_order_relaxed);
+            slot.state = PuredarkAfwBundleState::Free;
+            slot.input.valid = false;
+            slot.submission_serial = 0;
+            slot.ready_present = UINT64_MAX;
+            slot.recorded_present = UINT64_MAX;
             slot.producer_queue_fence = nullptr;
             slot.producer_queue_fence_value = 0;
             slot.retire_fence = 0;
@@ -9124,6 +9185,7 @@ int32_t capture_puredark_afw_dlss_inputs_from_resources(
         g_puredark_afw_route_epoch.load(std::memory_order_acquire);
     slot.submission_serial = 0;
     slot.ready_present = UINT64_MAX;
+    slot.recorded_present = capture_present;
     slot.producer_queue_fence = nullptr;
     slot.producer_queue_fence_value = 0;
     slot.retire_fence = 0;
@@ -9694,6 +9756,8 @@ bool capture_puredark_afw_mode3_taau_inputs(
     }
 
     uint32_t bundle_slot = UINT32_MAX;
+    const uint64_t capture_present =
+        g_present_count.load(std::memory_order_relaxed);
     const uint64_t completed_fence = g_xr_fence != nullptr
         ? g_xr_fence->GetCompletedValue()
         : 0;
@@ -9710,6 +9774,26 @@ bool capture_puredark_afw_mode3_taau_inputs(
             candidate_slot.input.valid = false;
             candidate_slot.submission_serial = 0;
             candidate_slot.ready_present = UINT64_MAX;
+            candidate_slot.recorded_present = UINT64_MAX;
+            candidate_slot.producer_queue_fence = nullptr;
+            candidate_slot.producer_queue_fence_value = 0;
+            candidate_slot.retire_fence = 0;
+        }
+        // [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 4/6] The TAAU ring shares this
+        // slot pool and the same fence-only retirement, so it has the same
+        // permanent-starvation exposure. Bound it identically.
+        if ((candidate_slot.state == PuredarkAfwBundleState::Recording ||
+                candidate_slot.state ==
+                    PuredarkAfwBundleState::PendingSubmission) &&
+            w3vr::mode3_transport::afw_unsubmitted_producer_expired(
+                capture_present, candidate_slot.recorded_present)) {
+            g_puredark_afw_unsubmitted_reclaims.fetch_add(
+                1, std::memory_order_relaxed);
+            candidate_slot.state = PuredarkAfwBundleState::Free;
+            candidate_slot.input.valid = false;
+            candidate_slot.submission_serial = 0;
+            candidate_slot.ready_present = UINT64_MAX;
+            candidate_slot.recorded_present = UINT64_MAX;
             candidate_slot.producer_queue_fence = nullptr;
             candidate_slot.producer_queue_fence_value = 0;
             candidate_slot.retire_fence = 0;
@@ -12206,8 +12290,6 @@ void load_config() {
             "engine", "streamline_taau_bridge", false);
         g_config.ngx_trace = read_ini_bool("engine", "ngx_trace", false);
         g_config.dlss_dlaa = read_ini_bool("engine", "dlss_dlaa", false);
-        g_config.dlss_streamline_evaluate_callback = read_ini_bool(
-            "engine", "dlss_streamline_evaluate_callback", false);
         g_config.low_budget_dlss = read_ini_bool(
             "engine", "low_budget_dlss", false);
         g_config.world_marker_diagnostics = read_ini_bool(
@@ -12338,11 +12420,10 @@ void load_config() {
             g_config.reverse_copy_max_logs,
             g_config.reverse_stereo_probe,
             g_config.reverse_geometry_shift);
-        log_line("Config engine temporal_backend=%s dlss_dlaa=%d dlss_public_streamline=%d legacy_dlss_callback_ini=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_split_viewports=%d streamline_right_temporal_offset=%.4f streamline_temporal_eye=%d streamline_temporal_clip_correction=%.5f streamline_trace=%d streamline_trace_start_frame=%d native_mvec_passthrough=1",
+        log_line("Config engine temporal_backend=%s dlss_dlaa=%d dlss_public_streamline=%d view_probe=%d frame_builder_probe=%d gameplay_entry_probe=%d scene_enqueue_probe=%d view_factory_probe=%d frame_factory_probe=%d dual_render_probe=%d native_stereo_offset=%.3f factory_stereo_offset=%.4f streamline_force_reset=%d streamline_split_viewports=%d streamline_right_temporal_offset=%.4f streamline_temporal_eye=%d streamline_temporal_clip_correction=%.5f streamline_trace=%d streamline_trace_start_frame=%d native_mvec_passthrough=1",
             temporal_backend_name(),
             g_config.dlss_dlaa,
             dlss_streamline_evaluate_callback_active() ? 1 : 0,
-            g_config.dlss_streamline_evaluate_callback ? 1 : 0,
             g_config.engine_view_probe, g_config.engine_frame_builder_probe,
             g_config.engine_gameplay_entry_probe,
             g_config.engine_scene_enqueue_probe,
@@ -36015,8 +36096,13 @@ int __fastcall hook_sl_evaluate_feature(
             hydrate_streamline_dlss_callback_constants(
                 frame_token, eye, &callback_constants);
     }
+    // [FIX:DLSS-COMPLETION-ARBITRATION 4/5] Stand the whole public route down
+    // once NGX is known to complete: capture, jitter resubmission and completion
+    // accounting all belong to a single owner. Leaving only part of it armed
+    // would double-apply the asymmetric jitter correction.
     const bool streamline_completion_active = feature == 0 &&
         dlss_streamline_evaluate_callback_active() &&
+        dlss_public_producer_capture_allowed() &&
         command_list != nullptr;
     const bool streamline_snapshot_active = streamline_completion_active &&
         streamline_dlss_evaluate_snapshot_matches_current(eye);
@@ -36884,6 +36970,11 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_evaluate_feature(
     const NVSDK_NGX_Parameter* parameters,
     PFN_NVSDK_NGX_ProgressCallback callback) {
     g_ngx_dlss_evaluate_calls.fetch_add(1, std::memory_order_relaxed);
+    // [FIX:DLSS-COMPLETION-ARBITRATION 5/5] Reaching this hook is the proof
+    // that NGX is the real completion boundary on this runtime. Record it
+    // before evaluating, so the public callback has stood down by the time the
+    // next frame records a producer.
+    note_dlss_completion_ngx_boundary();
     // [FIX:DLSS-COMPLETION-AUTO V1287 4/8] A matching public evaluation marks
     // this exact command list before calling Streamline. That observation is
     // valid even if the driver invokes NGX from a different thread.
@@ -37097,10 +37188,12 @@ void install_ngx_dlss_hook() {
             true, std::memory_order_relaxed)) {
         log_line(
             "DLSS owner=auto ngx_evaluate_hook=%s ngx_create_hook=%s "
-            "public_streamline_callback=%u",
+            "public_streamline_callback=%s owner=%s",
             g_ngx_evaluate_feature != nullptr ? "installed" : "unavailable",
             g_ngx_create_feature != nullptr ? "installed" : "unavailable",
-            dlss_streamline_evaluate_callback_active() ? 1u : 0u);
+            dlss_streamline_evaluate_callback_active() ? "armed" : "inactive",
+            dlss_completion_owner_name(
+                g_dlss_completion_owner.load(std::memory_order_relaxed)));
     }
 }
 
@@ -43464,7 +43557,8 @@ void render_openxr_test_frame(
                         log_line(
                             "V12016 AFW publication present=%llu valid=%u "
                             "hold=%u recorded=%llu submitted=%llu ready=%llu "
-                            "missing=%llu consumed=%llu held=%llu starved=%llu",
+                            "missing=%llu consumed=%llu held=%llu starved=%llu "
+                            "unsubmitted_reclaims=%llu owner=%s",
                             static_cast<unsigned long long>(current_present),
                             puredark_afw.valid ? 1u : 0u,
                             puredark_afw_hold_last ? 1u : 0u,
@@ -43481,7 +43575,12 @@ void render_openxr_test_frame(
                             static_cast<unsigned long long>(
                                 g_puredark_afw_held_presents.load()),
                             static_cast<unsigned long long>(
-                                g_puredark_afw_slot_starvation.load()));
+                                g_puredark_afw_slot_starvation.load()),
+                            static_cast<unsigned long long>(
+                                g_puredark_afw_unsubmitted_reclaims.load()),
+                            dlss_completion_owner_name(
+                                g_dlss_completion_owner.load(
+                                    std::memory_order_relaxed)));
                     }
                 }
 

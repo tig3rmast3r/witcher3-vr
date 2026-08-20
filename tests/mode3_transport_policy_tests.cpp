@@ -17,6 +17,8 @@ int main() {
     using w3vr::mode3_transport::exact_afw_backend;
     using w3vr::mode3_transport::final_backbuffer_route_active;
     using w3vr::mode3_transport::final_color_submission_backend;
+    using w3vr::mode3_transport::afw_unsubmitted_producer_expired;
+    using w3vr::mode3_transport::dlss_completion_observed_owner;
     using w3vr::mode3_transport::immutable_pair_view_ready;
     using w3vr::mode3_transport::late_hud_composite_source_ready;
     using w3vr::mode3_transport::native_hud_source_bootstrap_active;
@@ -59,6 +61,34 @@ int main() {
         DlssCompletionOwner::Ngx, true));
     assert(dlss_completion_ngx_uses_public_bundle(
         DlssCompletionOwner::Streamline, true));
+
+    // Ownership is sticky and topology-wide, not per frame. Before either
+    // boundary is seen the public route keeps capturing so a Streamline-only
+    // runtime bootstraps; one real NGX evaluation ends that permanently, and no
+    // later frame can hand ownership back and republish two producers.
+    assert(dlss_completion_observed_owner(
+        DlssCompletionOwner::Probe, false) == DlssCompletionOwner::Probe);
+    assert(dlss_completion_observed_owner(
+        DlssCompletionOwner::Probe, true) == DlssCompletionOwner::Ngx);
+    assert(dlss_completion_observed_owner(
+        DlssCompletionOwner::Ngx, false) == DlssCompletionOwner::Ngx);
+    assert(dlss_completion_observed_owner(
+        DlssCompletionOwner::Streamline, true) == DlssCompletionOwner::Ngx);
+    assert(dlss_completion_capture_public_bundle(
+        dlss_completion_observed_owner(DlssCompletionOwner::Probe, false)));
+    assert(!dlss_completion_capture_public_bundle(
+        dlss_completion_observed_owner(DlssCompletionOwner::Probe, true)));
+
+    // A slot that never reaches ExecuteCommandLists cannot retire on a fence.
+    // Bound its occupancy so a mismatched submission topology drops producers
+    // instead of consuming the ring permanently.
+    assert(!afw_unsubmitted_producer_expired(100, UINT64_MAX));
+    assert(!afw_unsubmitted_producer_expired(100, 100));
+    assert(!afw_unsubmitted_producer_expired(107, 100));
+    assert(afw_unsubmitted_producer_expired(108, 100));
+    assert(afw_unsubmitted_producer_expired(4096, 100));
+    // A slot recorded after the present counter reset must not be expired.
+    assert(!afw_unsubmitted_producer_expired(4, 100));
     assert(!dlss_completion_ngx_uses_public_bundle(
         DlssCompletionOwner::Streamline, false));
     assert(dlss_completion_resolved_owner(true) ==
