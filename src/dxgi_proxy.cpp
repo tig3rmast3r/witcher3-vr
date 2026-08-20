@@ -493,8 +493,16 @@ bool dlss_streamline_evaluate_callback_active() {
     // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 1/8] AER and strict Stereo use the
     // same public completion boundary. Projection and AFW presentation policy
     // do not select a different DLSS owner.
+    // [FIX:DLSS-NGX-PRODUCER-TAP 1/2] Honour the configured request instead of
+    // forcing the route on. The public callback captures the AFW producer from
+    // the command list Streamline passes to slEvaluateFeature, which is not
+    // always the list that reaches the hooked ExecuteCommandLists. Where it is
+    // not, every recorded bundle stalls in PendingSubmission and the six-slot
+    // producer ring starves permanently. Keep this route available for the
+    // driver-override systems it was written for, but let the canonical NGX
+    // boundary own completion by default.
     return w3vr::mode3_transport::streamline_dlss_evaluate_callback_active(
-        true,
+        g_config.dlss_streamline_evaluate_callback,
         g_config.openxr_enabled,
         g_config.openxr_mode,
         backend);
@@ -37052,19 +37060,47 @@ NVSDK_NGX_Result NVSDK_CONV hook_ngx_create_feature(
     return result;
 }
 
+// [FIX:DLSS-NGX-PRODUCER-TAP 2/2] V1289/V1290 removed this hook entirely and
+// made the public Streamline callback the sole completion owner. That leaves
+// no producer boundary at all on runtimes where Streamline evaluates DLSS on a
+// command list the game never submits through the hooked ExecuteCommandLists:
+// the AFW bundle ring records six slots, none reach PendingSubmission -> Ready,
+// and the reclaim loop only frees InFlight slots, so the route dies for the
+// rest of the session. Restore the canonical NGX boundary. V1287's completion
+// probe already resolves ownership at runtime, so when the public callback is
+// also configured only one of the two records a producer for a command list.
 void install_ngx_dlss_hook() {
-    if (!temporal_backend_is_dlss()) {
+    if (!temporal_backend_is_dlss() ||
+        (!g_config.ngx_trace && !asymmetric_authority_audit_active() &&
+            !puredark_afw_mode3_aer_dlss_route_configured() &&
+            !dlss_submitted_cache_route_active()) ||
+        g_ngx_evaluate_feature != nullptr) {
         return;
+    }
+
+    auto* module = GetModuleHandleW(L"nvngx_dlss.dll");
+    auto* target = module != nullptr ? GetProcAddress(module, "NVSDK_NGX_D3D12_EvaluateFeature") : nullptr;
+    auto* create_target = module != nullptr ? GetProcAddress(module, "NVSDK_NGX_D3D12_CreateFeature") : nullptr;
+    if (target != nullptr &&
+        MH_CreateHook(target, reinterpret_cast<void*>(&hook_ngx_evaluate_feature),
+            reinterpret_cast<void**>(&g_ngx_evaluate_feature)) == MH_OK &&
+        MH_EnableHook(target) == MH_OK) {
+        log_line("NGX DLSS EvaluateFeature hook installed target=%p", target);
+    }
+    if (create_target != nullptr && g_ngx_create_feature == nullptr &&
+        MH_CreateHook(create_target, reinterpret_cast<void*>(&hook_ngx_create_feature),
+            reinterpret_cast<void**>(&g_ngx_create_feature)) == MH_OK &&
+        MH_EnableHook(create_target) == MH_OK) {
+        log_line("NGX DLSS CreateFeature hook installed target=%p", create_target);
     }
     if (!g_dlss_completion_auto_hook_logged.exchange(
             true, std::memory_order_relaxed)) {
-        // [FIX:DLSS-STREAMLINE-UNIVERSAL V1289 5/8] Do not even resolve the
-        // private exports. In particular, CreateFeature must not clone a peer
-        // history while EvaluateFeature completes through a public override.
         log_line(
-            "V1289 DLSS owner=public_streamline ngx_evaluate_hook=disabled "
-            "ngx_create_hook=disabled split_viewport_history=enabled "
-            "token_eye_constants=enabled legacy_public_bool_success=nonzero");
+            "DLSS owner=auto ngx_evaluate_hook=%s ngx_create_hook=%s "
+            "public_streamline_callback=%u",
+            g_ngx_evaluate_feature != nullptr ? "installed" : "unavailable",
+            g_ngx_create_feature != nullptr ? "installed" : "unavailable",
+            dlss_streamline_evaluate_callback_active() ? 1u : 0u);
     }
 }
 
