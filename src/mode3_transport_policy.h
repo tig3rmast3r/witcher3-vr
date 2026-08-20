@@ -136,6 +136,22 @@ constexpr bool afw_queued_producer_expired(
         present - ready_present >= kAfwStaleProducerMaxAgePresents;
 }
 
+// A slot only reaches InFlight, and therefore fence retirement, once its
+// command list is seen at ExecuteCommandLists. A temporal callback that records
+// on a list the game never submits leaves the slot in Recording or
+// PendingSubmission forever, and the fence path cannot reclaim it: the whole
+// ring is consumed once and the route is dead for the rest of the session.
+// Bound that occupancy so an unexpected submission topology costs dropped
+// producers rather than the entire transport.
+inline constexpr uint64_t kAfwUnsubmittedProducerMaxAgePresents = 8;
+
+constexpr bool afw_unsubmitted_producer_expired(
+    uint64_t present,
+    uint64_t recorded_present) noexcept {
+    return recorded_present != UINT64_MAX && present > recorded_present &&
+        present - recorded_present >= kAfwUnsubmittedProducerMaxAgePresents;
+}
+
 // Gameplay owns the validated continuously scene-only contract. Cinema and
 // automatic Full VR can cross their activation boundary between the two AER
 // renders, so their late HUD is safe only when the exact published pair proves
