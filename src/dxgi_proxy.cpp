@@ -3198,17 +3198,30 @@ std::atomic<uint32_t> g_final_present_resource_next_id{1};
 std::atomic<uint32_t> g_final_present_non_swapchain_route_logs{};
 std::atomic<uint32_t> g_final_present_missing_route_logs{};
 
+// [FIX:STREAMLINE-COMMAND-LIST-UNWRAP 4/6] Every map that joins a temporal
+// producer to its submission must be keyed by the pointer
+// ExecuteCommandLists will see, never by the interposer wrapper handed to the
+// public callback. Unwrapping inside each writer keeps the identity contract in
+// one place per map and is a no-op for already-native lists.
+ID3D12GraphicsCommandList* resolve_native_command_list(
+    ID3D12GraphicsCommandList* command_list);
+
 void record_streamline_command_list_eye(
-    ID3D12GraphicsCommandList* command_list,
+    ID3D12GraphicsCommandList* wrapped_command_list,
     uint32_t eye) {
+    ID3D12GraphicsCommandList* const command_list =
+        resolve_native_command_list(wrapped_command_list);
     std::scoped_lock lock{g_streamline_command_list_eye_mutex};
     g_streamline_command_list_eyes[command_list] = eye;
     g_streamline_command_list_last_eyes[command_list] = eye;
 }
 
 void record_streamline_command_list_route(
-    ID3D12GraphicsCommandList* command_list,
+    ID3D12GraphicsCommandList* wrapped_command_list,
     const EngineFrameTag& tag) {
+    // [FIX:STREAMLINE-COMMAND-LIST-UNWRAP 5/6]
+    ID3D12GraphicsCommandList* const command_list =
+        resolve_native_command_list(wrapped_command_list);
     if (command_list == nullptr || tag.eye > 1 || tag.pair_id == 0 ||
         tag.pair_id == UINT64_MAX) {
         return;
@@ -10076,8 +10089,13 @@ void finalize_puredark_afw_dlss_submission(
 }
 
 void finalize_dlss_cache_submission(
-    ID3D12GraphicsCommandList* command_list,
+    ID3D12GraphicsCommandList* wrapped_command_list,
     NVSDK_NGX_Result result) {
+    // [FIX:STREAMLINE-COMMAND-LIST-UNWRAP 6/6] This is the gate the Mode-3 AFW
+    // consumer sits behind: peek_mode3_temporal_cache_submission must find the
+    // cache entry under the submitted pointer or no producer is ever consumed.
+    ID3D12GraphicsCommandList* const command_list =
+        resolve_native_command_list(wrapped_command_list);
     if (!dlss_submitted_cache_route_active() ||
         command_list == nullptr || result != NVSDK_NGX_Result_Success ||
         !g_streamline_dlss_route_tag_valid) {
