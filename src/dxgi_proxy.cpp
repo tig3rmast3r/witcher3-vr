@@ -1184,6 +1184,10 @@ struct PuredarkAfwBundleSlot {
     uint64_t route_epoch{};
     uint64_t submission_serial{};
     uint64_t ready_present{UINT64_MAX};
+    // [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 1/5] Present at which this slot
+    // entered Recording. Only InFlight slots retire on a fence, so this is the
+    // sole way to notice a slot whose command list never reached the queue.
+    uint64_t recorded_present{UINT64_MAX};
     // V12099: null/zero means the producer ran on the primary OpenXR queue.
     // Otherwise these identify the dedicated per-queue fence signal placed
     // immediately after this bundle's actual NGX ExecuteCommandLists call.
@@ -1251,6 +1255,11 @@ std::atomic<uint64_t> g_puredark_afw_cross_queue_waits{};
 // visual warp diagnostic in its Evaluate ABI. Keep it opt-in and process-local
 // so ordinary AFW output is byte-for-byte unchanged until the user presses F6.
 std::atomic<bool> g_puredark_afw_visual_debug{};
+// [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 2/5] Non-zero means some producer
+// bundles never reached ExecuteCommandLists and had to be reclaimed by age. A
+// steadily climbing value indicates the active temporal boundary is recording
+// on a command list this proxy does not observe.
+std::atomic<uint64_t> g_puredark_afw_unsubmitted_reclaims{};
 std::atomic<uint64_t> g_puredark_afw_recorded_candidates{};
 std::atomic<uint64_t> g_puredark_afw_submitted_candidates{};
 std::atomic<uint64_t> g_puredark_afw_ready_candidates{};
@@ -9088,6 +9097,8 @@ int32_t capture_puredark_afw_dlss_inputs_from_resources(
     }
 
     uint32_t bundle_slot = UINT32_MAX;
+    const uint64_t capture_present =
+        g_present_count.load(std::memory_order_relaxed);
     const uint64_t completed_fence = g_xr_fence != nullptr
         ? g_xr_fence->GetCompletedValue()
         : 0;
@@ -9104,6 +9115,27 @@ int32_t capture_puredark_afw_dlss_inputs_from_resources(
             slot.input.valid = false;
             slot.submission_serial = 0;
             slot.ready_present = UINT64_MAX;
+            slot.recorded_present = UINT64_MAX;
+            slot.producer_queue_fence = nullptr;
+            slot.producer_queue_fence_value = 0;
+            slot.retire_fence = 0;
+        }
+        // [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 3/5] A slot still Recording or
+        // PendingSubmission after this many Presents was never seen at
+        // ExecuteCommandLists, so no fence will ever retire it. Reclaiming it
+        // discards an input snapshot the transport already gave up on; leaving
+        // it occupies the ring for the rest of the session.
+        if ((slot.state == PuredarkAfwBundleState::Recording ||
+                slot.state == PuredarkAfwBundleState::PendingSubmission) &&
+            w3vr::mode3_transport::afw_unsubmitted_producer_expired(
+                capture_present, slot.recorded_present)) {
+            g_puredark_afw_unsubmitted_reclaims.fetch_add(
+                1, std::memory_order_relaxed);
+            slot.state = PuredarkAfwBundleState::Free;
+            slot.input.valid = false;
+            slot.submission_serial = 0;
+            slot.ready_present = UINT64_MAX;
+            slot.recorded_present = UINT64_MAX;
             slot.producer_queue_fence = nullptr;
             slot.producer_queue_fence_value = 0;
             slot.retire_fence = 0;
@@ -9129,6 +9161,7 @@ int32_t capture_puredark_afw_dlss_inputs_from_resources(
         g_puredark_afw_route_epoch.load(std::memory_order_acquire);
     slot.submission_serial = 0;
     slot.ready_present = UINT64_MAX;
+    slot.recorded_present = capture_present;
     slot.producer_queue_fence = nullptr;
     slot.producer_queue_fence_value = 0;
     slot.retire_fence = 0;
@@ -9699,6 +9732,8 @@ bool capture_puredark_afw_mode3_taau_inputs(
     }
 
     uint32_t bundle_slot = UINT32_MAX;
+    const uint64_t capture_present =
+        g_present_count.load(std::memory_order_relaxed);
     const uint64_t completed_fence = g_xr_fence != nullptr
         ? g_xr_fence->GetCompletedValue()
         : 0;
@@ -9715,6 +9750,26 @@ bool capture_puredark_afw_mode3_taau_inputs(
             candidate_slot.input.valid = false;
             candidate_slot.submission_serial = 0;
             candidate_slot.ready_present = UINT64_MAX;
+            candidate_slot.recorded_present = UINT64_MAX;
+            candidate_slot.producer_queue_fence = nullptr;
+            candidate_slot.producer_queue_fence_value = 0;
+            candidate_slot.retire_fence = 0;
+        }
+        // [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 4/5] The TAAU ring shares this
+        // slot pool and the same fence-only retirement, so it carries the same
+        // permanent-starvation exposure. Bound it identically.
+        if ((candidate_slot.state == PuredarkAfwBundleState::Recording ||
+                candidate_slot.state ==
+                    PuredarkAfwBundleState::PendingSubmission) &&
+            w3vr::mode3_transport::afw_unsubmitted_producer_expired(
+                capture_present, candidate_slot.recorded_present)) {
+            g_puredark_afw_unsubmitted_reclaims.fetch_add(
+                1, std::memory_order_relaxed);
+            candidate_slot.state = PuredarkAfwBundleState::Free;
+            candidate_slot.input.valid = false;
+            candidate_slot.submission_serial = 0;
+            candidate_slot.ready_present = UINT64_MAX;
+            candidate_slot.recorded_present = UINT64_MAX;
             candidate_slot.producer_queue_fence = nullptr;
             candidate_slot.producer_queue_fence_value = 0;
             candidate_slot.retire_fence = 0;
@@ -9745,6 +9800,7 @@ bool capture_puredark_afw_mode3_taau_inputs(
         g_puredark_afw_route_epoch.load(std::memory_order_acquire);
     slot.submission_serial = 0;
     slot.ready_present = UINT64_MAX;
+    slot.recorded_present = capture_present;
     slot.producer_queue_fence = nullptr;
     slot.producer_queue_fence_value = 0;
     slot.retire_fence = 0;
@@ -43584,7 +43640,8 @@ void render_openxr_test_frame(
                         log_line(
                             "V12016 AFW publication present=%llu valid=%u "
                             "hold=%u recorded=%llu submitted=%llu ready=%llu "
-                            "missing=%llu consumed=%llu held=%llu starved=%llu",
+                            "missing=%llu consumed=%llu held=%llu starved=%llu "
+                            "unsubmitted_reclaims=%llu",
                             static_cast<unsigned long long>(current_present),
                             puredark_afw.valid ? 1u : 0u,
                             puredark_afw_hold_last ? 1u : 0u,
@@ -43601,7 +43658,10 @@ void render_openxr_test_frame(
                             static_cast<unsigned long long>(
                                 g_puredark_afw_held_presents.load()),
                             static_cast<unsigned long long>(
-                                g_puredark_afw_slot_starvation.load()));
+                                g_puredark_afw_slot_starvation.load()),
+                            // [FIX:AFW-UNSUBMITTED-PRODUCER-RECLAIM 5/5]
+                            static_cast<unsigned long long>(
+                                g_puredark_afw_unsubmitted_reclaims.load()));
                     }
                 }
 
