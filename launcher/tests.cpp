@@ -220,6 +220,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.world_detail_range = 0.65f;
         state.menu_scale = 0.75f;
         state.cinema_scale = 1.1f;
+        state.cinema_height = -0.35f;
         state.cinema_aspect = static_cast<w3vr::CinemaAspect>(index %
             static_cast<int>(w3vr::CinemaAspect::Count));
         state.cinema_hud_scale = 1.5f;
@@ -333,6 +334,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "obsolete launcher and Streamline trial keys were not removed");
         Require(vr.Get("openxr", "cinema_scale") == "1.100",
             "cinema scale missing");
+        Require(vr.Get("openxr", "cinema_height") == "-0.350",
+            "cinema height missing");
         Require(vr.Get("openxr", "menu_distance") == "1.200",
             "launcher must not modify menu distance");
         Require(vr.Get("openxr", "cinema_render_stereo_strength") == "0.250",
@@ -473,6 +476,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "round-trip automatic full-VR cutscene mismatch");
         Require(loaded.state.cinema_aspect == state.cinema_aspect,
             "round-trip Cinema aspect mismatch");
+        Require(loaded.state.cinema_height == state.cinema_height,
+            "round-trip cinema height mismatch");
         Require(loaded.state.steady_icons,
             "round-trip steady-icons latency mismatch");
         Require(loaded.state.first_person_gamepad_head_follow,
@@ -1118,6 +1123,8 @@ void TestFallbackAndAtomicSave(const w3vr::ConfigPaths& paths) {
     const auto cinema_missing = w3vr::LoadConfiguration(paths);
     Require(cinema_missing.state.cinema_scale == cinema_missing.state.menu_scale,
         "cinema fallback must match menu scale");
+    Require(cinema_missing.state.cinema_height == -0.20f,
+        "missing cinema height must keep the current default offset");
 
     w3vr::LauncherState state;
     state.mode = w3vr::RenderMode::AerAfwTaau;

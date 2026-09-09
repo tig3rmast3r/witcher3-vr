@@ -56,6 +56,7 @@ struct CopyOperation {
     fs::path source;
     fs::path destination;
     fs::path staged;
+    bool preserve_existing{};
 };
 
 std::wstring WindowsError(DWORD code) {
@@ -227,6 +228,13 @@ void CleanupStaged(std::vector<CopyOperation>& operations) {
 }
 
 bool StageCopy(CopyOperation& operation, std::wstring& error) {
+    if (operation.preserve_existing) {
+        bool present{};
+        if (!InspectRegularFile(operation.destination, present, error)) {
+            return false;
+        }
+        if (present) return true;
+    }
     if (!RequireReferenceFile(operation.source, error) ||
         !EnsureDirectory(operation.destination.parent_path(), error)) {
         return false;
@@ -245,6 +253,7 @@ bool StageCopy(CopyOperation& operation, std::wstring& error) {
 }
 
 bool PublishCopy(CopyOperation& operation, std::wstring& error) {
+    if (operation.staged.empty()) return true;
     if (!MakeWritableIfPresent(operation.destination, error)) return false;
     if (MoveFileExW(operation.staged.c_str(), operation.destination.c_str(),
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -419,7 +428,11 @@ void AppendCopies(std::vector<CopyOperation>& operations,
     const fs::path& reference, const fs::path& root,
     const std::array<const wchar_t*, Count>& files) {
     for (const auto* relative : files) {
-        operations.push_back({reference / relative, root / relative, {}});
+        operations.push_back({
+            reference / relative,
+            root / relative,
+            {},
+            SameFilename(relative, L"OptiScaler.ini")});
     }
 }
 

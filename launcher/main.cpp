@@ -31,7 +31,7 @@ using w3vr::IntegrationMode;
 
 constexpr wchar_t kWindowClass[] = L"Witcher3VRLauncherWindow";
 constexpr int kClientWidth = 1180;
-constexpr int kClientHeight = 746;
+constexpr int kClientHeight = 782;
 constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
     WS_MINIMIZEBOX;
 
@@ -54,6 +54,8 @@ enum ControlId {
     IdMenuScaleValue,
     IdCinemaScale,
     IdCinemaScaleValue,
+    IdCinemaHeight,
+    IdCinemaHeightValue,
     IdCinemaAspect,
     IdCinemaHudScale,
     IdCinemaHudScaleValue,
@@ -264,6 +266,8 @@ void UpdateTrackLabels() {
         static_cast<float>(SendMessageW(Item(IdMenuScale), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
     SetWindowTextW(Item(IdCinemaScaleValue), FormatFloat(
         static_cast<float>(SendMessageW(Item(IdCinemaScale), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
+    SetWindowTextW(Item(IdCinemaHeightValue), FormatFloat(
+        static_cast<float>(SendMessageW(Item(IdCinemaHeight), TBM_GETPOS, 0, 0)) / 100.0f).c_str());
     const float cinema_hud_scale = static_cast<float>(SendMessageW(
         Item(IdCinemaHudScale), TBM_GETPOS, 0, 0)) / 100.0f;
     const int cinema_offset = static_cast<int>(SendMessageW(
@@ -456,6 +460,8 @@ bool CaptureState(LauncherState& state, std::wstring& error) {
         Item(IdMenuScale), TBM_GETPOS, 0, 0)) / 100.0f;
     state.cinema_scale = static_cast<float>(SendMessageW(
         Item(IdCinemaScale), TBM_GETPOS, 0, 0)) / 100.0f;
+    state.cinema_height = static_cast<float>(SendMessageW(
+        Item(IdCinemaHeight), TBM_GETPOS, 0, 0)) / 100.0f;
     state.cinema_aspect = static_cast<CinemaAspect>(std::clamp(
         static_cast<int>(SendMessageW(
             Item(IdCinemaAspect), CB_GETCURSEL, 0, 0)), 0,
@@ -868,6 +874,8 @@ void RestoreLauncherDefaults() {
         static_cast<int>(std::lround(defaults.menu_scale * 100.0f)));
     SendMessageW(Item(IdCinemaScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(defaults.cinema_scale * 100.0f)));
+    SendMessageW(Item(IdCinemaHeight), TBM_SETPOS, TRUE,
+        static_cast<int>(std::lround(defaults.cinema_height * 100.0f)));
     SendMessageW(Item(IdCinemaAspect), CB_SETCURSEL,
         static_cast<int>(defaults.cinema_aspect), 0);
     SendMessageW(Item(IdCinemaHudScale), TBM_SETPOS, TRUE,
@@ -1076,6 +1084,8 @@ void PopulateControls() {
         static_cast<int>(std::lround(loaded.state.menu_scale * 100.0f)));
     SendMessageW(Item(IdCinemaScale), TBM_SETPOS, TRUE,
         static_cast<int>(std::lround(loaded.state.cinema_scale * 100.0f)));
+    SendMessageW(Item(IdCinemaHeight), TBM_SETPOS, TRUE,
+        static_cast<int>(std::lround(loaded.state.cinema_height * 100.0f)));
     SendMessageW(cinema_aspect, CB_SETCURSEL,
         static_cast<int>(loaded.state.cinema_aspect), 0);
     SendMessageW(Item(IdCinemaHudScale), TBM_SETPOS, TRUE,
@@ -1186,7 +1196,7 @@ void CreateInterface(HWND window) {
          AddCombo(428, 108, 132, IdOfxrBridge)});
 
     AddTooltip(AddControl(L"BUTTON", L"Comfort and interface", BS_GROUPBOX,
-        20, 174, 560, 448),
+        20, 174, 560, 484),
         L"Tune headset presentation, HUD, cinema framing, and comfort options. Hover any setting name or control for details.");
     AddTooltips(
         L"Adjusts angular image size in the headset using matching producer and OpenXR FOV. No final image resampling or black-canvas pass.",
@@ -1228,56 +1238,63 @@ void CreateInterface(HWND window) {
          AddCombo(445, 352, 115, IdCinemaAspect)});
 
     AddTooltips(
+        L"Raises or lowers the anchored Cinema3D screen. Lower values drop it; the default matches the current height.",
+        {AddLabel(L"Cinema screen height", 38, 400, 155, 22),
+         AddTrack(193, 394, 310, IdCinemaHeight, -50, 20),
+         AddLabel(L"-0.20", 510, 400, 50, 22,
+              IdCinemaHeightValue, SS_RIGHT)});
+
+    AddTooltips(
         L"Adjusts the close third-person camera preset selected with F8. Higher values move the camera farther from Geralt.",
-        {AddLabel(L"Near View", 38, 400, 155, 22),
-         AddTrack(193, 394, 310, IdNearView, -200, 300),
-         AddLabel(L"0.75", 510, 400, 50, 22,
+        {AddLabel(L"Near View", 38, 436, 155, 22),
+         AddTrack(193, 430, 310, IdNearView, -200, 300),
+         AddLabel(L"0.75", 510, 436, 50, 22,
               IdNearViewValue, SS_RIGHT)});
 
     AddTooltips(
         L"Additional cutscene-only HUD and subtitle scale applied on top of the HUD Editor profile for Cinema3D. Use the HUD Editor to move and place elements.",
-        {AddLabel(L"Cinema3D HUD/text size", 38, 440, 150, 22),
-         AddTrack(188, 434, 55, IdCinemaHudScale, 50, 150),
-         AddLabel(L"1.30", 245, 440, 43, 22,
+        {AddLabel(L"Cinema3D HUD/text size", 38, 476, 150, 22),
+         AddTrack(188, 470, 55, IdCinemaHudScale, 50, 150),
+         AddLabel(L"1.30", 245, 476, 43, 22,
               IdCinemaHudScaleValue, SS_RIGHT)});
     AddTooltips(
         L"Additional cutscene-only HUD and subtitle scale applied on top of the HUD Editor profile for Full VR. Use the HUD Editor to move and place elements.",
-        {AddLabel(L"Full VR HUD/text size", 304, 440, 145, 22),
-         AddTrack(449, 434, 55, IdFullVrHudScale, 50, 150),
-         AddLabel(L"1.00", 506, 440, 54, 22,
+        {AddLabel(L"Full VR HUD/text size", 304, 476, 145, 22),
+         AddTrack(449, 470, 55, IdFullVrHudScale, 50, 150),
+         AddLabel(L"1.00", 506, 476, 54, 22,
               IdFullVrHudScaleValue, SS_RIGHT)});
 
     AddTooltips(
         L"Additional cutscene-only Cinema3D depth correction applied on top of the HUD Editor profile. Use the HUD Editor for element placement; this control only fine-tunes convergence.",
-        {AddLabel(L"Cinema3D conv. offset", 38, 480, 150, 22),
-         AddTrack(188, 474, 55, IdCinemaHudConvergenceOffset, -64, 64),
-         AddLabel(L"+0 / -72", 245, 480, 57, 22,
+        {AddLabel(L"Cinema3D conv. offset", 38, 516, 150, 22),
+         AddTrack(188, 510, 55, IdCinemaHudConvergenceOffset, -64, 64),
+         AddLabel(L"+0 / -72", 245, 516, 57, 22,
               IdCinemaHudConvergenceOffsetValue, SS_RIGHT)});
     AddTooltips(
         L"Additional cutscene-only Full VR depth correction applied on top of the HUD Editor profile. Use the HUD Editor for element placement; this control only fine-tunes convergence.",
-        {AddLabel(L"Full VR conv. offset", 304, 480, 145, 22),
-         AddTrack(449, 474, 55, IdFullVrHudConvergenceOffset, -64, 64),
-         AddLabel(L"+0 / -36", 506, 480, 54, 22,
+        {AddLabel(L"Full VR conv. offset", 304, 516, 145, 22),
+         AddTrack(449, 510, 55, IdFullVrHudConvergenceOffset, -64, 64),
+         AddLabel(L"+0 / -36", 506, 516, 54, 22,
               IdFullVrHudConvergenceOffsetValue, SS_RIGHT)});
 
     AddTooltip(AddControl(L"BUTTON", L"Automatic Cutscenes in Full VR",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 514, 260, 26, IdCinemaFullVr),
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 550, 260, 26, IdCinemaFullVr),
         L"Keeps supported automatic cutscenes in geometry stereo Full VR instead of placing them on the Cinema3D screen.");
     AddTooltip(AddControl(L"BUTTON", L"Steady Icons",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 304, 514, 256, 26, IdSteadyIcons),
+        BS_AUTOCHECKBOX | WS_TABSTOP, 304, 550, 256, 26, IdSteadyIcons),
         L"Stabilizes world-space icons. It adds one frame only in Stereo; under AER + AFW it may not remain as stable as it does in Stereo.");
 
     AddTooltip(AddControl(L"BUTTON",
         L"Enable vertical mouse/pad pitch",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 546, 260, 28, IdVerticalPitch),
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 582, 260, 28, IdVerticalPitch),
         L"Allows mouse or gamepad pitch to tilt the camera vertically while the complete headset rotation remains correctly composed with the pitched camera.");
     AddTooltip(AddControl(L"BUTTON", L"Faster Movement Transitions",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 304, 546, 256, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 304, 582, 256, 26,
         IdFastMovementTransitions),
         L"Enables the bundled movement-input fix DLC for faster transitions between movement states.");
 
     AddTooltip(AddControl(L"BUTTON", L"Hide Static HUD Outside Combat",
-        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 582, 510, 26,
+        BS_AUTOCHECKBOX | WS_TABSTOP, 38, 618, 510, 26,
         IdHideStaticHudOutsideCombat),
         L"Hides the minimap, tracked objectives, vitality, buffs, equipped items, damaged-item status, companion panel, and control hints outside combat. Witcher Sense reveals them; combat and horse races preserve navigation information.");
 
@@ -1402,27 +1419,27 @@ void CreateInterface(HWND window) {
         L"Ctrl+F6  AFW visual debug", 925, 598, 217, 20),
         L"Toggle the PureDark AFW visual diagnostic without consuming DLSS5's plain F6 toggle.");
 
-    AddTooltip(AddLabel(L"", 20, 636, 1140, 22, IdStatus, SS_LEFT),
+    AddTooltip(AddLabel(L"", 20, 672, 1140, 22, IdStatus, SS_LEFT),
         L"Shows validation results, saved changes, and launch status.");
     AddTooltip(AddControl(L"BUTTON", L"Configure Settings for VR",
-        BS_PUSHBUTTON | WS_TABSTOP, 20, 664, 220, 36, IdConfigureVr),
+        BS_PUSHBUTTON | WS_TABSTOP, 20, 700, 220, 36, IdConfigureVr),
         L"Installs the complete recommended VR graphics baseline, then reapplies the selected render mode and resolution.");
     AddTooltip(AddControl(L"BUTTON", L"Restore Original Settings",
-        BS_PUSHBUTTON | WS_TABSTOP, 252, 664, 220, 36, IdRestoreOriginal),
+        BS_PUSHBUTTON | WS_TABSTOP, 252, 700, 220, 36, IdRestoreOriginal),
         L"Restores the original dx12user.settings backup created by Configure Settings for VR.");
     AddTooltip(AddControl(L"BUTTON", L"Restore Defaults",
-        BS_PUSHBUTTON | WS_TABSTOP, 484, 664, 216, 36, IdRestoreDefaults),
+        BS_PUSHBUTTON | WS_TABSTOP, 484, 700, 216, 36, IdRestoreDefaults),
         L"Loads Witcher 3 VR launcher defaults into the controls. Press Save to apply them.");
     AddTooltip(AddControl(L"BUTTON", L"Save Only",
-        BS_PUSHBUTTON | WS_TABSTOP, 862, 664, 130, 36, IdSave),
+        BS_PUSHBUTTON | WS_TABSTOP, 862, 700, 130, 36, IdSave),
         L"Writes the selected launcher, renderer, and game settings without starting the game.");
     AddTooltip(AddControl(L"BUTTON", L"Save && Launch",
-        BS_DEFPUSHBUTTON | WS_TABSTOP, 1002, 664, 158, 36, IdSaveLaunch),
+        BS_DEFPUSHBUTTON | WS_TABSTOP, 1002, 700, 158, 36, IdSaveLaunch),
         L"Writes all settings, enforces render-mode compatibility, and starts The Witcher 3. If selected, OFXR Bridge is enabled only for this child process.");
 
     HWND kofi = AddControl(WC_LINK,
         L"If you're enjoying the mod, consider <a href=\"https://ko-fi.com/tig3rmast3r\">supporting it on Ko-fi</a>.",
-        WS_TABSTOP, 20, 712, 1140, 22, IdKofi);
+        WS_TABSTOP, 20, 748, 1140, 22, IdKofi);
     ApplySmallFont(kofi);
 
     PopulateControls();
