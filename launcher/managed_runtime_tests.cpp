@@ -299,6 +299,40 @@ void TestUnknownLegacyFolderEntryIsPreserved() {
     RequireNoStagingFiles(root);
 }
 
+void TestOptiscalerIniIsPreserved() {
+    TemporaryDirectory temporary;
+    const auto& root = temporary.path;
+    StageReferences(root);
+    std::wstring error;
+    Require(w3vr::ApplyManagedIntegrationMode(
+            root, w3vr::IntegrationMode::OptiscalerDlss5, error),
+        "first OptiScaler DLSS5 publish failed");
+    Require(ReadFile(root / L"OptiScaler.ini") ==
+            "[Menu]\r\nShortcutKey=0x2E\r\n",
+        "missing OptiScaler.ini was not seeded from the reference");
+    const std::string user =
+        "[Menu]\r\nShortcutKey=0x2E\r\n[Upscalers]\r\nDx12Upscaler=dlss\r\n";
+    WriteFile(root / L"OptiScaler.ini", user);
+    Require(w3vr::ApplyManagedIntegrationMode(
+            root, w3vr::IntegrationMode::OptiscalerDlss5, error),
+        "repeat OptiScaler DLSS5 publish failed");
+    Require(ReadFile(root / L"OptiScaler.ini") == user,
+        "OptiScaler UI settings were overwritten");
+    Require(w3vr::ApplyManagedIntegrationMode(
+            root, w3vr::IntegrationMode::Optiscaler, error),
+        "canonical OptiScaler transition failed");
+    Require(ReadFile(root / L"OptiScaler.ini") == user,
+        "OptiScaler UI settings were overwritten on mode change");
+    fs::remove(root / L"OptiScaler.ini");
+    Require(w3vr::ApplyManagedIntegrationMode(
+            root, w3vr::IntegrationMode::OptiscalerDlss5, error),
+        "reseed after delete failed");
+    Require(ReadFile(root / L"OptiScaler.ini") ==
+            "[Menu]\r\nShortcutKey=0x2E\r\n",
+        "deleted OptiScaler.ini was not reseeded");
+    RequireNoStagingFiles(root);
+}
+
 void TestUnsafeStreamlineOverrideFailsClosed() {
     TemporaryDirectory temporary;
     const auto& root = temporary.path;
@@ -353,6 +387,7 @@ int main() {
         TestUnsafeStreamlineOverrideFailsClosed();
         TestRepeatedModeAndStaleCleanup();
         TestUnknownLegacyFolderEntryIsPreserved();
+        TestOptiscalerIniIsPreserved();
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << exception.what() << '\n';

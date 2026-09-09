@@ -548,6 +548,7 @@ struct Config {
     float hud_size{1.0f};
     float menu_scale{0.7f};
     float cinema_scale{0.7f};
+    float cinema_height{-0.20f};
     float cinema_aspect_ratio{5.0f / 4.0f};
     bool cinema_full_vr{false};
     bool steady_icons{false};
@@ -721,6 +722,11 @@ struct Config {
 };
 
 Config g_config{};
+
+float cinema_panel_local_y() {
+    return g_config.cinema_height * g_config.cinema_scale;
+}
+
 constexpr int kOpenXrModeCleanMono = 1;
 constexpr int kOpenXrModeStereo = 3;
 
@@ -5529,6 +5535,7 @@ size_t g_rt_specular_last_write_slot{kRtInvalidHistorySlot};
 // temporal pass.
 std::atomic<bool> g_taau_force_matrix_fallback{};
 std::atomic<bool> g_close_camera_f8_latched{};
+std::atomic<bool> g_cinema_f10_latched{};
 std::atomic<bool> g_first_person_f11_latched{};
 std::atomic<int> g_camera_mode{};
 // [FIX:FIRST-PERSON-AIM-GAMEPLAY-AUTHORITY 1/3] The renderer's exact native
@@ -14260,6 +14267,9 @@ void load_config() {
         g_config.cinema_scale = std::clamp(
             read_ini_float("openxr", "cinema_scale", g_config.menu_scale),
             0.3f, 1.5f);
+        g_config.cinema_height = std::clamp(
+            read_ini_float("openxr", "cinema_height", -0.20f),
+            -0.50f, 0.20f);
         const bool legacy_cinema_5x4 = read_ini_bool(
             "openxr", "cinema_5x4", true);
         const auto cinema_aspect = read_ini_string(
@@ -48293,7 +48303,7 @@ void render_openxr_test_frame(
                 current_panel_views[1].pose.position.z) * 0.5f};
         const auto panel_offset = rotate_vector(
             cinema_projection_anchor.orientation,
-            XrVector3f{0.0f, 0.0f, -g_config.menu_distance});
+            XrVector3f{0.0f, cinema_panel_local_y(), -g_config.menu_distance});
         cinema_projection_anchor.position = {
             head_position.x + panel_offset.x,
             head_position.y + panel_offset.y,
@@ -51381,7 +51391,11 @@ void render_openxr_test_frame(
                 anchor_views[1].pose.position.z) * 0.5f};
         const auto panel_offset = rotate_vector(
             anchored_panel_pose.orientation,
-            XrVector3f{0.0f, 0.0f, -g_config.menu_distance});
+            XrVector3f{
+                0.0f,
+                cinema_panel && !fullscreen_menu
+                    ? cinema_panel_local_y() : 0.0f,
+                -g_config.menu_distance});
         anchored_panel_pose.position = {
             head_position.x + panel_offset.x,
             head_position.y + panel_offset.y,
@@ -51410,7 +51424,10 @@ void render_openxr_test_frame(
     menu_layer.pose = anchored_panel_pose_valid
         ? anchored_panel_pose
         : XrPosef{{0.0f, 0.0f, 0.0f, 1.0f},
-            {0.0f, 0.0f, -g_config.menu_distance}};
+            {0.0f,
+                cinema_panel && !fullscreen_menu
+                    ? cinema_panel_local_y() : 0.0f,
+                -g_config.menu_distance}};
     const float spatial_panel_scale = cinema_panel && !fullscreen_menu
         ? g_config.cinema_scale
         : g_config.menu_scale;
@@ -52289,7 +52306,13 @@ HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain* swapchain, UINT sync_inte
             g_camera_mode.load(std::memory_order_relaxed),
             manual_camera_input ? 1 : 0);
     }
-    if ((GetAsyncKeyState(VK_F10) & 1) != 0) {
+    const bool f10_down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    const bool f10_pressed = f10_down &&
+        !g_cinema_f10_latched.exchange(true, std::memory_order_relaxed);
+    if (!f10_down) {
+        g_cinema_f10_latched.store(false, std::memory_order_relaxed);
+    }
+    if (f10_pressed) {
         const bool forced = !g_force_mono_cinema.load(std::memory_order_relaxed);
         g_force_mono_cinema.store(forced, std::memory_order_release);
         // [FIX:FIRST-PERSON-CINEMA-INPUT-SUSPEND 3/3] Do not wait one Present

@@ -81,6 +81,7 @@ struct LauncherState {
     float world_detail_range{1.0f};
     float menu_scale{0.85f};
     float cinema_scale{0.9f};
+    float cinema_height{-0.20f};
     CinemaAspect cinema_aspect{CinemaAspect::FiveFour};
     float cinema_hud_scale{1.30f};
     int cinema_hud_convergence_offset{};

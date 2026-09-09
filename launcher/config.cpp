@@ -1553,6 +1553,9 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     result.state.cinema_scale = std::clamp(
         ReadFloat(*vr, "openxr", "cinema_scale", result.state.menu_scale),
         0.3f, 1.5f);
+    result.state.cinema_height = std::clamp(
+        ReadFloat(*vr, "openxr", "cinema_height", -0.20f),
+        -0.50f, 0.20f);
     result.state.cinema_aspect = ReadCinemaAspect(*vr);
     result.state.cinema_hud_scale = std::clamp(
         ReadFloat(*vr, "openxr", "cinema_hud_scale", 1.30f), 0.5f, 1.5f);
@@ -1678,6 +1681,7 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         std::clamp(state.world_detail_range, 0.4f, 1.0f)));
     vr_ini.Set("openxr", "menu_scale", FloatString(state.menu_scale));
     vr_ini.Set("openxr", "cinema_scale", FloatString(state.cinema_scale));
+    vr_ini.Set("openxr", "cinema_height", FloatString(state.cinema_height));
     vr_ini.Set("openxr", "cinema_hud_scale",
         FloatString(state.cinema_hud_scale));
     vr_ini.Set("openxr", "cinema_hud_stereo_shift_px",
