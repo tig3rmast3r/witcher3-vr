@@ -145,7 +145,9 @@ float inverse_hud_distance_from_parallel_reference(
 // Builds four perspective-correct clip-space corners for a cyclopean HUD
 // plane. source_fov describes the symmetric projection that generated the HUD
 // texture; target_fov is the exact raw FOV submitted for this eye. The output
-// order is top-left, top-right, bottom-left, bottom-right.
+// order is top-left, top-right, bottom-left, bottom-right. An optional
+// vertical offset moves the plane in its own tangent space, so a fixed HUD
+// stays fixed as the headset rotates.
 bool build_cyclopean_hud_plane_clip_positions(
     const EyeGeometry& geometry,
     uint32_t eye,
@@ -153,6 +155,7 @@ bool build_cyclopean_hud_plane_clip_positions(
     const XrFovf& target_fov,
     float hud_size,
     float inverse_distance_m,
-    std::array<float, 16>& clip_positions);
+    std::array<float, 16>& clip_positions,
+    float plane_offset_y_tangent = 0.0f);
 
 } // namespace w3vr::openxr_eye_geometry

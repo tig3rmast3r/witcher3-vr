@@ -1,4 +1,5 @@
 #include "openxr_eye_geometry.h"
+#include "fullscreen_cutscene_framing.h"
 
 #include <algorithm>
 #include <cmath>
@@ -506,6 +507,16 @@ void test_controller_locked_hud_plane() {
             fixed_clip[4] / fixed_clip[7]) * 0.5f;
     require(std::fabs(fixed_center - headlocked_center) > 0.1f,
         "fixed HUD moves in the view when the headset turns");
+    std::array<float, 16> lowered_fixed_clip{};
+    require(eye_geometry::build_cyclopean_hud_plane_clip_positions(
+        fixed, 0, fov, fov, 0.5f, 0.5f, lowered_fixed_clip, -0.4f),
+        "lowered controller-locked HUD plane");
+    require(lowered_fixed_clip[1] / lowered_fixed_clip[3] <
+            fixed_clip[1] / fixed_clip[3] - 0.1f,
+        "HUD offset lowers the physical fixed plane");
+    require(std::fabs(lowered_fixed_clip[0] / lowered_fixed_clip[3] -
+            fixed_clip[0] / fixed_clip[3]) < 1.0e-5f,
+        "lowering the plane preserves its horizontal anchor");
     eye_geometry::EyeGeometry recentered{};
     require(eye_geometry::with_hud_plane_orientation(
         current, turned_head, recentered),
@@ -517,6 +528,93 @@ void test_controller_locked_hud_plane() {
     require(std::fabs(recentered_clip[0] / recentered_clip[3] -
         headlocked_clip[0] / headlocked_clip[3]) < 1.0e-5f,
         "F9 recenter restores the HUD to the current head direction");
+}
+
+void test_fullscreen_cutscene_panel_center() {
+    using w3vr::fullscreen_cutscene_framing::stereo_zoom_gain;
+    require(std::fabs(stereo_zoom_gain(0.2f, 0.0f) - 1.0f) < 0.00001f,
+        "zero world-scale adjustment preserves actual stereo baseline");
+    require(std::fabs(stereo_zoom_gain(0.2f, 0.5f) - 0.2f) < 0.00001f,
+        "half world-scale adjustment scales eye separation by FOV gain");
+    require(std::fabs(stereo_zoom_gain(0.2f, 1.0f) - 0.04f) < 0.00001f,
+        "full world-scale adjustment squares the stereo zoom gain");
+    require(stereo_zoom_gain(1.0f, 1.0f) == 1.0f &&
+        stereo_zoom_gain(0.2f, -1.0f) == 1.0f &&
+        std::fabs(stereo_zoom_gain(0.2f, 2.0f) - 0.04f) < 0.00001f &&
+        stereo_zoom_gain(NAN, 0.5f) == 1.0f &&
+        stereo_zoom_gain(0.2f, NAN) == 1.0f,
+        "stereo zoom compensation is neutral unzoomed and bounds invalid inputs");
+    using w3vr::fullscreen_cutscene_framing::automatic_transition_recenter_allowed;
+    using w3vr::fullscreen_cutscene_framing::hud_counter_yaw_degrees;
+    require(!automatic_transition_recenter_allowed(true, true, false),
+        "fullscreen VR transitions retain current heading reference");
+    require(automatic_transition_recenter_allowed(false, true, false) &&
+        automatic_transition_recenter_allowed(true, true, true),
+        "framed and manual cinema retain legacy auto-recenter");
+    require(hud_counter_yaw_degrees(6.0f, 2.0f) == -4.0f &&
+        hud_counter_yaw_degrees(-3.0f, 2.0f) == 5.0f &&
+        hud_counter_yaw_degrees(6.0f, 6.0f) == 0.0f,
+        "HUD counters live yaw changes but resets its baseline in the next scene");
+    using w3vr::fullscreen_cutscene_framing::vertical_center_offset_px;
+    using w3vr::fullscreen_cutscene_framing::scene_pitch_degrees;
+    require(scene_pitch_degrees(-10.0f, 0.0f, true) == -10.0f &&
+        scene_pitch_degrees(7.75f, 0.0f, true) == 7.75f,
+        "fullscreen cutscenes retain both upward and downward director shots");
+    require(scene_pitch_degrees(-10.0f, 0.0f, false) == 0.0f,
+        "gameplay keeps its locked pitch reference");
+    constexpr uint32_t height = 3200;
+    const float fov_up = std::atan(1.0f);
+    const float fov_down = -fov_up;
+    const float lowered = vertical_center_offset_px(
+        -0.18f, 1.2f, fov_up, fov_down, height);
+    require(std::fabs(lowered + 240.0f) < 0.001f,
+        "cinema panel center maps into source projection pixels");
+    require(std::fabs(vertical_center_offset_px(
+        -0.36f, 2.4f, fov_up, fov_down, height) - lowered) < 0.001f,
+        "same apparent panel center remains stable across size and distance");
+    require(std::fabs(vertical_center_offset_px(
+        -0.18f, 1.2f, fov_up, fov_down, height / 2) -
+            lowered * 0.5f) < 0.001f,
+        "projection offset follows render resolution");
+    require(std::fabs(vertical_center_offset_px(
+        -0.18f, 1.2f, fov_up, fov_down, height, 0.15f) -
+            (lowered + 0.15f * height)) < 0.001f,
+        "cutscene projection retains calibrated offset");
+    require(std::fabs(vertical_center_offset_px(
+        -0.18f, 1.2f, fov_up, fov_down, height, 0.15f) -
+        vertical_center_offset_px(
+            -0.18f, 1.2f, fov_up, fov_down, height, -0.05f) -
+            0.20f * height) < 0.001f,
+        "latest scene correction is positive 20 percent from previous build");
+    require(std::fabs(vertical_center_offset_px(
+        -0.18f, 1.2f, fov_up, fov_down, height / 2, 0.15f) -
+            (lowered + 0.15f * height) * 0.5f) < 0.001f,
+        "screen-height correction scales with render resolution");
+    require(std::fabs(w3vr::fullscreen_cutscene_framing::
+        hud_down_ndc_after_screen_raise(0.05f, 0.02f) - 0.01f) < 0.00001f,
+        "cutscene dialogue is raised 2 percent after lowering it another 5 percent");
+    using w3vr::fullscreen_cutscene_framing::subject_lowering_pitch_degrees;
+    for (const float render_fov : {15.0f, 23.4537f, 60.0f, 100.0f}) {
+        const float pitch = subject_lowering_pitch_degrees(render_fov, 0.15f);
+        const float fraction = std::tan(pitch * kPi / 180.0f) /
+            (2.0f * std::tan(render_fov * kPi / 360.0f));
+        require(pitch > 0.0f && std::fabs(fraction - 0.15f) < 0.00001f,
+            "subject-lowering pitch targets 15 percent at the optical center");
+    }
+    float translated_up{}, translated_down{};
+    require(w3vr::fullscreen_cutscene_framing::translated_projection_tangents(
+        -1.0f, 1.0f, 1.0f, -1.0f, 0.20f, translated_up, translated_down) &&
+        std::fabs(translated_up - 0.6f) < 0.00001f &&
+        std::fabs(translated_down + 1.4f) < 0.00001f,
+        "final projection translation lowers rays without changing span");
+    require(subject_lowering_pitch_degrees(0.0f, 0.20f) == 0.0f &&
+        subject_lowering_pitch_degrees(180.0f, 0.20f) == 0.0f,
+        "invalid producer FOV cannot change camera pitch");
+    require(vertical_center_offset_px(
+        0.0f, 1.2f, fov_up, fov_down, height) == 0.0f &&
+        vertical_center_offset_px(
+            -0.18f, 0.0f, fov_up, fov_down, height) == 0.0f,
+        "centered and invalid panel positions do not shift the image");
 }
 
 void test_parallel_headset_adaptation() {
@@ -941,6 +1039,7 @@ int main() {
     test_quest_reference_hud_plane();
     test_canted_hud_plane_and_invalid_fallback();
     test_controller_locked_hud_plane();
+    test_fullscreen_cutscene_panel_center();
     test_parallel_headset_adaptation();
     test_asymmetric_projection_descriptor();
     test_asymmetric_presentation_scale();

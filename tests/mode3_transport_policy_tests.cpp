@@ -289,6 +289,8 @@ int main() {
     assert(strict_stereo_late_hud_proof_pair_id(
         true, HudProjectionRoute::FullVr, 9, 8, 42, 41) == 42);
     assert(strict_stereo_late_hud_proof_pair_id(
+        true, HudProjectionRoute::FullVr, 9, 9, 42, 42) == 42);
+    assert(strict_stereo_late_hud_proof_pair_id(
         true, HudProjectionRoute::Gameplay, 9, 8, 42, 41) == 42);
     assert(strict_stereo_late_hud_proof_pair_id(
         true, HudProjectionRoute::Gameplay, 9, 9, 42, 42) == 42);

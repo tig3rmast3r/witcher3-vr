@@ -1622,6 +1622,9 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
     result.state.cinema_scale = std::clamp(
         ReadFloat(*vr, "openxr", "cinema_scale", result.state.menu_scale),
         0.3f, 1.5f);
+    result.state.cinema_height = std::clamp(
+        ReadFloat(*vr, "openxr", "cinema_height", -0.20f),
+        -0.50f, 0.20f);
     result.state.cinema_aspect = ReadCinemaAspect(*vr);
     result.state.cinema_hud_scale = std::clamp(
         ReadFloat(*vr, "openxr", "cinema_hud_scale", 1.30f), 0.5f, 1.5f);
@@ -1641,6 +1644,13 @@ LoadResult LoadConfiguration(const ConfigPaths& paths) {
         *vr, "openxr", "vertical_pitch_enabled", false);
     result.state.cinema_full_vr = ReadBool(
         *vr, "openxr", "cinema_full_vr", true);
+    result.state.cinema_fullscreen = ReadBool(
+        *vr, "openxr", "cinema_fullscreen", false);
+    result.state.cinema_fullscreen_zoom = std::clamp(
+        ReadFloat(*vr, "openxr", "cinema_fullscreen_zoom", 1.35f),
+        0.50f, 4.00f);
+    result.state.cinema_pitch_lowering = std::clamp(
+        ReadFloat(*vr, "openxr", "cinema_pitch_lowering", 0.15f), -0.3f, 0.4f);
     result.state.steady_icons = ReadBool(
         *vr, "openxr", "steady_icons", false);
     result.state.first_person_gamepad_head_follow =
@@ -1748,6 +1758,7 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
         std::clamp(state.world_detail_range, 0.4f, 1.0f)));
     vr_ini.Set("openxr", "menu_scale", FloatString(state.menu_scale));
     vr_ini.Set("openxr", "cinema_scale", FloatString(state.cinema_scale));
+    vr_ini.Set("openxr", "cinema_height", FloatString(state.cinema_height));
     vr_ini.Set("openxr", "cinema_hud_scale",
         FloatString(state.cinema_hud_scale));
     vr_ini.Set("openxr", "cinema_hud_stereo_shift_px",
@@ -1769,7 +1780,14 @@ bool BuildUpdatedDocuments(const ConfigPaths& paths, const LauncherState& state,
     vr_ini.Set("openxr", "cinema_5x4",
         state.cinema_aspect == CinemaAspect::FiveFour ? "1" : "0");
     vr_ini.Set("openxr", "cinema_full_vr",
-        state.cinema_full_vr ? "1" : "0");
+        state.cinema_full_vr || state.cinema_fullscreen ? "1" : "0");
+    vr_ini.Set("openxr", "cinema_fullscreen",
+        state.cinema_fullscreen ? "1" : "0");
+    vr_ini.Remove("openxr", "cinema_fullscreen_lock_view");
+    vr_ini.Set("openxr", "cinema_fullscreen_zoom",
+        FloatString(std::clamp(state.cinema_fullscreen_zoom, 0.50f, 4.00f)));
+    vr_ini.Set("openxr", "cinema_pitch_lowering",
+        FloatString(std::clamp(state.cinema_pitch_lowering, -0.3f, 0.4f)));
     vr_ini.Set("openxr", "steady_icons", state.steady_icons ? "1" : "0");
     vr_ini.Set("engine", "close_camera_offset", FloatString(state.near_view));
     vr_ini.Set("engine", "dual_render_probe", mode.dual_render ? "1" : "0");

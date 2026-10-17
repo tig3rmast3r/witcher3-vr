@@ -128,6 +128,7 @@ void WriteBaseFixtures(const w3vr::ConfigPaths& paths) {
         "full_vr_hud_scale=0.750\r\n"
         "cinema_5x4=0\r\n"
         "cinema_full_vr=0\r\n"
+        "cinema_fullscreen_lock_view=1\r\n"
         "steady_icons=0\r\n"
         "vertical_pitch_enabled=0\r\n"
         "hmd_position_scale=0.375\r\n"
@@ -220,6 +221,7 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.world_detail_range = 0.65f;
         state.menu_scale = 0.75f;
         state.cinema_scale = 1.1f;
+        state.cinema_height = -0.35f;
         state.cinema_aspect = static_cast<w3vr::CinemaAspect>(index %
             static_cast<int>(w3vr::CinemaAspect::Count));
         state.cinema_hud_scale = 1.5f;
@@ -229,6 +231,9 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         state.near_view = 1.25f;
         state.vertical_pitch_enabled = true;
         state.cinema_full_vr = true;
+        state.cinema_fullscreen = true;
+        state.cinema_fullscreen_zoom = 1.75f;
+        state.cinema_pitch_lowering = 0.23f;
         state.steady_icons = true;
         state.first_person_gamepad_head_follow = true;
         state.first_person_snap_turn_degrees = 60;
@@ -334,6 +339,8 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
             "obsolete launcher and Streamline trial keys were not removed");
         Require(vr.Get("openxr", "cinema_scale") == "1.100",
             "cinema scale missing");
+        Require(vr.Get("openxr", "cinema_height") == "-0.350",
+            "cinema height missing");
         Require(vr.Get("openxr", "menu_distance") == "1.200",
             "launcher must not modify menu distance");
         Require(vr.Get("openxr", "cinema_render_stereo_strength") == "0.250",
@@ -363,6 +370,13 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         Require(vr.Get("openxr", "hud_controller_locked") ==
                 std::string(state.hud_controller_locked ? "1" : "0"),
             "controller-locked HUD flag missing");
+        Require(vr.Get("openxr", "cinema_fullscreen") == "1",
+            "fullscreen cutscene flag missing");
+        Require(vr.Get("openxr", "cinema_pitch_lowering") == "0.230",
+            "fullscreen vertical must save the overlay pitch adjustment key");
+        Require(!vr.Get("openxr", "cinema_fullscreen_lock_view").has_value() &&
+            vr.Get("openxr", "cinema_fullscreen_zoom") == "1.750",
+            "fullscreen cutscene zoom settings missing");
         Require(vr.Get("openxr", "steady_icons") == "1",
             "steady-icons latency flag missing");
         Require(vr.Get("engine", "first_person_snap_turn") == "1",
@@ -475,8 +489,17 @@ void TestAllModes(const w3vr::ConfigPaths& paths) {
         }
         Require(loaded.state.cinema_full_vr,
             "round-trip automatic full-VR cutscene mismatch");
+        Require(loaded.state.cinema_fullscreen,
+            "round-trip fullscreen cutscene mismatch");
+        Require(loaded.state.cinema_pitch_lowering == state.cinema_pitch_lowering,
+            "round-trip fullscreen pitch adjustment mismatch");
+        Require(loaded.state.cinema_fullscreen_zoom ==
+                state.cinema_fullscreen_zoom,
+            "round-trip fullscreen cutscene zoom mismatch");
         Require(loaded.state.cinema_aspect == state.cinema_aspect,
             "round-trip Cinema aspect mismatch");
+        Require(loaded.state.cinema_height == state.cinema_height,
+            "round-trip cinema height mismatch");
         Require(loaded.state.steady_icons,
             "round-trip steady-icons latency mismatch");
         Require(loaded.state.first_person_gamepad_head_follow,
@@ -618,6 +641,10 @@ void TestReleaseDefaults() {
         "Full VR cutscene HUD must default to size 1.0 at gameplay depth");
     Require(defaults.cinema_full_vr,
         "automatic Full VR cutscenes must default to enabled");
+    Require(!defaults.cinema_fullscreen,
+        "fullscreen no-frame cutscenes must default to disabled");
+    Require(defaults.cinema_fullscreen_zoom == 1.35f,
+        "fullscreen cutscene zoom must default to 1.35");
     Require(defaults.cinema_aspect == w3vr::CinemaAspect::FiveFour,
         "Cinema aspect must default to 5:4");
     Require(!defaults.steady_icons,
@@ -692,6 +719,10 @@ void TestEmbeddedLauncherDefaults() {
         !defaults->Get("openxr", "presentation_black_resize").has_value() &&
         defaults->Get("openxr", "world_detail_range") == "1.000" &&
         defaults->Get("openxr", "native_stereo") == "1" &&
+        defaults->Get("openxr", "cinema_full_vr") == "1" &&
+        defaults->Get("openxr", "cinema_fullscreen") == "0" &&
+        !defaults->Get("openxr", "cinema_fullscreen_lock_view").has_value() &&
+        defaults->Get("openxr", "cinema_fullscreen_zoom") == "1.350" &&
         !defaults->Get(
             "openxr", "alternate_presentation_resize").has_value() &&
         defaults->Get("engine", "temporal_backend") == "dlss" &&
@@ -1071,6 +1102,9 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
         "unsupported snap-turn angles must fall back to 45 degrees");
 
     vr->Remove("openxr", "cinema_full_vr");
+    vr->Remove("openxr", "cinema_fullscreen");
+    vr->Remove("openxr", "cinema_fullscreen_lock_view");
+    vr->Remove("openxr", "cinema_fullscreen_zoom");
     vr->Remove("openxr", "steady_icons");
     vr->Remove("openxr", "hud_controller_locked");
     vr->Remove("openxr", "vertical_pitch_enabled");
@@ -1088,6 +1122,10 @@ void TestDlssLabelsAndLegacyAuto(const w3vr::ConfigPaths& paths) {
     const auto missing_flags = w3vr::LoadConfiguration(paths);
     Require(missing_flags.state.cinema_full_vr,
         "missing automatic-cutscene flag must default to enabled");
+    Require(!missing_flags.state.cinema_fullscreen,
+        "missing fullscreen-cutscene flag must default to disabled");
+    Require(missing_flags.state.cinema_fullscreen_zoom == 1.35f,
+        "missing fullscreen zoom settings must default to 1.35");
     Require(!missing_flags.state.steady_icons,
         "missing steady-icons flag must default to disabled");
     Require(!missing_flags.state.hud_controller_locked,
@@ -1124,6 +1162,8 @@ void TestFallbackAndAtomicSave(const w3vr::ConfigPaths& paths) {
     const auto cinema_missing = w3vr::LoadConfiguration(paths);
     Require(cinema_missing.state.cinema_scale == cinema_missing.state.menu_scale,
         "cinema fallback must match menu scale");
+    Require(cinema_missing.state.cinema_height == -0.20f,
+        "missing cinema height must keep the current default offset");
 
     w3vr::LauncherState state;
     state.mode = w3vr::RenderMode::AerAfwTaau;

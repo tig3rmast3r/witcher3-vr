@@ -309,10 +309,12 @@ constexpr uint64_t hud_scene_only_source_pair_id(
 // the two submitted HUD command lists that prove scene-only ownership finish
 // during the following stereo cadence. At the OpenXR boundary for scene N,
 // the complete ownership record therefore belongs to exact predecessor H,
-// not to N. [FIX:FULL-VR-HUD-PROOF-CADENCE V1581] All strict projections share
-// this join, including Full VR: native text can already be suppressed while
-// the scene-N ownership record is still absent. AER/sequential sources and
-// invalid relations retain the final image identity selected above.
+// not to N. This also applies to strict-stereo Cinema: its retained HUD
+// readiness can suppress the baked text at H while the scene-N ownership
+// record has not completed yet. The same delayed proof occurs in strict
+// Full VR: its retained HUD target is H while the scene trace has advanced
+// to N. AER/sequential routes and invalid relations retain the final image
+// identity selected above.
 constexpr uint64_t strict_stereo_late_hud_proof_pair_id(
     bool strict_stereo_join_active,
     HudProjectionRoute route,

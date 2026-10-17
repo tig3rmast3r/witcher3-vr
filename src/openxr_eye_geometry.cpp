@@ -597,10 +597,12 @@ bool build_cyclopean_hud_plane_clip_positions(
     const XrFovf& target_fov,
     float hud_size,
     float inverse_distance_m,
-    std::array<float, 16>& clip_positions) {
+    std::array<float, 16>& clip_positions,
+    float plane_offset_y_tangent) {
     if (eye >= geometry.relative_orientations.size() ||
         !std::isfinite(hud_size) || hud_size <= 0.0f ||
         !std::isfinite(inverse_distance_m) ||
+        !std::isfinite(plane_offset_y_tangent) ||
         !finite(geometry.relative_positions[eye])) {
         return false;
     }
@@ -642,7 +644,8 @@ bool build_cyclopean_hud_plane_clip_positions(
     for (uint32_t corner = 0; corner < 4; ++corner) {
         const float plane_tangent_x = source_center_x + hud_size *
             (source_corner_x[corner] - source_center_x);
-        const float plane_tangent_y = source_center_y + hud_size *
+        const float plane_tangent_y = source_center_y +
+            plane_offset_y_tangent + hud_size *
             (source_corner_y[corner] - source_center_y);
         // Divide the physical eye-to-plane vector by the plane distance. This
         // remains well-defined for inverse_distance_m == 0 (infinite plane),

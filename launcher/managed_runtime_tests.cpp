@@ -277,6 +277,30 @@ void TestUnknownLegacyFolderEntryIsPreserved() {
     RequireNoStagingFiles(root);
 }
 
+void TestOptiscalerIniIsPreserved() {
+    TemporaryDirectory temporary;
+    const auto& root = temporary.path;
+    StageReferences(root);
+    const std::string user =
+        "[Menu]\r\nShortcutKey=0x2E\r\n[Upscalers]\r\nDx12Upscaler=dlss\r\n";
+    WriteFile(root / L"OptiScaler.ini", user);
+    std::wstring error;
+    Require(w3vr::ApplyManagedIntegrationMode(
+            root, w3vr::IntegrationMode::Optiscaler, error),
+        "OptiScaler publish failed");
+    Require(ReadFile(root / L"OptiScaler.ini") == user,
+        "OptiScaler UI settings were overwritten");
+    Require(w3vr::ApplyManagedIntegrationMode(
+            root, w3vr::IntegrationMode::Optiscaler, error),
+        "canonical OptiScaler transition failed");
+    Require(ReadFile(root / L"OptiScaler.ini") == user,
+        "OptiScaler UI settings were overwritten on mode change");
+    fs::remove(root / L"OptiScaler.ini");
+    Require(!fs::exists(root / L"OptiScaler.ini"),
+        "deleted OptiScaler.ini was unexpectedly recreated");
+    RequireNoStagingFiles(root);
+}
+
 void TestEveryIntegrationTransition() {
     TemporaryDirectory temporary;
     const auto& root = temporary.path;
@@ -315,6 +339,7 @@ int main() {
         TestDlss5ReferenceNeedsOnlyNr();
         TestRepeatedModeAndStaleCleanup();
         TestUnknownLegacyFolderEntryIsPreserved();
+        TestOptiscalerIniIsPreserved();
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << exception.what() << '\n';

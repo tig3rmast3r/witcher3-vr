@@ -66,6 +66,8 @@ target_link_libraries(witcher3vr_dxgi PRIVATE
     minhook
     d3d12
     dxguid
+    user32
+    gdi32
     # WaitOnAddress/WakeByAddressAll for the engine pair producer barrier.
     Synchronization
 )
